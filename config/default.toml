@@ -1,0 +1,70 @@
+[meta]
+ruleset_version = "phase0"
+
+[portfolio]
+quote_currency = "USD"
+interval_s = 86400
+target_gross_exposure = "0.80"
+constructor = "equal_weight"
+
+# Phase 0 signal. Marks every eligible asset as a long candidate with equal
+# conviction. It makes NO claim of edge and exists to exercise the diff, cost
+# and risk plumbing end to end. Phase 1 replaces it with a strategy that has to
+# clear the harness before it ships.
+signal = "placeholder_equal_long"
+
+# Configured, not ranked. Phase 1 replaces this with a real ranking source.
+# See planner/universe.py on why a list applied backwards is survivorship bias.
+universe = ["BTC", "ETH", "SOL"]
+
+# Eligibility. Below this median daily quote turnover an asset is not tradeable
+# at size regardless of what its signal says.
+min_dollar_volume = "50000000"
+
+# An asset with less history than this cannot have its features computed
+# honestly, so it is ineligible rather than silently carrying nulls.
+min_history_bars = 60
+
+# Rebalance deadband: skip a trade whose weight drift is worth less than this
+# multiple of its estimated round-trip cost. Prevents paying spread to correct
+# noise. Costs enter a constructor's *objective* only when the constructor has
+# one - equal_weight does not, so this is where they bind today.
+rebalance_cost_multiple = "3.0"
+
+[limits]
+max_gross_exposure = "1.00"
+max_position = "0.25"
+max_position_count = 20
+min_position_notional = "25"
+
+# Turnover is currently a hard veto, and at "0.50" that made building an initial
+# book from flat impossible: going from 0% to 75% invested IS 75% turnover, so
+# the first run of a new deployment could never be accepted.
+#
+# Set to 1.00 to permit a full initial build. This is a placeholder for an
+# unresolved design question, NOT a validated value - see docs/design-spec.md
+# section 6. Turnover constrains the *transition*, not the resulting portfolio,
+# so it probably belongs in the diff as a budget that trades the highest-priority
+# drifts and discloses what it dropped - not in the gate as a whole-plan veto.
+max_turnover = "1.00"
+
+# Not enforced yet. Left explicitly null rather than set to a permissive number,
+# so the run discloses them as unenforced instead of implying they passed.
+#   max_net_exposure     - needs shorts to be meaningful
+#   max_cluster_exposure - needs a grouping (L1 ecosystem / sector / correlation)
+#   max_benchmark_beta   - needs a beta estimate against BTC
+max_net_exposure = ""
+max_cluster_exposure = ""
+max_benchmark_beta = ""
+
+[costs]
+# Taker fee, roughly the level both candidate venues charge.
+commission_bps = "5.0"
+# Half-spread crossed on entry. A placeholder for liquid majors; per-asset
+# estimation from real quotes is Phase 1.
+spread_bps = "2.0"
+# Impact coefficient. UNCALIBRATED - see CostModel. Phase 3 compares realised
+# against estimated and this is the number that moves.
+impact_coefficient = "0.10"
+adv_lookback_days = 20
+calibrated = false
