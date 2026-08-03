@@ -1,0 +1,35 @@
+[project]
+name = "planner"
+version = "0.1.0"
+description = "Decision path (design spec steps 1-8): observe, featurize, signal, construct, risk-gate, diff, emit a Plan"
+requires-python = ">=3.12"
+dependencies = [
+    "polars>=1.0",
+    "jsonschema>=4.20",  # the Plan contract is validated on write, not trusted
+    "httpx>=0.27",
+    # Windows ships no IANA tz database and stdlib zoneinfo cannot resolve
+    # region names without it. Crypto is UTC-anchored, but the equities
+    # calendar (Phase 6) is not, and the dependency is cheap now.
+    "tzdata>=2024.1; platform_system == 'Windows'",
+    # Added in Phase 1, not now: a path dependency on
+    # ../../trading-journal/backtest for the validation harness
+    # (design spec section 2 - depend in place, do not extract yet).
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+ai-trader = "planner.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

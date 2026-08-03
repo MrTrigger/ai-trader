@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrtrigger/ai-trader/schema/plan.schema.json",
+  "title": "Plan",
+  "description": "The complete description of what the system intends to do, and the sole contract between the Python planner (steps 1-8) and the Rust executor (steps 9-10). See docs/design-spec.md sections 3.5 and 5.3. Immutable once written: a superseded plan gets status='superseded', it is never edited.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "run_id",
+    "created_at",
+    "as_of",
+    "mode",
+    "status",
+    "quote_currency",
+    "nav",
+    "provenance",
+    "targets",
+    "current",
+    "orders",
+    "risk_report",
+    "cost_estimate",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Semver of THIS schema. The executor refuses a plan whose major version it does not know rather than best-effort parsing it (design spec section 0.3, fail closed).",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "plan_id": { "$ref": "#/$defs/uuid" },
+    "run_id": { "$ref": "#/$defs/uuid" },
+
+    "created_at": {
+      "description": "Wall-clock time the plan was written. Never used for decisions - see as_of.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "as_of": {
+      "description": "The decision timestamp: the close of the newest bar the plan is allowed to have seen. Every feature and score in this plan is point-in-time as of here. Replaying the planner with this as_of must reproduce this plan.",
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "mode": {
+      "description": "dry: never executable, produced by backtest or by `plan --dry-run`. live: eligible for execute_plan.",
+      "enum": ["dry", "live"]
+    },
+    "status": {
+      "enum": ["accepted", "rejected", "superseded", "executing", "executed", "failed"]
+    },
+
+    "quote_currency": {
+      "description": "The currency NAV, weights and costs are denominated in.",
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 10
+    },
+
+    "nav": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "cash", "gross_exposure", "net_exposure"],
+      "properties": {
+        "total": { "$ref": "#/$defs/decimal" },
+        "cash": { "$ref": "#/$defs/decimal" },
+        "gross_exposure": {
+          "description": "Sum of |weight| across positions, as a fraction of NAV.",
+          "$ref": "#/$defs/decimal"
+        },
+        "net_exposure": { "$ref": "#/$defs/decimal" },
+        "benchmark_beta": {
+          "description": "Portfolio beta against the configured benchmark (BTC for crypto, SPY for equities). Null until a beta estimate exists.",
+          "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+        }
+      }
+    },
+
+    "provenance": {
+      "description": "Everything needed to re-derive this plan. If a plan cannot be reproduced from its inputs plus these versions, that is a bug, not a limitation (design spec section 5.1).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planner_version",
+        "feature_set_version",
+        "scoring_version",
+        "risk_model_version",
+        "ruleset_version",
+        "constructor",
+        "constructor_requested",
+        "inputs_hash",
+        "universe_size"
+      ],
+      "properties": {
+        "planner_version": { "type": "string" },
+        "feature_set_version": { "type": "string" },
+        "scoring_version": { "type": "string" },
+        "risk_model_version": { "type": "string" },
+        "ruleset_version": { "type": "string" },
+        "constructor": {
+          "description": "The constructor that actually produced these weights.",
+          "type": "string"
+        },
+        "constructor_requested": {
+          "description": "The constructor that was asked for. Differs from `constructor` when a fallback fired (e.g. mvo did not converge). A silent unrecorded fallback makes a backtest uninterpretable, so this field is required, not optional.",
+          "type": "string"
+        },
+        "model_id": {
+          "description": "Set only when an LLM-derived feature contributed. Null otherwise.",
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        },
+        "inputs_hash": {
+          "description": "Content hash of the bars and features this plan was computed from.",
+          "type": "string",
+          "minLength": 8
+        },
+        "universe_size": {
+          "description": "Number of eligible assets at as_of. The completeness gate compares this against the expected floor.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+
+    "targets": {
+      "description": "The desired portfolio. Complete: an asset absent from this list has a target weight of zero.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset", "weight", "direction"],
+        "properties": {
+          "asset": { "$ref": "#/$defs/asset" },
+          "weight": {
+            "description": "Signed fraction of NAV. Negative means short.",
+            "$ref": "#/$defs/decimal"
+          },
+          "direction": { "enum": ["long", "short"] },
+          "conviction": {
+            "description": "The signal score that drove this weight, carried for attribution.",
+            "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+          }
+        }
+      }
+    },
+
+    "current": {
+      "description": "Positions as observed at the venue at as_of - the baseline the diff was taken against. Recorded so a stale plan can be detected before execution.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset", "qty", "weight"],
+        "properties": {
+          "asset": { "$ref": "#/$defs/asset" },
+          "qty": { "$ref": "#/$defs/decimal" },
+          "weight": { "$ref": "#/$defs/decimal" }
+        }
+      }
+    },
+
+    "orders": {
+      "description": "The minimal set of orders that moves current to targets. Empty whenever status is rejected.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset", "side", "qty", "order_type", "reason"],
+        "properties": {
+          "asset": { "$ref": "#/$defs/asset" },
+          "side": { "enum": ["buy", "sell"] },
+          "qty": {
+            "description": "Absolute base-asset quantity, always positive. Direction is carried by `side`.",
+            "$ref": "#/$defs/positive_decimal"
+          },
+          "order_type": { "enum": ["market", "limit"] },
+          "limit_price": {
+            "oneOf": [{ "$ref": "#/$defs/positive_decimal" }, { "type": "null" }]
+          },
+          "reason": {
+            "description": "Why this order exists. `exit` and `reduce` are the only reasons permitted to run while trading is paused.",
+            "enum": ["entry", "exit", "increase", "reduce", "rebalance"]
+          },
+          "est_cost_bps": {
+            "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "order_type": { "const": "limit" } } },
+            "then": {
+              "required": ["limit_price"],
+              "properties": { "limit_price": { "$ref": "#/$defs/positive_decimal" } }
+            }
+          }
+        ]
+      }
+    },
+
+    "risk_report": {
+      "description": "The section 6 evaluation. A plan is accepted only if every hard limit passed - the risk layer rejects a plan whole, never partially.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "checks"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "limit", "value", "passed"],
+            "properties": {
+              "name": { "type": "string" },
+              "limit": { "$ref": "#/$defs/decimal" },
+              "value": { "$ref": "#/$defs/decimal" },
+              "passed": { "type": "boolean" },
+              "detail": { "oneOf": [{ "type": "string" }, { "type": "null" }] }
+            }
+          }
+        },
+        "rejected_reason": {
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        }
+      }
+    },
+
+    "cost_estimate": {
+      "description": "Estimated cost of executing this plan. Fed into the constructor's objective (design spec section 6.1), not merely reported. Compared against realised cost after execution.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_bps", "total_quote"],
+      "properties": {
+        "total_bps": { "$ref": "#/$defs/decimal" },
+        "total_quote": { "$ref": "#/$defs/decimal" },
+        "per_asset": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["asset", "bps"],
+            "properties": {
+              "asset": { "$ref": "#/$defs/asset" },
+              "bps": { "$ref": "#/$defs/decimal" },
+              "spread_bps": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+              "impact_bps": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] }
+            }
+          }
+        }
+      }
+    },
+
+    "warnings": {
+      "description": "Non-fatal disclosures that must be surfaced above any number derived from this plan: degenerate factors, unenforced rules, inadequate sample. Reported first, before results (design spec section 11).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "message"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "degenerate_feature",
+              "unenforced_rule",
+              "insufficient_sample",
+              "constructor_fallback",
+              "stale_input",
+              "other"
+            ]
+          },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  },
+
+  "allOf": [
+    {
+      "description": "A rejected plan carries no orders. Nothing downstream should have to remember this.",
+      "if": { "properties": { "status": { "const": "rejected" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "orders": { "maxItems": 0 },
+          "risk_report": { "properties": { "passed": { "const": false } } }
+        }
+      }
+    },
+    {
+      "description": "An accepted plan passed every hard limit.",
+      "if": { "properties": { "status": { "const": "accepted" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "risk_report": { "properties": { "passed": { "const": true } } }
+        }
+      }
+    }
+  ],
+
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "asset": {
+      "description": "Canonical asset id, venue-independent. Venue symbol mapping lives in the adapter, never in a plan.",
+      "type": "string",
+      "pattern": "^[A-Z0-9]{1,20}$"
+    },
+    "decimal": {
+      "description": "An exact decimal, carried as a string. Money and weights are never JSON numbers here: a JSON number is an IEEE double on both sides of this contract, and rounding that silently differs between Python and Rust is exactly the drift this schema exists to prevent.",
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$"
+    },
+    "positive_decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$"
+    }
+  }
+}
