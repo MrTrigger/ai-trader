@@ -22,9 +22,14 @@ futures trades and the judgment behind them. See §1.
 1. **The money path is deterministic.** Every decision that moves capital is made by code that,
    given identical inputs, produces identical outputs. No LLM sits between a signal and an order.
    This is the principle the rest of the document exists to protect.
-2. **No capital before evidence.** A strategy reaches live money only after it has cleared the
-   backtest harness (positive expectancy after costs, survives 2× slippage, survives walk-forward)
-   *and* paper-traded within the backtest's error bars. Both gates. In that order.
+2. **No capital before evidence — and the available evidence differs by layer.** The deterministic
+   core reaches live money only after clearing the backtest harness (positive expectancy after
+   costs, survives 2× slippage, survives walk-forward) *and* paper-trading within the backtest's
+   error bars. Both gates, in that order.
+   A **judgment-layer** feature (§7.3) cannot clear the first gate at all, because its backtest is
+   contaminated. Capital behind one is therefore funding an experiment, not deploying a validated
+   strategy. That is a legitimate thing to do deliberately and a bad thing to do by accident, so it
+   is stated here: know which of the two you are doing, and size it accordingly.
 3. **Fail closed.** Missing data, stale data, an incomplete universe, an unreachable venue, or a
    position that disagrees with the venue means **do nothing and alert**. Never act on partial
    knowledge. The default state of an automated trader is *flat and idle*, not *guessing*.
@@ -364,7 +369,7 @@ alone: it depends on which assets were in the universe that day. Storing scores 
 **`degenerate_flags` carries its own honesty.** A factor with insufficient history (fewer
 snapshots than its lookback needs) returns a neutral score and *says so*, rather than silently
 contributing a flat 50 that reads as a real measurement. Any report including a degenerate factor
-discloses it above the numbers (§11).
+discloses it above the numbers (§12).
 
 `nav_snapshots` is the thing the journal has no equivalent of and the thing every performance
 question depends on. Write one every run, and on every reconcile, regardless of whether anything
@@ -468,12 +473,28 @@ consumed by a deterministic function, or *is* the action.
 |---|---|---|
 | unstructured → numeric feature | yes, as a materialized column | the real one — §7.2 |
 | negative screening / veto | yes, as a boolean | failure mode is "don't trade", the safe direction |
+| portfolio-manager recommendation | yes, as a **signal** | `{asset: BUY\|SELL\|HOLD, confidence}` consumed by the constructor. See below |
 | research hypothesis generation | **no** — offline | proposes features; the harness kills the bad ones. Highest EV, zero runtime risk |
 | plan review / anomaly flagging | **no** — advisory | flags, never blocks, never modifies |
 | post-trade narration | **no** — after the fact | the "why" record; the AI-side analogue of the journal's judgment block |
 
-Explicitly excluded: choosing assets, choosing sizes, evaluating a numeric threshold, or
-constructing an order. Those are arithmetic. Code does arithmetic.
+Explicitly excluded: choosing sizes, evaluating a numeric threshold, or constructing an order.
+Those are arithmetic. Code does arithmetic.
+
+**On the portfolio-manager role.** A per-asset BUY/SELL/HOLD is permitted because it is a *signal,
+not an order*: the constructor still turns labels into weights, the risk gate still evaluates them,
+the diff still produces the orders. The model's output space does not contain an executable
+instruction, which is the line that matters — `{BTC: BUY}` does not, `sell 0.3 BTC at market` does.
+Everything downstream is unchanged, including the choice between acting automatically (the risk
+gate is the "other checks") and requiring approval (`propose_plan` → `execute_plan`); both already
+exist and neither needs a new mechanism.
+
+What it costs is not architecture but **evidence**. A BUY/SELL/HOLD is squarely the judgment
+category of §7.3, so its backtest means nothing and its evidence is forward-only (§7.5). That turns
+it from something sweepable in an afternoon into something learned about over a quarter. Which is
+also why the deterministic baseline is built first: the PM's contribution is only measurable *as a
+difference against something*, and that something has to exist and be trusted before the difference
+means anything.
 
 ### 7.2 Rules for an LLM-derived feature
 
@@ -490,23 +511,158 @@ constructing an order. Those are arithmetic. Code does arithmetic.
 
 ### 7.3 The contamination problem — read before building any LLM feature
 
-**Current models have seen the future.** Ask one to assess a 2024 announcement and it knows how
-that played out. The leakage is invisible, produces no error, and makes a backtest look
-extraordinary.
+**The leakage is in the weights, not the prompt.** This is the sharp form and it is the one that
+matters: feeding a model strictly point-in-time inputs does *nothing* about the fact that it was
+pretrained on the window it is being asked to predict. Careful prompt hygiene cannot fix it, and a
+system that claims "the agent only saw data available on that date" has addressed the easy half of
+the problem and none of the hard half.
 
-This partitions the use cases and the partition is not negotiable:
+This is not a theoretical worry. §11.3 works through a published multi-agent trading result whose
+entire test window predates the training cutoff of every model it used, while the paper claims no
+look-ahead on prompt-level grounds. There is now a benchmark for measuring the effect —
+[Look-Ahead-Bench](https://arxiv.org/pdf/2601.13770).
 
-- **Extraction is safe.** "Does this proposal change the emission rate, and to what value?"
-  Knowing the future does not help; the answer is in the document. Feed it the document, nothing
-  else, and never the date's market outcome.
+The partition that follows is not negotiable:
+
+- **Extraction is safe.** "Does this proposal change the emission rate, and to what value?" Knowing
+  the future does not help; the answer is in the document. Feed it the document, nothing else, and
+  never the date's market outcome.
 - **Judgment is contaminated.** "Was this bullish?" is unusable in backtest. Hindsight passes
-  straight through. If you want a judgment-shaped feature, **only forward-tested results count** —
-  paper it for months and disregard the backtest entirely.
+  straight through.
 
-Build extraction; keep interpretation in the deterministic layer downstream. The holdout split is
-the tool that catches a contaminated feature: impossible in-sample, dead out-of-sample.
+**Which decides where each layer's evidence comes from:**
 
-### 7.4 Non-LLM ML
+| Feature type | Contaminated | Evidence from |
+|---|---|---|
+| price/volume derived — momentum, vol, liquidity | no; no model involved | backtest, full harness, cheap |
+| LLM **extraction** — typed facts out of a document | barely | backtest, with the caveat stated |
+| LLM **judgment** — bullish?, BUY/SELL/HOLD | **yes, in the weights** | forward only (§7.5) |
+
+Read that table as an argument for where the strategy's *weight* should sit. The top row is the
+only place backtesting is both valid and cheap, which is a reason for the deterministic core to
+carry most of the strategy and for the model layer to be a bounded overlay whose contribution is
+measured rather than depended on.
+
+**One partial fix worth knowing:** pin a model whose training cutoff predates the test window.
+Contamination is then genuinely eliminated for that window, not merely mitigated. The costs are
+real — worse model, and a window that shrinks as time passes — but for a one-off "does this feature
+have *any* historical signal" it is a legitimate experiment and cheaper than the alternatives.
+
+### 7.4 Evaluating an LLM feature, and what it costs
+
+Materialization (§7.2 rule 2) buys less than it first appears, and being precise about which is
+which prevents a development process built on a false expectation.
+
+**What it buys:** sweeps of everything *downstream* of the feature — constructor, sizing,
+thresholds, limits — are clean and cheap, because the model layer is held constant while one thing
+varies. Plans stay replayable and auditable. And it makes attribution possible at all: with a
+reproducible core and a measured overlay you can answer *did the model help*, which you cannot if
+everything moves at once.
+
+**What it does not buy:** a free comparison of prompt v1 against prompt v2. A prompt change is a
+new `feature_set_version` and a full re-materialization. There is no way around that.
+
+#### The noise floor comes first
+
+Two tables built from the same prompt differ by sampling alone. Until that difference is measured,
+a difference between two *different* prompts means nothing.
+
+1. Materialize the same prompt twice → tables A and A′. Backtest both. The gap is the noise floor.
+2. Materialize v2 → table B. If `result(B) − result(A)` sits inside that band, the change did
+   nothing measurable. Outside it, there is an effect.
+
+So **one prompt change costs three or four full re-materializations**, not one. That is the real
+price of a model in the strategy and it should drive the design.
+
+Do this on the *first* LLM feature, before building a second. If the noise floor is wider than any
+plausible prompt improvement, the instrument cannot resolve what you are adjusting — and you would
+rather learn that in a day than after designing a development loop around it.
+
+#### Granularity is decided by iteration cost, not sophistication
+
+- A daily cross-section over 30 assets × 3 years is ~33k calls per materialization. At 3–4 per
+  iteration, the budget binds after two or three prompt revisions. That is not a development loop.
+- An event-driven feature — fires on a filing, an unlock, a governance proposal — might be 200–500
+  calls over the same history. A re-materialization is minutes, the noise floor is cheap, and
+  twenty iterations are affordable.
+
+The case for event-driven LLM features is therefore not purity. It is that event granularity is the
+only one at which the prompt can actually be *developed*. A per-bar agent debate is something you
+can build once and never meaningfully improve.
+
+### 7.5 Forward testing: what it can and cannot establish
+
+Where backtesting is invalid (§7.3) the evidence has to come from forward testing, and it is worth
+being blunt about its limits before building a process on it.
+
+**It cannot establish a modest edge in a useful timeframe.** The standard error on an estimated
+Sharpe is roughly `sqrt(1/T)` for `T` years; separating Sharpe 0.5 from zero at two standard errors
+is on the order of sixteen years. Hours-to-weeks holds give 25–50 semi-independent periods a year.
+No paper-trading run proves an edge, and any claim that one did was measuring something else.
+
+**What it does establish, in weeks:**
+
+- the plumbing — executed-vs-planned, realised-vs-modelled cost, reconciliation breaks
+- gross failure — far cheaper to detect than edge
+- feature stability — the §7.4 noise floor, the highest information per token available
+
+That is the honest reading of the Phase 2 gate: it proves the *system* works and the strategy is
+not obviously broken. It was never going to prove the strategy works.
+
+**Measure the signal, not the portfolio.** Portfolio P&L yields one observation per rebalance.
+The rank correlation between a signal and subsequent returns — the information coefficient —
+yields one *per asset* per period. Thirty assets over a year is ~1,500 observations instead of ~50:
+a 30× speedup on the same calendar time, answering the question that actually matters (does this
+rank assets better than chance). Construction and sizing are then evaluated separately in the
+deterministic layer where backtesting is valid. IC works on the contaminated layer too, because it
+is measured forward.
+
+### 7.6 Worked example: a news agent
+
+The most instructive case, because it fails in four independent ways and the fix is the same one.
+
+1. **Contamination is worse than general.** The model was trained *on news*. Given a pre-cutoff
+   article it may have memorised the subsequent coverage of that exact event. It is not inferring,
+   it is recalling.
+2. **The data problem is bigger than the model problem.** An honest backtest needs the corpus as it
+   existed at time T: first-publication timestamps (not crawl dates, which run hours off), original
+   text (not the silently-edited current version), and the articles that were later deleted (or it
+   is survivorship bias again). A timestamp off by hours is the same class of bug as bar
+   open-vs-close — except there is no continuity check to catch it. Trustworthy point-in-time crypto
+   news corpora are not purchasable at a sane price.
+3. **The mechanism is unstated.** News in liquid majors is priced in seconds to minutes. A daily
+   rebalancer is trading the residual after everyone faster has finished. That can be real —
+   post-event drift and underreaction are documented — but it is a different claim than "we read
+   the news", and it is the claim that would have to be tested.
+4. **Often the wrong sensor entirely.** Unlock schedules are on-chain and known months ahead;
+   listings are structured exchange announcements; upgrades are governance proposals; exploits show
+   in on-chain flows before they are written up. Where a fact is available exactly, reading a
+   journalist's description of it is the expensive, lossy, timestamp-ambiguous path to the same
+   thing. A news agent should only cover what genuinely has no structured source.
+
+**The version that survives** is the same split as everywhere: let the model read, let the code
+decide. Not *is this bullish* but *what happened, as typed facts*:
+
+```
+{event: "listing" | "delisting" | "unlock" | "upgrade" | "exploit" | "regulatory_action",
+ asset: "SOL", effective_date: "2026-08-14",
+ magnitude: {kind: "supply_pct", value: "0.05"},
+ confidence: 0.9}
+```
+
+Extraction, so contamination barely bites and the output is verifiable against its source. The
+mapping from "5% of supply unlocks in three days" to a position adjustment is code, and therefore
+backtestable. And it is event-granular, which per §7.4 is the only scale at which the prompt can be
+developed.
+
+**One thing worth starting early regardless.** A point-in-time news corpus cannot be bought and
+cannot be reconstructed later — but it can be *recorded*. A daily crawl storing headline, body,
+source, first-seen timestamp and a content hash, immutable, under the same conventions as the bar
+store, costs almost nothing to run. Started now it yields in twelve months something no amount of
+money buys today; not started, twelve months from now is exactly where today is. No model goes
+anywhere near it — it is a store, a source and an immutability rule. See §10.5.
+
+### 7.7 Non-LLM ML
 
 Gradient boosting over the feature frame for ranking or sizing, regime clustering, volatility
 forecasting — legitimate and often where the actual lift is. Caveat: crypto regimes are unstable
@@ -567,9 +723,9 @@ Each gate is stated as evidence. "It's done" is not a gate.
 | **0** Skeleton | repo, storage, `DataSource`, `paper` adapter, Plan schema + round-trip test (§3.5), CLI shell | `plan --dry-run` produces a plan from real bars, twice, byte-identical; Rust parses a Python-written Plan in CI |
 | **1** Strategy v1 | deterministic rules, feature frame, `scores`, `equal_weight` constructor, cost model, risk layer (§6), full backtest through the harness | positive expectancy after costs; **survives 2× slippage**; walk-forward beats baseline out of sample; sample size adequate or the run says so |
 | **1b** Better construction | `RiskModel` (shrunk covariance), `conviction_tilt`, `mvo` | each constructor beats `equal_weight` out of sample, or it is deleted. No constructor ships on elegance |
-| **2** Paper | `executor` live on real-time data, `paper` venue, alerting, reconciliation | ≥6 weeks unattended; paper results inside the backtest's error bars; **zero unexplained reconciliation mismatches** |
-| **3** Live, small | venue selected (§10), real credentials, small fixed capital | 4+ weeks; **realised cost within the model's error bars** (§6.1); no gate ever bypassed manually |
-| **4** First LLM feature | one extraction feature, materialized (§7.2) | beats the Phase-1 baseline out of sample, after inference cost. If not — delete it |
+| **2** Paper | `executor` live on real-time data, `paper` venue, alerting, reconciliation | ≥6 weeks unattended; **plumbing, not edge** (§7.5): executed matches planned, realised cost inside the model's error bars, **zero unexplained reconciliation mismatches**, and results not grossly outside the backtest |
+| **3** Live, small | venue selected (§10), real credentials, small fixed capital | 4+ weeks; realised cost within the model's error bars (§6.1); no gate ever bypassed manually |
+| **4** First LLM feature | one **extraction** feature, materialized (§7.2); noise floor measured first (§7.4) | noise floor established before any comparison; then beats the Phase-1 baseline out of sample after inference cost. If not — delete it |
 | **5** MCP + portfolio view | read surface over this + journal + harness | — |
 | **6** Equities | equities `DataSource`, broker adapter, real `Calendar`, equities factor library | Phase 1–3 gates again, independently, for that book |
 
@@ -648,9 +804,123 @@ offshore perps have materially different treatment, and the venue choice locks i
 generated for years. Out of scope for this spec and not a question for a coding agent — resolve it
 with a qualified advisor before Phase 3.
 
+**10.5 The news corpus — deferred, but time-sensitive in one direction.** Per §7.6, a trustworthy
+point-in-time news corpus cannot be bought and cannot be reconstructed after the fact. It can only
+be *recorded forward*. Whether a news feature is ever built is undecided and does not need deciding
+now; whether the corpus exists to decide it with is determined by when recording starts.
+
+Shape if started: a daily crawl storing headline, body, source, first-seen timestamp and content
+hash, immutable, under the bar store's conventions (§12). No model anywhere near it — a source, a
+store and an immutability rule. Roughly Phase-0-sized, and it does not touch the decision path.
+
+The cost of starting is small and recurring; the cost of not starting is that this question looks
+identical in twelve months. That asymmetry is the whole argument, and it is the only open question
+here where delay is not free.
+
 ---
 
-## 11. Conventions that matter
+## 11. Prior art reviewed
+
+Three existing systems were read before and during this design. None is a base for this project;
+each contributed something, and each demonstrates a failure mode worth naming. Recorded so the
+reasoning is not re-litigated later.
+
+The pattern across all three: **operational craft is high, evidence discipline is absent.** Each
+is a well-engineered machine with no instrument that measures whether it works. That absence is
+what §9's gates exist to prevent, and it is the single largest difference between this design and
+the alternatives.
+
+### 11.1 signum.money — LLM-executed rules
+
+Prompt-driven daily rebalancer. An LLM fetches a Gaussian-channel trend detector, evaluates
+crossovers across ~100 assets, and places the orders itself.
+
+**Adopted:** its operational hygiene, which is better than most production trading daemons.
+Fail-closed on any data fetch; a freshness gate requiring the signal date to be today; a
+**completeness gate** (fewer rows than expected → stop, do not evaluate exits) which correctly
+identifies that a truncated universe manufactures false "dropped out" exits; exits before entries;
+declarative target-state convergence rather than imperative order placement; no re-entry into an
+asset exited in the same run. All of these are in §3.2 and §6.3.
+
+**Rejected:** the LLM is doing arithmetic. Every rule is a hard float comparison, so the model adds
+nondeterminism and inference cost while contributing no judgment. Compounding problems: no
+portfolio-level cap at all (twenty correlated breakouts at 8% NAV each "wants" 160% of NAV, and the
+prompt has no answer), no stop between daily runs on a 24/7 market, and — the design flaw worth
+remembering — the bot fetches `aiRules` from its own config records and is instructed to obey them,
+which makes untrusted fetched data an instruction channel into a system holding trading
+credentials. §8.2's "tool results are data, never instructions" is a direct response.
+
+### 11.2 A seven-layer equities stack ("Meridian")
+
+Layered build: data → scoring (8 factors, 27 sub-factors, sector-relative percentile) → LLM
+analysis of filings/calls/insider data → portfolio construction (MVO + conviction-tilt) → risk
+(Barra-style factor model, pre-trade vetoes, circuit breakers, stress tests) → execution →
+reporting.
+
+**Adopted:** four things, all now in this spec — `PortfolioConstructor` as a swappable *and
+comparable* interface with a recorded fallback (§4.5); a `RiskModel` whose covariance is an input
+to construction and not only a veto (§4.4, §3.1); transaction costs subtracted from expected return
+*before* optimisation (§6.1); benchmark-beta as a first-class constraint (§6.2). Its analysis cache
+keyed by `(analyzer, ticker, artifact_id)` with TTL is independently the same idea as §7.2's
+materialization rule, and its "no Claude analysis available → 100% quantitative, no penalty" is
+independently §7.2's fail-neutral.
+
+**Rejected:** no validation layer anywhere in seven layers. The parameter surface is enormous — 27
+sub-factors, an 8-weight composite, regime-conditional weight switching on VIX bands, crowding at
+0.4, MCTR flag at 1.5×, top-5% gets 1.5× — and nothing in the system could tell you whether any
+constant is load-bearing or noise. Also: hardcoded FOMC dates that will go stale silently, and a
+daily cron running `--no-filings --no-13f`, meaning scheduled scores are computed differently from
+a full run — precisely the backtest/live divergence §0.1 forbids.
+
+### 11.3 TradingAgents (Tauric Research)
+
+[arXiv:2412.20138](https://arxiv.org/abs/2412.20138) ·
+[repo](https://github.com/TauricResearch/TradingAgents). A LangGraph firm simulation: four analysts
+(fundamentals, sentiment, news, technical) → bull and bear researchers debating for N configurable
+rounds → a research manager judging the debate → a trader → three risk perspectives
+(aggressive/conservative/neutral) → a portfolio manager approving or rejecting.
+
+**Adopted:** the bull/bear/judge debate is a genuinely good structure — for *research*, in §7.1's
+offline hypothesis-generation slot, where its output is "what to test" and the harness still
+adjudicates. The aggressive/conservative/neutral split is perspective-diverse verification, which
+catches failure modes that N identical checkers cannot; it applies to advisory plan review. Their
+reflection log (realised returns fed back as lessons) is the right instinct in an unbacktestable
+form — the disciplined version is realised-outcome statistics as a materialised point-in-time
+feature, not prompt memory.
+
+Also a third independent arrival at propose/execute: their portfolio manager approves or rejects
+the trader's proposal, as signum's approval step and Meridian's approve/reject cards do. Three
+unrelated teams landing on the same seam is evidence the seam is real, and it is §8.2's.
+
+**Rejected — and this is the concrete case that §7.3 and §7.5 are built on.** From the paper
+itself:
+
+| | |
+|---|---|
+| Test window | **1 Jan – 29 Mar 2024** (~60 trading days) |
+| Universe | **5 large-cap tech names** — AAPL, NVDA, MSFT, META, GOOGL |
+| Models | gpt-4o-mini, gpt-4o, o1-preview |
+| Transaction costs | **not modelled** — zero occurrences of "transaction cost" or "slippage" in 38 pages |
+| Look-ahead claim | *"Agents make decisions based solely on data available up to each trading day, ensuring no future data is used (eliminating look-ahead bias)."* |
+
+Every model used postdates the test window, so all three were trained on data spanning the period
+they are "predicting". The quoted claim addresses the prompt and is silent on the weights, which is
+exactly the distinction §7.3 turns on — and it is why prompt-level point-in-time discipline cannot
+be accepted as evidence of no look-ahead.
+
+Independently of contamination, the result would not clear this project's Phase 1 gate: five assets
+over one quarter is a sample the harness would flag before reporting any number; a single
+three-month window is not walk-forward; and a strategy with no cost model has not been shown to
+survive costs, let alone 2× slippage. The period was also strongly favourable for those specific
+names, so the benchmark comparison carries most of the burden — and the baselines are the part a
+reader cannot re-run.
+
+None of that makes the architecture uninteresting. It makes the *number* uninformative, which is a
+different and more common failure.
+
+---
+
+## 12. Conventions that matter
 
 - **`ts_utc` is always the bar's OPEN**, timezone-aware. Sources stamping the interval end convert
   at the adapter boundary and never again. Getting this wrong shifts every bar by one interval and
