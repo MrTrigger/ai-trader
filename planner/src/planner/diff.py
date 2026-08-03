@@ -48,6 +48,13 @@ class Trade:
 class DiffResult:
     trades: list[Trade]
     skipped: list[str]
+    turnover_used: Decimal = Decimal(0)
+    turnover_dropped: Decimal = Decimal(0)
+    dropped: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.dropped is None:
+            object.__setattr__(self, "dropped", [])
 
     @property
     def orders(self) -> list[Order]:
@@ -139,9 +146,71 @@ def compute(
             )
         )
 
-    trades.sort(key=lambda t: (_REASON_ORDER[t.reason], t.asset))
-    _assert_ordering(trades)
-    return DiffResult(trades=trades, skipped=skipped)
+    kept, dropped, used, shed = _apply_turnover_budget(trades, budget=config.turnover_budget)
+
+    kept.sort(key=lambda t: (_REASON_ORDER[t.reason], t.asset))
+    _assert_ordering(kept)
+    return DiffResult(
+        trades=kept,
+        skipped=skipped,
+        turnover_used=used,
+        turnover_dropped=shed,
+        dropped=dropped,
+    )
+
+
+def _apply_turnover_budget(
+    trades: list[Trade], *, budget: Decimal
+) -> tuple[list[Trade], list[str], Decimal, Decimal]:
+    """Spend a turnover budget on the trades that matter most.
+
+    A budget, not a limit. It paces the transition toward a portfolio the risk
+    gate has already declared legal; it never vetoes the destination. That
+    distinction is why an initial build from flat works: going 0% -> 75%
+    invested is 75% turnover, which under a veto could never be accepted, and
+    under a budget simply takes two runs.
+
+    **Exits are exempt.** A position we no longer want is risk we are still
+    carrying, and pacing our way out of it is not a saving - it is the same
+    exposure held longer for the sake of a number. If exits alone exceed the
+    budget, all of them still go, and the overspend is disclosed.
+
+    The remainder is taken largest-drift-first: the trade that closes the most
+    distance to target buys the most convergence per unit of turnover spent.
+
+    Whatever does not fit is **disclosed, never silently truncated**. A plan
+    that quietly did less than it said reads afterwards as a plan that failed.
+    """
+    exits = [t for t in trades if t.reason == "exit"]
+    rest = sorted(
+        (t for t in trades if t.reason != "exit"),
+        key=lambda t: (-abs(t.delta_weight), t.asset),
+    )
+
+    kept = list(exits)
+    used = sum((abs(t.delta_weight) for t in exits), Decimal(0))
+    dropped: list[str] = []
+    shed = Decimal(0)
+
+    if used > budget:
+        dropped.append(
+            f"turnover budget {budget} exceeded by exits alone ({used}); "
+            "exits are exempt and were all taken"
+        )
+
+    for t in rest:
+        cost = abs(t.delta_weight)
+        if used + cost <= budget:
+            kept.append(t)
+            used += cost
+        else:
+            shed += cost
+            dropped.append(
+                f"{t.asset}: {t.reason} of {cost} weight dropped - "
+                f"{(budget - used) if budget > used else Decimal(0)} of budget left"
+            )
+
+    return kept, dropped, used, shed
 
 
 def _assert_ordering(trades: list[Trade]) -> None:

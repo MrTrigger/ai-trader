@@ -1,0 +1,138 @@
+{
+  "as_of": "2026-08-01T00:00:00+00:00",
+  "cost_estimate": {
+    "per_asset": [
+      {
+        "asset": "BTC",
+        "bps": "7.08",
+        "impact_bps": "0.08",
+        "spread_bps": "2.00"
+      },
+      {
+        "asset": "ETH",
+        "bps": "7.17",
+        "impact_bps": null,
+        "spread_bps": "2.00"
+      }
+    ],
+    "total_bps": "5.39",
+    "total_quote": "53.88"
+  },
+  "created_at": "2026-08-01T06:30:00+00:00",
+  "current": [
+    {
+      "asset": "BTC",
+      "qty": "0.10000000",
+      "weight": "0.100000"
+    }
+  ],
+  "mode": "live",
+  "nav": {
+    "benchmark_beta": null,
+    "cash": "25000.10",
+    "gross_exposure": "0.750000",
+    "net_exposure": "0.250000",
+    "total": "100000.00"
+  },
+  "orders": [
+    {
+      "asset": "BTC",
+      "est_cost_bps": "7.08",
+      "limit_price": "64000.50",
+      "order_type": "limit",
+      "qty": "0.39753288",
+      "reason": "increase",
+      "side": "buy"
+    },
+    {
+      "asset": "ETH",
+      "est_cost_bps": "7.17",
+      "limit_price": null,
+      "order_type": "market",
+      "qty": "13.42209814",
+      "reason": "entry",
+      "side": "sell"
+    }
+  ],
+  "plan_id": "5227e5a9-d91b-50b0-9275-ce7ca4c3ddf8",
+  "provenance": {
+    "constructor": "conviction_tilt",
+    "constructor_requested": "mvo",
+    "feature_set_version": "fs-phase0-1",
+    "inputs_hash": "2117ef6d27b612fd",
+    "model_id": null,
+    "planner_version": "0.1.0",
+    "risk_model_version": "none-phase0",
+    "ruleset_version": "phase0",
+    "scoring_version": "none-phase0",
+    "universe_size": 30
+  },
+  "quote_currency": "USD",
+  "risk_report": {
+    "checks": [
+      {
+        "detail": "sum of |weight| across targets",
+        "limit": "1.00",
+        "name": "max_gross_exposure",
+        "passed": true,
+        "value": "0.75"
+      },
+      {
+        "detail": null,
+        "limit": "0.50",
+        "name": "max_position",
+        "passed": true,
+        "value": "0.50"
+      }
+    ],
+    "passed": true,
+    "rejected_reason": null
+  },
+  "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "schema_version": "1.1.0",
+  "status": "accepted",
+  "targets": [
+    {
+      "asset": "BTC",
+      "conviction": "0.87",
+      "direction": "long",
+      "weight": "0.500000"
+    },
+    {
+      "asset": "ETH",
+      "conviction": null,
+      "direction": "short",
+      "weight": "-0.250000"
+    }
+  ],
+  "warnings": [
+    {
+      "kind": "degenerate_feature",
+      "message": "revisions: 12 of 30 snapshots"
+    },
+    {
+      "kind": "unenforced_rule",
+      "message": "limit max_cluster_exposure is not enforced"
+    },
+    {
+      "kind": "insufficient_sample",
+      "message": "n=41, below the 100 floor"
+    },
+    {
+      "kind": "constructor_fallback",
+      "message": "requested mvo, used conviction_tilt"
+    },
+    {
+      "kind": "stale_input",
+      "message": "adv_quote is 2 bars old for ETH"
+    },
+    {
+      "kind": "turnover_capped",
+      "message": "budget 0.50 spent; 1 trade deferred"
+    },
+    {
+      "kind": "other",
+      "message": "cost model is uncalibrated"
+    }
+  ]
+}

@@ -1,9 +1,15 @@
 """The risk gate (step 6).
 
-Hard limits, evaluated at plan construction. **A plan that breaches any limit is
-rejected whole** - never partially applied, never truncated to fit. Truncating
-to fit is how a system ends up holding the first fifteen of twenty intended
-positions and calling it a portfolio.
+Hard limits on the **resulting portfolio**, evaluated at plan construction. A
+plan that breaches any limit is **rejected whole** - never partially applied,
+never truncated to fit. Truncating to fit is how a system ends up holding the
+first fifteen of twenty intended positions and calling it a portfolio.
+
+Every limit here is a property of the destination: how concentrated is the book,
+how many names, how much gross. Turnover is deliberately *not* here - it
+describes the transition, not the destination, and conflating the two made an
+initial build from flat unreachable (0% -> 75% invested is 75% turnover, so the
+first run of any deployment breached a 50% cap). It is a budget in `diff.py`.
 
 The failure mode this exists to prevent is specific: per-asset signals are
 correlated. In a broad rally, twenty assets trigger the same day, and per-asset
@@ -59,25 +65,6 @@ def evaluate(
             limit=Decimal(limits.max_position_count),
             value=count,
             passed=count <= limits.max_position_count,
-        )
-    )
-
-    # Turnover is one-way: the sum of weight changes, not their round trip.
-    assets = set(target_weights) | set(current_weights)
-    turnover = sum(
-        (
-            abs(target_weights.get(a, Decimal(0)) - current_weights.get(a, Decimal(0)))
-            for a in assets
-        ),
-        Decimal(0),
-    )
-    checks.append(
-        RiskCheck(
-            name="max_turnover",
-            limit=limits.max_turnover,
-            value=turnover,
-            passed=turnover <= limits.max_turnover,
-            detail="sum of |target - current| weight, one way",
         )
     )
 

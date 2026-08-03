@@ -218,7 +218,20 @@ def run(
         )
         orders = result.orders
         estimates = [t.cost for t in result.trades]
-        skipped = result.skipped
+        skipped = result.skipped + result.dropped
+        if result.dropped:
+            # No silent caps. A plan that quietly did less than it intended
+            # reads afterwards as a plan that failed.
+            warnings.append(
+                Warning(
+                    kind="turnover_capped",
+                    message=(
+                        f"turnover budget {config.turnover_budget} spent "
+                        f"({result.turnover_used} used); {len(result.dropped)} trade(s) "
+                        f"totalling {result.turnover_dropped} weight deferred to a later run"
+                    ),
+                )
+            )
     else:
         # Rejected plans carry no orders. Still price the intended trades, so
         # the record shows what the plan would have cost had it been legal.

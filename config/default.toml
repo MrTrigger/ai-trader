@@ -31,22 +31,28 @@ min_history_bars = 60
 # one - equal_weight does not, so this is where they bind today.
 rebalance_cost_multiple = "3.0"
 
+# Turnover budget per run, as a fraction of NAV. A BUDGET, not a limit: it paces
+# the transition rather than vetoing the destination. Trades are taken in
+# priority order until it is spent, and whatever is dropped is disclosed on the
+# plan (never silently truncated).
+#
+# It lives here and not in [limits] because gross exposure, position size and
+# count are properties of the resulting PORTFOLIO, while turnover is a property
+# of the TRANSITION. Mixing the two made an initial build from flat impossible
+# to accept: going 0% -> 75% invested simply IS 75% turnover.
+#
+# Exits are exempt and are never dropped - a position we no longer want is risk
+# we are still carrying, and pacing out of it is not a saving.
+turnover_budget = "0.50"
+
 [limits]
+# Properties of the RESULTING portfolio. Breaching any one rejects the plan
+# whole - never partially applied, never truncated to fit. Turnover is not here;
+# see turnover_budget above.
 max_gross_exposure = "1.00"
 max_position = "0.25"
 max_position_count = 20
 min_position_notional = "25"
-
-# Turnover is currently a hard veto, and at "0.50" that made building an initial
-# book from flat impossible: going from 0% to 75% invested IS 75% turnover, so
-# the first run of a new deployment could never be accepted.
-#
-# Set to 1.00 to permit a full initial build. This is a placeholder for an
-# unresolved design question, NOT a validated value - see docs/design-spec.md
-# section 6. Turnover constrains the *transition*, not the resulting portfolio,
-# so it probably belongs in the diff as a budget that trades the highest-priority
-# drifts and discloses what it dropped - not in the gate as a whole-plan veto.
-max_turnover = "1.00"
 
 # Not enforced yet. Left explicitly null rather than set to a permissive number,
 # so the run discloses them as unenforced instead of implying they passed.

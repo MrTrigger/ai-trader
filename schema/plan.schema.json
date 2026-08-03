@@ -267,6 +267,7 @@
               "insufficient_sample",
               "constructor_fallback",
               "stale_input",
+              "turnover_capped",
               "other"
             ]
           },

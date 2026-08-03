@@ -1,0 +1,14 @@
+[package]
+name = "plan"
+description = "The Plan contract, as the executor sees it. Parse only - this crate cannot construct a plan."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true

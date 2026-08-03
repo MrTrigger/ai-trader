@@ -37,7 +37,6 @@ class RiskLimits:
     max_gross_exposure: Decimal
     max_position: Decimal
     max_position_count: int
-    max_turnover: Decimal
     min_position_notional: Decimal
     max_net_exposure: Decimal | None = None
     max_cluster_exposure: Decimal | None = None
@@ -59,7 +58,6 @@ class RiskLimits:
             max_gross_exposure=_dec(d["max_gross_exposure"]),
             max_position=_dec(d["max_position"]),
             max_position_count=int(d["max_position_count"]),
-            max_turnover=_dec(d["max_turnover"]),
             min_position_notional=_dec(d["min_position_notional"]),
             max_net_exposure=opt("max_net_exposure"),
             max_cluster_exposure=opt("max_cluster_exposure"),
@@ -120,6 +118,7 @@ class Config:
     min_dollar_volume: Decimal
     min_history_bars: int
     rebalance_cost_multiple: Decimal
+    turnover_budget: Decimal
     limits: RiskLimits
     costs: CostModel
     ruleset_version: str = "phase0"
@@ -140,6 +139,7 @@ class Config:
             min_dollar_volume=_dec(p["min_dollar_volume"]),
             min_history_bars=int(p["min_history_bars"]),
             rebalance_cost_multiple=_dec(p["rebalance_cost_multiple"]),
+            turnover_budget=_dec(p["turnover_budget"]),
             signal=p.get("signal", "placeholder_equal_long"),
             ruleset_version=raw.get("meta", {}).get("ruleset_version", "phase0"),
             limits=RiskLimits.from_dict(raw["limits"]),

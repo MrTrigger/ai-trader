@@ -35,7 +35,11 @@ from typing import Any, Literal
 
 import jsonschema
 
-SCHEMA_VERSION = "1.0.0"
+# 1.1.0 added the `turnover_capped` warning kind when turnover moved from a
+# whole-plan veto to a diff budget. Additive to an enum, so a 1.0.0 consumer
+# would reject a plan carrying the new value - which is the correct behaviour
+# for a system that fails closed, and the reason the minor version moved.
+SCHEMA_VERSION = "1.1.0"
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "plan.schema.json"
 
@@ -242,6 +246,7 @@ class Warning:
         "insufficient_sample",
         "constructor_fallback",
         "stale_input",
+        "turnover_capped",
         "other",
     ]
     message: str
