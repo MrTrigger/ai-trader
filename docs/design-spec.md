@@ -875,7 +875,8 @@ a full run — precisely the backtest/live divergence §0.1 forbids.
 ### 11.3 TradingAgents (Tauric Research)
 
 [arXiv:2412.20138](https://arxiv.org/abs/2412.20138) ·
-[repo](https://github.com/TauricResearch/TradingAgents). A LangGraph firm simulation: four analysts
+[repo](https://github.com/TauricResearch/TradingAgents) ·
+[tauric.ai](https://tauric.ai/). A LangGraph firm simulation: four analysts
 (fundamentals, sentiment, news, technical) → bull and bear researchers debating for N configurable
 rounds → a research manager judging the debate → a trader → three risk perspectives
 (aggressive/conservative/neutral) → a portfolio manager approving or rejecting.
