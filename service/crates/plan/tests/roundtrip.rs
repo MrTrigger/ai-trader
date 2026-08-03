@@ -103,9 +103,19 @@ fn a_recorded_fallback_is_visible() {
 
 #[test]
 fn timestamps_parse_as_utc() {
+    // Asserted as date components rather than an epoch constant: a hand-written
+    // epoch is unreadable and easy to get wrong, and getting it wrong here
+    // looks identical to a genuine timezone bug.
     let p = fixture();
-    assert_eq!(p.as_of.unix_timestamp(), 1_785_888_000);
-    assert!(p.created_at > p.as_of, "created_at is wall clock, as_of is the horizon");
+    assert_eq!(p.as_of.year(), 2026);
+    assert_eq!(p.as_of.month(), time::Month::August);
+    assert_eq!(p.as_of.day(), 1);
+    assert_eq!(p.as_of.time(), time::Time::MIDNIGHT);
+    assert_eq!(p.as_of.offset(), time::UtcOffset::UTC);
+    assert!(
+        p.created_at > p.as_of,
+        "created_at is wall clock; as_of is the horizon it was computed against"
+    );
 }
 
 // --- failing closed --------------------------------------------------------
