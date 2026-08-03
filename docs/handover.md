@@ -1,24 +1,32 @@
 # Handover — moving development into WSL
 
-> **Point-in-time, not a design document.** Written 2026-08-03 at commit `42451e3`, for an agent
-> picking this up inside WSL. Everything durable lives in
+> **Point-in-time, not a design document.** Written 2026-08-03, updated at commit `fa37cd2`, for
+> an agent picking this up inside WSL. Everything durable lives in
 > [`design-spec.md`](./design-spec.md) — read §0 there before writing code. **Delete this file
-> once the move is done and the Rust crate has compiled at least once.**
+> once CI has run green at least once.**
 
 ---
 
-## 1. The single most important thing
+## 1. Status of the previously-unverified half
 
-**The Rust crate has never been compiled.** `service/crates/plan/` — roughly 250 lines of types,
-parsing and invariant checks — was written on a Windows machine with no MSVC linker, so `cargo
-build` has never run against it. It may not compile. It is committed anyway because CI would have
-caught it, but CI has also never run.
+**Resolved.** The Rust crate now compiles and passes under WSL: 17 round-trip tests, one fix
+needed (a hand-written epoch constant four days off, replaced with date components).
 
-Treat every claim about the Rust half as unverified. Everything on the Python side *is* verified:
-85 tests, passing.
+The cross-language contract was then checked by hand and **holds**: Python running on Linux
+regenerates `plan.json` byte-identically to the copy committed from Windows, which is what proves
+the CRLF fix in `42451e3` actually did what it claimed rather than merely passing on the machine
+that caused the problem.
 
-**First job: `cd service && cargo test`.** Expect to fix compile errors. That is not a surprise,
-it is the known state.
+Verified as of `fa37cd2`:
+
+| | |
+|---|---|
+| Python, Windows | 85 tests pass |
+| Python, Linux (WSL) | 85 tests pass |
+| Rust, Linux (WSL) | 17 tests pass |
+| Fixture bytes, Windows vs Linux | identical |
+
+**Still never run: CI.** That is now the first job — see §5.
 
 ---
 
@@ -93,7 +101,7 @@ every plan it emits.
 | Plan schema (`schema/plan.schema.json`) | done, v1.1.0 |
 | Python planner: bars, store, source, universe, decision path, CLI | done, 85 tests |
 | Determinism gate (`plan verify`) | **passing** — same decision twice is one plan |
-| Rust `plan` crate + round-trip test | written, **never compiled** |
+| Rust `plan` crate + round-trip test | done, 17 tests, compiles under WSL |
 | CI (`.github/workflows/ci.yaml`) | written, **never run** |
 | `paper` venue adapter | **not started** — last Phase 0 piece, belongs in Rust |
 
@@ -102,28 +110,31 @@ every plan it emits.
 > `plan --dry-run` produces byte-identical plans across two runs, **and** Rust parses a
 > Python-written Plan in CI.
 
-First half: verified locally and covered by `planner/tests/test_pipeline.py`, which runs the gate
-on synthetic bars so CI enforces it without shipping a data set. Second half: not verified at all.
+First half: verified, and covered by `planner/tests/test_pipeline.py`, which runs the gate on
+synthetic bars so CI enforces it without shipping a data set. Second half: verified *locally* on
+both platforms, but **not yet in CI**, which is what the gate actually asks for.
 
 ---
 
 ## 5. What to do, in order
 
-1. **Compile the Rust crate.** Fix whatever breaks. The types must keep matching
-   `schema/plan.schema.json` — if you change a Rust type, check the schema, not just the test.
-2. **Run the cross-language check by hand** before trusting CI:
-   ```bash
-   cd planner && AI_TRADER_UPDATE_FIXTURE=1 pytest tests/test_fixture.py -q
-   git diff --exit-code -- service/crates/plan/tests/fixtures/plan.json   # must be clean
-   cd ../service && cargo test -p plan --test roundtrip
-   ```
-   A clean `git diff` here is the whole point: it proves the fixture Python produces on Linux is
-   byte-identical to the one committed from Windows. If it is not, the §7 lesson was not fully
-   applied and that is more important than whatever else you were doing.
-3. **Get CI green.** It has never run. Expect small things.
-4. **Then, and only then, the `paper` venue adapter** — the last Phase 0 piece.
+1. **Get CI green.** It has never run once. Push and see; expect small things.
+2. **Then the `paper` venue adapter** — the last Phase 0 piece, and the first real Rust beyond the
+   contract types.
 
-Do not start Phase 1 (a real strategy). Phase 0's gate is not met until step 3.
+Re-run the cross-language check by hand any time the Plan shape changes:
+
+```bash
+cd planner && AI_TRADER_UPDATE_FIXTURE=1 pytest tests/test_fixture.py -q
+git diff --exit-code -- service/crates/plan/tests/fixtures/plan.json   # must be clean
+cd ../service && cargo test -p plan --test roundtrip
+```
+
+A clean `git diff` is the whole point: it proves the fixture Python produces here is byte-identical
+to the committed copy. If it ever is not, that outranks whatever else you were doing. If you change
+a Rust type, check it against `schema/plan.schema.json`, not just against the test.
+
+Do not start Phase 1 (a real strategy). Phase 0's gate is not met until step 1.
 
 ---
 
