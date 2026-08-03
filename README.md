@@ -33,13 +33,28 @@ See [design spec §3.5](docs/design-spec.md#35-implementation-stack-and-why-it-i
 
 ## Status
 
-Spec only. No code, no data, no venue account, no capital.
+**Phase 0 in progress.** No venue account, no capital, no strategy — the Phase 0 signal is an
+explicit placeholder that claims no edge and says so on every plan it produces.
 
-Next: Phase 0 — storage, `DataSource`, the `paper` venue adapter, the Plan schema and its
-round-trip test, and a CLI that can emit a plan from real bars. Gate: `plan --dry-run` produces
-byte-identical plans across two runs, and Rust parses a Python-written Plan in CI.
+Done: the Plan contract (schema + Python writer + Rust parser + a committed fixture CI checks both
+halves against), the bar store, a public `DataSource`, point-in-time universe snapshots, and the
+decision path — eligibility, construction, risk gate, cost-aware diff, orders.
+
+```bash
+ai-trader data pull --days 400 && ai-trader universe record && ai-trader book init --cash 100000
+ai-trader plan --as-of 2026-08-01
+ai-trader plan verify --runs 3     # the gate
+```
+
+Remaining for Phase 0: the `paper` venue adapter, and a first green CI run.
 
 See [design spec §9](docs/design-spec.md#9-phased-build-order) for the phased order and the gates.
+
+### Local build note
+
+The Rust crate needs an MSVC linker on Windows. If `cargo test` fails with `linker link.exe not
+found`, install the **Desktop development with C++** workload from the Visual Studio Installer.
+CI builds it on Linux and does not need this.
 
 ## Relationship to `trading-journal`
 

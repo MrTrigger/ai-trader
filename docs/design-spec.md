@@ -118,7 +118,8 @@ One pass. Ordered. Each step is a pure function of the prior step's output plus 
   5. CONSTRUCT   PortfolioConstructor (§4.5): expected return net of costs,
                  subject to soft constraints -> target weights
   6. RISK GATE   enforce hard portfolio limits -> plan REJECTED or ACCEPTED  (§6)
-  7. DIFF        target state - actual state = the minimal set of orders
+  7. DIFF        target state - actual state, within a turnover budget (§6)
+                 -> the minimal set of orders, plus what was deferred
   8. PLAN        persist an immutable Plan (this is the artifact; §5.3)
   9. EXECUTE     submit orders for a Plan id  (skipped in dry-run)
  10. RECONCILE   re-fetch venue truth, verify, record fills + NAV snapshot
@@ -403,7 +404,6 @@ crypto rally, twenty assets trigger on the same day. Per-asset sizing with no po
 | max single position | % NAV |
 | max position count | keeps the book auditable by a human |
 | max cluster exposure | % NAV per correlated group — see below |
-| max per-run turnover | % NAV; catches a runaway signal producing churn |
 | max benchmark beta | `\|wᵀβ\|` against BTC (crypto) or SPY (equities) — see §6.2 |
 | min position notional | below venue minimum → drop, don't submit |
 | max drawdown | from peak NAV → auto-pause, alert, require manual resume |
@@ -417,6 +417,23 @@ and improve it. Crude and present beats sophisticated and Phase 5.
 **Longs need an exit that isn't a daily close.** A once-daily close-based exit on a 24/7 market
 leaves a position unattended for 24 hours. Either carry a resting stop at the venue or run the
 exit check more often than the rebalance. Decide in Phase 1; do not ship Phase 3 without it.
+
+**Turnover is not a limit here, and the distinction is load-bearing.** Every limit above describes
+the **resulting portfolio** — how concentrated, how many names, how much gross. Turnover describes
+the **transition**. Putting it in this gate made an initial build from flat unreachable: going 0%
+to 75% invested *is* 75% turnover, so the first run of any deployment breached a 50% cap and was
+rejected whole. Found by running the real pipeline, not by reasoning about it.
+
+It is a **budget in the diff** (§3.1 step 7): trades are taken largest-drift-first — the trade
+closing the most distance buys the most convergence per unit spent — until the budget is exhausted,
+and the remainder is deferred to the next run. The destination is never vetoed, only paced.
+
+**Exits are exempt and are never deferred.** A position we no longer want is risk we are still
+carrying, and pacing our way out of it is the same exposure held longer for the sake of a number.
+If exits alone exceed the budget they all still go, and the overspend is disclosed.
+
+**Whatever is deferred is disclosed on the plan** (`turnover_capped`). A plan that quietly did less
+than it said reads afterwards as a plan that failed.
 
 ### 6.1 Costs belong in the objective, not only in the report
 
