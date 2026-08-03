@@ -92,4 +92,4 @@ def save(portfolio: Portfolio, path: Path = DEFAULT_PATH) -> None:
         "positions": [{"asset": p.asset, "qty": str(p.qty)} for p in portfolio.positions],
         "as_of": portfolio.as_of.isoformat(),
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_bytes((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))

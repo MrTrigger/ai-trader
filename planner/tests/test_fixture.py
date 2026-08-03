@@ -21,7 +21,13 @@ from planner import plan as P
 
 
 def test_fixture_matches_current_code():
-    expected = P.canonical_json(fixture.build())
+    """Compared as **bytes**, deliberately.
+
+    Comparing decoded text would let a platform newline difference pass here and
+    fail only in CI, because text-mode reads translate CRLF back to \\n. The
+    bytes are the contract, so the bytes are what is asserted.
+    """
+    expected = P.canonical_bytes(fixture.build())
 
     if os.environ.get("AI_TRADER_UPDATE_FIXTURE"):
         fixture.write()
@@ -33,12 +39,26 @@ def test_fixture_matches_current_code():
             "Regenerate with AI_TRADER_UPDATE_FIXTURE=1 pytest tests/test_fixture.py"
         )
 
-    actual = fixture.FIXTURE_PATH.read_text(encoding="utf-8")
+    actual = fixture.FIXTURE_PATH.read_bytes()
     assert actual == expected, (
         "the committed fixture no longer matches what the planner produces.\n"
         "If the Plan shape changed on purpose: update service/crates/plan/src/lib.rs "
         "to match, then regenerate with AI_TRADER_UPDATE_FIXTURE=1."
     )
+
+
+def test_the_wire_form_uses_lf_only():
+    """A CRLF here makes the serialisation platform-dependent.
+
+    §3.5 requires two runs to produce byte-identical output. That cannot be true
+    if the bytes depend on which OS wrote them, and this repo is developed on
+    Windows and deployed on Debian.
+    """
+    raw = P.canonical_bytes(fixture.build())
+    assert b"\r" not in raw
+    assert raw.endswith(b"\n")
+    if fixture.FIXTURE_PATH.exists():
+        assert b"\r" not in fixture.FIXTURE_PATH.read_bytes()
 
 
 def test_fixture_is_valid_against_the_schema():

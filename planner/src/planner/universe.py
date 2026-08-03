@@ -74,7 +74,9 @@ def record(
         "source": source,
         "members": [asdict(m) for m in members],
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Bytes, not text: a snapshot is an immutable observation, and its bytes
+    # should not depend on which OS recorded it. See plan.canonical_bytes.
+    path.write_bytes((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     return path
 
 

@@ -144,7 +144,7 @@ def test_manifest_records_source_and_hash(tmp_path):
     assert len(manifests) == 1
     import json
 
-    m = json.loads(manifests[0].read_text())
+    m = json.loads(manifests[0].read_bytes().decode("utf-8"))
     assert m["source"] == "unit-test"
     assert m["asset"] == "BTC"
     assert len(m["content_hash"]) == 16

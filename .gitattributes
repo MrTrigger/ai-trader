@@ -1,0 +1,12 @@
+# Developed on Windows, deployed on Debian. Without this, line endings depend
+# on which machine touched a file, and the Plan fixture's bytes ARE the contract
+# between the Python planner and the Rust executor.
+* text=auto eol=lf
+
+# Files whose bytes must never be rewritten by git. The fixture is compared
+# byte-for-byte in CI; the schema is what both languages agree on.
+schema/*.json          -text
+service/crates/plan/tests/fixtures/*.json -text
+
+*.png binary
+*.parquet binary

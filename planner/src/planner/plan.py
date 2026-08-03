@@ -265,6 +265,20 @@ def canonical_json(doc: dict[str, Any]) -> str:
     return json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
 
 
+def canonical_bytes(doc: dict[str, Any]) -> bytes:
+    """The wire form. **Always write this, never `write_text`.**
+
+    `Path.write_text` opens in text mode, which on Windows translates every
+    `\\n` into `\\r\\n`. For a file whose *bytes are the contract*, that makes
+    the serialisation platform-dependent - which is exactly what §3.5 says it
+    must not be. The asymmetry is what makes it hard to catch: `read_text`
+    translates the CRLFs back on the way in, so a round-trip test passes on the
+    machine that produced the wrong bytes, and only a Linux CI job comparing
+    against the committed file notices.
+    """
+    return canonical_json(doc).encode("utf-8")
+
+
 def digest(doc: dict[str, Any]) -> str:
     """SHA-256 over the plan's decision content.
 
@@ -356,11 +370,11 @@ def write(path: Path, doc: dict[str, Any]) -> str:
     """Validate and write canonically. Returns the digest."""
     validate(doc)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(canonical_json(doc), encoding="utf-8")
+    path.write_bytes(canonical_bytes(doc))
     return digest(doc)
 
 
 def read(path: Path) -> dict[str, Any]:
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc = json.loads(path.read_bytes().decode("utf-8"))
     validate(doc)
     return doc

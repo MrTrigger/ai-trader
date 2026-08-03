@@ -153,7 +153,7 @@ def _write_manifest(
     }
     stamp = now.strftime("%Y%m%dT%H%M%S%f")
     path = manifest_dir / f"{stamp}-{asset}-{interval_s}.json"
-    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    path.write_bytes((json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
 
 
 def read(

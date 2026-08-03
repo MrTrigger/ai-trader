@@ -156,8 +156,13 @@ def build() -> dict:
 
 
 def write() -> str:
-    """Regenerate the committed fixture. Returns its digest."""
+    """Regenerate the committed fixture. Returns its digest.
+
+    Bytes, not text - see `plan.canonical_bytes`. This file is compared
+    byte-for-byte by CI, so a platform newline translation here would make the
+    contract depend on which machine last regenerated it.
+    """
     doc = build()
     FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE_PATH.write_text(P.canonical_json(doc), encoding="utf-8")
+    FIXTURE_PATH.write_bytes(P.canonical_bytes(doc))
     return P.digest(doc)
