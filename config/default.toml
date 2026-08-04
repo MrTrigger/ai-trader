@@ -5,16 +5,35 @@ ruleset_version = "phase0"
 quote_currency = "USD"
 interval_s = 86400
 target_gross_exposure = "0.80"
-constructor = "equal_weight"
+# equal_weight is the baseline every constructor must beat; conviction_tilt
+# and inverse_vol are the candidates. Compared, not argued about (4.5).
+constructor = "conviction_tilt"
 
-# Phase 0 signal. Marks every eligible asset as a long candidate with equal
-# conviction. It makes NO claim of edge and exists to exercise the diff, cost
-# and risk plumbing end to end. Phase 1 replaces it with a strategy that has to
-# clear the harness before it ships.
-signal = "placeholder_equal_long"
+# Phase 1 candidate: cross-sectional momentum with a skip period. Ranks the
+# eligible universe on the return from t-30d to t-7d and holds the top names
+# long. The skip is there because short-horizon reversal would otherwise
+# contaminate the momentum measurement.
+#
+# It is a HYPOTHESIS, not a conclusion. `ai-trader gate` is what decides whether
+# it survives costs, and it is meant to be capable of saying no.
+signal = "xs_momentum"
 
-# Configured, not ranked. Phase 1 replaces this with a real ranking source.
-# See planner/universe.py on why a list applied backwards is survivorship bias.
+# How many names the signal holds. Distinct from limits.max_position_count,
+# which is a hard risk limit: this is what the strategy intends, that is what it
+# may not exceed.
+max_holdings = 10
+
+# Below this many rankable assets a cross-sectional signal declines to rank.
+# "Top 10 of 11" is holding almost everything and calling it a signal.
+min_cross_section = 15
+
+# Intervals between decisions. Weekly on daily bars: the horizon is
+# hours-to-weeks, and every rebalance costs spread. Swept, not assumed (10.3).
+rebalance_every = 7
+
+# Superseded by `ai-trader universe rank`, which ranks by trailing liquidity
+# from the bar store and records a point-in-time snapshot per decision date.
+# Kept only for `universe record`, the Phase 0 configured-list path.
 universe = ["BTC", "ETH", "SOL"]
 
 # What portfolio beta is measured against (spec 6.2). BTC for crypto, SPY for
@@ -23,13 +42,29 @@ universe = ["BTC", "ETH", "SOL"]
 # holding.
 benchmark = "BTC"
 
-# Eligibility. Below this median daily quote turnover an asset is not tradeable
-# at size regardless of what its signal says.
-min_dollar_volume = "50000000"
+# Eligibility floor: below this median daily quote turnover an asset is not
+# tradeable at our size regardless of what its signal says.
+#
+# A SCREEN, not a selector. Selection is the liquidity rank in
+# `universe rank`; this only removes what could not be traded. The Phase 0
+# value of 50M was chosen when the universe was three configured names, and as
+# a screen over a ranked universe it silently became the selector: in 2026 only
+# 8 assets cleared it, which would have collapsed the cross-section below
+# `min_cross_section` and left the book flat for a whole period.
+#
+# 5M against a 10-name book of ~$10k positions is two orders of magnitude of
+# headroom, which is what a screen should be.
+min_dollar_volume = "5000000"
+
+# Below this annualised realised volatility an asset is a peg, not a position.
+# Behavioural rather than a maintained name list - a new stablecoin should not
+# need a config change to be recognised, and nothing genuinely risky in crypto
+# sits near zero vol.
+min_volatility = "0.10"
 
 # An asset with less history than this cannot have its features computed
 # honestly, so it is ineligible rather than silently carrying nulls.
-min_history_bars = 60
+min_history_bars = 90
 
 # Rebalance deadband: skip a trade whose weight drift is worth less than this
 # multiple of its estimated round-trip cost. Prevents paying spread to correct
@@ -57,7 +92,7 @@ turnover_budget = "0.50"
 # see turnover_budget above.
 max_gross_exposure = "1.00"
 max_position = "0.25"
-max_position_count = 20
+max_position_count = 12
 min_position_notional = "25"
 
 # Gross exposure per correlated group. NOT OPTIONAL per spec 6: a hundred crypto

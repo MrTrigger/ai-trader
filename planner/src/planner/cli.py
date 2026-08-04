@@ -22,7 +22,7 @@ import polars as pl
 from . import inspect as inspect_mod
 from . import plan as plan_mod
 from . import backtest as backtest_mod
-from . import features, pipeline, scores, state, store, universe
+from . import features, gate, pipeline, scores, state, store, universe
 from .config import Config, DEFAULT_CONFIG_PATH
 from .sources import BinancePublic
 
@@ -125,6 +125,72 @@ def cmd_universe_record(args) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"recorded {len(members)} members for {as_of.date()} -> {path}")
+    return 0
+
+
+def cmd_universe_rank(args) -> int:
+    """Record point-in-time snapshots from the bar store, by liquidity rank.
+
+    A range is allowed because a backtest needs a snapshot per decision date and
+    none of them may be backfilled *as a list* — but each one is computed from
+    the rule using only bars that closed by its own date, which is what makes
+    reconstructing it legitimate (see `universe.by_liquidity`).
+
+    Bluntly: this is only honest if the store contains delisted assets. Ranking
+    over survivors reintroduces exactly the bias the module exists to prevent.
+    """
+    config = _config(args)
+    root = Path(args.data_root)
+    start = _utc(args.start)
+    end = _utc(args.end) if args.end else start
+
+    bars = store.read(root=root, interval_s=config.interval_s)
+    if bars.is_empty():
+        print("no bars in the store; nothing to rank", file=sys.stderr)
+        return 2
+
+    # Step at the decision cadence, not the bar interval: a snapshot is only
+    # needed where a decision is taken, and recording daily ones for a weekly
+    # rebalance writes thousands of files nothing reads.
+    step = timedelta(seconds=config.interval_s * max(1, config.rebalance_every))
+    written = skipped = 0
+    last_written: datetime | None = None
+    day = start
+    while day <= end:
+        members = universe.by_liquidity(
+            bars,
+            as_of=day,
+            top_n=args.top,
+            lookback_days=args.lookback,
+            min_history_bars=config.min_history_bars,
+            min_turnover=float(config.min_dollar_volume),
+        )
+        if not members:
+            skipped += 1
+            day += step
+            continue
+        try:
+            universe.record(
+                members,
+                as_of=day,
+                source="by_liquidity",
+                root=root,
+                overwrite=args.overwrite,
+            )
+            written += 1
+            last_written = day
+        except FileExistsError:
+            skipped += 1
+        day += step
+
+    print(f"recorded {written} snapshot(s), skipped {skipped}")
+    if last_written is not None:
+        last = universe.load(last_written, root=root)
+        eligible = [m.asset for m in last if m.eligible]
+        dead = [m for m in last if "delisted" in m.reason]
+        print(f"{last_written.date()}: {len(eligible)} eligible of {len(last)} considered")
+        print(f"  top: {', '.join(eligible[:12])}")
+        print(f"  carried as delisted/halted: {len(dead)}")
     return 0
 
 
@@ -255,6 +321,20 @@ def cmd_scores(args) -> int:
         print(line + ("   " + ", ".join(flags) if flags else ""))
 
     return 0
+
+
+def cmd_gate(args) -> int:
+    """Run the Phase 1 gate and print the verdict, whatever it is."""
+    result = gate.run(
+        config=_config(args),
+        start=_utc(args.start),
+        end=_utc(args.end),
+        data_root=Path(args.data_root),
+        initial_cash=Decimal(args.cash),
+    )
+    print(gate.format_result(result))
+    # Non-zero on a failed gate: a gate that cannot fail a script is decoration.
+    return 0 if result.passed else 1
 
 
 def cmd_backtest(args) -> int:
@@ -478,6 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--as-of")
     rec.add_argument("--overwrite", action="store_true", help="only to fix a recording error")
     rec.set_defaults(func=cmd_universe_record)
+    rank = uni.add_parser("rank", help="record snapshots by liquidity rank, from the store")
+    rank.add_argument("--start", required=True, help="first snapshot date, ISO 8601")
+    rank.add_argument("--end", help="last snapshot date (default: same as --start)")
+    rank.add_argument("--top", type=int, default=30, help="how many are eligible")
+    rank.add_argument("--lookback", type=int, default=30, help="turnover window in days")
+    rank.add_argument("--overwrite", action="store_true", help="correct a recording error")
+    rank.set_defaults(func=cmd_universe_rank)
+
     uni.add_parser("list", help="recorded snapshots").set_defaults(func=cmd_universe_list)
 
     book = sub.add_parser("book", help="portfolio state").add_subparsers(
@@ -501,6 +589,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bt.add_argument("--nav", help="write the NAV series to this CSV")
     bt.set_defaults(func=cmd_backtest)
+
+    gt = sub.add_parser("gate", help="run the Phase 1 gate (design spec 9)")
+    gt.add_argument("--start", required=True, help="first decision timestamp, ISO 8601")
+    gt.add_argument("--end", required=True, help="last decision timestamp, inclusive")
+    gt.add_argument("--cash", default="100000", help="starting cash")
+    gt.set_defaults(func=cmd_gate)
 
     sc = sub.add_parser("scores", help="the scored cross-section (a lens, not a decision)")
     sc.add_argument("--as-of", help="decision timestamp, ISO 8601 (default: today UTC)")

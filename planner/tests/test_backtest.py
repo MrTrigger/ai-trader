@@ -38,13 +38,19 @@ MID = START + timedelta(days=30)
 
 
 def _bars(assets=ASSETS, drift: float = 0.0006) -> pl.DataFrame:
-    """Contiguous daily bars ending at END, each opening where the last closed."""
+    """Contiguous daily bars ending at END, each opening where the last closed.
+
+    The oscillation amplitude is chosen so realised volatility lands in the
+    range a real crypto asset occupies. Calmer bars would be screened out as
+    pegs by `min_volatility` — which is the screen working, but it would make
+    this fixture test the screen rather than the replay.
+    """
     rows = []
     for i, asset in enumerate(assets):
         close = 100.0 * (i + 1)
         for d in range(HISTORY):
             ts = END - timedelta(seconds=DAY * (HISTORY - 1 - d))
-            nxt = close * math.exp(0.006 * math.sin(i + d * 0.55) + drift)
+            nxt = close * math.exp(0.02 * math.sin(i + d * 0.55) + drift)
             rows.append(
                 {
                     "asset": asset,

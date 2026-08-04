@@ -132,6 +132,20 @@ class Config:
     #: Below this many rankable assets, a cross-sectional signal declines to
     #: rank rather than pretending a handful of names is a cross-section.
     min_cross_section: int = 8
+    #: Annualised realised volatility below which an asset is treated as a peg
+    #: rather than a position.
+    #:
+    #: Behavioural, not a maintained name list: an asset pegged to the quote
+    #: currency *is* cash, whatever it is called, and a new stablecoin should
+    #: not need a config change to be recognised. Nothing genuinely risky in
+    #: crypto sits near zero vol, so the test is not close.
+    min_volatility: Decimal = Decimal("0.10")
+    #: How many intervals between decisions. 1 is "every bar".
+    #:
+    #: Separate from `interval_s` on purpose: rebalancing less often must not
+    #: change the *features*, or a frequency sweep would be measuring two things
+    #: at once (design spec §10.3).
+    rebalance_every: int = 1
     benchmark: str | None = None
     #: asset -> cluster name. See `clusters_from_dict` for why it is stored
     #: this way round rather than as the groups it is written as.
@@ -156,6 +170,8 @@ class Config:
             signal=p.get("signal", "placeholder_equal_long"),
             max_holdings=int(p.get("max_holdings", 10)),
             min_cross_section=int(p.get("min_cross_section", 8)),
+            rebalance_every=int(p.get("rebalance_every", 1)),
+            min_volatility=_dec(p.get("min_volatility", "0.10")),
             benchmark=(p.get("benchmark") or None),
             clusters=clusters_from_dict(raw.get("clusters", {})),
             ruleset_version=raw.get("meta", {}).get("ruleset_version", "phase0"),

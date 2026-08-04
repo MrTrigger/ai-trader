@@ -184,7 +184,11 @@ def replay(
     if start > end:
         raise ValueError(f"start {start.date()} is after end {end.date()}")
 
-    step = timedelta(seconds=config.interval_s)
+    # The decision cadence, which is not the bar interval. Rebalancing weekly
+    # over daily bars leaves the features untouched and only changes how often
+    # they are acted on - which is what makes a frequency sweep measure one
+    # thing (§10.3).
+    step = timedelta(seconds=config.interval_s * max(1, config.rebalance_every))
     fills_model = SimFill(
         commission_bps=config.costs.commission_bps,
         slippage_bps=config.costs.spread_bps,
@@ -198,7 +202,11 @@ def replay(
 
     # Execution prices come from the bar opening at each decision timestamp -
     # the bar the planner itself excluded as still forming. Loaded once.
-    opens = _open_prices(config, data_root, start, end + step)
+    # One bar interval past the last decision, not one rebalance step: the
+    # execution bar is always the *next bar*, however far apart decisions are.
+    opens = _open_prices(
+        config, data_root, start, end + timedelta(seconds=config.interval_s)
+    )
 
     as_of = start
     while as_of <= end:

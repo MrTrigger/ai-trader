@@ -98,6 +98,17 @@ def _eligible(cross: pl.DataFrame, config: Config) -> tuple[list[dict], list[str
                 f"{config.min_dollar_volume}"
             )
             continue
+        # A peg is not a position. Stablecoins rank near the top of any
+        # liquidity screen and have no momentum to measure, so leaving them in
+        # both wastes cross-section slots and hands a risk-parity constructor an
+        # asset it would size enormously on a near-zero denominator.
+        vol = row.get("vol_30")
+        if vol is not None and Decimal(str(vol)) < config.min_volatility:
+            notes.append(
+                f"{asset}: realised vol {Decimal(str(vol)):.4f} below "
+                f"{config.min_volatility} - a peg, not a position"
+            )
+            continue
         keep.append(row)
 
     return keep, notes
