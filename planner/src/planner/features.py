@@ -15,12 +15,23 @@ from __future__ import annotations
 
 import polars as pl
 
-FEATURE_SET_VERSION = "fs-phase1-1"
+FEATURE_SET_VERSION = "fs-phase1-2"
 
 # Windows in bars. At the daily interval these are calendar days.
 _RETURN_WINDOWS = (7, 30, 90)
 _VOL_WINDOW = 30
 _ADV_WINDOW = 20
+
+# Momentum measured from t-30 to t-7, skipping the most recent week.
+#
+# The skip is the point. Short-horizon reversal is well documented in crypto,
+# and a plain 30-day return has last week's reversal baked into it - the two
+# effects partially cancel and the measurement is of neither. Dropping the
+# recent window is the standard equity 12-1 construction adapted to a shorter
+# horizon, and it is why `ret_30` is kept separately rather than reused: they
+# are different measurements and a strategy should have to say which it means.
+_MOMENTUM_LOOKBACK = 30
+_MOMENTUM_SKIP = 7
 
 # Beta wants a longer window than vol: it is a two-series estimate, so it needs
 # more observations to say anything, and a noisy short-window beta is worse than
@@ -58,6 +69,16 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
         exprs.append(
             (pl.col("close") / pl.col("close").shift(w) - 1).over("asset").alias(f"ret_{w}")
         )
+
+    exprs.append(
+        (
+            pl.col("close").shift(_MOMENTUM_SKIP)
+            / pl.col("close").shift(_MOMENTUM_LOOKBACK)
+            - 1
+        )
+        .over("asset")
+        .alias(f"ret_{_MOMENTUM_LOOKBACK}_skip_{_MOMENTUM_SKIP}")
+    )
 
     df = df.with_columns(exprs)
 

@@ -21,7 +21,18 @@ from pathlib import Path
 
 import polars as pl
 
-from . import __version__, construct, costs, diff, features, risk, state, store, universe
+from . import (
+    __version__,
+    construct,
+    costs,
+    diff,
+    features,
+    risk,
+    signal,
+    state,
+    store,
+    universe,
+)
 from .config import Config
 from .plan import (
     AssetCost,
@@ -36,7 +47,6 @@ from .plan import (
 )
 
 RISK_MODEL_VERSION = "none-phase0"
-SCORING_VERSION = "none-phase0"
 
 
 class GateFailure(RuntimeError):
@@ -178,17 +188,10 @@ def run(
     current_weights = book.weights(prices)
 
     # --- 3. SIGNAL ----------------------------------------------------------
-    signals, eligibility_notes = _signal(cross, config)
-    notes.extend(eligibility_notes)
-    warnings.append(
-        Warning(
-            kind="unenforced_rule",
-            message=(
-                f"signal {config.signal!r} is a Phase 0 placeholder and claims no edge. "
-                "It has not been through the backtest harness. No capital until it has."
-            ),
-        )
-    )
+    generated = signal.get(config.signal).generate(cross, config=config)
+    signals = generated.signals
+    notes.extend(generated.notes)
+    warnings.extend(generated.warnings)
 
     # --- 4. RISK MODEL ------------------------------------------------------
     # No covariance estimate yet, so nothing here shapes construction (step 5).
@@ -211,6 +214,11 @@ def run(
     # --- 5. CONSTRUCT -------------------------------------------------------
     constructor = construct.get(config.constructor)
     built = constructor.construct(signals, config=config)
+    convictions = (
+        {s.asset: s.conviction for s in signals}
+        if constructor.name != "equal_weight"
+        else {}
+    )
     notes.extend(built.notes)
     if built.fell_back:
         warnings.append(
@@ -303,7 +311,7 @@ def run(
         provenance=Provenance(
             planner_version=_planner_version(),
             feature_set_version=features.FEATURE_SET_VERSION,
-            scoring_version=SCORING_VERSION,
+            scoring_version=generated.scoring_version,
             risk_model_version=RISK_MODEL_VERSION,
             ruleset_version=config.ruleset_version,
             constructor=built.constructor,
@@ -316,7 +324,12 @@ def run(
                 asset=a,
                 weight=_q(w, "0.000001"),
                 direction="long" if w >= 0 else "short",
-                conviction=Decimal(1),
+                # The score that actually drove this weight, or null. Carrying a
+                # flat 1 when no constructor consumed a score would make the
+                # field read as attribution it cannot support.
+                conviction=(
+                    None if convictions.get(a) is None else _q(convictions[a], "0.0001")
+                ),
             )
             for a, w in sorted(built.weights.items())
         ],
@@ -349,36 +362,6 @@ def run(
 
     return PlanResult(document=document, skipped=skipped, notes=notes)
 
-
-def _signal(cross: pl.DataFrame, config: Config) -> tuple[list[construct.Signal], list[str]]:
-    """Phase 0 placeholder: every *eligible* asset is an equal-conviction long.
-
-    The eligibility filter is real - insufficient history and insufficient
-    liquidity are genuine reasons not to hold something. The direction and
-    conviction are not: they claim no edge and exist to exercise the path.
-    """
-    signals: list[construct.Signal] = []
-    notes: list[str] = []
-
-    for r in cross.sort("asset").iter_rows(named=True):
-        asset = r["asset"]
-        if r["bars_available"] < config.min_history_bars:
-            notes.append(
-                f"{asset}: {r['bars_available']} bars, needs {config.min_history_bars}"
-            )
-            continue
-        if r["adv_quote"] is None:
-            notes.append(f"{asset}: no liquidity estimate")
-            continue
-        if Decimal(str(r["adv_quote"])) < config.min_dollar_volume:
-            notes.append(
-                f"{asset}: median turnover {Decimal(str(r['adv_quote'])):.0f} below "
-                f"{config.min_dollar_volume}"
-            )
-            continue
-        signals.append(construct.Signal(asset=asset, direction="long", conviction=Decimal(1)))
-
-    return signals, notes
 
 
 def _q(value: Decimal, exp: str = "0.01") -> Decimal:

@@ -2,5 +2,12 @@
 
 from .base import DataSource, UniverseMember
 from .binance import BinancePublic
+from .binance_archive import BinanceArchive, is_leveraged_token
 
-__all__ = ["DataSource", "UniverseMember", "BinancePublic"]
+__all__ = [
+    "DataSource",
+    "UniverseMember",
+    "BinancePublic",
+    "BinanceArchive",
+    "is_leveraged_token",
+]

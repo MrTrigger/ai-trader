@@ -123,6 +123,15 @@ class Config:
     costs: CostModel
     ruleset_version: str = "phase0"
     signal: str = "placeholder_equal_long"
+    #: How many names a ranking signal holds. Distinct from
+    #: `limits.max_position_count`, which is a hard risk limit that rejects a
+    #: plan: this is what the strategy *intends*, and the limit is what it may
+    #: not exceed. Collapsing the two would make a strategy change look like a
+    #: risk change in the record.
+    max_holdings: int = 10
+    #: Below this many rankable assets, a cross-sectional signal declines to
+    #: rank rather than pretending a handful of names is a cross-section.
+    min_cross_section: int = 8
     benchmark: str | None = None
     #: asset -> cluster name. See `clusters_from_dict` for why it is stored
     #: this way round rather than as the groups it is written as.
@@ -145,6 +154,8 @@ class Config:
             rebalance_cost_multiple=_dec(p["rebalance_cost_multiple"]),
             turnover_budget=_dec(p["turnover_budget"]),
             signal=p.get("signal", "placeholder_equal_long"),
+            max_holdings=int(p.get("max_holdings", 10)),
+            min_cross_section=int(p.get("min_cross_section", 8)),
             benchmark=(p.get("benchmark") or None),
             clusters=clusters_from_dict(raw.get("clusters", {})),
             ruleset_version=raw.get("meta", {}).get("ruleset_version", "phase0"),
