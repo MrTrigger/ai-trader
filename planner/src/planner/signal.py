@@ -144,6 +144,58 @@ class PlaceholderEqualLong:
         )
 
 
+class LiquidityTop:
+    """Hold the most liquid names. The null hypothesis a ranking has to beat.
+
+    This is the honest baseline for a cross-sectional strategy, and a better one
+    than `placeholder_equal_long`: it holds the *same number* of names, so the
+    comparison isolates **which** names the ranking picked rather than confusing
+    it with how many. Holding everything eligible instead is not a comparable
+    book, and against a `max_position_count` limit it is not even a legal one -
+    every plan is rejected and the "baseline" silently becomes a flat book that
+    any strategy beats.
+
+    Ranking by liquidity is roughly "hold the biggest names", which is what a
+    crypto index would do. If momentum cannot beat that, the ranking is costing
+    turnover and buying nothing.
+    """
+
+    name = "liquidity_top"
+
+    def generate(self, cross: pl.DataFrame, *, config: Config) -> SignalResult:
+        rows, notes = _eligible(cross, config)
+        if not rows:
+            return SignalResult(signals=[], notes=notes + ["no eligible assets"])
+
+        ordered = sorted(rows, key=lambda r: (-float(r["adv_quote"]), r["asset"]))
+        held = ordered[: config.max_holdings]
+
+        for row in ordered[config.max_holdings :]:
+            notes.append(f"{row['asset']}: outside the top {config.max_holdings} by liquidity")
+
+        return SignalResult(
+            signals=[
+                AssetSignal(
+                    asset=r["asset"],
+                    direction="long",
+                    conviction=Decimal(1),
+                    volatility=(None if r.get("vol_30") is None else Decimal(str(r["vol_30"]))),
+                )
+                for r in held
+            ],
+            notes=notes,
+            warnings=[
+                Warning(
+                    kind="unenforced_rule",
+                    message=(
+                        f"signal {self.name!r} is a baseline, not a strategy: it claims no "
+                        "edge and exists to be beaten."
+                    ),
+                )
+            ],
+        )
+
+
 class CrossSectionalMomentum:
     """Rank on skip-period momentum; hold the top `max_position_count` long."""
 
@@ -220,7 +272,7 @@ class CrossSectionalMomentum:
 
 _REGISTRY: dict[str, SignalGenerator] = {
     generator.name: generator
-    for generator in (PlaceholderEqualLong(), CrossSectionalMomentum())
+    for generator in (PlaceholderEqualLong(), LiquidityTop(), CrossSectionalMomentum())
 }
 
 

@@ -392,3 +392,60 @@ def test_the_benchmark_is_featurized_even_when_it_is_not_eligible(tmp_path: Path
     assert not any(
         "beta assumed" in w["message"] for w in doc["warnings"]
     ), "AAA's bars were available, so both betas were estimable"
+
+
+def test_a_holding_that_leaves_the_universe_can_still_be_marked_and_sold(tmp_path: Path):
+    """Eligibility governs what may be ENTERED, never what may be exited.
+
+    A ranking strategy drops names constantly — that is what ranking is. If a
+    position leaving the eligible universe made the run impossible, the first
+    such drop would deadlock the system permanently. This is the regression
+    test for exactly that: it produced 243 gate failures out of 253 dates on
+    the first real Phase 1 run.
+    """
+    store.write(_bars(), root=tmp_path, source="synthetic")
+    # CCC has bars but is not in the recorded universe.
+    universe.record(
+        universe.from_config(["AAA", "BBB"]), as_of=AS_OF, source="test", root=tmp_path
+    )
+    state.save(
+        state.Portfolio(
+            cash=Decimal(50_000),
+            positions=[state.Position(asset="CCC", qty=Decimal("10"))],
+            as_of=AS_OF,
+        ),
+        tmp_path / "book.json",
+    )
+
+    doc = _run(tmp_path, created_at=AS_OF)
+
+    assert doc["status"] == "accepted"
+    marked = {c["asset"] for c in doc["current"]}
+    assert "CCC" in marked, "a held position must be marked whatever the universe says"
+    assert Decimal(doc["nav"]["total"]) > Decimal(50_000), "CCC contributes to NAV"
+
+    # And it is on its way out: no target, so the diff sells it.
+    assert "CCC" not in {t["asset"] for t in doc["targets"]}
+    exits = [o for o in doc["orders"] if o["asset"] == "CCC"]
+    assert exits and exits[0]["side"] == "sell"
+    assert exits[0]["reason"] == "exit"
+
+
+def test_a_holding_with_no_bars_at_all_still_stops_the_run(tmp_path: Path):
+    # The original gate is still right for its actual case: an asset we cannot
+    # price from any bar cannot be marked, and marking it at zero would
+    # understate NAV and every weight computed from it.
+    store.write(_bars(), root=tmp_path, source="synthetic")
+    universe.record(
+        universe.from_config(list(ASSETS)), as_of=AS_OF, source="test", root=tmp_path
+    )
+    state.save(
+        state.Portfolio(
+            cash=Decimal(50_000),
+            positions=[state.Position(asset="ZZZ", qty=Decimal("10"))],
+            as_of=AS_OF,
+        ),
+        tmp_path / "book.json",
+    )
+    with pytest.raises(pipeline.GateFailure, match="no price"):
+        _run(tmp_path, created_at=AS_OF)

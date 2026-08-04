@@ -62,7 +62,7 @@ def run(
     end: datetime,
     data_root: Path,
     initial_cash: Decimal,
-    baseline_signal: str = "placeholder_equal_long",
+    baseline_signal: str = "liquidity_top",
     baseline_constructor: str = "equal_weight",
 ) -> GateResult:
     """Replay the candidate and the baseline, then evaluate the four criteria."""

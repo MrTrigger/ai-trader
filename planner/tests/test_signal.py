@@ -215,3 +215,44 @@ def test_the_placeholder_still_claims_no_edge():
 def test_an_unknown_signal_is_refused():
     with pytest.raises(ValueError, match="unknown signal"):
         signal.get("wishful_thinking")
+
+
+# --- the baseline a ranking has to beat ------------------------------------
+
+
+def test_the_liquidity_baseline_holds_the_most_liquid_names():
+    frame = six(adv_quote=[1e8, 9e8, 3e8, 8e8, 2e8, 7e8])
+    result = signal.get("liquidity_top").generate(frame, config=config(max_holdings=2))
+    assert sorted(held(result)) == ["BBB", "DDD"]
+
+
+def test_the_baseline_holds_the_same_number_of_names_as_the_candidate():
+    """Otherwise the comparison confounds *which* names with *how many*.
+
+    And against a max_position_count limit, a baseline holding everything is
+    not merely incomparable — it is illegal, every plan is rejected, and the
+    baseline silently becomes a flat book that any strategy beats.
+    """
+    cfg = config(max_holdings=3)
+    baseline = signal.get("liquidity_top").generate(six(), config=cfg)
+    candidate = signal.get("xs_momentum").generate(six(), config=cfg)
+    assert len(baseline.signals) == len(candidate.signals) == 3
+
+
+def test_the_baseline_ignores_momentum_entirely():
+    strong = cross({"A": 0.9, "B": 0.1, "C": 0.1, "D": 0.1, "E": 0.1, "F": 0.1})
+    weak = cross({"A": 0.1, "B": 0.9, "C": 0.1, "D": 0.1, "E": 0.1, "F": 0.1})
+    a = signal.get("liquidity_top").generate(strong, config=config())
+    b = signal.get("liquidity_top").generate(weak, config=config())
+    assert held(a) == held(b)
+
+
+def test_the_baseline_says_it_claims_no_edge():
+    result = signal.get("liquidity_top").generate(six(), config=config())
+    assert any("exists to be beaten" in w.message for w in result.warnings)
+
+
+def test_the_baseline_applies_the_same_eligibility_screens():
+    frame = six(adv_quote=[5e8, 100.0, 5e8, 5e8, 5e8, 5e8])
+    result = signal.get("liquidity_top").generate(frame, config=config())
+    assert "BBB" not in held(result)

@@ -395,13 +395,24 @@ def metrics(steps: list[Step], *, interval_s: int) -> Metrics:
     first, last = navs[0], navs[-1]
     total_return = (last - first) / first if first else Decimal(0)
 
-    periods_per_year = CRYPTO_YEAR * 86_400 / interval_s
-    years = (len(navs) - 1) / periods_per_year
+    # Annualise from the calendar, not from the step count.
+    #
+    # Deriving the period count from `interval_s` assumes the steps are
+    # contiguous. They are not: a date whose gates failed produces no step, so a
+    # run with gaps has fewer observations than its span implies. Treating ten
+    # steps spread over five years as ten consecutive weeks reported a 38% total
+    # return as a CAGR of 58,996,978%, which is the kind of number that is at
+    # least obviously wrong - the same error at 40% would not have been.
+    span_days = (steps[-1].as_of - steps[0].as_of).days
+    years = span_days / CRYPTO_YEAR if span_days > 0 else 0.0
     cagr = (float(last / first) ** (1 / years) - 1) if years > 0 and first > 0 else 0.0
 
     rets = [
         float((navs[i] - navs[i - 1]) / navs[i - 1]) for i in range(1, len(navs)) if navs[i - 1]
     ]
+    # Observed sampling rate rather than the configured one, for the same
+    # reason: this is how often a return was actually measured.
+    periods_per_year = (len(rets) / years) if years > 0 else 0.0
     mean = sum(rets) / len(rets) if rets else 0.0
     variance = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) if len(rets) > 1 else 0.0
     volatility = math.sqrt(variance * periods_per_year)

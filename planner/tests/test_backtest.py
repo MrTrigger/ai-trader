@@ -485,3 +485,48 @@ def test_the_cli_fails_closed_when_no_date_produced_a_plan(tmp_path, cfg, capsys
     )
     assert rc == 2
     assert "nothing to report" in capsys.readouterr().err
+
+
+def test_annualisation_uses_the_calendar_not_the_step_count(env):
+    """Steps are not contiguous when gates fail, and CAGR must not assume they are.
+
+    Ten steps spread over five years is not ten consecutive weeks. Treating it
+    as such reported a 38% total return as a CAGR of 58,996,978% — obviously
+    wrong at that magnitude, and silently wrong at a smaller one.
+    """
+    steps = [
+        backtest.Step(
+            as_of=START + timedelta(days=i * 365),
+            nav=Decimal(100_000) * (Decimal("1.10") ** i),
+            cash=Decimal(0),
+            gross_exposure=Decimal("0.75"),
+            status="accepted",
+            fills=[],
+            plan_id=f"p{i}",
+            warnings=[],
+        )
+        for i in range(5)
+    ]
+    m = backtest.metrics(steps, interval_s=DAY)
+    assert m.n == 5
+    # Four years apart, compounding at 10% a year.
+    assert m.cagr == pytest.approx(0.10, abs=0.005)
+
+
+def test_a_sparse_replay_does_not_inflate_volatility(env):
+    widely_spaced = [
+        backtest.Step(
+            as_of=START + timedelta(days=i * 180),
+            nav=Decimal(100_000 + i * 1_000),
+            cash=Decimal(0),
+            gross_exposure=Decimal("0.75"),
+            status="accepted",
+            fills=[],
+            plan_id=f"p{i}",
+            warnings=[],
+        )
+        for i in range(6)
+    ]
+    m = backtest.metrics(widely_spaced, interval_s=DAY)
+    # Two observations a year cannot produce a triple-digit annualised vol.
+    assert m.volatility < 0.5

@@ -145,8 +145,11 @@ def test_passing_requires_all_four(env):
 def test_the_candidate_is_compared_against_a_named_baseline(env):
     result = run(env)
     assert "xs_momentum" in result.candidate
-    assert "placeholder_equal_long" in result.baseline
+    # The baseline holds the same NUMBER of names, so the comparison isolates
+    # which names the ranking picked rather than how many it held.
+    assert "liquidity_top" in result.baseline
     assert result.baseline_metrics is not None
+    assert result.baseline_metrics.n > 0, "a baseline that never traded is not one"
 
 
 def test_every_criterion_carries_the_numbers_behind_it(env):

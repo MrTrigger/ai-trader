@@ -132,12 +132,23 @@ def run(
     book = state.load(book_path or (data_root / "book.json"), as_of=as_of)
 
     # --- 2. FEATURIZE -------------------------------------------------------
-    # The benchmark is featurized alongside the universe even when it is not
-    # itself eligible: its return series is what every beta is measured against
-    # (section 6.2), and dropping it here would silently disable that limit.
-    featurizable = list(eligible_by_config)
-    if config.benchmark and config.benchmark not in featurizable:
-        featurizable.append(config.benchmark)
+    # Three sets, and the union is what gets featurized:
+    #
+    #   eligible  - what the signal may choose from
+    #   held      - what we already own, eligible or not
+    #   benchmark - the yardstick betas are measured against (section 6.2)
+    #
+    # **Held is the one that is easy to get wrong.** Eligibility governs what
+    # may be ENTERED. A position already open must be markable and exitable
+    # whatever the universe now says, or the first asset to drop out of the
+    # ranking makes every subsequent run impossible - a permanent deadlock, and
+    # for a ranking strategy that is not an edge case but the normal course of
+    # business. Held-but-ineligible then simply gets a target of zero, which is
+    # an exit, which is correct.
+    featurizable = set(eligible_by_config)
+    featurizable.update(p.asset for p in book.positions)
+    if config.benchmark:
+        featurizable.add(config.benchmark)
 
     if config.limits.max_benchmark_beta is not None:
         if not config.benchmark:
@@ -153,15 +164,18 @@ def run(
             )
 
     frame = features.build(
-        bars.filter(pl.col("asset").is_in(featurizable)), benchmark=config.benchmark
+        bars.filter(pl.col("asset").is_in(sorted(featurizable))), benchmark=config.benchmark
     )
-    cross = features.latest(frame).filter(pl.col("asset").is_in(eligible_by_config))
+    marked = features.latest(frame)
+    # The signal sees only what is eligible; everything else here is marked and
+    # priced so it can be valued and sold.
+    cross = marked.filter(pl.col("asset").is_in(eligible_by_config))
 
-    prices = {r["asset"]: Decimal(str(r["close"])) for r in cross.iter_rows(named=True)}
+    prices = {r["asset"]: Decimal(str(r["close"])) for r in marked.iter_rows(named=True)}
     adv: dict[str, Decimal | None] = {}
     vol: dict[str, Decimal | None] = {}
     betas: dict[str, Decimal | None] = {}
-    for r in cross.iter_rows(named=True):
+    for r in marked.iter_rows(named=True):
         adv[r["asset"]] = None if r["adv_quote"] is None else Decimal(str(r["adv_quote"]))
         vol[r["asset"]] = None if r["vol_30"] is None else Decimal(str(r["vol_30"])) / Decimal(
             str(365 ** 0.5)
