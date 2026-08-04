@@ -484,15 +484,95 @@ def combined_section(record: dict) -> str:
         '<div class="scroll"><table class="data"><thead><tr><th>full period</th>'
         '<th class="num">total return</th><th class="num">max drawdown</th></tr></thead>'
         '<tbody>' + totals + '</tbody></table></div>'
-        '<p class="finding"><strong>The regime tilt does what the flat line could not.</strong> '
-        'The market-neutral book is the steady grind that never captures a move in either '
-        'direction. Tilting net exposure by the benchmark\'s own channel state - gross held '
-        'at 1.0 throughout, so no leverage - beats buy-and-hold BTC by a wide margin while '
-        'holding a drawdown around a quarter of its depth. Two parameters, each sitting at '
-        'the centre of a five-wide plateau and each improving the WORSE of the two windows: '
-        'a tilt of 0.15, and a 48-day channel for reading the regime rather than the 144-day '
-        'one used to pick assets. The market state has to be read faster than the positions '
-        'are chosen.</p></section>'
+        '<p class="finding"><strong>Read the phase-robustness section below before drawing '
+        'anything from this chart.</strong> Every curve here is one rebalance phase - the '
+        'Friday one - and the choice of weekday is arbitrary: nothing in the strategy refers '
+        'to it. Across the seven possible phases the same strategy ranges from strongly '
+        'profitable to loss-making, and Friday is the best of the seven. These curves are '
+        'kept because they are what the research actually produced and deleting them would '
+        'hide how the error was made, but they describe one draw and not the strategy.</p>'
+        '</section>'
+    )
+
+
+def phase_section(record: dict) -> str:
+    """The seven rebalance phases, and what they do to every result on this page.
+
+    A weekly strategy has seven equally valid start days. Nothing in this one
+    refers to a weekday: shifting the rebalance by three days changes no
+    parameter, no rule, and no data - only which Friday-to-Friday or
+    Tuesday-to-Tuesday windows the returns are chopped into. A real weekly edge
+    is therefore close to invariant across the seven, and the spread across them
+    is a lower bound on the noise in any single-phase number.
+
+    This spread turned out to dominate everything else measured here, which is
+    why the section exists and why it sits above the older results rather than
+    beneath them. The failure is not that a wrong number was computed - each
+    phase is computed correctly - but that one draw was reported as though it
+    were the quantity of interest, and every subsequent test reused that same
+    draw. Out-of-sample windows, walk-forward folds, plateau sweeps and the
+    label-shuffle null were all run on the Friday phase, so none of them was
+    capable of detecting it. A validation suite is only as good as the degrees of
+    freedom it knows about.
+
+    The benchmark row is the control that makes the reading unambiguous. Buy-and-
+    hold BTC is the same asset in all seven phases, so its spread is pure
+    sampling noise and everything wider than it is the strategy's own.
+    """
+    rows = ""
+    for c in record["candidates"]:
+        spread = c["orig_max"] - c["orig_min"]
+        cls = "ev-no" if spread > 3.0 else ("ev-thin" if spread > 1.0 else "ev-ok")
+        rows += (
+            f'<tr><td>{_esc(c["name"])}</td>'
+            f'<td class="num">{c["fresh_median"] * 100:.1f}%</td>'
+            f'<td class="num">{c["orig_median"] * 100:.1f}%</td>'
+            f'<td class="num">{c["sharpe_median"]:.2f}</td>'
+            f'<td class="num muted">{c["orig_min"] * 100:.1f}%</td>'
+            f'<td class="num muted">{c["orig_max"] * 100:.1f}%</td>'
+            f'<td class="num"><span class="ev {cls}">{spread * 100:.0f} pts</span></td>'
+            f'<td class="num">{c["sharpe_min"]:.2f} … {c["sharpe_max"]:.2f}</td></tr>'
+        )
+
+    series = [(s["label"], s["equity"]) for s in record["series"]]
+    chart = _line_panel(
+        series,
+        height=300,
+        split=record.get("split"),
+        fmt=lambda v: f"{v:.1f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="Equity of the median rebalance phase for each candidate",
+        baseline=1.0,
+    )
+
+    return (
+        '<section><h2>Phase robustness — the result that supersedes the rest</h2>'
+        '<p class="note">A weekly strategy has seven equally valid rebalance days, and '
+        '<strong>nothing in this strategy refers to a weekday</strong>. Shifting the rebalance '
+        'by three days changes no parameter, no rule and no data. A real weekly edge should '
+        'barely notice. Every other number on this page was measured on the Friday phase.</p>'
+        '<div class="scroll"><table class="data"><thead>'
+        '<tr><th rowspan="2">candidate</th><th colspan="3">median across 7 phases</th>'
+        '<th colspan="3">orig window, across phases</th>'
+        '<th rowspan="2" class="num">Sharpe range</th></tr>'
+        '<tr><th class="num">fresh</th><th class="num">orig</th><th class="num">Sharpe</th>'
+        '<th class="num">worst</th><th class="num">best</th><th class="num">spread</th></tr>'
+        '</thead><tbody>' + rows + '</tbody></table></div>'
+        '<p class="note" style="margin-top:14px">Equity of the <strong>median</strong> phase '
+        'for each candidate — not the best one, so the chart and the table describe the same '
+        'thing.</p>'
+        + chart
+        + '<p class="finding"><strong>The headline result was a sampling artifact.</strong> '
+        'The strategy swings from strongly profitable to loss-making across the seven phases, '
+        'and Friday — the phase every result on this page was built on — is the best of the '
+        'seven in <em>both</em> test windows. Buy-and-hold BTC is the control: it is the same '
+        'asset in all seven phases, so its spread is the sampling noise floor, and the '
+        'strategy\'s is many times wider. What survives is much smaller than what was claimed '
+        'and its range still includes losing money. The deeper lesson is about the validation '
+        'rather than the strategy: a fresh out-of-sample window, walk-forward folds, plateau '
+        'sweeps and a label-shuffle null were all run on this same phase, so the entire '
+        'apparatus was blind to it by construction. An unrecognised degree of freedom is not '
+        'protected against by testing the ones you did recognise.</p></section>'
     )
 
 
@@ -560,16 +640,17 @@ def fixed_budget_section(record: dict) -> str:
         + '<div class="scroll"><table class="data"><thead><tr><th>year</th>'
         '<th class="num">P&amp;L, in units of the fixed stake</th></tr></thead>'
         '<tbody>' + years + '</tbody></table></div>'
-        '<p class="finding"><strong>The edge is decaying, and the compounded curve hides it.</strong> '
-        'Measured against a constant stake the strategy returned an average of about 80% of '
-        'stake per year through 2020–2024 and roughly 30% across 2025–26. On the compounded '
-        'chart that same stretch still climbs, because a weaker edge applied to an account '
-        'eighteen times larger still adds dollars. The two drawdowns are the same story: '
-        'September 2021 cost 10.8% of stake and July 2025 onward cost 5.3%, so the later '
-        'episode was <em>half</em> as severe per dollar at risk even though it was far larger '
-        'in dollars and looks comparable as a percentage of NAV. Which of those three numbers '
-        'is the right one depends entirely on the question, and only the fixed-budget line '
-        'answers "is this still working".</p></section>'
+        '<p class="finding"><strong>The two lines nearly coincide, and that is the finding.</strong> '
+        'On the median rebalance phase the strategy roughly doubles either way — compounding '
+        'adds almost nothing over seven years, because compounding only compounds when returns '
+        'are consistently positive, and here two of the seven years are negative. The earlier '
+        'version of this panel showed a steep exponential and reported a decaying edge; both '
+        'were properties of the Friday phase rather than of the strategy. On the median phase '
+        'the year-by-year P&amp;L has no trend at all — 2022 is the worst year and 2025 the '
+        'best, which is the reverse of the earlier reading. That reversal is worth more than '
+        'either result: a story confidently derived from one phase came out backwards on '
+        'another, so the fixed-budget view corrects the compounding illusion but cannot rescue '
+        'a number measured on a single arbitrary phase.</p></section>'
     )
 
 
@@ -625,15 +706,16 @@ def candidates_table(cands: list[dict]) -> str:
         '<tr><th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th>'
         '<th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th></tr>'
         '</thead><tbody>' + body + '</tbody></table></div>'
-        '<p class="finding"><strong>Two rows carry real evidence, for different reasons.</strong> '
-        '<em>market-neutral</em> is the only line tested once on a window that had never '
-        'informed it. The bottom row was reached after 88 configurations — but when 24 null '
-        'draws were given the <em>same</em> search, none reached it (best 1.71 against 2.06, '
-        'p = 0.040), and replacing the selection with random legs or with BTC alone costs most '
-        'of the return. So the search does not explain it. What no test here can supply is a '
-        'window that did not set its parameters — and the same edge was measured collapsing '
-        'from +1.19%/wk to +0.11%/wk after mid-2025, so a real edge stopping is not '
-        'hypothetical. The bottom row also carries double the drawdown.</p></section>'
+        '<p class="finding"><strong>None of these rows carries the evidence it appears to, and '
+        'the reason is not in this table.</strong> Every long/short row was measured on one '
+        'rebalance phase. The strategy turns out to be far more sensitive to that arbitrary '
+        'choice than to any parameter here — so a rerun of the identical search on a different '
+        'weekday would crown a different winner, and the ordering is largely an artifact. '
+        'The <em>searched</em> column was the right instinct pointed at the wrong risk: it '
+        'counts configurations while the damage came from a degree of freedom nobody counted, '
+        'because nobody thought of it as one. Even the null test inherits the flaw — all 24 '
+        'draws were run on the same phase as the real data, so it compared a lucky phase '
+        'against a lucky phase. See the phase-robustness section.</p></section>'
     )
 
 
@@ -830,6 +912,7 @@ def render(record: dict) -> str:
   {_results_table(record)}
 </section>
 
+{phase_section(record["phases"]) if record.get("phases") else ""}
 {combined_section(record["combined"]) if record.get("combined") else ""}
 {fixed_budget_section(record["fixed_budget"]) if record.get("fixed_budget") else ""}
 {candidates_table(record["combined"]["candidates"]) if record.get("combined", {}).get("candidates") else ""}
