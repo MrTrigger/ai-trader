@@ -178,6 +178,21 @@ would start every window flat with a cold feature frame. Sweeps are one axis at 
 ai-trader backtest --start 2021-10-01 --end 2026-08-01   # with the 2× slippage error bar
 ```
 
+### The research view
+
+Results as a page rather than terminal tables — gate verdicts, equity curves with the
+walk-forward windows shaded behind them, IC, the breakout spread test.
+
+```bash
+ai-trader report --record docs/research/phase-1-record.json --out docs/research/research.html
+cargo run -p viewer -- docs/research/research.html        # http://127.0.0.1:7433
+```
+
+`report` computes nothing — it renders a record a run produced, so the page cannot
+disagree with the CLI. `viewer` is a zero-dependency Rust binary **hardcoded to
+loopback**; there is no flag to change the bind address, and a test greps the source to
+keep it that way. Nothing here is ever published to a hosted surface.
+
 ### Two known gaps, recorded so they are not rediscovered
 
 - **The Rust Plan types are hand-written against the schema**, where

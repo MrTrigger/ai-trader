@@ -1,0 +1,14 @@
+[package]
+name = "viewer"
+description = "Serves the research view on loopback. No dependencies, no network exposure."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "viewer"
+path = "src/main.rs"
+
+# Deliberately no dependencies. Serving one local file to one local browser does
+# not need a web framework, and the smallest thing that works is the thing least
+# likely to grow into an accidental public surface.
