@@ -152,7 +152,17 @@ def cmd_universe_rank(args) -> int:
     # Step at the decision cadence, not the bar interval: a snapshot is only
     # needed where a decision is taken, and recording daily ones for a weekly
     # rebalance writes thousands of files nothing reads.
-    step = timedelta(seconds=config.interval_s * max(1, config.rebalance_every))
+    #
+    # `--step-days` overrides that, and exists for one reason: a cadence SWEEP
+    # needs snapshots on the finest grid it will test, because every coarser
+    # cadence's dates are a subset of the finer one's. Recording per-cadence
+    # instead would give each arm of the sweep a different universe, which is
+    # the one thing a one-axis sweep must not do.
+    step = (
+        timedelta(days=args.step_days)
+        if getattr(args, "step_days", None)
+        else timedelta(seconds=config.interval_s * max(1, config.rebalance_every))
+    )
     written = skipped = 0
     last_written: datetime | None = None
     day = start
@@ -597,6 +607,12 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--end", help="last snapshot date (default: same as --start)")
     rank.add_argument("--top", type=int, default=30, help="how many are eligible")
     rank.add_argument("--lookback", type=int, default=30, help="turnover window in days")
+    rank.add_argument(
+        "--step-days",
+        type=int,
+        help="snapshot cadence in days (default: the config rebalance cadence). "
+        "Use the finest grid a sweep will test.",
+    )
     rank.add_argument("--overwrite", action="store_true", help="correct a recording error")
     rank.set_defaults(func=cmd_universe_rank)
 
