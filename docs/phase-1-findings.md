@@ -82,6 +82,48 @@ Until then it constrains little and can bind on noise, which is what happened.
   would give a different number; the *relative* comparison against the baseline
   travels better than the absolute one.
 
+## The IC verdict: the ranking has no usable content
+
+Run after the gate, over the same 253 decisions. Forward returns measured
+`mark_open` to `mark_open`, delisted assets kept at their last traded price.
+
+| horizon | periods | eff n | obs | mean IC | t-stat | hit rate | |
+|---|---|---|---|---|---|---|---|
+| 7d | 253 | 253 | 9,263 | −0.0223 | −1.37 | 46.6% | not distinguishable from zero |
+| 14d | 253 | 126 | 9,263 | −0.0382 | −1.74 | 45.5% | not distinguishable from zero |
+| 30d | 253 | 59 | 9,263 | −0.0503 | −1.72 | 38.7% | not distinguishable from zero |
+
+**No horizon shows positive predictive content**, which fully explains the
+backtest: the strategy underperformed the baseline because the ranking was, at
+best, uninformative about subsequent returns.
+
+The sign is consistently negative and the 30d hit rate is 38.7% — the IC was
+positive in fewer than four periods in ten. That is *suggestive* of mild
+short-horizon reversal, which is a documented crypto effect and the very thing
+the 7-day skip was meant to avoid contaminating the measurement with. It is not
+established: nothing clears |t| > 2.
+
+### The correction that changed this verdict
+
+Sampling a 30-day forward return every 7 days reuses each window 4.3×.
+Uncorrected, the 30d IC reads **t = −3.55** and would have been reported as an
+established reversal effect. Deflating to 59 effective periods gives **−1.72**,
+which is a hint. The instrument now reports both the raw period count and the
+effective one, and reads significance off the latter.
+
+## What this rules out, and what it leaves open
+
+**Ruled out:** that the Phase 1 loss was a construction problem. If the ranking
+had content and sizing or costs were destroying it, the IC would be positive and
+it is not. Sweeping holding counts, cadences or constructors on this signal
+would be tuning the packaging of noise.
+
+**Left open:** cross-sectional *reversal* at this horizon. The sign is
+consistently negative across all three horizons. That is a hypothesis, not a
+result, and testing the inverse of a failed signal on the same data is the
+classic way to fit noise — it wants a fresh window or a different venue's
+universe before it means anything.
+
 ## The next diagnostic, and why it is not "try another strategy"
 
 **Measure the signal, not the portfolio** (§7.5). Portfolio P&L yields one
@@ -101,3 +143,8 @@ the cheapest next thing to know, and it splits the outcome cleanly:
 
 Doing the sweeps before knowing which of those is true would be tuning a
 strategy whose signal might have no content. The IC comes first.
+
+**Answered: the first branch.** `xs_momentum` as specified is retired. The next
+candidate is a different family — absolute channel-breakout trend-following,
+which §10.2 names as a legitimate baseline to beat — and it goes through the
+same gate.

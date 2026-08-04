@@ -22,7 +22,7 @@ import polars as pl
 from . import inspect as inspect_mod
 from . import plan as plan_mod
 from . import backtest as backtest_mod
-from . import features, gate, pipeline, scores, state, store, universe
+from . import features, gate, ic, pipeline, scores, state, store, universe
 from .config import Config, DEFAULT_CONFIG_PATH
 from .sources import BinancePublic
 
@@ -323,6 +323,25 @@ def cmd_scores(args) -> int:
     return 0
 
 
+def cmd_ic(args) -> int:
+    """Information coefficient of a score against subsequent returns.
+
+    A lens on the signal rather than the portfolio (design spec 7.5): one
+    observation per asset per period instead of one per rebalance, which is
+    roughly 30x the evidence for the same calendar time.
+    """
+    results = ic.measure(
+        config=_config(args),
+        start=_utc(args.start),
+        end=_utc(args.end),
+        data_root=Path(args.data_root),
+        score_column=args.score,
+        horizons_days=tuple(int(h) for h in args.horizons),
+    )
+    print(ic.format_results(results, score_column=args.score))
+    return 0
+
+
 def cmd_gate(args) -> int:
     """Run the Phase 1 gate and print the verdict, whatever it is."""
     result = gate.run(
@@ -589,6 +608,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bt.add_argument("--nav", help="write the NAV series to this CSV")
     bt.set_defaults(func=cmd_backtest)
+
+    icp = sub.add_parser("ic", help="information coefficient of a score (7.5)")
+    icp.add_argument("--start", required=True, help="first decision timestamp, ISO 8601")
+    icp.add_argument("--end", required=True, help="last decision timestamp, inclusive")
+    icp.add_argument("--score", default="ret_30_skip_7", help="feature column to rank on")
+    icp.add_argument("--horizons", nargs="+", default=["7", "14", "30"], help="forward days")
+    icp.set_defaults(func=cmd_ic)
 
     gt = sub.add_parser("gate", help="run the Phase 1 gate (design spec 9)")
     gt.add_argument("--start", required=True, help="first decision timestamp, ISO 8601")
