@@ -548,6 +548,87 @@ worse window: **tilt 0.15, regime period 48**. The principle underneath is worth
 keeping even if the numbers move: *the market state has to be read faster than
 the positions are chosen.*
 
+## Leaning hard needs a fast channel — and where the search went wrong
+
+The synthesis was worth testing: lean-sizing failed on a 144-day channel, but
+maybe the failure was *slow channel plus magnitude sizing* rather than magnitude
+sizing itself. On a channel short enough to turn, leaning hard might work.
+
+On the 144-day channel it does not, and the failure is diagnostic:
+
+| mode | fresh Sharpe | orig Sharpe | |
+|---|---|---|---|
+| lean (sign + size from slope) | 2.70 → 2.13 | **0.87 → 0.34** | collapses |
+| state × lean (bands set sign, lean sets size) | 2.82 → 2.48 | **0.90 → 0.20** | collapses |
+
+Both hold up in the fresh window and fall apart in the original. The fresh
+window is essentially one sustained trend; the original is choppy. Lean-sizing
+makes exposure proportional to how strong the trend *has already been*, so it is
+largest just after the biggest run — disproportionately just before the turn.
+It is momentum-of-momentum, and it is pro-cyclical the wrong way.
+
+That is the mirror image of the period result, and the pair is the useful part:
+
+| change | effect on the **worse** window |
+|---|---|
+| read the market **faster** (48d vs 144d) | min Sharpe 1.14 → **1.74** |
+| size the tilt by **trend magnitude** (144d) | min Sharpe 1.14 → **0.90** |
+
+**Reading faster catches turns. Sizing by magnitude leans hardest into trends
+that are already old.**
+
+### A costing bug the search surfaced
+
+Turnover was measured as the symmetric difference of the *name* sets. A tilt
+swinging from +0.5 to −0.5 holds the **same names at inverted weights** — an
+enormous trade the model charged nothing for. That systematically under-costs
+exactly the settings that tilt hardest, which is the direction the search was
+being pulled. Fixed to `sum |Δweight|` across the union of holdings. It moved
+the headline from +7725% to +6884%: real, and not the explanation.
+
+### The thing that matters more than any of these numbers
+
+On a fast channel, lean-sizing *does* clear every criterion, with an interior
+optimum rather than a boundary one — plateau 4–12, centre 8, min Sharpe 2.06,
+combined +6884%. Roughly 88% CAGR.
+
+**That result should not be believed, and the reason is arithmetic.**
+
+| what was swept | configurations |
+|---|---|
+| tilt magnitude | 16 |
+| regime definitions | 8 |
+| regime channel period | 16 |
+| lean scale × mode × period | 36 |
+| extended scale sweep | 12 |
+| **total** | **88**, all on the same two windows |
+
+Forty-four distinct configurations, each scored on both windows. Under the null
+of no edge, taking the best of forty-four on a two-window criterion selects for
+luck. More decisively: **both windows have now informed parameter choice, so
+neither is out-of-sample any longer.** The out-of-sample claim earned earlier —
+one hypothesis, tested once, on a window never touched — has been spent.
+
+The early results and the late ones are not the same kind of evidence, and the
+document should not present them as though they were:
+
+| finding | status |
+|---|---|
+| market-neutral GC has a relative edge (Sharpe ~1.0) | **one hypothesis, one clean OOS test** |
+| regime tilt improves it (0.15, plateau of 5) | 2nd–3rd hypothesis; still credible |
+| faster regime channel (48d, plateau of 5) | ~30 configs in; weakening |
+| lean-sizing at scale 8 (+6884%) | 88 configs in; **not evidence** |
+
+Also worth noting on its own terms: the drawdowns doubled to get there —
+−27.6% and −27.1% against −9.9% and −16.5% — which is not the steady character
+the construction was being steered toward.
+
+**The correct next step is not another variant.** It is to freeze a
+configuration and get data that has never informed it: forward-test, or a third
+window. There is no third window available here — pre-2019 has no perpetuals, so
+no funding and no shortability — which means forward testing is the only honest
+instrument left, and §7.5 already says what it can and cannot establish.
+
 ---
 
 # Where Phase 1 stands
