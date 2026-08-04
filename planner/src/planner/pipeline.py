@@ -122,16 +122,42 @@ def run(
     book = state.load(book_path or (data_root / "book.json"), as_of=as_of)
 
     # --- 2. FEATURIZE -------------------------------------------------------
-    frame = features.build(bars.filter(pl.col("asset").is_in(eligible_by_config)))
-    cross = features.latest(frame)
+    # The benchmark is featurized alongside the universe even when it is not
+    # itself eligible: its return series is what every beta is measured against
+    # (section 6.2), and dropping it here would silently disable that limit.
+    featurizable = list(eligible_by_config)
+    if config.benchmark and config.benchmark not in featurizable:
+        featurizable.append(config.benchmark)
+
+    if config.limits.max_benchmark_beta is not None:
+        if not config.benchmark:
+            raise GateFailure(
+                "max_benchmark_beta is enforced but no benchmark is configured; "
+                "refusing to evaluate a limit against nothing"
+            )
+        if config.benchmark not in have_bars:
+            raise GateFailure(
+                f"max_benchmark_beta is enforced but benchmark {config.benchmark} "
+                "has no bars at the horizon. A limit that cannot be evaluated is "
+                "not a limit."
+            )
+
+    frame = features.build(
+        bars.filter(pl.col("asset").is_in(featurizable)), benchmark=config.benchmark
+    )
+    cross = features.latest(frame).filter(pl.col("asset").is_in(eligible_by_config))
 
     prices = {r["asset"]: Decimal(str(r["close"])) for r in cross.iter_rows(named=True)}
     adv: dict[str, Decimal | None] = {}
     vol: dict[str, Decimal | None] = {}
+    betas: dict[str, Decimal | None] = {}
     for r in cross.iter_rows(named=True):
         adv[r["asset"]] = None if r["adv_quote"] is None else Decimal(str(r["adv_quote"]))
         vol[r["asset"]] = None if r["vol_30"] is None else Decimal(str(r["vol_30"])) / Decimal(
             str(365 ** 0.5)
+        )
+        betas[r["asset"]] = (
+            None if r["beta_bench"] is None else Decimal(str(r["beta_bench"]))
         )
 
     for p in book.positions:
@@ -160,12 +186,19 @@ def run(
     )
 
     # --- 4. RISK MODEL ------------------------------------------------------
+    # No covariance estimate yet, so nothing here shapes construction (step 5).
+    # The cluster and beta limits below are the crude stand-ins the spec asks
+    # for, and they veto rather than shape - which is the weaker of the two
+    # jobs section 3.1 says risk should do.
+    constrained_by = "the position count and gross cap"
+    if config.limits.max_cluster_exposure is not None:
+        constrained_by = "a configured cluster grouping, the position count and gross cap"
     warnings.append(
         Warning(
             kind="unenforced_rule",
             message=(
-                "no risk model: covariance does not inform construction, so correlated "
-                "positions are constrained only by the position count and gross cap."
+                f"no risk model: covariance does not inform construction, so correlated "
+                f"positions are constrained only by {constrained_by}."
             ),
         )
     )
@@ -183,16 +216,24 @@ def run(
         )
 
     # --- 6. RISK GATE -------------------------------------------------------
-    report = risk.evaluate(
+    evaluation = risk.evaluate(
         target_weights=built.weights,
         current_weights=current_weights,
         limits=config.limits,
         nav=nav,
+        clusters=config.clusters,
+        betas=betas,
     )
+    report = evaluation.report
     for name in config.limits.unenforced():
         warnings.append(
             Warning(kind="unenforced_rule", message=f"limit {name} is not enforced")
         )
+    # A limit can be enforced and still be weaker than it reads - an
+    # unclassified asset escapes the cluster constraint, an unestimable beta is
+    # assumed. Disclosed above the numbers, never beneath them (section 12).
+    for note in evaluation.disclosures:
+        warnings.append(Warning(kind="unenforced_rule", message=note))
     if not config.costs.calibrated:
         warnings.append(
             Warning(

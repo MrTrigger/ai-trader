@@ -123,6 +123,10 @@ class Config:
     costs: CostModel
     ruleset_version: str = "phase0"
     signal: str = "placeholder_equal_long"
+    benchmark: str | None = None
+    #: asset -> cluster name. See `clusters_from_dict` for why it is stored
+    #: this way round rather than as the groups it is written as.
+    clusters: dict[str, str] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
@@ -141,8 +145,32 @@ class Config:
             rebalance_cost_multiple=_dec(p["rebalance_cost_multiple"]),
             turnover_budget=_dec(p["turnover_budget"]),
             signal=p.get("signal", "placeholder_equal_long"),
+            benchmark=(p.get("benchmark") or None),
+            clusters=clusters_from_dict(raw.get("clusters", {})),
             ruleset_version=raw.get("meta", {}).get("ruleset_version", "phase0"),
             limits=RiskLimits.from_dict(raw["limits"]),
             costs=CostModel.from_dict(raw["costs"]),
             meta=raw.get("meta", {}),
         )
+
+
+def clusters_from_dict(raw: dict[str, Any]) -> dict[str, str]:
+    """Invert `{cluster: [assets]}` into `{asset: cluster}`.
+
+    Written as groups because that is how a human maintains it, and stored
+    inverted because that is how the risk gate reads it. Inverting here rather
+    than at every call site is also what makes the one genuine error in this
+    mapping - an asset claimed by two clusters - detectable at load time instead
+    of silently resolving to whichever the iteration order reached last.
+    """
+    out: dict[str, str] = {}
+    for cluster, assets in raw.items():
+        for asset in assets:
+            asset = asset.upper()
+            if asset in out and out[asset] != cluster:
+                raise ValueError(
+                    f"{asset} is in two clusters ({out[asset]!r} and {cluster!r}); "
+                    "an asset belongs to exactly one group or the exposure sums lie"
+                )
+            out[asset] = cluster
+    return out

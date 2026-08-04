@@ -60,8 +60,32 @@ ai-trader plan --as-of 2026-08-01
 ai-trader plan verify --runs 3     # the gate
 ```
 
-Next is Phase 1 — a real strategy, measured through the harness. See
-[design spec §9](docs/design-spec.md#9-phased-build-order) for the order and the gates.
+**Phase 1 has started, from the strategy-independent end.** The risk layer
+([§6](docs/design-spec.md#6-risk-the-layer-the-alternatives-dont-have)) now enforces the two limits
+the spec argues hardest for, both of which catch the same failure — a book that looks diversified
+and is not:
+
+- **`max_cluster_exposure`** — gross per correlated group, over a configured grouping. §6 calls
+  this not optional: a hundred crypto assets are approximately one asset, and an equal-weight book
+  across them is a leveraged beta bet wearing a diversification costume. An asset the grouping does
+  not name escapes the limit, and the plan discloses it by name rather than absorbing it.
+- **`max_benchmark_beta`** — `|wᵀβ|` against a configured benchmark (BTC now, SPY for equities
+  later; same code). Beta is a new causal feature, a trailing 90-bar regression slope. An asset
+  whose beta cannot be estimated is assumed to be 1.0 — conservative by construction, since a
+  missing estimate can then only tighten the limit, never relax it. Also disclosed.
+
+Both thresholds are **asserted, not derived**. They are judgements recorded in `config/default.toml`
+with their reasoning, and Phase 1's sweep is where a number like that earns its value.
+
+`planner/tests/test_features.py` also adds the causality test the harness contributes and this repo
+had been missing: build features over the full history, rebuild over every prefix, require row *i*
+identical. Beta is why it exists now — every other feature is a rolling window over one asset's own
+column, but beta joins a second series across assets on timestamp, which is exactly the shape of
+operation that can quietly reach forward.
+
+Still to come in Phase 1: the `scores` layer (cross-sectional transforms with `degenerate_flags`),
+a real signal, and the full backtest through the harness. **The strategy itself is still undecided
+on purpose** — see [§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
 
 ### Two known gaps, recorded so they are not rediscovered
 

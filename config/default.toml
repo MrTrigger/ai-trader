@@ -17,6 +17,12 @@ signal = "placeholder_equal_long"
 # See planner/universe.py on why a list applied backwards is survivorship bias.
 universe = ["BTC", "ETH", "SOL"]
 
+# What portfolio beta is measured against (spec 6.2). BTC for crypto, SPY for
+# equities later - same code, different benchmark. It does not have to be in the
+# universe: it is featurized either way, because it is the yardstick and not a
+# holding.
+benchmark = "BTC"
+
 # Eligibility. Below this median daily quote turnover an asset is not tradeable
 # at size regardless of what its signal says.
 min_dollar_volume = "50000000"
@@ -54,14 +60,43 @@ max_position = "0.25"
 max_position_count = 20
 min_position_notional = "25"
 
+# Gross exposure per correlated group. NOT OPTIONAL per spec 6: a hundred crypto
+# assets are approximately one asset, and an equal-weight book across them is a
+# leveraged beta bet wearing a diversification costume.
+#
+# 0.40 is ASSERTED, not derived. It allows at most two max-size positions in one
+# group, which forces a book to span at least two groups before it can reach the
+# gross target. Phase 1's sweep is where a number like this earns its value, and
+# until then it is a judgement recorded rather than a result.
+max_cluster_exposure = "0.40"
+
+# |w'beta| against `benchmark`. One means the book may not carry more
+# BTC-equivalent exposure than its own NAV - the natural line rather than a
+# tuned one, and also asserted rather than derived.
+#
+# An asset whose beta cannot be estimated is assumed to be 1.0, which can only
+# tighten this. See risk.UNKNOWN_BETA.
+max_benchmark_beta = "1.00"
+
 # Not enforced yet. Left explicitly null rather than set to a permissive number,
-# so the run discloses them as unenforced instead of implying they passed.
-#   max_net_exposure     - needs shorts to be meaningful
-#   max_cluster_exposure - needs a grouping (L1 ecosystem / sector / correlation)
-#   max_benchmark_beta   - needs a beta estimate against BTC
+# so the run discloses it as unenforced instead of implying it passed.
+#   max_net_exposure - needs shorts to be meaningful
 max_net_exposure = ""
-max_cluster_exposure = ""
-max_benchmark_beta = ""
+
+# Correlated groups, for max_cluster_exposure above. Crude and present beats
+# sophisticated and Phase 5: this is a hand-maintained sector map, not a
+# correlation clustering, and it is expected to be replaced by one.
+#
+# An asset named here belongs to exactly one group - being in two makes the
+# exposure sums lie, and config loading refuses it. An asset named in NO group
+# is not constrained by the limit at all, and the plan says so by name rather
+# than absorbing it quietly.
+[clusters]
+btc = ["BTC"]
+eth = ["ETH"]
+alt_l1 = ["SOL", "AVAX", "NEAR", "ADA", "DOT", "SUI", "APT"]
+l2 = ["ARB", "OP", "MATIC", "STRK"]
+defi = ["UNI", "AAVE", "LINK", "MKR", "CRV"]
 
 [costs]
 # Taker fee, roughly the level both candidate venues charge.

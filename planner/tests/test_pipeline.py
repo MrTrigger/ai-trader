@@ -266,3 +266,129 @@ def test_turnover_budget_defers_rather_than_rejects(env):
     assert doc["status"] == "accepted"
     assert len(doc["orders"]) == 1
     assert any(w["kind"] == "turnover_capped" for w in doc["warnings"])
+
+
+def _limits(**over) -> RiskLimits:
+    base = dict(
+        max_gross_exposure=Decimal("1.0"),
+        max_position=Decimal("0.30"),
+        max_position_count=20,
+        min_position_notional=Decimal(25),
+    )
+    return RiskLimits(**(base | over))
+
+
+def test_a_correlated_cluster_rejects_the_whole_plan(env):
+    """Three names individually inside every per-asset limit, and one bet."""
+    doc = _run(
+        env,
+        created_at=AS_OF,
+        limits=_limits(max_cluster_exposure=Decimal("0.40")),
+        clusters={a: "one_group" for a in ASSETS},
+    )
+    assert doc["status"] == "rejected"
+    assert doc["orders"] == []
+    assert "max_cluster_exposure" in doc["risk_report"]["rejected_reason"]
+
+    check = next(
+        c for c in doc["risk_report"]["checks"] if c["name"] == "max_cluster_exposure"
+    )
+    assert Decimal(check["value"]) == Decimal("0.75"), "the whole book is one cluster"
+
+
+def test_separate_clusters_pass_the_same_book(env):
+    # Same weights, same limit, different grouping. The limit measures
+    # correlation as declared, which is exactly why the declaration matters.
+    doc = _run(
+        env,
+        created_at=AS_OF,
+        limits=_limits(max_cluster_exposure=Decimal("0.40")),
+        clusters={a: f"group_{a}" for a in ASSETS},
+    )
+    assert doc["status"] == "accepted"
+
+
+def test_an_unclassified_asset_is_disclosed_on_the_plan(env):
+    doc = _run(
+        env,
+        created_at=AS_OF,
+        limits=_limits(max_cluster_exposure=Decimal("0.40")),
+        clusters={"AAA": "one_group"},
+    )
+    assert doc["status"] == "accepted"
+    disclosures = [w["message"] for w in doc["warnings"] if w["kind"] == "unenforced_rule"]
+    assert any("BBB" in m and "CCC" in m for m in disclosures), (
+        "an asset outside the grouping escapes the limit, and the plan must say so"
+    )
+
+
+def test_an_enforced_beta_limit_with_no_benchmark_stops_the_run(env):
+    """A limit that cannot be evaluated is not a limit (design spec 0.3)."""
+    with pytest.raises(pipeline.GateFailure, match="no benchmark is configured"):
+        _run(env, created_at=AS_OF, limits=_limits(max_benchmark_beta=Decimal("1.0")))
+
+
+def test_an_enforced_beta_limit_with_an_absent_benchmark_stops_the_run(env):
+    with pytest.raises(pipeline.GateFailure, match="has no bars"):
+        _run(
+            env,
+            created_at=AS_OF,
+            benchmark="ZZZ",
+            limits=_limits(max_benchmark_beta=Decimal("1.0")),
+        )
+
+
+def test_the_beta_limit_is_evaluated_against_the_configured_benchmark(env):
+    doc = _run(
+        env,
+        created_at=AS_OF,
+        benchmark="AAA",
+        limits=_limits(max_benchmark_beta=Decimal("5.0")),
+    )
+    check = next(
+        c for c in doc["risk_report"]["checks"] if c["name"] == "max_benchmark_beta"
+    )
+    assert check["passed"]
+    assert Decimal(check["value"]) > 0, "a long book has non-zero benchmark exposure"
+
+
+def test_a_tight_beta_limit_rejects_the_plan(env):
+    doc = _run(
+        env,
+        created_at=AS_OF,
+        benchmark="AAA",
+        limits=_limits(max_benchmark_beta=Decimal("0.01")),
+    )
+    assert doc["status"] == "rejected"
+    assert "max_benchmark_beta" in doc["risk_report"]["rejected_reason"]
+
+
+def test_the_benchmark_is_featurized_even_when_it_is_not_eligible(tmp_path: Path):
+    """The yardstick is not a holding, and dropping it disables the limit.
+
+    AAA has bars but is not in the recorded universe, so it is never a target.
+    Its return series is still what BBB's and CCC's betas are measured against.
+    """
+    store.write(_bars(), root=tmp_path, source="synthetic")
+    universe.record(
+        universe.from_config(["BBB", "CCC"]), as_of=AS_OF, source="test", root=tmp_path
+    )
+    state.save(
+        state.Portfolio(cash=Decimal(100_000), positions=[], as_of=AS_OF),
+        tmp_path / "book.json",
+    )
+
+    doc = _run(
+        tmp_path,
+        created_at=AS_OF,
+        benchmark="AAA",
+        limits=_limits(max_benchmark_beta=Decimal("5.0")),
+    )
+    assert {t["asset"] for t in doc["targets"]} == {"BBB", "CCC"}
+    check = next(
+        c for c in doc["risk_report"]["checks"] if c["name"] == "max_benchmark_beta"
+    )
+    assert check["passed"]
+    assert not any(
+        "beta assumed" in w["message"] for w in doc["warnings"]
+    ), "AAA's bars were available, so both betas were estimable"
