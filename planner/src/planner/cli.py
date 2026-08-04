@@ -22,7 +22,7 @@ import polars as pl
 from . import inspect as inspect_mod
 from . import plan as plan_mod
 from . import backtest as backtest_mod
-from . import features, gate, ic, pipeline, scores, state, store, universe
+from . import features, gate, ic, pipeline, report, scores, state, store, universe
 from .config import Config, DEFAULT_CONFIG_PATH
 from .sources import BinancePublic
 
@@ -323,6 +323,21 @@ def cmd_scores(args) -> int:
     return 0
 
 
+def cmd_report(args) -> int:
+    """Render the research view from a record the CLI produced.
+
+    A lens, per design spec 8.1: this computes nothing. If it disappeared the
+    project would lose a convenience and no evidence.
+    """
+    record = Path(args.record)
+    if not record.exists():
+        print(f"no record at {record}", file=sys.stderr)
+        return 2
+    out = report.write(record, Path(args.out))
+    print(f"wrote {out} ({out.stat().st_size // 1024}kb, self-contained)")
+    return 0
+
+
 def cmd_ic(args) -> int:
     """Information coefficient of a score against subsequent returns.
 
@@ -608,6 +623,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bt.add_argument("--nav", help="write the NAV series to this CSV")
     bt.set_defaults(func=cmd_backtest)
+
+    rep = sub.add_parser("report", help="render the research view (a lens, computes nothing)")
+    rep.add_argument("--record", required=True, help="JSON record produced by a run")
+    rep.add_argument("--out", required=True, help="HTML file to write")
+    rep.set_defaults(func=cmd_report)
 
     icp = sub.add_parser("ic", help="information coefficient of a score (7.5)")
     icp.add_argument("--start", required=True, help="first decision timestamp, ISO 8601")
