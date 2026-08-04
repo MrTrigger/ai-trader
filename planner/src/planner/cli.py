@@ -17,9 +17,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import polars as pl
+
 from . import inspect as inspect_mod
 from . import plan as plan_mod
-from . import pipeline, state, store, universe
+from . import features, pipeline, scores, state, store, universe
 from .config import Config, DEFAULT_CONFIG_PATH
 from .sources import BinancePublic
 
@@ -176,6 +178,82 @@ def cmd_book_show(args) -> int:
 # ---------------------------------------------------------------------------
 # plan
 # ---------------------------------------------------------------------------
+
+
+def cmd_scores(args) -> int:
+    """Show the scored cross-section at `as_of`.
+
+    A lens, not a decision: nothing in the decision path consumes these yet.
+    §10.2 leaves the strategy undecided, and the point of being able to look at
+    a cross-section is to decide it against evidence.
+    """
+    config = _config(args)
+    as_of = _utc(args.as_of) if args.as_of else datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    root = Path(args.data_root)
+
+    horizon = pipeline.usable_horizon(as_of, config.interval_s)
+    bars = store.read(root=root, interval_s=config.interval_s, until=horizon)
+    if bars.is_empty():
+        print(f"no bars at or before {horizon.isoformat()}", file=sys.stderr)
+        return 2
+
+    try:
+        members = universe.load(as_of, root=root)
+    except FileNotFoundError as exc:
+        print(f"GATE FAILED: {exc}", file=sys.stderr)
+        return 2
+    eligible = [m.asset for m in members if m.eligible]
+
+    featurizable = list(eligible)
+    if config.benchmark and config.benchmark not in featurizable:
+        featurizable.append(config.benchmark)
+
+    frame = features.build(
+        bars.filter(pl.col("asset").is_in(featurizable)), benchmark=config.benchmark
+    )
+    cross = features.latest(frame).filter(pl.col("asset").is_in(eligible))
+
+    result = scores.score(
+        cross,
+        factors=scores.BASELINE,
+        groups=config.clusters if args.by_cluster else None,
+    )
+
+    # Disclosures first, always. A score read before its caveats has already
+    # misled - and a neutral score looks exactly like a measured average one.
+    print("DISCLOSURES (read before any number below)")
+    print(
+        "  ! these factors are a candidate cross-section, not a chosen strategy. "
+        "They have not been through the backtest harness and claim no edge."
+    )
+    for note in result.disclosures:
+        print(f"  ! {note}")
+    print()
+
+    print(f"as of {as_of.isoformat()}   horizon {horizon.isoformat()}")
+    print(f"scoring {result.scoring_version}   features {features.FEATURE_SET_VERSION}")
+    print(
+        "grouped by "
+        + ("configured clusters" if args.by_cluster else f"{scores.UNGROUPED!r} (one cross-section)")
+    )
+
+    factor_names = [f.name for f in scores.BASELINE]
+    header = f"\n{'asset':<8}{'group':<12}{'composite':>10}"
+    for name in factor_names:
+        header += f"{name:>12}"
+    print(header + "   flags")
+
+    ordered = result.frame.sort("composite", descending=True)
+    for row in ordered.iter_rows(named=True):
+        line = f"{row['asset']:<8}{row['group_key']:<12}{row['composite']:>10.1f}"
+        for name in factor_names:
+            line += f"{row[scores.factor_column(name)]:>12.1f}"
+        flags = row["degenerate_flags"]
+        print(line + ("   " + ", ".join(flags) if flags else ""))
+
+    return 0
 
 
 def cmd_plan(args) -> int:
@@ -338,6 +416,15 @@ def build_parser() -> argparse.ArgumentParser:
     binit.add_argument("--force", action="store_true")
     binit.set_defaults(func=cmd_book_init)
     book.add_parser("show", help="current holdings").set_defaults(func=cmd_book_show)
+
+    sc = sub.add_parser("scores", help="the scored cross-section (a lens, not a decision)")
+    sc.add_argument("--as-of", help="decision timestamp, ISO 8601 (default: today UTC)")
+    sc.add_argument(
+        "--by-cluster",
+        action="store_true",
+        help="rank within configured clusters instead of across the whole universe",
+    )
+    sc.set_defaults(func=cmd_scores)
 
     pl_ = sub.add_parser("plan", help="produce a plan (steps 1-8, no side effects)")
     pl_sub = pl_.add_subparsers(dest="cmd")

@@ -83,9 +83,29 @@ identical. Beta is why it exists now — every other feature is a rolling window
 column, but beta joins a second series across assets on timestamp, which is exactly the shape of
 operation that can quietly reach forward.
 
-Still to come in Phase 1: the `scores` layer (cross-sectional transforms with `degenerate_flags`),
-a real signal, and the full backtest through the harness. **The strategy itself is still undecided
-on purpose** — see [§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
+The **`scores` layer** ([§5.2](docs/design-spec.md#52-tables-sketch--refine-in-phase-0),
+[§9.1](docs/design-spec.md#91-what-phase-6-inherits-and-what-it-doesnt)) is in too. Scores are not
+features: a feature measures one asset, a score ranks it against the others in its group, which is
+why a score is only replayable stored beside the universe snapshot that produced it. The framework
+is shared across asset classes — sub-factors, equal weight within a parent, group-relative
+percentile rank, weighted composite — and the factors are not.
+
+Two things can go wrong and neither is allowed to be silent: a measurement can be missing, or the
+group can be too small to rank within. Both score neutral and both say so, because a flat 50 that
+reads downstream as a real measurement of average-ness is the quiet way a backtest gets corrupted.
+
+```bash
+ai-trader scores --as-of 2026-08-01                # rank across the whole universe
+ai-trader scores --as-of 2026-08-01 --by-cluster   # rank within configured clusters
+```
+
+That command is **a lens, not a decision** — nothing in the decision path consumes scores yet, and
+the factor set it displays is a candidate cross-section that has never been near the harness and
+claims no edge. It exists so the strategy can be chosen against evidence rather than argument.
+
+Still to come in Phase 1: a real signal, and the full backtest through the harness. **The strategy
+itself is undecided on purpose** — see
+[§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
 
 ### Two known gaps, recorded so they are not rediscovered
 
