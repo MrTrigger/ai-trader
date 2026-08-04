@@ -750,6 +750,11 @@ Each gate is stated as evidence. "It's done" is not a gate.
 extension. If Phase 1's gate fails, the correct outcome is a different strategy — or none — not a
 softer gate.
 
+**Phase 2's "≥6 weeks" is asserted, not derived.** It is long enough to surface plumbing failures
+and far too short to establish an edge (§7.5 does the arithmetic). Flagged rather than quietly
+inherited: if that number is ever the thing standing between the system and capital, it deserves
+an argument, and it does not currently have one.
+
 ### 9.1 What Phase 6 inherits, and what it doesn't
 
 The equities book reuses **everything above the interfaces**: the run loop, the Plan artifact, the
@@ -949,6 +954,12 @@ different and more common failure.
   never backfilled. Backfilling it is survivorship bias with extra steps — the delisted, the
   rugged, and the dead must remain in history exactly as they were.
 - **Money is decimal, never float.** Sizes, prices, fees, NAV.
+- **Contract artifacts are written as bytes, never as text.** `Path.write_bytes`, never
+  `write_text`. Text mode translates newlines per platform *and* translates them back on the way
+  in, so a round-trip test passes on the very machine producing the wrong bytes — which is how a
+  CRLF Plan fixture got committed and would have failed CI on its first run. The fixture test
+  compares bytes and asserts no `\r`; `.gitattributes` marks the fixture and schema `-text` so git
+  never rewrites them either.
 - **Every number in a report carries its `n`**, and an inadequate sample says so before the number,
   not in a footnote.
 - **Report what was not enforced, first.** Inherited from the harness: any run with a declared but

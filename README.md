@@ -33,12 +33,26 @@ See [design spec §3.5](docs/design-spec.md#35-implementation-stack-and-why-it-i
 
 ## Status
 
-**Phase 0 in progress.** No venue account, no capital, no strategy — the Phase 0 signal is an
-explicit placeholder that claims no edge and says so on every plan it produces.
+**Phase 0 complete; its gate is met.** No venue account, no capital, no strategy — the Phase 0
+signal is an explicit placeholder that claims no edge and says so on every plan it produces.
 
-Done: the Plan contract (schema + Python writer + Rust parser + a committed fixture CI checks both
-halves against), the bar store, a public `DataSource`, point-in-time universe snapshots, and the
-decision path — eligibility, construction, risk gate, cost-aware diff, orders.
+> **The gate:** `plan --dry-run` produces byte-identical plans across two runs, **and** Rust parses
+> a Python-written Plan in CI.
+
+Both halves hold. `plan verify` passes on real bars and on synthetic bars in `test_pipeline.py`, so
+CI enforces determinism without shipping a data set; the `cross-language contract` CI job
+regenerates the fixture from the current planner, fails if the committed bytes drifted, and then
+has Rust parse it.
+
+Built:
+
+| Piece | Where |
+|---|---|
+| Plan schema, v1.1.0 | `schema/plan.schema.json` |
+| Python planner — bars, store, source, universe, decision path, CLI | `planner/` |
+| Rust Plan parser (parse-only by design) | `service/crates/plan` |
+| `VenueAdapter` interface + shared venue types | `service/crates/venue` |
+| `paper` venue adapter | `service/crates/paper` |
 
 ```bash
 ai-trader data pull --days 400 && ai-trader universe record && ai-trader book init --cash 100000
@@ -46,15 +60,35 @@ ai-trader plan --as-of 2026-08-01
 ai-trader plan verify --runs 3     # the gate
 ```
 
-Remaining for Phase 0: the `paper` venue adapter, and a first green CI run.
+Next is Phase 1 — a real strategy, measured through the harness. See
+[design spec §9](docs/design-spec.md#9-phased-build-order) for the order and the gates.
 
-See [design spec §9](docs/design-spec.md#9-phased-build-order) for the phased order and the gates.
+### Two known gaps, recorded so they are not rediscovered
 
-### Local build note
+- **The Rust Plan types are hand-written against the schema**, where
+  [§3.5](docs/design-spec.md#35-implementation-stack-and-why-it-is-split) calls for generating them
+  from it. `deny_unknown_fields` plus the fixture diff catches most drift, but not a field added to
+  the schema that neither side implements. Worth closing before Phase 1 hardens the schema.
+- **`paper` has no live price feed yet.** It is a fake broker over a `PriceSource`, and the only
+  implementation so far is `ManualPrices`. Phase 2 adds a real-time feed as a second implementation;
+  the adapter does not change when it lands.
 
-The Rust crate needs an MSVC linker on Windows. If `cargo test` fails with `linker link.exe not
-found`, install the **Desktop development with C++** workload from the Visual Studio Installer.
-CI builds it on Linux and does not need this.
+### Local development
+
+Linux (or WSL) — production is a Debian pod, and the Rust half needs a gcc toolchain.
+
+```bash
+python3 -m venv planner/.venv
+planner/.venv/bin/pip install -e "planner[dev]"
+(cd planner && ../planner/.venv/bin/pytest -q)     # 85 tests
+
+(cd service && cargo test --all)                   # 53 tests
+```
+
+Market data is gitignored and re-pulled with the commands above (public API, no account).
+
+Keep the repo on the Linux filesystem rather than under `/mnt/c`: Rust builds across the 9p mount
+are slow enough to be worth avoiding, and it sidesteps the CRLF class of bug entirely.
 
 ## Relationship to `trading-journal`
 
@@ -75,4 +109,14 @@ by the Phase 1 breadth sweep rather than by preference — see
 [design spec §10.1](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
 Public market data needs no account anywhere, so nothing is blocked by that decision.
 
-Until it's made: `paper` adapter only.
+Until it's made: `paper` adapter only — which is not a placeholder. Per
+[§4.1](docs/design-spec.md#41-venueadapter) it stays first-class forever, and Phase 2's gate is run
+against it for weeks.
+
+Also open, and belonging to a human rather than to an agent:
+
+- Phase 2's **"≥6 weeks paper"** is an invented number, not a derived one.
+- The [§5.2](docs/design-spec.md#52-tables-sketch--refine-in-phase-0) table sketch is worth a review
+  before Phase 1 hardens the schema.
+- Whether `trading-journal/backtest` stays a path dependency or gets extracted
+  ([§2](docs/design-spec.md#2-reused-not-rebuilt) says Phase 4+, deliberately).
