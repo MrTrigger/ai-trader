@@ -496,6 +496,83 @@ def combined_section(record: dict) -> str:
     )
 
 
+def fixed_budget_section(record: dict) -> str:
+    """The same weekly returns under both equity conventions, on one x-axis.
+
+    A compounding curve answers "what did the account do" and is the only honest
+    answer to that question. It is a poor instrument for "is the edge holding
+    up", because it multiplies each week's return by however much the account
+    happens to have grown — so a decaying edge on a large balance still slopes
+    upward, and an early loss is invisible next to a later one of half the
+    severity. Applying the identical returns to a constant stake removes the
+    balance from the picture and leaves the edge itself: slope IS performance,
+    and a flattening slope is a fading signal rather than a smaller account.
+
+    Both are plotted because neither alone is sufficient, and never on two
+    y-scales — they are the same quantity under two conventions, so they share
+    one axis and the divergence between them is the point.
+    """
+    comp = [(d, v) for d, v in record["compounded"]]
+    fixed = [(d, v) for d, v in record["fixed"]]
+    split = record.get("split")
+
+    # Separate panels, not one plot: 64x and 5.7x on a shared scale would flatten
+    # the fixed-budget line into the axis and destroy the only thing it shows.
+    grown = _line_panel(
+        [("compounded", comp)],
+        height=250,
+        split=split,
+        fmt=lambda v: f"{v:.0f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="Compounded equity: each week's return applied to the running balance",
+        baseline=1.0,
+    )
+    flat = _line_panel(
+        [("fixed budget", fixed)],
+        height=250,
+        split=split,
+        fmt=lambda v: f"{v:.1f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="Fixed-budget equity: the same returns applied to a constant stake",
+        baseline=1.0,
+    )
+
+    years = "".join(
+        f"<tr><td>{y['year']}</td><td class='num'>{y['pnl'] * 100:+.1f}%</td></tr>"
+        for y in record["years"]
+    )
+
+    return (
+        '<section><h2>Compounding, removed</h2>'
+        '<p class="note">The chart above shows what the <em>account</em> did. Position sizes '
+        'are fractions of NAV, so every dollar earned is redeployed and the curve is '
+        'exponential by construction — which makes it a bad instrument for asking whether the '
+        '<em>edge</em> is holding up. The pair below is the same series of weekly returns '
+        'under both conventions.</p>'
+        '<p class="note"><strong>Compounded</strong> — <code>equity ×= 1 + r</code>. '
+        'What the account actually does.</p>'
+        + grown
+        + '<p class="note" style="margin-top:14px"><strong>Fixed budget</strong> — '
+        '<code>equity += r</code>, the identical weekly returns on a constant stake. '
+        'Here slope <em>is</em> performance: a straight line means a steady edge, and a '
+        'flattening one means a fading edge rather than a smaller account.</p>'
+        + flat
+        + '<div class="scroll"><table class="data"><thead><tr><th>year</th>'
+        '<th class="num">P&amp;L, in units of the fixed stake</th></tr></thead>'
+        '<tbody>' + years + '</tbody></table></div>'
+        '<p class="finding"><strong>The edge is decaying, and the compounded curve hides it.</strong> '
+        'Measured against a constant stake the strategy returned an average of about 80% of '
+        'stake per year through 2020–2024 and roughly 30% across 2025–26. On the compounded '
+        'chart that same stretch still climbs, because a weaker edge applied to an account '
+        'eighteen times larger still adds dollars. The two drawdowns are the same story: '
+        'September 2021 cost 10.8% of stake and July 2025 onward cost 5.3%, so the later '
+        'episode was <em>half</em> as severe per dollar at risk even though it was far larger '
+        'in dollars and looks comparable as a percentage of NAV. Which of those three numbers '
+        'is the right one depends entirely on the question, and only the fixed-budget line '
+        'answers "is this still working".</p></section>'
+    )
+
+
 def candidates_table(cands: list[dict]) -> str:
     """Every candidate, with how much search preceded it.
 
@@ -754,6 +831,7 @@ def render(record: dict) -> str:
 </section>
 
 {combined_section(record["combined"]) if record.get("combined") else ""}
+{fixed_budget_section(record["fixed_budget"]) if record.get("fixed_budget") else ""}
 {candidates_table(record["combined"]["candidates"]) if record.get("combined", {}).get("candidates") else ""}
 
 <section>

@@ -372,6 +372,208 @@ class GaussianChannelBreakout:
         )
 
 
+def _below_band(row: dict) -> tuple[float, str]:
+    """How far under the lower channel band, as a fraction of it.
+
+    Ranks the short leg. Assets with no lower band sort last rather than being
+    treated as deeply broken down, which a naive `or 0.0` would do.
+    """
+    close, lower = row.get("close"), row.get("gc_lower")
+    if close is None or lower is None or lower == 0:
+        return (float("inf"), row["asset"])
+    return ((float(close) - float(lower)) / abs(float(lower)), row["asset"])
+
+
+class GaussianChannelLongShort:
+    """`gc_breakout`'s selection, expressed market-neutral and tilted by regime.
+
+    Long-only, the channel breakout lost 77% against a benchmark that gained 43%
+    (§ Phase 1 findings). The selection was not worthless; the *packaging* was.
+    Every name it picks is picked for being in an uptrend, so in a falling market
+    it is long the least-bad assets in a book with no offset, and the beta buries
+    whatever cross-sectional content exists. Holding the same longs against a
+    short leg cancels the beta and leaves the spread, which is the only thing the
+    signal ever had an opinion about.
+
+    ## The two legs are not symmetric, and that is deliberate
+
+    - **Long** = above the upper channel. A selection.
+    - **Short** = eligible, shortable, and *not* above it. A residual.
+
+    Making the short leg symmetric (only names below the *lower* band) was tested
+    and is worse: min-Sharpe 1.49 against 2.05, and it stands the book down for
+    most of 2019-21 for want of three qualifying shorts. The residual form is
+    also the more honest description of what is being claimed - the signal has an
+    opinion about which assets are strong, not about which are weak, and the
+    short leg is a hedge that funds itself rather than a second forecast.
+
+    The leg *sizes* need no such rule: `L` thins to three or four names by itself
+    when almost nothing is trending, and the short leg fattens in the same move,
+    so the book rotates net-short in a downtrend without being told to.
+
+    ## The tilt, and why it lives here
+
+    Gross stays pinned at 1.0 in every state - this is not leverage and §9.2 is
+    untouched. Only the split moves, read off the *benchmark's* own channel:
+
+        BTC above its upper band  -> long 0.5 + t, short 0.5 - t
+        BTC below its filter      -> long 0.5 - t, short 0.5 + t
+        between                   -> 0.5 / 0.5, no opinion
+
+    where `t` scales with the filter's own slope and is capped at `TILT_CAP`.
+    A view about market state is a *view*, so it belongs to the signal; the
+    constructor's job is to turn views into weights and it should not acquire
+    opinions of its own. Expressing the split as conviction is what lets it: with
+    `conviction_tilt`, per-name conviction of `leg_weight / names_in_leg`
+    normalises to exactly the intended leg weights, so no new interface is
+    needed and `max_position` still binds where it should.
+
+    **Weighting the split by breadth instead was tested and refuted** - monotonically
+    worse (min-Sharpe 2.06 -> 1.45), because the share of names trending up does
+    not predict the forward week (rho +0.09, t 1.45, widest quartile nearly the
+    worst). The intuition that a wide long leg should mean a bigger long is a
+    good one and the data does not support it.
+
+    **How this most likely dies:** the tilt is one regime detector on one asset,
+    and its 48-day read was chosen on the same two windows everything else was.
+    If the edge is really the tilt rather than the selection, this is a BTC
+    market-timing strategy wearing a long/short costume. The label-shuffle null
+    puts that at p=0.040 - evidence, not proof, and paper is what settles it.
+    """
+
+    name = "gc_long_short"
+
+    #: Cap on how far the split may lean from neutral. 0.5 is fully one-sided.
+    TILT_CAP = Decimal("0.5")
+    #: Bars over which the benchmark filter's slope is measured.
+    LEAN_BARS = 20
+    #: Slope-to-tilt gain. Plateau centre, per §7.4.
+    LEAN_SCALE = Decimal(8)
+    #: A leg thinner than this is not a portfolio, so the book stands down.
+    MIN_LEG = 3
+
+    def _tilt(self, cross: pl.DataFrame, config: Config) -> tuple[Decimal, str]:
+        """Read the benchmark's channel state. Returns (tilt, description)."""
+        if not config.benchmark:
+            return Decimal(0), "no benchmark configured; split held neutral"
+        row = cross.filter(pl.col("asset") == config.benchmark)
+        if row.is_empty():
+            return Decimal(0), f"{config.benchmark} not in the cross-section; split neutral"
+        r = row.row(0, named=True)
+        if r.get("gc_regime_upper") is None or r.get("gc_regime_filter") is None:
+            return Decimal(0), f"{config.benchmark} channel has not converged; split neutral"
+        if r["close"] > r["gc_regime_upper"]:
+            sign, state = Decimal(1), "above its upper band"
+        elif r["close"] < r["gc_regime_filter"]:
+            sign, state = Decimal(-1), "below its filter"
+        else:
+            return Decimal(0), f"{config.benchmark} is inside its channel; split neutral"
+
+        slope = r.get("gc_regime_slope")
+        if slope is None:
+            return Decimal(0), f"{config.benchmark} slope unavailable; split neutral"
+        raw = sign * abs(Decimal(str(slope))) * self.LEAN_SCALE
+        tilt = max(-self.TILT_CAP, min(self.TILT_CAP, raw))
+        return tilt, (
+            f"{config.benchmark} is {state}, filter slope "
+            f"{Decimal(str(slope)):.4f} over {self.LEAN_BARS} bars -> tilt {tilt:+.3f}"
+        )
+
+    def generate(self, cross: pl.DataFrame, *, config: Config) -> SignalResult:
+        rows, notes = _eligible(cross, config)
+        warnings: list[Warning] = []
+
+        for needed in ("gc_breakout_age", "shortable"):
+            if needed not in cross.columns:
+                raise ValueError(
+                    f"{self.name} needs the {needed!r} column; the feature set does "
+                    "not provide it"
+                )
+
+        warmed = [r for r in rows if r.get("gc_upper") is not None]
+        longs = [r for r in warmed if r.get("gc_breakout_age") is not None]
+        shorts = [
+            r for r in warmed if r.get("gc_breakout_age") is None and r.get("shortable")
+        ]
+
+        unborrowable = sum(
+            1 for r in warmed if r.get("gc_breakout_age") is None and not r.get("shortable")
+        )
+        if unborrowable:
+            notes.append(
+                f"{unborrowable} asset(s) are below their channel but have no borrow "
+                "available and were not shorted"
+            )
+
+        if len(longs) < self.MIN_LEG or len(shorts) < self.MIN_LEG:
+            # Not a failure. A book that cannot form two legs is not a
+            # market-neutral book, and holding one leg alone would be a
+            # directional bet this signal never claimed to have.
+            return SignalResult(
+                signals=[],
+                notes=notes
+                + [
+                    f"only {len(longs)} long and {len(shorts)} short candidates against a "
+                    f"{self.MIN_LEG}-a-side minimum; target is flat"
+                ],
+                warnings=warnings,
+            )
+
+        tilt, why = self._tilt(cross, config)
+        notes.append(why)
+        long_w = Decimal("0.5") + tilt
+        short_w = Decimal("0.5") - tilt
+
+        # Fit inside `max_position_count`. The book naturally wants ~34 names and
+        # the limit allows 12, so without this the risk gate rejects every plan -
+        # which is the correct behaviour of a gate and the wrong behaviour of a
+        # strategy. Truncating here rather than raising the limit keeps the limit
+        # a constraint instead of quietly making it a parameter; the strategy was
+        # measured under it and holds up (min-Sharpe 1.97 against 2.08 untruncated).
+        #
+        # The budget splits by leg weight, so a tilted book keeps more names on
+        # the side it is leaning into, and neither leg drops below MIN_LEG.
+        budget = config.limits.max_position_count
+        if len(longs) + len(shorts) > budget:
+            n_long = max(self.MIN_LEG, min(len(longs), round(budget * long_w)))
+            n_short = max(self.MIN_LEG, min(len(shorts), budget - n_long))
+            # Longs by breakout recency: freshest first, as `gc_breakout` sizes.
+            longs = sorted(longs, key=lambda r: (int(r["gc_breakout_age"]), r["asset"]))[
+                :n_long
+            ]
+            # The short leg is a residual and carries no score of its own, so it
+            # is ranked by the same detector read the other way - furthest below
+            # the lower band first. Least arbitrary available, not principled.
+            shorts = sorted(shorts, key=_below_band)[:n_short]
+            notes.append(
+                f"truncated to {len(longs)} long and {len(shorts)} short to fit "
+                f"max_position_count={budget}"
+            )
+
+        notes.append(
+            f"{len(longs)} long at {long_w:.3f} of gross, {len(shorts)} short at "
+            f"{short_w:.3f}; gross unchanged at the configured target"
+        )
+
+        def sized(rs: list[dict], leg: Decimal, direction: str) -> list[AssetSignal]:
+            per = leg / Decimal(len(rs))
+            return [
+                AssetSignal(
+                    asset=r["asset"],
+                    direction=direction,
+                    conviction=per,
+                    volatility=(None if r.get("vol_30") is None else Decimal(str(r["vol_30"]))),
+                )
+                for r in sorted(rs, key=lambda x: x["asset"])
+            ]
+
+        return SignalResult(
+            signals=sized(longs, long_w, "long") + sized(shorts, short_w, "short"),
+            notes=notes,
+            warnings=warnings,
+        )
+
+
 _REGISTRY: dict[str, SignalGenerator] = {
     generator.name: generator
     for generator in (
@@ -379,6 +581,7 @@ _REGISTRY: dict[str, SignalGenerator] = {
         LiquidityTop(),
         CrossSectionalMomentum(),
         GaussianChannelBreakout(),
+        GaussianChannelLongShort(),
     )
 }
 

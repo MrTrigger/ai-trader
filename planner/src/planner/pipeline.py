@@ -23,6 +23,7 @@ import polars as pl
 
 from . import (
     __version__,
+    borrow,
     construct,
     costs,
     diff,
@@ -164,7 +165,9 @@ def run(
             )
 
     frame = features.build(
-        bars.filter(pl.col("asset").is_in(sorted(featurizable))), benchmark=config.benchmark
+        bars.filter(pl.col("asset").is_in(sorted(featurizable))),
+        benchmark=config.benchmark,
+        shortable_from=borrow.listings(root=data_root),
     )
     marked = features.latest(frame)
     # The signal sees only what is eligible; everything else here is marked and

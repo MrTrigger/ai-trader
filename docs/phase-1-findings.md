@@ -724,3 +724,124 @@ Ordered by evidence-per-unit-effort, not by appeal:
    signal on the same data is how noise gets fitted.
 4. **Not a third trend variant.** Two families have now failed the same way.
    The next thing tried should differ in structure rather than in indicator.
+
+---
+
+# Addendum: what the port into the pipeline found
+
+Everything above the line was produced by standalone research scripts that
+computed weights directly. Moving the long/short strategy into `signal.py` so it
+runs through `pipeline.run()` — one implementation, per §0.1 — falsified three of
+those results and characterised the strategy differently. This is the clearest
+argument for §0.1 the project has produced, so the errors are recorded rather
+than quietly corrected.
+
+## 1. Every reported Sharpe was inflated by 15–23%
+
+The research scripts advanced past a stand-down week with `continue`, appending
+no point to the equity curve, and then annualised the resulting series with a
+factor of 52. That asserts 52 traded weeks a year. **The book actually trades
+about 36** — it is flat 31% of the time — so the annualisation was applied to a
+series with roughly a quarter of its observations missing.
+
+| window | live | flat | Sharpe as reported | corrected |
+|---|---|---|---|---|
+| fresh 2019-10..2021-10 | 55 wk | 34 wk (38%) | 2.34 | **1.81** |
+| orig 2021-10..2026-08 | 184 wk | 68 wk (27%) | 2.08 | **1.76** |
+
+Returns, CAGR and drawdown are unaffected: the compounding is a straight product
+and the annualisation there used elapsed calendar time. Only the risk-adjusted
+figures moved — which is precisely the criterion the strategy was selected on.
+
+**The comparison against BTC was biased by this.** Buy-and-hold is never flat, so
+its Sharpe was never inflated, and every strategy-vs-BTC Sharpe comparison above
+favoured the strategy by this margin.
+
+`backtest.replay()` never had this bug. It skips a date only on `GateFailure` —
+a data outage — while a flat book still produces a plan with zero targets and
+records a `Step` at unchanged NAV, which is a real zero-return week. The repo
+implementation was correct and the research that bypassed it was not.
+
+## 2. The book stands down in exactly the conditions it should be paid for
+
+111 of 357 weeks are flat. **80 of those are caused by too few longs**, and 59%
+of them occur with the benchmark below its regime filter. The long leg is a
+selection and the short leg is a residual, so when nothing is trending upward the
+long leg falls below the three-a-side minimum and the *whole* book stands down —
+abandoning the short leg, which was the half that would have profited.
+
+This is the mechanism behind "why did it not capitalise on the big downtrends",
+and it is a design consequence rather than a tuning problem: requiring both legs
+means requiring something to be trending up.
+
+## 3. "Market-neutral with a tilt" is not an accurate description
+
+At maximum tilt the short leg's weight reaches zero and the book is 100%
+directional. Measured over 3,227 days:
+
+| |net exposure| / NAV |
+|---|---|
+| median | 0.511 |
+| 75th percentile and above | 0.800 — equal to gross |
+| days pinned fully one-sided | **1,291 / 3,227 (40.0%)** |
+
+Gross never exceeds its target, so §9.2 holds and no leverage is introduced. But
+40% of the time this is a directional book, net short (1,504 days) roughly twice
+as often as net long (844). It is better described as a **benchmark market-timing
+strategy expressed through a long/short book** than as a market-neutral one, and
+that reframing raises the stakes on the label-shuffle null (p=0.040) considerably:
+the timing component is not a modifier, it is most of the strategy.
+
+## 4. What the risk gate said, once it was finally asked
+
+| check | observed | limit | |
+|---|---|---|---|
+| `max_gross_exposure` | 0.800 | 1.00 | ok |
+| `max_position` | 0.033 | 0.25 | ok |
+| `max_position_count` | **34** | **12** | **rejected** |
+| `max_cluster_exposure` | 0.106 | 0.40 | ok |
+| `max_benchmark_beta` | **0.093** | 1.25 | ok |
+
+Two of these are informative beyond pass/fail. The **beta check at 0.093** is
+independent confirmation that the long/short construction cancels beta as
+claimed; the long-only form of the same signal would sit near 1.0. The **cluster
+check at 0.106** passes because the legs net out within each cluster, which a
+long-only book of the same names could not do.
+
+`max_position_count` rejected every plan. The strategy was measured under the
+limit rather than the limit being raised to fit it, and it survives: min-Sharpe
+1.97 truncated to 12 names against 2.08 untruncated (both pre-correction). The
+sweep peaked at 16 names; **12 was kept because it is the config's number**, and
+choosing 16 would have converted a constraint into a fitted parameter.
+
+Truncation did require inventing a short-leg ranking — distance below the lower
+band — because the residual leg carries no score of its own. That is a genuine
+new degree of freedom and is disclosed as one.
+
+## 5. Two hypotheses tested and refuted
+
+**Weighting the leg split by breadth.** If 30 names are above their bands and 5
+below, allocating by evidence rather than 50/50 sounds obviously right. It is
+monotonically worse: min-Sharpe 2.06 → 1.45 as the breadth weight goes 0 → 1.
+Breadth does not predict the forward week (rho +0.09, t 1.45), and the widest
+quartile is nearly the worst-performing.
+
+**A symmetric short leg** (short only what is below the *lower* band, making both
+legs selections). Worse — min-Sharpe 1.49 against 2.05 — and it cannot form a
+book at all for most of 2019–21 for want of three qualifying shorts. The residual
+short leg is kept, and is now described honestly as a hedge rather than a second
+forecast.
+
+## 6. Still open
+
+- **The edge is decaying and nothing here explains why.** On a fixed stake the
+  strategy returned ~80% of stake per year through 2020–2024 and ~30% across
+  2025–26. The compounded curve hides this completely, because a weaker edge on
+  an account eighteen times larger still adds dollars.
+- **`max_net_exposure` has no value.** Config left it unset on the explicit
+  grounds that it "needs shorts to be meaningful". They have arrived. Setting it
+  is a risk-appetite decision that trades directly against capturing trends.
+- **None of the corrected numbers have been re-run through `replay()`.** The
+  strategy now runs through the pipeline, but the headline figures in this
+  document still come from the scripts. They should be regenerated by the
+  harness before any of them is quoted again.

@@ -14,12 +14,13 @@ creeping in later.
 from __future__ import annotations
 
 import math
+from datetime import date
 
 import polars as pl
 
 from .bars import mark_discontinuities
 
-FEATURE_SET_VERSION = "fs-phase1-5"
+FEATURE_SET_VERSION = "fs-phase1-6"
 
 # Windows in bars. At the daily interval these are calendar days.
 _RETURN_WINDOWS = (7, 30, 90)
@@ -46,7 +47,12 @@ _BETA_WINDOW = 90
 
 
 
-def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
+def build(
+    bars: pl.DataFrame,
+    *,
+    benchmark: str | None = None,
+    shortable_from: dict[str, date] | None = None,
+) -> pl.DataFrame:
     """Feature frame, one row per (asset, bar).
 
     The caller is responsible for having already trimmed `bars` to the horizon
@@ -59,6 +65,14 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
     is the whole reason it is a parameter and not a constant. When it is absent
     from `bars`, `beta_bench` is null everywhere and the risk gate decides what
     to do about that rather than this function guessing.
+
+    `shortable_from` maps an asset to the first date a borrow existed for it -
+    in crypto, the day its perpetual listed. It produces a `shortable` column
+    that is False before that date and True after, which is the point-in-time
+    form the question has to take: whether an asset *can* be shorted is a fact
+    about a date, not about an asset, and treating it as the latter would let a
+    2026 instrument list open a 2021 short. Omitted, `shortable` is False
+    everywhere - a book that does not know what it may borrow may not borrow.
     """
     if bars.is_empty():
         return bars
@@ -86,6 +100,24 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
     )
 
     df = df.with_columns(exprs)
+
+    # Borrow availability, as of each bar. Assets with no entry are never
+    # shortable rather than silently shortable, so a gap in the borrow table
+    # under-trades instead of inventing a position that could not be opened.
+    if shortable_from:
+        first = pl.col("asset").replace_strict(
+            {a: d.isoformat() for a, d in shortable_from.items()},
+            default=None,
+            return_dtype=pl.Utf8,
+        )
+        df = df.with_columns(
+            pl.when(first.is_null())
+            .then(pl.lit(False))
+            .otherwise(pl.col("ts_utc").dt.date() >= first.str.to_date())
+            .alias("shortable")
+        )
+    else:
+        df = df.with_columns(pl.lit(False).alias("shortable"))
 
     df = df.with_columns(
         [
@@ -134,6 +166,20 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
 _GC_PERIOD = 144
 _GC_POLES = 4
 _GC_MULTIPLIER = 1.414
+
+# A SECOND channel, at a shorter period, for reading market state rather than
+# picking assets. These are not the same job and they do not want the same
+# horizon: 144 days is deliberately slow so that selection is not whipsawed by
+# noise, but a regime read at 144 days turns weeks after the market has, which
+# for a tilt is the entire cost. Phase 1 measured this - a 48-day read sits at
+# the centre of a five-wide plateau and improves the worse of both windows,
+# while the 144-day read gives most of it back.
+#
+# `gc_regime_slope` is the filter's own rate of change, which is what makes the
+# tilt proportional to how hard the market is moving rather than a step
+# function that treats a drift and a collapse identically.
+_GC_REGIME_PERIOD = 48
+_GC_REGIME_SLOPE_BARS = 20
 
 
 def _gc_alpha(period: int, poles: int) -> float:
@@ -195,12 +241,39 @@ def _with_gaussian_channel(df: pl.DataFrame) -> pl.DataFrame:
         .over("asset")
         .alias("_run")
     )
-    return df.with_columns(
+    df = df.with_columns(
         pl.when(pl.col("_above"))
         .then(pl.col("ts_utc").cum_count().over(["asset", "_run"]))
         .otherwise(None)
         .alias("gc_breakout_age")
     ).drop(["_gc_tr", "_above", "_run"])
+
+    # The faster regime channel. Same construction, shorter period; computed for
+    # every asset because it is vectorised and costs nothing, though only the
+    # benchmark's is read.
+    ra = _gc_alpha(_GC_REGIME_PERIOD, _GC_POLES)
+    df = df.with_columns(
+        _cascade((pl.col("high") + pl.col("low") + pl.col("close")) / 3, ra, _GC_POLES)
+        .alias("gc_regime_filter"),
+        _cascade(true_range, ra, _GC_POLES).alias("_gcr_tr"),
+    )
+    df = df.with_columns(
+        (pl.col("gc_regime_filter") + pl.col("_gcr_tr") * _GC_MULTIPLIER).alias(
+            "gc_regime_upper"
+        ),
+        (
+            pl.col("gc_regime_filter")
+            / pl.col("gc_regime_filter").shift(_GC_REGIME_SLOPE_BARS).over("asset")
+            - 1
+        ).alias("gc_regime_slope"),
+    )
+    rwarm = pl.col("bars_available") >= _GC_REGIME_PERIOD
+    return df.with_columns(
+        [
+            pl.when(rwarm).then(pl.col(c)).otherwise(None).alias(c)
+            for c in ("gc_regime_filter", "gc_regime_upper", "gc_regime_slope")
+        ]
+    ).drop("_gcr_tr")
 
 
 def _with_beta(df: pl.DataFrame, benchmark: str | None) -> pl.DataFrame:
