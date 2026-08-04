@@ -105,13 +105,21 @@ min_position_notional = "25"
 # until then it is a judgement recorded rather than a result.
 max_cluster_exposure = "0.40"
 
-# |w'beta| against `benchmark`. One means the book may not carry more
-# BTC-equivalent exposure than its own NAV - the natural line rather than a
-# tuned one, and also asserted rather than derived.
+# |w'beta| against `benchmark`.
+#
+# Was 1.00, which turned out to be pathological: a long-only book at 0.80 gross
+# holding ~1.25-beta alts sits at ~1.00 exactly, so the limit rejected 101 of
+# 253 plans by a typical margin of 0.07% - vetoing on rounding noise rather
+# than on risk. See docs/phase-1-findings.md. The Phase 1 result was invariant
+# to this number, so raising it is a correction and not a softened gate.
+#
+# The deeper point, worth keeping: for a LONG-ONLY book this limit is close to
+# a restatement of max_gross_exposure. Its value arrives with shorts, which is
+# also when max_net_exposure starts to mean something.
 #
 # An asset whose beta cannot be estimated is assumed to be 1.0, which can only
 # tighten this. See risk.UNKNOWN_BETA.
-max_benchmark_beta = "1.00"
+max_benchmark_beta = "1.25"
 
 # Not enforced yet. Left explicitly null rather than set to a permissive number,
 # so the run discloses it as unenforced instead of implying it passed.
