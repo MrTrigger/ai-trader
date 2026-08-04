@@ -13,9 +13,11 @@ creeping in later.
 
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
-FEATURE_SET_VERSION = "fs-phase1-2"
+FEATURE_SET_VERSION = "fs-phase1-3"
 
 # Windows in bars. At the daily interval these are calendar days.
 _RETURN_WINDOWS = (7, 30, 90)
@@ -39,6 +41,22 @@ _MOMENTUM_SKIP = 7
 # 6.2 constraint on the strength of an estimate that cannot support it, whereas
 # a null falls back to 1.0 and can only make the limit bind harder.
 _BETA_WINDOW = 90
+
+# A single-bar log return above this is treated as a **discontinuity in what the
+# ticker means**, not as a price move.
+#
+# The case that forced it: Binance renamed the collapsed Terra token to LUNC and
+# launched Luna 2.0 under the same `LUNA` ticker. The series is continuous and
+# describes two different assets. A backtest bought the old token at $0.0001,
+# received 12.4 million units, and then the ticker restarted at $7 — turning a
+# $43k book into $88m in one step. Every number downstream of that is fiction.
+#
+# **Deliberately one-sided.** A 10x single-day *gain* on a top-40 liquid asset is
+# effectively always a redenomination, ticker reuse or reverse split. A 90%
+# single-day *loss* is a thing that genuinely happens in crypto — it is what LUNA
+# actually did — and treating it as a data event would erase exactly the history
+# a momentum strategy most needs to be tested against.
+_MAX_BAR_LOG_RETURN = math.log(10)
 
 
 def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
@@ -103,9 +121,18 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
         ]
     )
 
+    # History is counted from the last discontinuity, not from the first bar.
+    # After a ticker changes meaning, the asset genuinely has no usable history:
+    # it needs `min_history_bars` again before anything may be computed from it,
+    # which is what makes it ineligible until the new series stands on its own.
     df = df.with_columns(
-        pl.col("ts_utc").cum_count().over("asset").alias("bars_available")
-    ).drop("_asset_rows")
+        (pl.col("ret_1") > _MAX_BAR_LOG_RETURN).fill_null(False).alias("_break")
+    )
+    df = df.with_columns(pl.col("_break").cum_sum().over("asset").alias("_regime"))
+    df = df.with_columns(
+        pl.col("ts_utc").cum_count().over(["asset", "_regime"]).alias("bars_available"),
+        (pl.col("_regime") > 0).alias("had_discontinuity"),
+    ).drop(["_asset_rows", "_break", "_regime"])
 
     return _with_beta(df, benchmark)
 

@@ -198,3 +198,66 @@ def test_latest_returns_one_row_per_asset(bars):
     cross = features.latest(features.build(bars, benchmark="BTC"))
     assert cross.height == 3
     assert sorted(cross["asset"].to_list()) == ["BTC", "ETH", "LEV"]
+
+
+# --- ticker discontinuities ------------------------------------------------
+
+
+def test_a_ticker_that_changes_meaning_resets_its_history():
+    """The LUNA case, and the reason this check exists.
+
+    Binance renamed the collapsed Terra token to LUNC and launched Luna 2.0
+    under the same `LUNA` ticker. The series is continuous and describes two
+    different assets. A backtest bought the old token at $0.0001, received 12.4
+    million units, and the ticker restarted at $7 — a $43k book became $88m in
+    one step, and every number after it was fiction.
+    """
+    # 120 bars of a normal asset, then the ticker restarts 100,000x higher.
+    old = _series(_wobble(120, seed=2), start=100.0)
+    new = _series(_wobble(60, seed=5), start=old[-1] * 100_000)
+    frame = features.build(_bars({"X": old + new}))
+
+    x = frame.filter(pl.col("asset") == "X").sort("ts_utc")
+    # The LAST value, not the max: max spans both regimes, and the pre-break
+    # one legitimately had a long history.
+    assert x["bars_available"][-1] == len(new), "history restarts at the discontinuity"
+    assert x["bars_available"].max() == len(old), "the old regime is untouched"
+    assert x["had_discontinuity"][-1]
+
+
+def test_an_ordinary_asset_has_no_discontinuity(bars):
+    frame = features.build(bars, benchmark="BTC")
+    assert not frame["had_discontinuity"].any()
+
+
+def test_a_collapse_is_not_treated_as_a_discontinuity():
+    """One-sided on purpose.
+
+    A 90% single-day loss is a thing that genuinely happens in crypto — it is
+    what LUNA actually did — and erasing it would remove exactly the history a
+    momentum strategy most needs to be tested against.
+    """
+    collapsing = _series(_wobble(120, seed=3)) + [1.0, 0.05, 0.004, 0.0009]
+    frame = features.build(_bars({"X": collapsing}))
+    x = frame.filter(pl.col("asset") == "X")
+    assert not x["had_discontinuity"].any()
+    assert x["bars_available"].max() == len(collapsing)
+
+
+def test_a_large_but_plausible_gain_is_not_a_discontinuity():
+    # 4x in a day is extraordinary and does happen. 10x is the line.
+    frame = features.build(_bars({"X": _series(_wobble(120, seed=4)) + [100.0, 400.0]}))
+    assert not frame.filter(pl.col("asset") == "X")["had_discontinuity"].any()
+
+
+def test_a_discontinuity_does_not_leak_across_assets():
+    frame = features.build(
+        _bars(
+            {
+                "BROKEN": _series(_wobble(60, seed=1)) + [100.0, 100_000_000.0],
+                "FINE": _series(_wobble(62, seed=6), start=50.0),
+            }
+        )
+    )
+    assert frame.filter(pl.col("asset") == "BROKEN")["had_discontinuity"].any()
+    assert not frame.filter(pl.col("asset") == "FINE")["had_discontinuity"].any()

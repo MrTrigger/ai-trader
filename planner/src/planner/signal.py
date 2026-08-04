@@ -87,7 +87,13 @@ def _eligible(cross: pl.DataFrame, config: Config) -> tuple[list[dict], list[str
     for row in cross.sort("asset").iter_rows(named=True):
         asset = row["asset"]
         if row["bars_available"] < config.min_history_bars:
-            notes.append(f"{asset}: {row['bars_available']} bars, needs {config.min_history_bars}")
+            # Counted from the last discontinuity, so a ticker that changed
+            # meaning reads as a young asset - which is what it is.
+            broke = " since a price discontinuity" if row.get("had_discontinuity") else ""
+            notes.append(
+                f"{asset}: {row['bars_available']} bars{broke}, "
+                f"needs {config.min_history_bars}"
+            )
             continue
         if row["adv_quote"] is None:
             notes.append(f"{asset}: no liquidity estimate")
