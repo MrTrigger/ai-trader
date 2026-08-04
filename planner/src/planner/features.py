@@ -13,11 +13,13 @@ creeping in later.
 
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from .bars import mark_discontinuities
 
-FEATURE_SET_VERSION = "fs-phase1-4"
+FEATURE_SET_VERSION = "fs-phase1-5"
 
 # Windows in bars. At the daily interval these are calendar days.
 _RETURN_WINDOWS = (7, 30, 90)
@@ -119,7 +121,86 @@ def build(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
         .alias("bars_available"),
     ).drop("_asset_rows")
 
-    return _with_beta(df, benchmark)
+    return _with_beta(_with_gaussian_channel(df), benchmark)
+
+
+# Gaussian Channel (Donovan Wall). The detector the TR-GC prompt family uses,
+# reimplemented here so the same gate can be pointed at it.
+#
+# The N-pole filter is N cascaded single-pole filters with a shared alpha, which
+# is exactly `ewm_mean(adjust=False)` applied N times — so no recursion is
+# needed and the whole thing stays vectorised. Defaults are the indicator's:
+# 144-period, 4-pole, 1.414x the filtered true range.
+_GC_PERIOD = 144
+_GC_POLES = 4
+_GC_MULTIPLIER = 1.414
+
+
+def _gc_alpha(period: int, poles: int) -> float:
+    beta = (1 - math.cos(2 * math.pi / period)) / (2 ** (1 / poles) - 1)
+    return -beta + math.sqrt(beta * beta + 2 * beta)
+
+
+def _cascade(expr: pl.Expr, alpha: float, poles: int) -> pl.Expr:
+    for _ in range(poles):
+        expr = expr.ewm_mean(alpha=alpha, adjust=False).over("asset")
+    return expr
+
+
+def _with_gaussian_channel(df: pl.DataFrame) -> pl.DataFrame:
+    """Filter, bands, and how long the close has been above the upper band.
+
+    `gc_breakout_age` is 1 on the bar the close first crosses above the upper
+    band and counts up while it stays there, null when it is below. That single
+    column carries both the state (above/below) and the recency the TR-GC rules
+    size on, without the caller having to re-derive a crossing.
+
+    Nulled until `_GC_PERIOD` bars exist. An IIR filter converges rather than
+    needing a full window, but its first values are pulled toward the seed, and
+    a band computed from a transient is not a band.
+    """
+    alpha = _gc_alpha(_GC_PERIOD, _GC_POLES)
+
+    prev_close = pl.col("close").shift(1).over("asset")
+    true_range = pl.max_horizontal(
+        pl.col("high") - pl.col("low"),
+        (pl.col("high") - prev_close).abs(),
+        (pl.col("low") - prev_close).abs(),
+    )
+
+    df = df.with_columns(
+        _cascade((pl.col("high") + pl.col("low") + pl.col("close")) / 3, alpha, _GC_POLES)
+        .alias("gc_filter"),
+        _cascade(true_range, alpha, _GC_POLES).alias("_gc_tr"),
+    )
+    df = df.with_columns(
+        (pl.col("gc_filter") + pl.col("_gc_tr") * _GC_MULTIPLIER).alias("gc_upper"),
+        (pl.col("gc_filter") - pl.col("_gc_tr") * _GC_MULTIPLIER).alias("gc_lower"),
+    )
+
+    # Warm-up: the filter is not trustworthy before it has seen a full period.
+    warm = pl.col("bars_available") >= _GC_PERIOD
+    df = df.with_columns(
+        [
+            pl.when(warm).then(pl.col(c)).otherwise(None).alias(c)
+            for c in ("gc_filter", "gc_upper", "gc_lower")
+        ]
+    )
+
+    above = (pl.col("close") > pl.col("gc_upper")).fill_null(False)
+    df = df.with_columns(above.alias("_above"))
+    df = df.with_columns(
+        (pl.col("_above") & ~pl.col("_above").shift(1).fill_null(False))
+        .cum_sum()
+        .over("asset")
+        .alias("_run")
+    )
+    return df.with_columns(
+        pl.when(pl.col("_above"))
+        .then(pl.col("ts_utc").cum_count().over(["asset", "_run"]))
+        .otherwise(None)
+        .alias("gc_breakout_age")
+    ).drop(["_gc_tr", "_above", "_run"])
 
 
 def _with_beta(df: pl.DataFrame, benchmark: str | None) -> pl.DataFrame:

@@ -276,9 +276,110 @@ class CrossSectionalMomentum:
         )
 
 
+class GaussianChannelBreakout:
+    """Hold what is trading above its Gaussian Channel upper band.
+
+    A different *family* from `xs_momentum`, which is why it is worth testing
+    after that one failed. Momentum is **relative** — rank assets against each
+    other. This is **absolute** — each asset is judged against its own channel,
+    and in a market where nothing is breaking out the book is simply flat. §10.2
+    names channel-breakout trend-following as a legitimate documented family and
+    "a reasonable baseline to beat, not a destination".
+
+    The rules are taken from the TR-GC prompt family, which runs this live:
+
+    - **Enter** when the close is above the upper band.
+    - **Exit** when it is not. Here that falls out of target-state convergence —
+      an asset no longer breaking out gets no target, and the diff sells it — so
+      there is no separate exit rule to keep in step with the entry rule.
+    - **Size by breakout recency**: those prompts use 8% of NAV for a breakout
+      within 25 days and 2% otherwise. Expressed here as conviction 4:1 and left
+      to the constructor, because the thing that differs between this system and
+      that one is *not* the signal.
+
+    That difference is worth stating plainly. Those prompts size per asset with
+    no portfolio-level cap at all: twenty simultaneous breakouts at 8% "wants"
+    160% of NAV, and channel breakouts are correlated by construction, so that
+    is the normal case in a rally rather than a tail. Here the same signal is
+    bounded by `target_gross_exposure`, `max_position` and `max_position_count`,
+    and the risk gate rejects a plan that breaches them. Whether the *signal*
+    has content is the question the gate is about to answer; whether it can be
+    run without a gross cap is not in question.
+    """
+
+    name = "gc_breakout"
+
+    #: Breakouts at least this fresh get the larger conviction. The TR-GC value.
+    RECENT_DAYS = 25
+    RECENT_CONVICTION = Decimal(4)
+    STALE_CONVICTION = Decimal(1)
+
+    def generate(self, cross: pl.DataFrame, *, config: Config) -> SignalResult:
+        rows, notes = _eligible(cross, config)
+        warnings: list[Warning] = []
+
+        if "gc_breakout_age" not in cross.columns:
+            raise ValueError(
+                f"{self.name} needs the 'gc_breakout_age' feature; the feature set "
+                "does not provide it"
+            )
+
+        unwarmed = [r["asset"] for r in rows if r.get("gc_upper") is None]
+        if unwarmed:
+            notes.append(
+                f"{len(unwarmed)} asset(s) have too little history for the channel to "
+                "have converged and were not evaluated"
+            )
+
+        breaking = [
+            r for r in rows if r.get("gc_breakout_age") is not None and r.get("gc_upper")
+        ]
+        if not breaking:
+            # Not a failure. An absolute signal is allowed to say "nothing
+            # qualifies", and a flat book is the correct expression of that.
+            return SignalResult(
+                signals=[],
+                notes=notes + ["no asset is above its upper channel; target is flat"],
+                warnings=warnings,
+            )
+
+        # Freshest breakouts first, matching the sizing preference.
+        breaking.sort(key=lambda r: (int(r["gc_breakout_age"]), r["asset"]))
+        held = breaking[: config.max_holdings]
+
+        for row in breaking[config.max_holdings :]:
+            notes.append(
+                f"{row['asset']}: breaking out {int(row['gc_breakout_age'])} bars ago, "
+                f"outside the top {config.max_holdings} by recency"
+            )
+
+        return SignalResult(
+            signals=[
+                AssetSignal(
+                    asset=r["asset"],
+                    direction="long",
+                    conviction=(
+                        self.RECENT_CONVICTION
+                        if int(r["gc_breakout_age"]) <= self.RECENT_DAYS
+                        else self.STALE_CONVICTION
+                    ),
+                    volatility=(None if r.get("vol_30") is None else Decimal(str(r["vol_30"]))),
+                )
+                for r in held
+            ],
+            notes=notes,
+            warnings=warnings,
+        )
+
+
 _REGISTRY: dict[str, SignalGenerator] = {
     generator.name: generator
-    for generator in (PlaceholderEqualLong(), LiquidityTop(), CrossSectionalMomentum())
+    for generator in (
+        PlaceholderEqualLong(),
+        LiquidityTop(),
+        CrossSectionalMomentum(),
+        GaussianChannelBreakout(),
+    )
 }
 
 

@@ -9,14 +9,13 @@ target_gross_exposure = "0.80"
 # and inverse_vol are the candidates. Compared, not argued about (4.5).
 constructor = "conviction_tilt"
 
-# Phase 1 candidate: cross-sectional momentum with a skip period. Ranks the
-# eligible universe on the return from t-30d to t-7d and holds the top names
-# long. The skip is there because short-horizon reversal would otherwise
-# contaminate the momentum measurement.
+# Back to the Phase 0 placeholder, which claims no edge and says so on every
+# plan it emits. TWO candidates have now failed the Phase 1 gate and neither may
+# be named here: `xs_momentum` and `gc_breakout`. See docs/phase-1-findings.md.
 #
-# It is a HYPOTHESIS, not a conclusion. `ai-trader gate` is what decides whether
-# it survives costs, and it is meant to be capable of saying no.
-signal = "xs_momentum"
+# This field naming a signal that failed its gate would be the softest possible
+# version of shipping it.
+signal = "placeholder_equal_long"
 
 # How many names the signal holds. Distinct from limits.max_position_count,
 # which is a hard risk limit: this is what the strategy intends, that is what it

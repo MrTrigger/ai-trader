@@ -268,3 +268,67 @@ def test_a_discontinuity_does_not_leak_across_assets():
     )
     assert frame.filter(pl.col("asset") == "BROKEN")["had_discontinuity"].any()
     assert not frame.filter(pl.col("asset") == "FINE")["had_discontinuity"].any()
+
+
+# --- gaussian channel ------------------------------------------------------
+
+
+def test_the_channel_brackets_the_filter():
+    frame = features.build(_bars({"X": _series(_wobble(400, seed=8))}))
+    x = frame.filter(pl.col("gc_upper").is_not_null())
+    assert (x["gc_upper"] > x["gc_filter"]).all()
+    assert (x["gc_lower"] < x["gc_filter"]).all()
+
+
+def test_the_channel_is_null_until_the_filter_has_converged():
+    frame = features.build(_bars({"X": _series(_wobble(400, seed=8))}))
+    x = frame.filter(pl.col("asset") == "X").sort("ts_utc")
+    assert x["gc_upper"][:features._GC_PERIOD - 1].null_count() == features._GC_PERIOD - 1
+    assert x["gc_upper"][features._GC_PERIOD] is not None
+
+
+def test_breakout_age_counts_from_the_crossing():
+    frame = features.build(_bars({"X": _series(_wobble(400, seed=8))}))
+    x = frame.filter(pl.col("asset") == "X").sort("ts_utc")
+
+    ages = [a for a in x["gc_breakout_age"].to_list() if a is not None]
+    assert ages, "the wobble should break out at least once"
+    assert min(ages) == 1, "a run starts at 1, not 0"
+    # Within a run it increments by exactly one and never skips.
+    run = x.filter(pl.col("gc_breakout_age").is_not_null())
+    assert all(a >= 1 for a in run["gc_breakout_age"].to_list())
+
+
+def test_breakout_age_is_null_while_below_the_band():
+    frame = features.build(_bars({"X": _series(_wobble(400, seed=8))}))
+    x = frame.filter(pl.col("gc_upper").is_not_null())
+    below = x.filter(pl.col("close") <= pl.col("gc_upper"))
+    assert below["gc_breakout_age"].null_count() == below.height
+
+
+def test_the_n_pole_filter_is_cascaded_single_poles():
+    # The identity the implementation relies on: an N-pole Gaussian filter is N
+    # cascaded EMAs sharing one alpha. If polars ever changed `ewm_mean`, this
+    # is what would catch it.
+    alpha = features._gc_alpha(144, 4)
+    assert 0 < alpha < 1
+    df = pl.DataFrame({"asset": ["X"] * 50, "v": [float(i) for i in range(50)]})
+    cascaded = df.with_columns(features._cascade(pl.col("v"), alpha, 3).alias("out"))
+    manual = df
+    for _ in range(3):
+        manual = manual.with_columns(
+            pl.col("v").ewm_mean(alpha=alpha, adjust=False).over("asset").alias("v")
+        )
+    assert cascaded["out"].to_list() == pytest.approx(manual["v"].to_list())
+
+
+def test_the_channel_is_causal(bars):
+    full = features.build(bars, benchmark="BTC")
+    timestamps = sorted(bars["ts_utc"].unique().to_list())
+    cutoff = timestamps[-10]
+    prefix = features.build(bars.filter(pl.col("ts_utc") <= cutoff), benchmark="BTC")
+
+    cols = ["asset", "ts_utc", "gc_filter", "gc_upper", "gc_breakout_age"]
+    assert prefix.sort(["asset", "ts_utc"]).select(cols).equals(
+        full.filter(pl.col("ts_utc") <= cutoff).sort(["asset", "ts_utc"]).select(cols)
+    )

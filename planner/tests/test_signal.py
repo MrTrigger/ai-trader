@@ -256,3 +256,94 @@ def test_the_baseline_applies_the_same_eligibility_screens():
     frame = six(adv_quote=[5e8, 100.0, 5e8, 5e8, 5e8, 5e8])
     result = signal.get("liquidity_top").generate(frame, config=config())
     assert "BBB" not in held(result)
+
+
+# --- gaussian channel breakout: an ABSOLUTE signal --------------------------
+
+
+def gc(states: dict[str, int | None], **over) -> pl.DataFrame:
+    """`{asset: breakout_age or None}`, plus what eligibility needs."""
+    assets = list(states)
+    return pl.DataFrame(
+        {
+            "asset": assets,
+            MOMENTUM_COLUMN: [0.1] * len(assets),
+            "gc_breakout_age": [states[a] for a in assets],
+            "gc_upper": over.get("gc_upper", [100.0] * len(assets)),
+            "bars_available": over.get("bars_available", [200] * len(assets)),
+            "adv_quote": over.get("adv_quote", [5e8] * len(assets)),
+            "vol_30": over.get("vol_30", [0.5] * len(assets)),
+        }
+    )
+
+
+def test_it_holds_only_what_is_above_its_channel():
+    result = signal.get("gc_breakout").generate(
+        gc({"A": 3, "B": None, "C": 10, "D": None}), config=config()
+    )
+    assert sorted(held(result)) == ["A", "C"]
+
+
+def test_nothing_breaking_out_is_a_flat_book_not_a_failure():
+    """An absolute signal is allowed to say 'nothing qualifies'.
+
+    That is the structural difference from a ranking, which always has a top N
+    however bad the cross-section is.
+    """
+    result = signal.get("gc_breakout").generate(
+        gc({"A": None, "B": None, "C": None}), config=config()
+    )
+    assert result.signals == []
+    assert any("no asset is above its upper channel" in n for n in result.notes)
+
+
+def test_the_freshest_breakouts_are_preferred_when_slots_are_scarce():
+    result = signal.get("gc_breakout").generate(
+        gc({"A": 40, "B": 2, "C": 15, "D": 90}), config=config(max_holdings=2)
+    )
+    assert sorted(held(result)) == ["B", "C"]
+    assert any("outside the top 2 by recency" in n for n in result.notes)
+
+
+def test_recent_breakouts_get_the_larger_conviction():
+    # The TR-GC rules size these 8% vs 2% of NAV; expressed here as 4:1 and left
+    # to the constructor, because the sizing is where the two systems differ.
+    result = signal.get("gc_breakout").generate(
+        gc({"FRESH": 5, "STALE": 200}), config=config()
+    )
+    by_asset = {s.asset: s.conviction for s in result.signals}
+    assert by_asset["FRESH"] == Decimal(4)
+    assert by_asset["STALE"] == Decimal(1)
+    assert by_asset["FRESH"] / by_asset["STALE"] == 4
+
+
+def test_the_recency_boundary_is_inclusive():
+    result = signal.get("gc_breakout").generate(
+        gc({"ON": 25, "OFF": 26}), config=config()
+    )
+    by_asset = {s.asset: s.conviction for s in result.signals}
+    assert by_asset["ON"] == Decimal(4)
+    assert by_asset["OFF"] == Decimal(1)
+
+
+def test_an_unconverged_channel_is_not_evaluated():
+    frame = gc({"A": 3, "B": 4}, gc_upper=[100.0, None])
+    result = signal.get("gc_breakout").generate(frame, config=config())
+    assert held(result) == ["A"]
+    assert any("converged" in n for n in result.notes)
+
+
+def test_it_still_applies_every_eligibility_screen():
+    frame = gc({"A": 3, "B": 3, "C": 3}, adv_quote=[5e8, 100.0, 5e8],
+               bars_available=[200, 200, 10])
+    result = signal.get("gc_breakout").generate(frame, config=config())
+    assert held(result) == ["A"]
+
+
+def test_a_feature_frame_without_the_channel_is_refused():
+    frame = pl.DataFrame(
+        {"asset": ["A"], MOMENTUM_COLUMN: [0.1], "bars_available": [200],
+         "adv_quote": [5e8], "vol_30": [0.5]}
+    )
+    with pytest.raises(ValueError, match="gc_breakout_age"):
+        signal.get("gc_breakout").generate(frame, config=config())

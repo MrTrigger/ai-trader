@@ -1,4 +1,4 @@
-# Phase 1: first candidate, and what the gate said
+# Phase 1: two candidates, and what the gate said about each
 
 > Recorded because a negative result is the asset. §9 states gates as evidence,
 > and evidence that is not written down gets re-litigated by whoever arrives
@@ -144,7 +144,90 @@ the cheapest next thing to know, and it splits the outcome cleanly:
 Doing the sweeps before knowing which of those is true would be tuning a
 strategy whose signal might have no content. The IC comes first.
 
-**Answered: the first branch.** `xs_momentum` as specified is retired. The next
-candidate is a different family — absolute channel-breakout trend-following,
-which §10.2 names as a legitimate baseline to beat — and it goes through the
-same gate.
+**Answered: the first branch.** `xs_momentum` as specified is retired.
+
+---
+
+# Candidate 2: Gaussian Channel breakout
+
+A deliberately different *family*. Momentum is **relative** — rank assets
+against each other. This is **absolute** — each asset judged against its own
+channel, and when nothing is breaking out the book goes flat. §10.2 names
+channel-breakout trend-following as a legitimate documented family and "a
+reasonable baseline to beat, not a destination".
+
+Rules taken from the TR-GC prompt family, which runs this live: enter above the
+upper band, exit below it, size by 25-day breakout recency (their 8%/2% of NAV,
+expressed here as conviction 4:1). Indicator is Donovan Wall's Gaussian Channel
+at its defaults — 144-period, 4-pole, 1.414× the filtered true range.
+
+**Verdict: NOT PASSED.** Three of four criteria failed.
+
+| | n | return | CAGR | vol | Sharpe | maxDD | turnover | cost bps |
+|---|---|---|---|---|---|---|---|---|
+| `gc_breakout` | 253 | −77.65% | −26.66% | 35.8% | −0.68 | −82.67% | 38.56% | 488 |
+| at 2× slippage | 253 | −78.04% | −26.92% | 35.8% | −0.69 | −82.95% | 38.60% | 488 |
+| baseline | 253 | −53.31% | −14.58% | 53.9% | −0.02 | −79.21% | 15.98% | 202 |
+
+Better than momentum's −86.87%, still well short of holding the biggest names.
+
+**The folds say whipsaw**, and they are far more varied than momentum's:
++16.08%, +31.43%, −31.52%, −6.18%. The signal captures trends when they exist —
+fold1 is a Sharpe of 1.83 through the 2023–24 run — and bleeds through chop.
+Turnover is 38.56% per rebalance, the highest of anything tested.
+
+## The spread test, and why rank IC is the wrong instrument here
+
+An absolute signal is a *state*, not an ordering, so the question is whether
+assets above the band outperform those below it:
+
+| horizon | eff n | mean spread (above − below) | t | |
+|---|---|---|---|---|
+| 7d | 185 | +0.93% | 1.60 | not distinguishable from zero |
+| 14d | 92 | +1.07% | 0.90 | not distinguishable from zero |
+| 30d | 43 | −1.44% | −0.66 | not distinguishable from zero |
+
+Suggestive at short horizons, decaying and reversing by 30 days, and nothing
+clears |t| > 2. About 32% of the eligible universe is above its band at any time.
+
+**The structural point is the one worth keeping: the spread is relative and the
+book is absolute.** Picking assets that fall less than others still loses money
+in a long-only book when everything falls. A relative edge needs a short leg to
+be monetised, which is exactly why the long-short variant of those prompts
+exists — and why §9.2 putting leverage out of scope before Phase 3 also puts
+this class of edge out of reach for now.
+
+---
+
+# Where Phase 1 stands
+
+Two candidates, two families, both failed. `config/default.toml` is back to the
+Phase 0 placeholder that claims no edge, because a config naming a signal that
+failed its gate is the softest possible version of shipping it.
+
+What the exercise did produce, and what it cost:
+
+| | |
+|---|---|
+| Data | 656 assets, 714k bars, **174 delisted series retained** |
+| Instruments | replay backtest, walk-forward, plateau sweeps, gate, IC, spread test |
+| Bugs found by running rather than reading | **five**, four of which flattered the strategy |
+
+The largest was ticker reuse: LUNA renamed to LUNC with Luna 2.0 taking the
+ticker turned a −87% result into **+23,742%**, and it was caught by an
+implausible volatility number rather than by the return.
+
+## What would actually be worth trying next
+
+Ordered by evidence-per-unit-effort, not by appeal:
+
+1. **The 7d spread, measured properly.** GC's only positive signal was at the
+   shortest horizon and decayed to nothing by 30 days. If there is anything
+   here it is short-horizon, and weekly rebalancing cannot capture it — the
+   rebalance-frequency sweep (§10.3) is the cheap test and it has not been run.
+2. **Cross-sectional reversal.** Momentum's IC was consistently negative across
+   every horizon. On a *fresh window*, because testing the inverse of a failed
+   signal on the same data is how noise gets fitted.
+3. **Not a third trend variant.** Two families have now failed the same way —
+   long-only, relative edge, absolute book. The next thing tried should differ
+   in that structure rather than in its indicator.
