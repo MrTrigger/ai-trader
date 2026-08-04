@@ -156,8 +156,13 @@ def run(
         vol[r["asset"]] = None if r["vol_30"] is None else Decimal(str(r["vol_30"])) / Decimal(
             str(365 ** 0.5)
         )
+        # Quantized where the float becomes a Decimal, not later. A beta is not
+        # meaningful past six places, and carrying the full binary tail into the
+        # risk report puts nineteen digits of noise next to a two-digit limit.
+        # Rounding here rather than on the way out keeps the number that was
+        # *checked* and the number that is *reported* the same number.
         betas[r["asset"]] = (
-            None if r["beta_bench"] is None else Decimal(str(r["beta_bench"]))
+            None if r["beta_bench"] is None else _q(Decimal(str(r["beta_bench"])), "0.000001")
         )
 
     for p in book.positions:
