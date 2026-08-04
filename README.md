@@ -124,9 +124,59 @@ Dates where a gate would have failed live produce no plan here either, are absen
 number, and are counted in the disclosures — a backtest that silently traded through a gate failure
 measures a system that does not exist.
 
-Still to come in Phase 1: a real signal, plateau-not-peak sweeps, and walk-forward splits. **The
-strategy itself is undecided on purpose** — see
-[§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
+### The Phase 1 candidate
+
+**Cross-sectional momentum with a skip period**, long-only, top ~10 of a liquidity-ranked
+universe. It is a *hypothesis*, not a conclusion — `ai-trader gate` is what decides whether it
+survives contact with costs, and it is built to be capable of saying no.
+
+The skip period is the part that isn't obvious: rank on the return from **t−30d to t−7d**, not the
+plain 30-day return. Short-horizon reversal is well documented in crypto, so a plain measure has
+last week's reversal baked into it and the two effects partially cancel.
+
+Long-only is not a preference — shorting spot needs margin, and
+[§9.2](docs/design-spec.md#92-explicitly-not-in-scope) puts leverage above 1× out of scope before
+Phase 3. Shorts arrive with a venue decision, not before it.
+
+**How it most likely dies:** long-only crypto momentum is a leveraged BTC bet in a rising market,
+and an attribution that ignores beta will call that alpha. `max_benchmark_beta` is what stops the
+book expressing it, and the beta-neutral residual is what the gate should be read on.
+
+### The data problem, and why it did not cost anything
+
+A momentum backtest over *currently listed* assets is survivorship bias at its most flattering: the
+assets momentum would have bought are disproportionately the ones that ran up and then died.
+
+Binance keeps the dead. `exchangeInfo` retains delisted pairs as `BREAK`, the REST klines endpoint
+serves their full history up to the delisting date, and `data.binance.vision` retains more still.
+The store here holds **656 assets and 714k daily bars, of which 174 series end before 2026-07** —
+LUNA, FTT, COCOS, BTCST among them. LUNA ranks #4 and eligible on 2022-05-13, mid-collapse, which
+is exactly what a survivor-only universe could never show.
+
+```bash
+ai-trader universe rank --start 2021-10-01 --end 2026-08-01 --top 40   # point-in-time snapshots
+ai-trader gate --start 2021-10-01 --end 2026-08-01                     # the four criteria
+```
+
+The distinction that makes this legitimate: **reconstructing a rule from complete history is
+point-in-time; reconstructing a survivor list is not.** "Top N by trailing median turnover among
+assets with bars at T" uses only inputs knowable at T. Delisted assets are recorded as delisted
+rather than dropped — omitting them would hand the backtest survivors by a different route.
+
+One caveat found while wiring it: the archive is **not internally consistent about its epoch
+unit** — older dumps are milliseconds, newer ones microseconds. The unit is inferred by magnitude
+and the result range-checked, because the same mistake in the other direction lands a bar in 1970,
+where it sorts before everything and silently becomes the oldest row of every rolling window.
+
+### Validation
+
+Splits are by date and applied to *results*, never to inputs — slicing bars and replaying the slice
+would start every window flat with a cold feature frame. Sweeps are one axis at a time, and report
+**the plateau's centre, never the peak**; a width-1 plateau is labelled as the peak it is.
+
+```bash
+ai-trader backtest --start 2021-10-01 --end 2026-08-01   # with the 2× slippage error bar
+```
 
 ### Two known gaps, recorded so they are not rediscovered
 
