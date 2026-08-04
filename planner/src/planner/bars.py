@@ -26,6 +26,7 @@ otherwise mirrors:
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -86,6 +87,70 @@ def is_canonical_asset(asset: str) -> bool:
     eligibility is decided is much better than discovering it at serialisation.
     """
     return bool(CANONICAL_ASSET.match(asset))
+
+
+#: A single-bar log return above this is a **discontinuity in what the ticker
+#: means**, not a price move. See `mark_discontinuities`.
+MAX_BAR_LOG_RETURN = math.log(10)
+
+
+def mark_discontinuities(df: pl.DataFrame) -> pl.DataFrame:
+    """Flag tickers whose identity changed, and freeze their marks.
+
+    Three tickers in Binance's USDT history do this: COCOS and DREP redenominated,
+    and LUNA was reused for Luna 2.0 after Terra collapsed. The price series is
+    continuous and describes two different assets. A backtest bought old LUNA at
+    $0.0001, received 12.4 million units, and the ticker restarted at $7 — a $43k
+    book became $88m in one step, and the strategy appeared to work because of it.
+
+    Adds three columns:
+
+    - ``had_discontinuity`` — true from the first break onward.
+    - ``mark_open`` / ``mark_close`` — the real prices until the break, then
+      **frozen at the last pre-break values forever**.
+
+    Freezing rather than dropping is what makes a *held* position tractable.
+    Eligibility only governs entry, so a break that happens while we hold the
+    asset cannot be handled by refusing to buy it: the units we own are
+    denominated in the old token, and the last price at which that token traded
+    is the only honest mark for them. Freezing lets the position be valued and
+    sold at that price; the alternative is a book that revalues 100,000x on a
+    rename.
+
+    This is deliberately one-sided. A 10x single-day *gain* on a liquid asset is
+    effectively always a redenomination, reuse or reverse split. A 90% single-day
+    *loss* genuinely happens in crypto — it is what LUNA actually did — and
+    treating that as a data event would erase exactly the history a momentum
+    strategy most needs to be tested against. The collapse stays; the
+    resurrection does not.
+
+    Causal: the flag at row *t* depends only on bars at or before *t*, so an
+    asset is untouched until the break actually happens.
+    """
+    if df.is_empty():
+        return df
+
+    out = df.sort(["asset", "ts_utc"]).with_columns(
+        ((pl.col("close") / pl.col("close").shift(1)).log() > MAX_BAR_LOG_RETURN)
+        .fill_null(False)
+        .over("asset")
+        .alias("_break")
+    )
+    out = out.with_columns(pl.col("_break").cum_sum().over("asset").alias("_regime"))
+
+    # The FIRST break's pre-price, carried forward. A later break must not move
+    # the mark: by then the ticker is already untradeable and anything held
+    # predates the first one.
+    first = pl.when(pl.col("_break") & (pl.col("_regime") == 1))
+    return out.with_columns(
+        (pl.col("_regime") > 0).alias("had_discontinuity"),
+        pl.coalesce(
+            [first.then(pl.col("open").shift(1)).forward_fill().over("asset"), pl.col("open")]
+        ).alias("mark_open"),
+        pl.coalesce(
+            [first.then(pl.col("close").shift(1)).forward_fill().over("asset"), pl.col("close")]
+        ).alias("mark_close"),
+    ).drop(["_break", "_regime"])
 
 
 def empty_frame() -> pl.DataFrame:

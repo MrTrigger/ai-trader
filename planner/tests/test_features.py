@@ -203,7 +203,7 @@ def test_latest_returns_one_row_per_asset(bars):
 # --- ticker discontinuities ------------------------------------------------
 
 
-def test_a_ticker_that_changes_meaning_resets_its_history():
+def test_a_ticker_that_changes_meaning_is_retired_and_its_mark_frozen():
     """The LUNA case, and the reason this check exists.
 
     Binance renamed the collapsed Terra token to LUNC and launched Luna 2.0
@@ -211,18 +211,24 @@ def test_a_ticker_that_changes_meaning_resets_its_history():
     different assets. A backtest bought the old token at $0.0001, received 12.4
     million units, and the ticker restarted at $7 — a $43k book became $88m in
     one step, and every number after it was fiction.
+
+    The ticker is retired rather than merely aged: without corporate-action data
+    we cannot tell which units a position is denominated in, so the honest
+    answer is to stop trading it and mark what is held at the last price the old
+    token actually traded at.
     """
-    # 120 bars of a normal asset, then the ticker restarts 100,000x higher.
     old = _series(_wobble(120, seed=2), start=100.0)
     new = _series(_wobble(60, seed=5), start=old[-1] * 100_000)
     frame = features.build(_bars({"X": old + new}))
 
     x = frame.filter(pl.col("asset") == "X").sort("ts_utc")
-    # The LAST value, not the max: max spans both regimes, and the pre-break
-    # one legitimately had a long history.
-    assert x["bars_available"][-1] == len(new), "history restarts at the discontinuity"
-    assert x["bars_available"].max() == len(old), "the old regime is untouched"
     assert x["had_discontinuity"][-1]
+    assert x["bars_available"][-1] == 0, "never tradeable again"
+    assert x["bars_available"].max() == len(old), "the pre-break regime is untouched"
+
+    # Frozen at the last pre-break close, not the post-break one.
+    assert x["mark_close"][-1] == pytest.approx(old[-1])
+    assert x["close"][-1] > old[-1] * 10_000, "the raw series really did jump"
 
 
 def test_an_ordinary_asset_has_no_discontinuity(bars):
@@ -242,6 +248,7 @@ def test_a_collapse_is_not_treated_as_a_discontinuity():
     x = frame.filter(pl.col("asset") == "X")
     assert not x["had_discontinuity"].any()
     assert x["bars_available"].max() == len(collapsing)
+    assert x["mark_close"][-1] == pytest.approx(collapsing[-1]), "no freeze applied"
 
 
 def test_a_large_but_plausible_gain_is_not_a_discontinuity():

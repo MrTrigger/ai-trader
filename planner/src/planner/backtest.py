@@ -46,6 +46,7 @@ from pathlib import Path
 import polars as pl
 
 from . import pipeline, state, store
+from .bars import mark_discontinuities
 from .config import Config
 
 #: Annualisation factor. Crypto trades every day, so 365 — using the equity
@@ -276,10 +277,15 @@ def _open_prices(
     if bars.is_empty():
         return {}
 
+    # The same freeze the marking path applies. A forced exit out of a ticker
+    # that changed identity must fill at the old token's last price, not at the
+    # new one's - otherwise the sale prints the fiction the mark refused to.
+    bars = mark_discontinuities(bars)
+
     window = bars.filter((pl.col("ts_utc") >= start) & (pl.col("ts_utc") <= end))
     out: dict[datetime, dict[str, Decimal]] = {}
     for row in window.iter_rows(named=True):
-        out.setdefault(row["ts_utc"], {})[row["asset"]] = Decimal(str(row["open"]))
+        out.setdefault(row["ts_utc"], {})[row["asset"]] = Decimal(str(row["mark_open"]))
     return out
 
 

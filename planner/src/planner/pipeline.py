@@ -171,7 +171,10 @@ def run(
     # priced so it can be valued and sold.
     cross = marked.filter(pl.col("asset").is_in(eligible_by_config))
 
-    prices = {r["asset"]: Decimal(str(r["close"])) for r in marked.iter_rows(named=True)}
+    # `mark_close`, not `close`: a ticker whose identity changed is frozen at its
+    # last pre-break price, because the units we hold are denominated in the old
+    # token (see bars.mark_discontinuities).
+    prices = {r["asset"]: Decimal(str(r["mark_close"])) for r in marked.iter_rows(named=True)}
     adv: dict[str, Decimal | None] = {}
     vol: dict[str, Decimal | None] = {}
     betas: dict[str, Decimal | None] = {}
