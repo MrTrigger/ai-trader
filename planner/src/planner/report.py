@@ -39,8 +39,12 @@ from pathlib import Path
 # Light-mode aqua sits at 2.74:1 against the surface, below the 3:1 line, so the
 # relief rule applies: every series carries a visible direct label AND a table
 # view, and colour never carries identity alone.
-SERIES_LIGHT = ("#2a78d6", "#eb6834", "#1baf7a")
-SERIES_DARK = ("#3987e5", "#d95926", "#199e70")
+SERIES_LIGHT = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
+SERIES_DARK = ("#3987e5", "#d95926", "#199e70", "#d99000")
+
+#: Minimum vertical separation between two end labels, in SVG units. Below this
+#: they overprint and the reader cannot tell which line carries which name.
+_LABEL_MIN_GAP = 15.0
 
 
 @dataclass(frozen=True)
@@ -393,6 +397,13 @@ def _line_panel(
             f'y2="{c.pad_top + c.plot_h}" class="split"/>'
         )
 
+    if len(series) > len(SERIES_LIGHT):
+        raise ValueError(
+            f"{len(series)} series but only {len(SERIES_LIGHT)} validated colours. "
+            "Cycling hues would give two series the same colour; drop a series or "
+            "extend the palette and re-run the CVD check."
+        )
+
     for slot, (label, pts) in enumerate(series):
         d = " ".join(f"{px(a):.1f},{py(b):.1f}" for a, b in pts)
         out.append(f'<polyline points="{d}" class="line s{slot + 1}" fill="none"/>')
@@ -400,8 +411,25 @@ def _line_panel(
         out.append(
             f'<circle cx="{px(a):.1f}" cy="{py(b):.1f}" r="3.5" class="dot s{slot + 1}"/>'
         )
+
+    # End labels, de-collided. Two series that finish at similar values put their
+    # labels in the same place and overprint, which is worse than no label - the
+    # reader cannot tell which line is which and may read the wrong series
+    # entirely. Nudged apart vertically, with a leader implied by the dot each
+    # already has.
+    ends = sorted(
+        ((py(pts[-1][1]), px(pts[-1][0]), slot, label) for slot, (label, pts) in enumerate(series)),
+        key=lambda e: e[0],
+    )
+    placed: list[float] = []
+    for y, x, slot, label in ends:
+        target = y
+        while any(abs(target - other) < _LABEL_MIN_GAP for other in placed):
+            target += _LABEL_MIN_GAP / 2
+        target = min(target, c.pad_top + c.plot_h)
+        placed.append(target)
         out.append(
-            f'<text x="{px(a) + 9:.1f}" y="{py(b) + 4:.1f}" '
+            f'<text x="{x + 9:.1f}" y="{target + 4:.1f}" '
             f'class="endlabel s{slot + 1}">{_esc(label)}</text>'
         )
 
@@ -534,14 +562,19 @@ def phase_section(record: dict) -> str:
             f'<td class="num">{c["sharpe_min"]:.2f} … {c["sharpe_max"]:.2f}</td></tr>'
         )
 
-    series = [(s["label"], s["equity"]) for s in record["series"]]
+    # Three lines, not six. The argument here is benchmark vs base construction
+    # vs final, and the intermediate tuning steps are table rows - putting all
+    # six on one axis crowds four of them into a band narrower than their own
+    # labels, which reads as precision that is not there.
+    shown = record.get("chart_series") or [s["label"] for s in record["series"]]
+    series = [(s["label"], s["equity"]) for s in record["series"] if s["label"] in shown]
     chart = _line_panel(
         series,
         height=300,
         split=record.get("split"),
         fmt=lambda v: f"{v:.1f}x",
         ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Equity of the median rebalance phase for each candidate",
+        aria="Equity of the median rebalance phase: benchmark, base construction, final",
         baseline=1.0,
     )
 
@@ -558,9 +591,11 @@ def phase_section(record: dict) -> str:
         '<tr><th class="num">fresh</th><th class="num">orig</th><th class="num">Sharpe</th>'
         '<th class="num">worst</th><th class="num">best</th><th class="num">spread</th></tr>'
         '</thead><tbody>' + rows + '</tbody></table></div>'
-        '<p class="note" style="margin-top:14px">Equity of the <strong>median</strong> phase '
-        'for each candidate — not the best one, so the chart and the table describe the same '
-        'thing.</p>'
+        '<p class="note" style="margin-top:14px">Equity on the <strong>median</strong> phase — '
+        'not the best one, so the chart and the table describe the same thing. Three lines '
+        'rather than all six: the benchmark, the base market-neutral construction, and the '
+        'configuration actually shipped. The tuning steps between them are table rows above, '
+        'because on one axis they crowd into a band narrower than their own labels.</p>'
         + chart
         + '<p class="finding"><strong>The headline result was a sampling artifact.</strong> '
         'The strategy swings from strongly profitable to loss-making across the seven phases, '
