@@ -41,6 +41,7 @@ from pathlib import Path
 
 import polars as pl
 
+from . import bars as bars_mod
 from .sources.base import UniverseMember
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[3] / "data"
@@ -196,7 +197,14 @@ def by_liquidity(
     scored = []
     for row in stats.iter_rows(named=True):
         turnover = row["turnover"]
-        if row["last_bar"] < stale_before:
+        if not bars_mod.is_canonical_asset(row["asset"]):
+            # A venue can list something whose base asset is not expressible as
+            # a canonical id - Binance carries one whose ticker is CJK text.
+            # Caught here, where eligibility is decided, rather than at plan
+            # serialisation where it costs a whole run.
+            reason = "asset id is not canonical; needs a venue alias (spec 5.2)"
+            eligible = False
+        elif row["last_bar"] < stale_before:
             reason = f"no bars since {row['last_bar'].date()}: delisted or halted"
             eligible = False
         elif row["bars_available"] < min_history_bars:

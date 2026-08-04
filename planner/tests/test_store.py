@@ -173,3 +173,50 @@ def test_multiple_assets_stay_separate(tmp_path):
     assert sorted(df["asset"].unique().to_list()) == ["BTC", "ETH"]
     only_eth = S.read(root=tmp_path, assets=["ETH"], interval_s=DAY)
     assert only_eth["asset"].unique().to_list() == ["ETH"]
+
+
+# --- the read cache --------------------------------------------------------
+
+
+def _week(asset: str = "BTC", days: int = 7) -> pl.DataFrame:
+    return _frame([_bar(d, asset=asset, close=100.0 + d) for d in range(1, days + 1)])
+
+
+def test_a_cached_read_returns_the_same_bars(tmp_path):
+    S.write(_week(), root=tmp_path, source="test")
+    first = S.read(root=tmp_path, interval_s=DAY)
+    second = S.read(root=tmp_path, interval_s=DAY)
+    assert first.equals(second)
+
+
+def test_the_horizon_still_applies_to_a_cached_read(tmp_path):
+    """The cache must never be a route around `until`.
+
+    Serving a full frame where a bounded one was asked for would hand the
+    planner bars past its horizon - the exact bug the parameter exists to make
+    impossible.
+    """
+    S.write(_week(), root=tmp_path, source="test")
+    full = S.read(root=tmp_path, interval_s=DAY)  # populates the cache
+
+    cutoff = full["ts_utc"].min()
+    bounded = S.read(root=tmp_path, interval_s=DAY, until=cutoff)
+    assert bounded["ts_utc"].max() == cutoff
+    assert bounded.height < full.height
+
+
+def test_writing_invalidates_the_cache(tmp_path):
+    """Immutability is a promise about existing bars, not about the set of them."""
+    S.write(_week(days=3), root=tmp_path, source="test")
+    before = S.read(root=tmp_path, interval_s=DAY).height
+
+    S.write(_week(days=7), root=tmp_path, source="test")
+    after = S.read(root=tmp_path, interval_s=DAY).height
+    assert after > before, "a cached read must not hide bars written since"
+
+
+def test_two_roots_do_not_share_a_cache_entry(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    S.write(_week(days=7), root=a, source="test")
+    S.write(_week(days=3), root=b, source="test")
+    assert S.read(root=a, interval_s=DAY).height != S.read(root=b, interval_s=DAY).height

@@ -25,6 +25,7 @@ otherwise mirrors:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -65,6 +66,26 @@ class Issue:
     code: str
     detail: str
     count: int = 1
+
+
+#: What a canonical asset id may look like, mirroring `schema/plan.schema.json`.
+#:
+#: Kept in step with the schema by `test_plan.py`, because a plan carrying an id
+#: this side accepts and the contract rejects is a failure at the worst possible
+#: moment: after the decision, at serialisation, with the whole run wasted.
+CANONICAL_ASSET = re.compile(r"^[A-Z0-9]{1,20}$")
+
+
+def is_canonical_asset(asset: str) -> bool:
+    """Whether `asset` can cross the Plan contract as an id.
+
+    Venues list things this is false for — Binance carries a token whose base
+    asset is CJK text. Such an asset is not unusable in principle; it needs an
+    entry in the alias table §5.2 describes, mapping a venue symbol to a
+    canonical id. Until it has one it cannot be held, and saying so where
+    eligibility is decided is much better than discovering it at serialisation.
+    """
+    return bool(CANONICAL_ASSET.match(asset))
 
 
 def empty_frame() -> pl.DataFrame:

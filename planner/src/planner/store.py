@@ -115,6 +115,9 @@ def write(
             issues=issues,
         )
 
+    # Anything cached for this root is now behind the store. Immutability is a
+    # promise about *existing* bars, not about the set of them.
+    clear_cache()
     return issues
 
 
@@ -156,6 +159,23 @@ def _write_manifest(
     path.write_bytes((json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
 
 
+#: Parsed bars, keyed by (root, interval_s). Sound because §3.4 makes bars
+#: immutable: a stored bar is never edited, so a frame read once stays correct
+#: for the life of the process. `write` clears the entry it touches.
+#:
+#: This exists because a backtest calls `pipeline.run` once per rebalance and
+#: each call re-reads the whole store — 759 full reads over 714k rows on a
+#: five-year replay, which is I/O-bound and was taking most of the wall clock.
+#: Caching in the store rather than passing a frame into the pipeline keeps the
+#: backtest and the live path the same function, which is the property §0.1
+#: actually cares about.
+_CACHE: dict[tuple[str, int], pl.DataFrame] = {}
+
+
+def clear_cache() -> None:
+    _CACHE.clear()
+
+
 def read(
     *,
     root: Path = DEFAULT_ROOT,
@@ -173,19 +193,26 @@ def read(
     if not base.exists():
         return empty_frame()
 
-    dirs = (
-        [bars_dir(root, a, interval_s) for a in assets]
-        if assets
-        else [d / f"interval_s={interval_s}" for d in base.glob("asset=*")]
-    )
+    # Only the whole-store read is cached. A subset read is rare and cheap, and
+    # caching per asset-list would multiply keys for no gain.
+    key = (str(root.resolve()), interval_s)
+    if assets is None and key in _CACHE:
+        df = _CACHE[key]
+    else:
+        dirs = (
+            [bars_dir(root, a, interval_s) for a in assets]
+            if assets
+            else [d / f"interval_s={interval_s}" for d in base.glob("asset=*")]
+        )
+        frames = [
+            pl.read_parquet(f) for d in dirs if d.exists() for f in sorted(d.glob("*.parquet"))
+        ]
+        if not frames:
+            return empty_frame()
+        df = conform(pl.concat(frames, how="vertical_relaxed"))
+        if assets is None:
+            _CACHE[key] = df
 
-    frames = [
-        pl.read_parquet(f) for d in dirs if d.exists() for f in sorted(d.glob("*.parquet"))
-    ]
-    if not frames:
-        return empty_frame()
-
-    df = conform(pl.concat(frames, how="vertical_relaxed"))
     if until is not None:
         df = df.filter(pl.col("ts_utc") <= until)
     return df

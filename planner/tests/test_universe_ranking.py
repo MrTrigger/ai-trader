@@ -221,3 +221,43 @@ def test_a_recorded_snapshot_is_still_never_silently_replaced(tmp_path):
     universe.record(result, as_of=AS_OF, source="by_liquidity", root=tmp_path)
     with pytest.raises(FileExistsError, match="observations, not settings"):
         universe.record(result, as_of=AS_OF, source="by_liquidity", root=tmp_path)
+
+
+# --- ids that cannot cross the contract ------------------------------------
+
+
+def test_an_asset_id_that_is_not_canonical_is_ineligible():
+    """Venues list things the Plan contract cannot carry.
+
+    Binance has a token whose base asset is CJK text. Caught here, where
+    eligibility is decided, rather than at plan serialisation — where it costs
+    a whole run and the schema error names a target index rather than a cause.
+    """
+    df = pl.concat([bars({"AAA": flat(1e6)}), bars({"币安人生": flat(9e6)})])
+    result = members(df)
+
+    by_asset = {m.asset: m for m in result}
+    assert not by_asset["币安人生"].eligible
+    assert "not canonical" in by_asset["币安人生"].reason
+    assert by_asset["AAA"].eligible
+
+
+def test_a_non_canonical_asset_does_not_consume_a_top_n_slot():
+    df = pl.concat(
+        [bars({"A": flat(5e6), "B": flat(4e6), "C": flat(3e6)}), bars({"币安人生": flat(9e9)})]
+    )
+    assert eligible_of(members(df, top_n=3)) == ["A", "B", "C"]
+
+
+def test_the_canonical_rule_matches_the_plan_schema():
+    # If these ever diverge, the planner produces ids the executor refuses -
+    # discovered in production, which is the drift the shared schema exists to
+    # prevent.
+    import json
+    from pathlib import Path
+
+    from planner import bars as bars_mod
+    from planner.plan import SCHEMA_PATH
+
+    schema = json.loads(Path(SCHEMA_PATH).read_text(encoding="utf-8"))
+    assert bars_mod.CANONICAL_ASSET.pattern == schema["$defs"]["asset"]["pattern"]
