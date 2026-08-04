@@ -197,6 +197,48 @@ be monetised, which is exactly why the long-short variant of those prompts
 exists — and why §9.2 putting leverage out of scope before Phase 3 also puts
 this class of edge out of reach for now.
 
+## The cadence sweep: a peak, not a plateau
+
+§10.3 asks for this one explicitly — *"Daily is the assumed start... Sweep it in
+Phase 1 — one axis, plateau centre, not the peak."* It was also the last live
+thread: GC's only positive signal was at 7 days and gone by 30, so if a cadence
+existed that could capture it, this is where it would show.
+
+**The control is what makes it interpretable.** A cadence sweep on a long-only
+book in a falling market trivially favours trading less — every trade costs and
+every position loses — so the baseline was swept on the identical grid and the
+reported statistic is `candidate − control`. Both arms pay the same kind of cost
+at the same frequency; what is left is whether acting on the signal more or less
+often helps.
+
+| every | n | candidate | control | spread | cand. turnover | cand. cost | |
+|---|---|---|---|---|---|---|---|
+| 1 | 1766 | −72.13% | −59.36% | −12.77pp | 24.03% | 2122 bps | loses |
+| 3 | 589 | −89.59% | −62.79% | −26.80pp | 34.57% | 1018 bps | loses |
+| 7 | 253 | −77.65% | −53.31% | −24.34pp | 38.56% | 488 bps | loses |
+| **14** | 127 | −56.49% | −60.18% | **+3.69pp** | 36.80% | 234 bps | **beats control** |
+| 30 | 59 | −58.44% | −45.95% | −12.49pp | 38.54% | 114 bps | loses |
+
+    rebalance_every: plateau 14..14 (width 1), centre 14  <- a PEAK, not a plateau
+
+**This is the rule earning its keep.** Reported without it, "14-day rebalancing
+beats the baseline by 3.7pp" is a finding, and a plausible-sounding one. A
+setting that wins at exactly one value and loses by 12–27pp at both neighbours
+is an artifact of this particular history, and the sweep is built to say so
+rather than to hand back its best cell.
+
+The one clean mechanical result: **daily rebalancing costs 21% of NAV in fees**
+(2122 bps at 24% turnover per rebalance) against the control's 4.23% turnover.
+The candidate churns roughly six times as much for a worse outcome at every
+cadence but one.
+
+**A gap, recorded rather than papered over.** The harness script crashed on
+serialisation after all ten replays finished, and the per-cadence walk-forward
+folds were lost with it. The table above was assembled from the run's own
+output. Re-running 90 minutes to add fold detail to a candidate that a width-1
+plateau has already retired would be one-more-analysis on a settled question, so
+it was not done.
+
 ---
 
 # Where Phase 1 stands
@@ -221,13 +263,18 @@ implausible volatility number rather than by the return.
 
 Ordered by evidence-per-unit-effort, not by appeal:
 
-1. **The 7d spread, measured properly.** GC's only positive signal was at the
-   shortest horizon and decayed to nothing by 30 days. If there is anything
-   here it is short-horizon, and weekly rebalancing cannot capture it — the
-   rebalance-frequency sweep (§10.3) is the cheap test and it has not been run.
-2. **Cross-sectional reversal.** Momentum's IC was consistently negative across
+1. ~~**The 7d spread, measured properly**~~ — done. The cadence sweep found a
+   peak, not a plateau, and closed the thread. `gc_breakout` is retired.
+2. **Test the structural hypothesis directly.** Both candidates showed a weak
+   *relative* signal and lost *absolutely*. That combination is not a strategy
+   problem, it is a shape problem: a relative edge needs a short leg, and §9.2
+   puts leverage out of scope before Phase 3. Measuring what a long/short
+   version of these same signals would have returned is cheap and settles which
+   of two very different situations we are in — signals that are simply bad, or
+   signals whose edge is real but unreachable with the book we are allowed to
+   run. That is a roadmap fact either way and it costs one diagnostic.
+3. **Cross-sectional reversal.** Momentum's IC was consistently negative across
    every horizon. On a *fresh window*, because testing the inverse of a failed
    signal on the same data is how noise gets fitted.
-3. **Not a third trend variant.** Two families have now failed the same way —
-   long-only, relative edge, absolute book. The next thing tried should differ
-   in that structure rather than in its indicator.
+4. **Not a third trend variant.** Two families have now failed the same way.
+   The next thing tried should differ in structure rather than in indicator.
