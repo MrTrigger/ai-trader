@@ -300,6 +300,73 @@ is a venue question (§10.1) and a Phase 3 question. It also gives §6's
 `max_net_exposure` — currently unenforced because "it needs shorts to be
 meaningful" — a concrete future.
 
+## The benchmark that reframes everything: buy-and-hold BTC
+
+Neither candidate was ever compared against the obvious thing.
+
+**BTC, 2021-10-01 → 2026-08-01: +43.37% total, CAGR +7.73%, Sharpe 0.11, maxDD −76.63%.**
+
+| | return | CAGR | Sharpe | maxDD |
+|---|---|---|---|---|
+| `xs_momentum` long-only | −86.87% | −34.30% | −0.93 | −91.89% |
+| `gc_breakout` long-only | −77.65% | −26.66% | −0.68 | −82.67% |
+| `liquidity_top` baseline | −53.31% | −14.58% | −0.02 | −79.21% |
+| **buy-and-hold BTC** | **+43.37%** | **+7.73%** | **0.11** | −76.63% |
+
+Every deterministic long-only thing built in Phase 1 lost catastrophically to
+doing nothing but holding BTC. That is the honest headline, and it should have
+been the first comparison run rather than the last.
+
+## Funding and shortability, modelled with real data
+
+The first long/short probe assumed shorting is free and universal. Both are
+false, and both were checked against Binance's own USD-M perpetual data —
+1.88M funding intervals across 442 assets.
+
+**Only 442 of our 656 assets ever had a perp**, so 214 are unshortable at any
+price. Enforcing that dropped 679 name-slots from the short leg over the window.
+
+**Funding is not a rounding error**: the median across all of it is 0.03%/day,
+about 11% annualised. Measured conditionally on our own legs:
+
+| leg | mean funding | direction |
+|---|---|---|
+| above band (we go long) | **−9.79%/yr** | negative — shorts pay longs |
+| below band (we go short) | **+4.20%/yr** | positive — our short receives |
+| short − long | **+13.99%/yr** | |
+
+The sign on the long leg is the surprise. Assets that have just broken out
+attract short interest fading the move, the perp trades below spot, and funding
+goes negative — so **the long leg gets paid as well**. That is a documented
+crypto dynamic and it is doing a lot of work in the numbers below.
+
+| structure | shortability | n | net | CAGR | vol | Sharpe | maxDD | funding/yr |
+|---|---|---|---|---|---|---|---|---|
+| perp-long / perp-short | not enforced | 185 | +150.01% | +20.86% | 28.7% | 1.03 | −19.19% | +6.51% |
+| perp-long / perp-short | enforced | 185 | +181.45% | +23.86% | 28.7% | 1.16 | −19.35% | +6.86% |
+| **spot-long / perp-short** | enforced | 185 | **+139.32%** | **+19.78%** | 28.5% | **1.00** | −22.54% | +2.22% |
+
+The third row is the one to read. Spot-long/perp-short is the realistic
+market-neutral shape at 1.0 gross with no leverage, and it is the only structure
+with no funding-data gap on the long leg. It clears §7.5's bar — Sharpe 1.00
+against the 0.91 that two standard errors needs over this window — and it beats
+buy-and-hold BTC on every axis: +139% vs +43%, CAGR 19.8% vs 7.7%, Sharpe 1.00
+vs 0.11, drawdown −22.5% vs −76.6%.
+
+**A known bias in the perp/perp rows**: 10% of long-leg names had no perp, so
+their funding was silently treated as zero. Since the real figure is *negative*
+(a benefit), those two rows understate rather than flatter. The spot-long row is
+unaffected, which is another reason to read it rather than them.
+
+**Still unmodelled, all cutting the same way**: borrow availability, perp
+liquidity at size, squeeze risk on beaten-down names, and the fact that a short
+leg made of the weakest assets is exactly where a position gets recalled or
+gapped through.
+
+**And it remains one window.** Everything above is a single 4.8-year slice that
+also produced two dead candidates, so the run is not naive to it. A fresh window
+is the test that matters and it is next.
+
 ---
 
 # Where Phase 1 stands
