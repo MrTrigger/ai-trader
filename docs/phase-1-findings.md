@@ -629,6 +629,58 @@ window. There is no third window available here — pre-2019 has no perpetuals, 
 no funding and no shortability — which means forward testing is the only honest
 instrument left, and §7.5 already says what it can and cannot establish.
 
+## Falsifying the fast version instead of doubting it
+
+"88 configurations, therefore not evidence" is an assertion, not a test. Three
+tests turn it into one.
+
+**1. Label shuffle.** Keep the tilt schedule, leg sizes, costs, funding and
+universe identical; randomise only *which* assets land in which leg. If the
+result survives, the channel signal contributes nothing.
+
+    REAL   min-Sharpe 2.06   combined +6884%
+    NULL   median 1.29   90th pct 1.58   max 1.71   (25 seeds)
+
+Real sits above all 25. The selection is doing work.
+
+**2. Timing only.** Same tilt schedule, legs replaced by BTC itself.
+
+    TIMING  min-Sharpe 1.30   combined +504.6%
+
+The selection adds roughly 8× on top of the timing, so this is not a BTC
+market-timer in a long/short costume.
+
+**3. The search itself.** The first two test one configuration; the real result
+was the best of forty-four. So give **each null draw the same sweep** and take
+its best — the fair comparison.
+
+    REAL best-of-sweep    min-Sharpe 2.06   combined +6884%
+    NULL best-of-sweep    median 1.33   max 1.71        (24 seeds)
+    0/24 matched or beat it   ->   empirical p = 0.040
+
+A signal with no information, allowed to search the same grid, tops out at 1.71.
+**The search does not explain the result.**
+
+Worth reading alongside: the null draws routinely make **+466% to +1588%**
+combined, median +830%. Most of the headline is the tilt, the funding carry and
+alt beta — things random legs also collect. The selection is what takes it from
+~830% to 6884%.
+
+### What these tests do and do not license
+
+They rule out one specific failure — that the number is an artifact of searching.
+That was the objection, and it does not survive.
+
+They do **not** make the windows out-of-sample. Parameters were still chosen
+using both, and no test on this data can undo that. And they say nothing about
+whether the edge persists: the same signal was measured collapsing from
++1.19%/wk to +0.11%/wk after mid-2025, with the hit rate unchanged at ~57%. A
+real edge stopping is not hypothetical here, it is observed.
+
+    p = 0.040 is also close to the floor 24 draws allows, (0+1)/(24+1).
+    The null shuffles SELECTION while holding the tilt schedule fixed, so it
+    establishes that the picking is real, not that the timing is.
+
 ---
 
 # Where Phase 1 stands

@@ -513,10 +513,12 @@ def candidates_table(cands: list[dict]) -> str:
 
     body = ""
     for c in cands:
-        trust = (
-            "no" if c["configs"] >= 88
-            else ("thin" if c["configs"] >= 40 else "ok")
-        )
+        # Grade by what SURVIVED, not by how much search preceded it. A result
+        # reached after a long search but which a matched null cannot reproduce
+        # is different from one that has never been falsification-tested.
+        ev = c["evidence"]
+        trust = ("ok" if ("clean OOS" in ev or "survives null" in ev)
+                 else ("thin" if c["configs"] >= 16 else "ok"))
         body += (
             f'<tr class="shape-{_esc(c["shape"])}">'
             f'<td>{_esc(c["name"])}</td>'
@@ -546,12 +548,15 @@ def candidates_table(cands: list[dict]) -> str:
         '<tr><th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th>'
         '<th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th></tr>'
         '</thead><tbody>' + body + '</tbody></table></div>'
-        '<p class="finding"><strong>The row to trust is <em>market-neutral</em>, not the one '
-        'at the bottom.</strong> It is the only line here tested once, on a window that had '
-        'never informed it. Everything below it was reached by searching the same two windows, '
-        'and by the last row both of them have set parameters — so neither is out-of-sample '
-        'any more and the number is a description of this data rather than a prediction about '
-        'any other. The bottom row also doubles the drawdown to get there.</p></section>'
+        '<p class="finding"><strong>Two rows carry real evidence, for different reasons.</strong> '
+        '<em>market-neutral</em> is the only line tested once on a window that had never '
+        'informed it. The bottom row was reached after 88 configurations — but when 24 null '
+        'draws were given the <em>same</em> search, none reached it (best 1.71 against 2.06, '
+        'p = 0.040), and replacing the selection with random legs or with BTC alone costs most '
+        'of the return. So the search does not explain it. What no test here can supply is a '
+        'window that did not set its parameters — and the same edge was measured collapsing '
+        'from +1.19%/wk to +0.11%/wk after mid-2025, so a real edge stopping is not '
+        'hypothetical. The bottom row also carries double the drawdown.</p></section>'
     )
 
 

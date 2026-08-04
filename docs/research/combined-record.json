@@ -7883,8 +7883,8 @@
       "fdd": -0.27648665422493945,
       "odd": -0.2714071546262252,
       "configs": 88,
-      "evidence": "88 configs \u2014 NOT evidence",
-      "note": "drawdown doubles; both windows now in-sample",
+      "evidence": "survives null, p=.040",
+      "note": "88 configs, but 0/24 null draws given the same search reached it; still not OOS",
       "combined": 68.84146741754327
     }
   ]
