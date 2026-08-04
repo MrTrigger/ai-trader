@@ -1,0 +1,16 @@
+[package]
+name = "venue"
+description = "The VenueAdapter interface and its shared types. Contains no venue-specific code by design - see the crate docs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plan.workspace = true
+async-trait.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -130,7 +130,10 @@ fn unknown_field_is_refused() {
 
 #[test]
 fn unknown_major_version_is_refused() {
-    let doc = FIXTURE.replace(r#""schema_version": "1.1.0""#, r#""schema_version": "2.0.0""#);
+    let doc = FIXTURE.replace(
+        r#""schema_version": "1.1.0""#,
+        r#""schema_version": "2.0.0""#,
+    );
     assert!(matches!(
         Plan::parse(&doc),
         Err(PlanError::UnsupportedVersion { .. })
@@ -141,7 +144,10 @@ fn unknown_major_version_is_refused() {
 fn a_newer_minor_version_still_parses() {
     // Minor bumps are additive. A field we do not know about would still trip
     // deny_unknown_fields, which is the correct place for that to fail.
-    let doc = FIXTURE.replace(r#""schema_version": "1.1.0""#, r#""schema_version": "1.9.0""#);
+    let doc = FIXTURE.replace(
+        r#""schema_version": "1.1.0""#,
+        r#""schema_version": "1.9.0""#,
+    );
     assert!(Plan::parse(&doc).is_ok());
 }
 

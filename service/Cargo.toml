@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plan"]
+members = ["crates/plan", "crates/venue", "crates/paper"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,10 @@ edition = "2021"
 rust-version = "1.82"
 
 [workspace.dependencies]
+plan = { path = "crates/plan" }
+venue = { path = "crates/venue" }
+async-trait = "0.1"
+tokio = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }

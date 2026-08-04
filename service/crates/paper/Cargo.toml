@@ -1,0 +1,18 @@
+[package]
+name = "paper"
+description = "The `paper` venue: a fake broker over a real price feed. Exercises the real execution and reconciliation path with no venue account and no capital."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+venue.workspace = true
+async-trait.workspace = true
+rust_decimal.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+plan.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
