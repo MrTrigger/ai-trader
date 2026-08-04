@@ -367,6 +367,53 @@ gapped through.
 also produced two dead candidates, so the run is not naive to it. A fresh window
 is the test that matters and it is next.
 
+## The fresh window, and the benchmark that decides it
+
+A window with **zero overlap** with anything tested: 2019-10 → 2021-10, using
+bars pulled back to 2017 so the channel warmup and history floor are satisfied
+before the first decision, and funding pulled back to 2019 so the short leg is
+costed with real data throughout.
+
+| window | | strategy | | | buy & hold BTC | | |
+|---|---|---|---|---|---|---|---|
+| | return | CAGR | Sharpe | | return | CAGR | Sharpe |
+| **fresh** 2019-10..2021-10 | +100.4% | +41.5% | **2.19** | | **+480.7%** | +140.7% | 1.09 |
+| orig 2021-10..2026-08 | +139.3% | +19.8% | **1.00** | | +43.4% | +7.7% | 0.11 |
+| **combined, chained** | **+379.5%** | +25.8% | | | **+657.8%** | +34.5% | 0.48 |
+
+**The signal survives out of sample.** Sharpe 2.19 on the fresh window against
+the 1.41 that two standard errors needs over two years; 1.00 against 0.91 over
+4.8. It clears §7.5's bar on both, independently. That is more than anything else
+in Phase 1 has managed and it is a real finding.
+
+**And it loses to buy-and-hold BTC.** +379.5% against +657.8% over the full 6.8
+years. Not marginally — by a third of the total return.
+
+### Why, and why it was predictable
+
+The split is the whole story: the strategy **beats BTC by 96 points** in the
+flat-to-falling window and **loses to it by 380 points** in the raging bull. A
+market-neutral book does not capture beta. That is not a defect in the
+implementation, it is the definition of the shape — and it means "beat
+buy-and-hold BTC" is a criterion this construction can only satisfy in regimes
+where BTC does badly.
+
+Risk-adjusted the picture inverts: worst drawdown −22.5% against BTC's −76.6%,
+and roughly 2–4× the Sharpe depending on window. **Absolute return says BTC,
+risk-adjusted return says the strategy**, and they do not resolve into one
+answer without deciding what the account is actually for.
+
+### Two things that temper the fresh-window number
+
+**Funding does 36% of the work there** — 14.79pp of a 41.48% CAGR, against 11%
+(2.22pp of 19.78%) in the original window. 2020–21 was a leverage mania and
+perp funding was extreme; a short leg earned carry simply for existing. Funding
+regimes change, and a third of that CAGR is a bet that they do not.
+
+**n = 56 periods over two years.** It clears the bar for its own length, but the
+bar scales with `sqrt(1/T)` precisely because short windows are easy to clear by
+luck.
+
 ---
 
 # Where Phase 1 stands
@@ -374,6 +421,10 @@ is the test that matters and it is next.
 Two candidates, two families, both failed. `config/default.toml` is back to the
 Phase 0 placeholder that claims no edge, because a config naming a signal that
 failed its gate is the softest possible version of shipping it.
+
+**The market-neutral shape is the only thing that measured an edge**, it holds
+out of sample, and it does not beat buy-and-hold BTC over the full period. §9.2
+also puts it out of reach before Phase 3, since it needs shorts.
 
 What the exercise did produce, and what it cost:
 

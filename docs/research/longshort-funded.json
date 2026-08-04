@@ -5,13 +5,13 @@
       "structure": "perp_long_perp_short",
       "shortability_enforced": false,
       "periods": 185,
-      "net_return": 1.500106049036987,
-      "cagr": 0.20864108374211443,
-      "volatility": 0.2874429621751732,
-      "sharpe": 1.032341189042818,
+      "net_return": 1.500088926977666,
+      "cagr": 0.20863937197667637,
+      "volatility": 0.28744318665729157,
+      "sharpe": 1.0323338223043055,
       "max_drawdown": -0.19194134085099768,
-      "mean_funding_per_period": 0.0012492137595530436,
-      "funding_annualised": 0.06513757460526585,
+      "mean_funding_per_period": 0.0012491777894629535,
+      "funding_annualised": 0.06513569902199687,
       "unshortable_dropped": 0,
       "curve": [
         [
@@ -752,7 +752,7 @@
         ],
         [
           "2026-07-31",
-          2.500106049036987
+          2.500088926977666
         ]
       ]
     },
@@ -760,13 +760,13 @@
       "structure": "perp_long_perp_short",
       "shortability_enforced": true,
       "periods": 185,
-      "net_return": 1.8145255622753815,
-      "cagr": 0.23861542905093303,
-      "volatility": 0.2874237345666931,
-      "sharpe": 1.1550278466409967,
+      "net_return": 1.8145049278198644,
+      "cagr": 0.23861355114549632,
+      "volatility": 0.28742397416599813,
+      "sharpe": 1.1550198544005679,
       "max_drawdown": -0.193467375746467,
-      "mean_funding_per_period": 0.0013148371462790988,
-      "funding_annualised": 0.068559365484553,
+      "mean_funding_per_period": 0.0013147986079908103,
+      "funding_annualised": 0.06855735598809226,
       "unshortable_dropped": 679,
       "curve": [
         [
@@ -1507,7 +1507,7 @@
         ],
         [
           "2026-07-31",
-          2.8145255622753815
+          2.8145049278198644
         ]
       ]
     },
@@ -1515,13 +1515,13 @@
       "structure": "spot_long_perp_short",
       "shortability_enforced": true,
       "periods": 185,
-      "net_return": 1.3931576892257707,
-      "cagr": 0.19776284972224412,
-      "volatility": 0.28530524520998224,
-      "sharpe": 0.9993670986688417,
+      "net_return": 1.3931284618082174,
+      "cagr": 0.1977598246188339,
+      "volatility": 0.28530563552489724,
+      "sharpe": 0.9993539335156242,
       "max_drawdown": -0.22541121553624066,
-      "mean_funding_per_period": 0.000425959504391947,
-      "funding_annualised": 0.022210745586151524,
+      "mean_funding_per_period": 0.00042589529943699205,
+      "funding_annualised": 0.022207397756357442,
       "unshortable_dropped": 679,
       "curve": [
         [
@@ -2262,7 +2262,7 @@
         ],
         [
           "2026-07-31",
-          2.3931576892257707
+          2.3931284618082174
         ]
       ]
     }
