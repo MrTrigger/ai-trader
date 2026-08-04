@@ -487,10 +487,12 @@ def combined_section(record: dict) -> str:
         '<p class="finding"><strong>The regime tilt does what the flat line could not.</strong> '
         'The market-neutral book is the steady grind that never captures a move in either '
         'direction. Tilting net exposure by the benchmark\'s own channel state - gross held '
-        'at 1.0 throughout, so no leverage - beats buy-and-hold BTC outright while keeping a '
-        'drawdown roughly a quarter of its depth. The tilt sits at the centre of a five-wide '
-        'plateau and improves Sharpe in both windows independently, which is what separates '
-        'it from a fitted parameter.</p></section>'
+        'at 1.0 throughout, so no leverage - beats buy-and-hold BTC by a wide margin while '
+        'holding a drawdown around a quarter of its depth. Two parameters, each sitting at '
+        'the centre of a five-wide plateau and each improving the WORSE of the two windows: '
+        'a tilt of 0.15, and a 48-day channel for reading the regime rather than the 144-day '
+        'one used to pick assets. The market state has to be read faster than the positions '
+        'are chosen.</p></section>'
     )
 
 

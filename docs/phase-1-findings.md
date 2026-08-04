@@ -483,6 +483,71 @@ quarter of its depth.** Both windows clear §7.5's Sharpe bar independently —
 - **It needs shorts**, so §9.2 puts it behind Phase 3 and §10.1's venue decision
   regardless of how good the number is.
 
+## Reading the market faster than the positions
+
+A challenge worth recording, because testing it changed the answer: *is the
+level test the right regime mechanism? If BTC is crashing we should not wait
+until it is below the filter.*
+
+**Measured first.** How late does a level test turn defensive?
+
+| | 2021-11 top | |
+|---|---|---|
+| BTC peak 2021-11-08 at 67,526 | | |
+| leaves "up" (below upper band) | +10d | **−15.7%** from peak |
+| turns "down" (below filter) | +14d | **−16.7%** from peak |
+| filter slope turns negative | +32d | **−30.2%** from peak |
+
+The concern is real — 16.7% before turning defensive. But the *proposed fix is
+worse*: the derivative of a 4-pole 144-day filter lags **more** than price
+crossing it, because smoothing is exactly what a derivative of a smoothed series
+inherits. Tested in the strategy rather than argued about:
+
+| regime | fresh Sharpe | fresh maxDD | orig Sharpe | orig maxDD | combined |
+|---|---|---|---|---|---|
+| level, 144d (was) | 2.82 | −9.9% | 1.14 | −16.5% | +787.7% |
+| **filter slope** | 2.69 | −22.8% | **0.83** | **−28.1%** | +613.6% |
+| continuous position | 3.00 | −9.7% | 0.99 | −19.3% | +716.9% |
+
+Slope is worst in both windows. Refuted.
+
+**The instinct was right about the wrong thing.** What was too slow was not the
+*test* but the *instrument*: a 144-day channel is the right timescale for
+deciding which assets to hold and the wrong one for deciding how exposed to be.
+Sweeping the regime channel's period, tilt pinned at 0.15:
+
+| period | fresh CAGR | fresh Sharpe | orig CAGR | orig Sharpe | combined | min Sharpe |
+|---|---|---|---|---|---|---|
+| 12 | 23.5% | 1.08 | 31.3% | 1.56 | +468.6% | 1.08 |
+| 18 | 26.5% | 1.21 | 35.6% | 1.70 | +599.1% | 1.21 |
+| 24 | 38.2% | 1.67 | 36.4% | 1.74 | +758.4% | 1.67 |
+| 36 | 50.5% | 1.99 | 35.9% | 1.72 | +899.8% | 1.72 |
+| **48** | **65.2%** | **2.76** | **36.8%** | **1.74** | **+1142.0%** | **1.74** |
+| 72 | 67.7% | 2.84 | 31.6% | 1.53 | +961.9% | 1.53 |
+| 96 | 81.9% | 3.15 | 31.9% | 1.53 | +1164.0% | 1.53 |
+| 144 | 81.1% | 2.82 | 22.8% | 1.14 | +787.7% | 1.14 |
+
+    beats the 144d baseline on BOTH min-Sharpe and combined return at 24..96
+    regime_channel_period: plateau 24..96 (width 5), centre 48
+
+A second genuine plateau. The criterion is deliberately the **worse** of the two
+windows — improving the good window while wrecking the bad one is how a
+parameter gets fitted — and 48 raises that floor from 1.14 to 1.74.
+
+### Where that leaves the construction
+
+| | total return | worst-window drawdown |
+|---|---|---|
+| market-neutral (no tilt) | +379.5% | −22.5% |
+| regime-tilted, 144d read | +787.7% | −16.5% |
+| **regime-tilted, 48d read** | **+1142.0%** | −19.5% |
+| buy & hold BTC | +658.6% | −74.2% |
+
+Two parameters, each at the centre of a five-wide plateau, each chosen on the
+worse window: **tilt 0.15, regime period 48**. The principle underneath is worth
+keeping even if the numbers move: *the market state has to be read faster than
+the positions are chosen.*
+
 ---
 
 # Where Phase 1 stands
