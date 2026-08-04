@@ -414,6 +414,75 @@ regimes change, and a third of that CAGR is a bet that they do not.
 bar scales with `sqrt(1/T)` precisely because short windows are easy to clear by
 luck.
 
+## The regime tilt: keeping the edge, stopping being flat through the big moves
+
+The market-neutral book grinds steadily upward and sits out every large
+directional move, up and down. The hypothesis: point the **same detector already
+used on each asset** at the benchmark, and let its channel state decide how much
+net exposure the book carries.
+
+    BTC above its upper channel   -> tilt net LONG
+    BTC below its channel filter  -> tilt net SHORT
+    in between                    -> stay neutral
+
+**Gross stays at 1.0 in every state** — only the split moves, so this is not
+leverage and §9.2 still holds:
+
+    up:      long 0.5+t,  short 0.5-t
+    down:    long 0.5-t,  short 0.5+t
+    flat:    long 0.5,     short 0.5
+
+`t = 0` is exactly the book already measured, so the sweep carries its own
+control: any setting that fails to beat that column has added nothing.
+
+| tilt | fresh CAGR | fresh Sharpe | fresh maxDD | orig CAGR | orig Sharpe | orig maxDD |
+|---|---|---|---|---|---|---|
+| 0.00 | 41.5% | 2.19 | −20.5% | 19.8% | 1.00 | −22.5% |
+| 0.05 | 54.2% | 2.60 | −16.5% | 21.1% | 1.10 | −18.4% |
+| 0.10 | 67.4% | 2.79 | −13.0% | 22.2% | **1.15** | −14.1% |
+| **0.15** | **81.1%** | **2.82** | **−9.9%** | **22.8%** | 1.14 | −16.5% |
+| 0.20 | 95.1% | 2.78 | −13.3% | 23.1% | 1.09 | −20.8% |
+| 0.25 | 109.4% | 2.71 | −16.7% | 23.1% | 1.02 | −25.0% |
+| 0.30 | 124.0% | 2.64 | −20.6% | 22.6% | 0.96 | −29.2% |
+| 0.40 | 153.5% | 2.50 | −28.7% | 20.6% | 0.83 | −45.9% |
+
+    improves Sharpe in BOTH windows at: 0.05, 0.10, 0.15, 0.20, 0.25
+    regime_tilt: plateau 0.05..0.25 (width 5), centre 0.15
+
+**A real plateau, not a peak.** Five settings wide, improving Sharpe in each
+window *independently*, with the centre at 0.15. That is the distinction the
+plateau rule exists to draw, and it is the first time in Phase 1 that a sweep has
+produced one.
+
+**Drawdown improves alongside return**, which is the unusual part. Adding
+directional exposure normally buys return with risk; here 0.10–0.15 is better on
+both axes than 0.00 in both windows. The mechanism is that the tilt goes *short*
+in downtrends, so the 2022 decline that mauled every long-only variant is
+partially harvested rather than merely avoided.
+
+### Against the benchmark, chained across both windows
+
+| | total return | worst-window drawdown |
+|---|---|---|
+| market-neutral (tilt 0) | +379.5% | −22.5% |
+| **regime-tilted (0.15)** | **+787.7%** | **−16.5%** |
+| buy & hold BTC | +658.6% | −74.2% |
+
+**It beats buy-and-hold BTC on absolute return and holds a drawdown roughly a
+quarter of its depth.** Both windows clear §7.5's Sharpe bar independently —
+2.82 against 1.41 on the fresh window, 1.14 against 0.91 on the original.
+
+### What is still not established
+
+- **Two windows, 241 periods.** Better than one, still not many.
+- **The tilt shares an indicator family with the selection signal.** Both read a
+  Gaussian channel, so they are not independent bets and a regime where that
+  detector fails would hurt twice.
+- **Funding assumptions carry through** unchanged, and still exclude borrow,
+  squeeze and liquidity-at-size.
+- **It needs shorts**, so §9.2 puts it behind Phase 3 and §10.1's venue decision
+  regardless of how good the number is.
+
 ---
 
 # Where Phase 1 stands

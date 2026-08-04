@@ -484,11 +484,13 @@ def combined_section(record: dict) -> str:
         '<div class="scroll"><table class="data"><thead><tr><th>full period</th>'
         '<th class="num">total return</th><th class="num">max drawdown</th></tr></thead>'
         '<tbody>' + totals + '</tbody></table></div>'
-        '<p class="finding"><strong>Absolute return says BTC; risk-adjusted says the neutral '
-        'book.</strong> BTC ends 279 points higher and spent the 2022 bear more than 74% '
-        'below its peak. The neutral book never lost more than 22.5%, and beat BTC outright '
-        'in the window where BTC went nowhere. Which of those is the better outcome is a '
-        'question about what the account is for, not one the data answers.</p></section>'
+        '<p class="finding"><strong>The regime tilt does what the flat line could not.</strong> '
+        'The market-neutral book is the steady grind that never captures a move in either '
+        'direction. Tilting net exposure by the benchmark\'s own channel state - gross held '
+        'at 1.0 throughout, so no leverage - beats buy-and-hold BTC outright while keeping a '
+        'drawdown roughly a quarter of its depth. The tilt sits at the centre of a five-wide '
+        'plateau and improves Sharpe in both windows independently, which is what separates '
+        'it from a fitted parameter.</p></section>'
     )
 
 
