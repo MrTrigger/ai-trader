@@ -496,6 +496,65 @@ def combined_section(record: dict) -> str:
     )
 
 
+def candidates_table(cands: list[dict]) -> str:
+    """Every candidate, with how much search preceded it.
+
+    The `searched` column is the one that matters and it is why this is a table
+    rather than a leaderboard. Sorting by return would put the least trustworthy
+    row on top: a result found after eighty-eight configurations on two windows
+    is not the same kind of evidence as one hypothesis tested once, and a table
+    that does not say so is actively misleading. Rows are therefore in the order
+    they were *reached*, not the order they score.
+    """
+    def cell(v, pct=True, places=1):
+        if v is None:
+            return '<td class="num muted">—</td>'
+        return f'<td class="num">{v * 100:.{places}f}%</td>' if pct else f'<td class="num">{v:.2f}</td>'
+
+    body = ""
+    for c in cands:
+        trust = (
+            "no" if c["configs"] >= 88
+            else ("thin" if c["configs"] >= 40 else "ok")
+        )
+        body += (
+            f'<tr class="shape-{_esc(c["shape"])}">'
+            f'<td>{_esc(c["name"])}</td>'
+            f'<td class="mono-s">{_esc(c["shape"])}</td>'
+            + cell(c["fresh"]) + cell(c["fs"], pct=False) + cell(c["fdd"])
+            + cell(c["orig"]) + cell(c["os"], pct=False) + cell(c["odd"])
+            + cell(c["combined"])
+            + f'<td class="num">{c["configs"]}</td>'
+            f'<td><span class="ev ev-{trust}">{_esc(c["evidence"])}</span></td>'
+            f'<td class="note-cell">{_esc(c["note"])}</td></tr>'
+        )
+
+    return (
+        '<section><h2>Every candidate</h2>'
+        '<p class="note">In the order they were reached, not the order they score. '
+        '<strong>The <em>searched</em> column is the one to read first</strong> — a result '
+        'found after eighty-eight configurations on two windows is not the same kind of '
+        'evidence as one hypothesis tested once, and sorting by return would put the least '
+        'trustworthy row on top.</p>'
+        '<div class="scroll"><table class="data cands"><thead>'
+        '<tr><th rowspan="2">candidate</th><th rowspan="2">shape</th>'
+        '<th colspan="3">fresh 2019-10..2021-10</th>'
+        '<th colspan="3">orig 2021-10..2026-08</th>'
+        '<th rowspan="2" class="num">combined</th>'
+        '<th rowspan="2" class="num">searched</th>'
+        '<th rowspan="2">evidence</th><th rowspan="2">note</th></tr>'
+        '<tr><th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th>'
+        '<th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th></tr>'
+        '</thead><tbody>' + body + '</tbody></table></div>'
+        '<p class="finding"><strong>The row to trust is <em>market-neutral</em>, not the one '
+        'at the bottom.</strong> It is the only line here tested once, on a window that had '
+        'never informed it. Everything below it was reached by searching the same two windows, '
+        'and by the last row both of them have set parameters — so neither is out-of-sample '
+        'any more and the number is a description of this data rather than a prediction about '
+        'any other. The bottom row also doubles the drawdown to get there.</p></section>'
+    )
+
+
 # --- page -------------------------------------------------------------------
 
 
@@ -690,6 +749,7 @@ def render(record: dict) -> str:
 </section>
 
 {combined_section(record["combined"]) if record.get("combined") else ""}
+{candidates_table(record["combined"]["candidates"]) if record.get("combined", {}).get("candidates") else ""}
 
 <section>
   <h2>Walk-forward, out of sample</h2>
@@ -760,7 +820,7 @@ CSS = """
   --ground: #f9f9f7; --surface: #fcfcfb;
   --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --rule: #e1e0d9; --axis: #c3c2b7; --hair: rgba(11,11,11,0.10);
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
   --good: #0ca30c; --critical: #d03b3b;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -774,7 +834,7 @@ CSS = """
     --ground: #0d0d0d; --surface: #1a1a19;
     --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --rule: #2c2c2a; --axis: #383835; --hair: rgba(255,255,255,0.10);
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
   }
 }
 :root[data-theme="light"] .viz-root {
@@ -782,14 +842,14 @@ CSS = """
   --ground: #f9f9f7; --surface: #fcfcfb;
   --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --rule: #e1e0d9; --axis: #c3c2b7; --hair: rgba(11,11,11,0.10);
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
 }
 :root[data-theme="dark"] .viz-root {
   color-scheme: dark;
   --ground: #0d0d0d; --surface: #1a1a19;
   --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
   --rule: #2c2c2a; --axis: #383835; --hair: rgba(255,255,255,0.10);
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
 }
 .viz-root * { box-sizing: border-box; }
 .viz-root :focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
@@ -856,6 +916,19 @@ table.crit td:nth-child(2) { font-family: var(--sans); font-size: 13.5px; }
   white-space: nowrap; }
 .data tbody tr:last-child td { border-bottom: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
+.cands th { text-align: center; }
+.cands th[rowspan] { text-align: left; vertical-align: bottom; }
+.cands th.num { text-align: right; }
+.cands td:first-child { white-space: nowrap; font-weight: 500; }
+.mono-s { color: var(--muted); font-size: 11px; }
+.note-cell { white-space: normal; min-width: 15rem; color: var(--ink-2);
+  font-family: var(--sans); font-size: 12.5px; }
+td.muted { color: var(--muted); }
+.ev { font-size: 10.5px; padding: 2px 6px; border: 1px solid currentColor;
+  white-space: nowrap; }
+.ev-ok { color: var(--good); }
+.ev-thin { color: var(--ink-2); }
+.ev-no { color: var(--critical); }
 
 .chart-wrap { position: relative; }
 .chart { width: 100%; height: auto; display: block; }
@@ -867,10 +940,12 @@ table.crit td:nth-child(2) { font-family: var(--sans); font-size: 13.5px; }
 .line.s1, .dot.s1 { stroke: var(--s1); }
 .line.s2, .dot.s2 { stroke: var(--s2); }
 .line.s3, .dot.s3 { stroke: var(--s3); }
+.line.s4, .dot.s4 { stroke: var(--s4); }
 .dot { fill: var(--surface); stroke-width: 2; }
 .endlabel { font-size: 11px; font-family: var(--mono); font-weight: 600; }
 .endlabel.s1 { fill: var(--s1); } .endlabel.s2 { fill: var(--s2); }
 .endlabel.s3 { fill: var(--s3); }
+.endlabel.s4 { fill: var(--s4); }
 .fold { fill: var(--rule); opacity: .5; }
 .fold-label { fill: var(--muted); font-size: 9px; font-family: var(--mono);
   letter-spacing: .1em; }
