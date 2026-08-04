@@ -21,13 +21,14 @@ Later, the same engine runs equities through a second venue adapter and a real m
 |---|---|---|
 | `api`, frontend | Rust (axum + sqlx), React + TS (Vite, Tailwind) | same as `trading-journal` |
 | `executor` | Rust | long-running, holds trade credentials, needs explicit error handling |
-| `planner`, backtest, validation | Python | scipy/cvxpy/pandas, and the backtest harness is Python |
+| `planner`, backtest, validation | Python | Phase 1 is almost entirely research loop — sweeps, holdouts, factors discarded by the dozen — and that is what Python is best at |
 | State | Postgres (operational) + Parquet (bars, features, scores) | |
 
-The split is not a preference — it's forced by [§0.1](docs/design-spec.md#0-guiding-principles-non-negotiable):
-research and live must be **one** implementation of the decision path, and that path is Python
-because the harness is. The immutable Plan row is the boundary between the two languages, and its
-schema is generated from one source with a CI round-trip test.
+[§0.1](docs/design-spec.md#0-guiding-principles-non-negotiable) requires research and live to be
+**one** implementation of the decision path — which is satisfied by the backtest being
+`pipeline.run()` replayed over history, not by the choice of language. The language choice rests on
+where the work is, and Phase 1's work is research. The immutable Plan row is the boundary between
+the two languages, checked by a CI round-trip test against a shared JSON Schema.
 
 See [design spec §3.5](docs/design-spec.md#35-implementation-stack-and-why-it-is-split).
 
@@ -103,8 +104,28 @@ That command is **a lens, not a decision** — nothing in the decision path cons
 the factor set it displays is a candidate cross-section that has never been near the harness and
 claims no edge. It exists so the strategy can be chosen against evidence rather than argument.
 
-Still to come in Phase 1: a real signal, and the full backtest through the harness. **The strategy
-itself is undecided on purpose** — see
+**The backtest is `pipeline.run()` replayed over history** — the same function the live planner
+calls, with its orders filled against the bar that opened at each decision timestamp. There is no
+second engine, and that is the point: §0.1 requires research and live to be one implementation of
+steps 1–8, and this satisfies it by construction rather than by discipline.
+
+Causality has two mechanisms and neither depends on remembering to be careful. `store.read(until=)`
+never loads a bar past the horizon, so a bar the decision may not use is absent rather than
+ignored. And fills land on the bar that *opens* at the decision timestamp — the one the planner
+excluded as still forming — which is the earliest honest price. Filling at that bar's close would
+be a free look at a whole interval.
+
+```bash
+ai-trader backtest --start 2026-01-01 --end 2026-08-01           # with the 2× slippage error bar
+ai-trader backtest --start 2026-01-01 --end 2026-08-01 --nav out.csv
+```
+
+Dates where a gate would have failed live produce no plan here either, are absent from every
+number, and are counted in the disclosures — a backtest that silently traded through a gate failure
+measures a system that does not exist.
+
+Still to come in Phase 1: a real signal, plateau-not-peak sweeps, and walk-forward splits. **The
+strategy itself is undecided on purpose** — see
 [§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved).
 
 ### Two known gaps, recorded so they are not rediscovered
@@ -143,8 +164,15 @@ The journal records *a human's* discretionary futures trades and the judgment be
 manages a book automatically. Different core record, different uptime requirements, different blast
 radius. They unify at the read layer (a portfolio view / MCP over both), never at the write layer.
 
-The journal's `backtest/` harness is reused in place — its causality guarantee and walk-forward
-validation are what Phase 1's gate is measured with. Not vendored, not extracted yet.
+**There is no dependency on the journal's `backtest/` harness, and there should not be.** That
+harness measures discrete futures trades in R-multiples over New York sessions, one position at a
+time; every module in its `validate/` package imports its own engine directly. This project
+measures a continuously rebalanced multi-asset book, and an R-multiple is undefined for a position
+that is resized rather than stopped out. What is inherited is the *discipline* — prefix-invariance
+causality testing, plateau-not-peak sweeps, cost sensitivity as an error bar, disclosure-first
+ordering, every number with its `n`. See
+[§2](docs/design-spec.md#2-what-is-inherited-from-trading-journalbacktest-and-what-is-not) for the
+evidence behind that call.
 
 ## Deliberately undecided
 
@@ -162,5 +190,6 @@ Also open, and belonging to a human rather than to an agent:
 - Phase 2's **"≥6 weeks paper"** is an invented number, not a derived one.
 - The [§5.2](docs/design-spec.md#52-tables-sketch--refine-in-phase-0) table sketch is worth a review
   before Phase 1 hardens the schema.
-- Whether `trading-journal/backtest` stays a path dependency or gets extracted
-  ([§2](docs/design-spec.md#2-reused-not-rebuilt) says Phase 4+, deliberately).
+- The **strategy** ([§10.2](docs/design-spec.md#10-open-questions-unresolved-and-how-they-get-resolved)).
+  `ai-trader scores` exists so this gets decided against evidence; nothing downstream can be
+  finished until it is.

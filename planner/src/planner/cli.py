@@ -21,6 +21,7 @@ import polars as pl
 
 from . import inspect as inspect_mod
 from . import plan as plan_mod
+from . import backtest as backtest_mod
 from . import features, pipeline, scores, state, store, universe
 from .config import Config, DEFAULT_CONFIG_PATH
 from .sources import BinancePublic
@@ -256,6 +257,77 @@ def cmd_scores(args) -> int:
     return 0
 
 
+def cmd_backtest(args) -> int:
+    """Replay the decision path over history.
+
+    Not a second engine: this calls the same `pipeline.run` the live planner
+    calls, fills its orders against the bar that opened at each decision
+    timestamp, and steps forward (design spec §2.3).
+    """
+    config = _config(args)
+    start, end = _utc(args.start), _utc(args.end)
+
+    multiples = tuple(Decimal(m) for m in args.slippage)
+    runs = backtest_mod.sensitivity(
+        config=config,
+        start=start,
+        end=end,
+        data_root=Path(args.data_root),
+        initial_cash=Decimal(args.cash),
+        multiples=multiples,
+    )
+
+    baseline = runs[0]
+    if not baseline.steps:
+        print("no rebalance produced a plan; nothing to report", file=sys.stderr)
+        for note in baseline.disclosures:
+            print(f"  ! {note}", file=sys.stderr)
+        return 2
+
+    # Disclosures first. Everything below is read through them.
+    print("DISCLOSURES (read before any number below)")
+    for note in baseline.disclosures:
+        print(f"  ! {note}")
+    print()
+
+    print(f"window   {start.date()} .. {end.date()}   interval {config.interval_s}s")
+    print(f"ruleset  {config.ruleset_version}   signal {config.signal}")
+    print(f"features {features.FEATURE_SET_VERSION}   constructor {config.constructor}")
+
+    print(f"\n{'slippage':<10}{'n':>6}{'return':>10}{'CAGR':>9}{'vol':>8}"
+          f"{'Sharpe':>8}{'maxDD':>9}{'turnover':>10}{'cost bps':>10}")
+    for run in runs:
+        m = run.metrics
+        print(
+            f"{str(run.slippage_multiple) + 'x':<10}{m.n:>6}"
+            f"{float(m.total_return) * 100:>9.2f}%{m.cagr * 100:>8.2f}%"
+            f"{m.volatility * 100:>7.1f}%{m.sharpe:>8.2f}"
+            f"{float(m.max_drawdown) * 100:>8.2f}%"
+            f"{float(m.turnover_per_rebalance) * 100:>9.2f}%{float(m.cost_drag_bps):>10.1f}"
+        )
+
+    if len(runs) > 1:
+        survived = runs[-1].metrics.total_return > 0 and baseline.metrics.total_return > 0
+        print(
+            f"\n2x slippage is an error bar, not a parameter (§2.2). "
+            f"{'Result survives it.' if survived else 'Result does not survive it.'}"
+        )
+
+    if baseline.metrics.insufficient_sample:
+        print(
+            f"\nRead none of the above as evidence of edge: {baseline.metrics.n} rebalances. "
+            "§7.5 argues no paper or backtest run of a plausible length establishes a modest one."
+        )
+
+    if args.nav:
+        path = Path(args.nav)
+        rows = "\n".join(f"{ts.isoformat()},{nav}" for ts, nav in baseline.nav_series)
+        path.write_bytes(("ts_utc,nav\n" + rows + "\n").encode("utf-8"))
+        print(f"\nNAV series written to {path}")
+
+    return 0
+
+
 def cmd_plan(args) -> int:
     config = _config(args)
     as_of = _utc(args.as_of) if args.as_of else datetime.now(timezone.utc).replace(
@@ -416,6 +488,19 @@ def build_parser() -> argparse.ArgumentParser:
     binit.add_argument("--force", action="store_true")
     binit.set_defaults(func=cmd_book_init)
     book.add_parser("show", help="current holdings").set_defaults(func=cmd_book_show)
+
+    bt = sub.add_parser("backtest", help="replay the decision path over history")
+    bt.add_argument("--start", required=True, help="first decision timestamp, ISO 8601")
+    bt.add_argument("--end", required=True, help="last decision timestamp, inclusive")
+    bt.add_argument("--cash", default="100000", help="starting cash")
+    bt.add_argument(
+        "--slippage",
+        nargs="+",
+        default=["1", "2"],
+        help="slippage multiples to run as error bars (default: 1 2)",
+    )
+    bt.add_argument("--nav", help="write the NAV series to this CSV")
+    bt.set_defaults(func=cmd_backtest)
 
     sc = sub.add_parser("scores", help="the scored cross-section (a lens, not a decision)")
     sc.add_argument("--as-of", help="decision timestamp, ISO 8601 (default: today UTC)")

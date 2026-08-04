@@ -79,27 +79,60 @@ shape is unguessable before then.
 
 ---
 
-## 2. Reused, not rebuilt
+## 2. What is inherited from `trading-journal/backtest`, and what is not
 
-`trading-journal/backtest/` is the most valuable existing asset for this project and it is already
-a standalone Python package that the journal image never touches. It carries:
+**The discipline, not the code. There is no dependency.** An earlier draft of this section called
+for a path dependency on that package. Reading it rather than describing it showed that would not
+work, and the reasons are worth recording so the question is not reopened by someone who has only
+read the summary.
+
+### 2.1 Why the code does not transfer
+
+| | `trading-journal/backtest` | what this project needs |
+|---|---|---|
+| Unit of analysis | a **discrete trade** — entry, stop, target | a **continuously rebalanced book** of weights |
+| Headline metric | `expectancy_r`, `win_rate`, `net_r` — R-multiples | NAV series, drawdown, turnover, cost drag |
+| Splits | by **session**, attributed by session date | by UTC date; there are no sessions |
+| Position model | `engine/portfolio.py`: one position at a time, `max_trades_per_day`, `daily_stop_r` | 20 names concurrently, sized by weight |
+| Causality device | `BarCursor` — a one-way walk over **one session's** bars, single instrument | a **cross-sectional** cursor: every asset's row at time *T* |
+| Stated ceiling | its README: *"It cannot validate an edge"* — "not obviously broken" | §9 Phase 1: expectancy after costs, 2× slippage, walk-forward |
+
+The decisive detail is that `validate/` is **not a harness parameterised over a strategy**. Every
+substantive module in it — `sweep`, `walkforward`, `sensitivity`, `report` — does
+`from ..engine import run_backtest, Rules, RunConfig`. It is wired to that engine's signature and
+to rule files with fields like `stop_offset_ticks` and `trigger_offset_ticks`. `sweep.SWEEPABLE`
+is a hardcoded list of them. None of those concepts exist here.
+
+Only `splits.py` and `metrics.py` are engine-free, and both are trade-and-session shaped.
+
+An R-multiple is undefined for a position that is resized every rebalance rather than exited at a
+stop. That is not an impedance mismatch to adapt around; it is a different measurement.
+
+### 2.2 What is inherited
+
+Principles, and they are worth as much as they ever were:
 
 - the **causality guarantee** — build features over full history, rebuild over every prefix,
   require row *i* identical both times. A feature is causal exactly when deleting the future
-  doesn't change it. This is the single most important test this project will inherit.
-- `engine/causal.py` — a cursor that **raises** on lookahead rather than discouraging it.
-- `validate/` — holdout + walk-forward splits by session, one-axis sweeps that report **the
-  plateau's centre, never the peak**, cost and intrabar sensitivity error bars, and the
-  disclosure-first report ordering (what was *not* enforced, before any number).
+  doesn't change it. Reimplemented here in `planner/tests/test_features.py`, ~40 lines.
+- **lookahead should raise, not be discouraged.** The equivalent here is `store.read(until=...)`
+  and `pipeline.usable_horizon`: a bar newer than the horizon is never loaded, so it cannot be read.
+- **report the plateau's centre, never the peak**, and sweep one axis at a time.
+- **cost sensitivity as an error bar, not a parameter** — re-run at 2× slippage and see what
+  survives. §9's Phase 1 gate is stated in exactly these terms.
+- **disclosure-first ordering** — what was *not* enforced, before any number.
+- **every number carries its `n`**, and an inadequate sample says so above the result.
 
-**Do not extract it into a shared package yet.** Depend on it in place (path/git dependency) until
-this repo is a real second consumer with real requirements. Pre-factoring against an imagined
-consumer produces the wrong interface. Extraction is a Phase 4+ decision.
+### 2.3 What the backtest here actually is
 
-What must be adapted, not copied: the harness is session-anchored to `America/New_York` with a
-trade date rolling at 18:00 ET. Crypto is 24/7 with no sessions. The **calendar is an interface**
-(§4.3), and the crypto implementation is "always open, UTC days". Equities later reuses the
-harness's existing session logic almost verbatim.
+`pipeline.run(as_of=T)` replayed over history with a simulated fill model, accumulating a NAV
+series. That is not a convenience — it is the only construction that satisfies §0.1, because the
+backtest and the live run are then *literally the same function*. A harness with its own engine
+cannot provide that no matter how good the engine is, which is the deeper reason the dependency
+was the wrong idea rather than merely an awkward one.
+
+Extraction of anything shared into a common package remains a Phase 4+ decision, and now needs a
+second consumer that actually wants the same abstraction — which, per §2.1, this one does not.
 
 ---
 
@@ -193,14 +226,29 @@ conventions inherited from the harness; adapters convert at the boundary and nev
 |---|---|---|
 | `api`, frontend | **Rust + React/TS** | Directly the journal's pattern. No reason to differ. |
 | `executor`, venue adapters | **Rust** | A long-running process holding trade credentials. Explicit error types, no GIL, no silent `None`/float surprises, real retry and idempotency discipline. Rust is *better* here, not merely acceptable. |
-| `planner` (steps 1–8), backtest, validation | **Python** | scipy/cvxpy for MVO, pandas/numpy for the feature frame, statsmodels for cross-sectional regression, and the Anthropic SDK. No mature Rust equivalent for the optimiser or the harness. |
+| `planner` (steps 1–8), backtest, validation | **Python** | The research loop lives here — sweeps, holdouts, notebooks, candidate factors thrown away by the dozen — and Phase 1 is almost entirely research loop. Plus cvxpy for MVO, statsmodels for cross-sectional regression, and the Anthropic SDK. |
 
-**The decisive constraint is §0.1, not library convenience.** The research path and the live path
-must be *one* implementation of steps 1–8, or the Phase 1 gate measures nothing. The backtest
-harness is Python and is reused in place (§2). Therefore the planner is Python — because the
-alternative is two implementations of the strategy, which is the failure mode this whole document
-exists to prevent. Rewriting steps 1–8 in Rust means rewriting the harness too, and then
-maintaining the *equivalence* of two numerical stacks forever.
+**§0.1 constrains the shape, not the language.** The research path and the live path must be *one*
+implementation of steps 1–8 or the Phase 1 gate measures nothing — which is why the backtest is
+`pipeline.run()` replayed over history (§2.3) rather than a second engine. That requirement is
+satisfied by construction and would be satisfied in either language.
+
+So the language choice rests on where the work actually is. Phase 1 is "the whole project" (§9) and
+Phase 1 is research: score a factor, sweep an axis, look at a plateau, discard it. Python is best
+at that and Rust is worst at it, and no amount of `polars` closes that particular gap.
+
+**Two arguments deliberately *not* made here**, because both have been checked and neither holds:
+
+- *"The library gap forces it."* It is narrower than it looks. `polars` is Rust-native and beats
+  pandas for a feature frame; `clarabel`, the solver cvxpy would dispatch `mvo` to, is itself a
+  Rust crate; Ledoit–Wolf shrinkage is thirty lines. On libraries alone this would be close.
+- *"The harness is Python, so the planner must be."* This was the original argument and it was
+  wrong — see §2.1. Steps 1–8 were never going to run through that harness, so a Rust planner
+  would not have meant rewriting it.
+
+The cost of the split is real and accepted: a JSON Schema, a fixture, a cross-language CI job, two
+images, and one CRLF bug already paid for. It buys a security property worth having on its own
+(§3.3) — the process that decides holds no key that can trade.
 
 **The Plan is the process boundary**, and it already had the right shape for this: immutable,
 schema'd, risk-cleared, persisted, and addressed by id (§5.3, §8.2). Rust never needs to know how
