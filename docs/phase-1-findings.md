@@ -239,6 +239,67 @@ output. Re-running 90 minutes to add fold detail to a candidate that a width-1
 plateau has already retired would be one-more-analysis on a settled question, so
 it was not done.
 
+## The structural probe: it was the constraint, not the signal
+
+Both candidates showed a weak *relative* signal and lost *absolutely*. That is a
+shape problem rather than a strategy problem, and it is cheap to test: what would
+a **market-neutral** version of the same signals have returned?
+
+Construction is deliberately crude and pessimistic — dollar-neutral 50/50, gross
+1.0, no leverage, equal weight within each leg, forward returns `mark_open` to
+`mark_open`, costs charged on measured name turnover, and re-run at 2× slippage.
+**No borrow, no funding, no squeeze risk**, all of which are real and would make
+it worse. The number is therefore an *upper bound* on what the shape could
+deliver, which is the useful direction for a go/no-go.
+
+| signal | n | gross | net | net @2× | CAGR | vol | Sharpe | maxDD |
+|---|---|---|---|---|---|---|---|---|
+| `xs_momentum` | 253 | −1.34% | −8.48% | −10.42% | −1.82% | 25.0% | 0.07 | −46.69% |
+| `gc_breakout` | 185 | +104.20% | +96.99% | +94.98% | +15.05% | 28.9% | **0.81** | −21.10% |
+
+Momentum is flat even market-neutral, which closes it for good: the signal is
+dead in every shape. **The breakout signal is not.** Long-only it lost 78%;
+market-neutral it returns +97% after costs and +95% at 2× slippage.
+
+### Three checks that could have killed it, and did not
+
+**Is it just short beta?** GC longs what is above its channel and shorts what is
+below, and beaten-down alts are typically higher beta — so a "neutral" book could
+be a disguised short. Measured: long leg beta +1.148, short leg +1.272, **net
+−0.062** (t = −6.45, net-short in 66% of periods). Statistically unambiguous and
+economically tiny — and BTC *rose* over this window, so a −0.062 tilt was a small
+drag on the result, not its source.
+
+**Did one regime carry it?** Net return by sub-period: **+19.9%** through the
+2021–22 bear, **+25.1%** through the 2023 recovery, **+28.5%** across 2024–26. It
+made money in all three, which is what a short-beta bet would not do.
+
+**Does it depend on an arbitrary pick?** The probe took the alphabetically-first
+ten names per leg. Re-run holding *every* above-band name against *every*
+below-band name: Sharpe 0.81 vs 0.80, net +98.95% vs +95.86%. The effect does not
+live in the selection.
+
+### It still does not clear the bar
+
+§7.5's arithmetic, applied to this window: the standard error on an estimated
+Sharpe is roughly `sqrt(1/T)` = **0.455** over 4.8 years, so two standard errors
+needs **Sharpe > 0.91**. This is 0.81. It is the best thing measured in Phase 1 by
+a wide margin, it survives every check aimed at it, and it **does not establish an
+edge** — exactly as §7.5 warns no run of this length can.
+
+Nor is it runnable. §9.2 puts leverage above 1× out of scope before Phase 3, and
+shorting spot needs margin. Borrow cost, funding and availability on beaten-down
+alts are all unmodelled and all cut the same way.
+
+### What it changes
+
+**The long-only constraint, not the signal, is what killed `gc_breakout`.** That
+is a roadmap fact rather than a strategy: it says the next useful move is not a
+third indicator but a decision about *when this shape becomes reachable*, which
+is a venue question (§10.1) and a Phase 3 question. It also gives §6's
+`max_net_exposure` — currently unenforced because "it needs shorts to be
+meaningful" — a concrete future.
+
 ---
 
 # Where Phase 1 stands
