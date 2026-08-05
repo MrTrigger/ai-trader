@@ -1660,3 +1660,71 @@ being one.
 Three levers extend it, each trading edge for capacity: execute across several
 hours rather than one (participation falls linearly), hold more names (smaller
 orders each), or drop the least liquid assets from the universe.
+
+## Capacity-aware construction: a liquidity cap, a waterfall, and a scaled fill
+
+Two changes, both proposed as design objections and both confirmed. Together
+they move practical capacity from about $300k to about $10M.
+
+### 1. Cap by liquidity, spill the remainder down the ranking
+
+Each name is capped at the lower of the risk limit and what its own volume
+supports; whatever cannot be placed spills to names with headroom, extending
+*past* the profitability threshold only when the alternative is idle capital.
+
+| NAV | current | + liquidity cap & extension | names | 99th participation |
+|---|---|---|---|---|
+| $30,000 | 2.53 | **2.65** | 20 → 31 | 1.38% → 1.16% |
+| $300,000 | 2.17 | **2.29** | 20 → 31 | 13.83% → 8.80% |
+| $3,000,000 | 1.04* | **1.21** | 20 → 31 | 138%* → 26.9% |
+| $10,000,000 | −0.33* | **0.31** | 20 → 31 | 461%* → 34.7% |
+
+*\*infeasible: the order exceeds the hour's entire volume, so the number is a
+model artifact rather than a result.*
+
+**It improves the book at $30,000, where liquidity does not bind at all** —
+Sharpe 2.53 → 2.65, drawdown −17.5% → −16.0%. Return falls slightly because the
+marginal names are worse, and the diversification more than pays for it. So this
+is not only a capacity mechanism.
+
+Two things the test settled against expectation: the name count self-limits near
+31 regardless of the ceiling (40 or 80 make no difference — the ranked pool runs
+out), and a 2% participation cap is too tight above $300k, leaving 16% of capital
+idle at $3M where the foregone return costs more than the impact avoided.
+
+### 2. Scale the order in and out over several hours
+
+Splitting an order into N slices divides each slice by N against the same
+per-hour liquidity, so impact falls as 1/√N. The cap rises proportionally, since
+N hours of volume absorbs N times as much. Entry is the mean of the opens across
+the window and exit the mean across the matching window 24 hours later — a TWAP
+fill on both sides, so scaling out is modelled too.
+
+It is not free: the average fill lands later and the signal decays (Sharpe 2.22
+at a one-hour lag, 2.09 at four, 1.86 at eight).
+
+| NAV | best window | Sharpe at 1h | Sharpe at best | undeployed 1h → best |
+|---|---|---|---|---|
+| $30,000 | 2h | 2.65 | 2.67 | 0.0% → 0.0% |
+| $300,000 | 2h | 2.29 | 2.50 | 0.0% → 0.0% |
+| $3,000,000 | 8h | 1.21 | **1.80** | 4.6% → 0.0% |
+| $10,000,000 | 4h | 0.31 | **1.09** | 22.1% → 3.5% |
+| $30,000,000 | 4h | −0.59 | **0.66** | 48.0% → 17.5% |
+
+The optimal window scales with the account, which is the expected shape: a small
+book has no impact to avoid and pays only the decay. The `undeployed` column is
+the mechanism — at $10M a one-hour window strands 22% of capital because no name
+can absorb it, and four hours brings that to 3.5%.
+
+Participation per slice barely falls (26.9% → 19.7% at $3M across eight times the
+slices) because the cap scales with the window: the extra hours buy larger
+positions rather than gentler ones, which is the point.
+
+### What this is not
+
+A fixed time-slice schedule is the crudest possible execution. Real execution
+reads the book — accelerating into depth, waiting out thin patches, posting
+passively rather than crossing (maker fills alone were worth about +110pp
+earlier). **These numbers are therefore a floor, not a forecast.** Modelling
+anything better requires order-book data the store does not have and cannot
+backfill, so TWAP is the most that can honestly be claimed.
