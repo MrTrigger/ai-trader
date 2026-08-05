@@ -1336,3 +1336,58 @@ for liquid majors while this book trades alts at a one-day holding period, and
 the out-of-sample window is 2022-09 to 2026-07 on a single hyperparameter set.
 The hourly store now makes realised spread measurable per asset per hour, which
 is the next thing worth doing and no longer requires new data.
+
+## Spread: measured, and the assumption was backwards
+
+`spread_bps = 2.0` was config's "placeholder for liquid majors", and the worry
+was that it understated the cost of trading alts at a one-day holding period.
+Measured, it overstates it by about five times.
+
+**OHLC estimators do not work here and were discarded.** Corwin-Schultz returns
+21bp for BTC where the truth is under 1bp — at hourly frequency it reads
+volatility, not spread — and Abdi-Ranaldo floors at zero for every liquid name
+because the true spread sits below its noise floor. Both failed the BTC
+validation, so neither was used. Worth recording: had the BTC anchor not been
+checked first, a 45bp median across the universe would have looked like a
+finding.
+
+Quotes were needed instead. Binance publishes best bid/ask per perpetual, and
+although a symbol-month is 1.2–6.5GB, a range request over the first few MB
+decompresses as a partial deflate stream and yields several hours of quotes —
+enough to sample a quantity that does not change character within a day.
+Time-weighted, because a spread that stands for one second and one that stands
+for an hour should not count equally.
+
+| | full spread | half |
+|---|---|---|
+| BTC / ETH | 0.03–0.04bp | 0.02bp |
+| SOL / AVAX / ARB | 0.38–0.77bp | ~0.3bp |
+| DOGE / LINK | 1.1–1.2bp | ~0.6bp |
+| GALA / TRB | 3.0–5.9bp | 1.5–3.0bp |
+| **Binance sample, median** | **0.77bp** | **0.39bp** |
+| **Hyperliquid, live snapshot** | **0.74bp** | **0.37bp** |
+
+Two independent readings on two venues agree to within 0.04bp, and BTC/ETH come
+back at the tight values that say the instrument is measuring a spread rather
+than volatility. It also settles a separate worry: Hyperliquid is the smaller
+venue but its spreads are not wider, so the Binance-derived history is a fair
+proxy for it.
+
+`spread_bps` is now **0.5**, not 0.39. A flat rate replacing a median should sit
+above it, and the illiquid tail is genuinely wider — GALA reads 2.84bp half on
+Hyperliquid. A per-asset spread keyed to liquidity is the honest form and is not
+built.
+
+### What that does to the result
+
+All-in cost falls from 6.5bp to about 4.9bp. At a one-hour fill lag:
+
+| all-in | 1h lag return | Sharpe | 8h lag Sharpe |
+|---|---|---|---|
+| 4.9bp (measured) | **+655.7%** | **2.45** | 2.08 |
+| 6.5bp (previous) | +518.8% | 2.22 | 1.86 |
+| 9.0bp (pessimistic) | +352.7% | 1.86 | 1.51 |
+
+Against buy-and-hold's +233.3% at Sharpe 0.90. The strategy still fails at a
+24-hour lag under every cost assumption, so the latency requirement is a property
+of the signal rather than of the fee schedule.

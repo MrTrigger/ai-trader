@@ -156,9 +156,21 @@ defi = ["UNI", "AAVE", "LINK", "MKR", "CRV"]
 # passive fills are an execution capability the system does not have yet, and
 # assuming them would price in work that has not been done.
 commission_bps = "4.5"
-# Half-spread crossed on entry. A placeholder for liquid majors; per-asset
-# estimation from real quotes is Phase 1.
-spread_bps = "2.0"
+# Half-spread crossed on entry. MEASURED, no longer a placeholder.
+#
+# Two independent readings agree: Binance USD-M bookTicker sampled across the
+# liquidity range gives a 0.77bp full spread at the median (0.39bp half), and a
+# live Hyperliquid L2 snapshot over the same coins gives 0.74bp full (0.37bp
+# half). BTC reads 0.03bp and ETH 0.04bp, which is the validation that the
+# measurement is a spread and not volatility in disguise - the OHLC estimators
+# tried first failed exactly that check, Corwin-Schultz returning 21bp for BTC.
+#
+# The previous 2.0bp was roughly five times too conservative for the median
+# asset. It is raised to 0.5 rather than 0.39 because the illiquid tail is
+# genuinely wider - GALA reads 2.84bp half on Hyperliquid - and a flat rate
+# should sit above the median it replaces, not on it. A per-asset spread keyed
+# to liquidity is the honest form and is not built yet.
+spread_bps = "0.5"
 # Impact coefficient. UNCALIBRATED - see CostModel. Phase 3 compares realised
 # against estimated and this is the number that moves.
 impact_coefficient = "0.10"
