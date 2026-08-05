@@ -1801,3 +1801,70 @@ more training time.
 the record as a demonstrated alternative rather than a shipped component — and as
 a reminder that a model reported as failing had a bug in its objective, not in
 its premise.
+
+## The LSTM, concluded: it does not earn its place
+
+Three variants, and the pattern that matters is in the metric rather than the
+model.
+
+| | IC | decile 1 | decile 10 | spread |
+|---|---|---|---|---|
+| GBM | 0.0643 | **−0.295%** | +0.276% | **0.571%** |
+| LSTM, raw target | 0.0923 | −0.221% | **+0.348%** | 0.568% |
+| LSTM, rank target | **0.1159** | −0.242% | +0.200% | 0.443% |
+
+**IC ranks these in exactly the reverse of what the book needs.** The
+highest-IC configuration has the worst decile spread. That is the third time
+this session IC has pointed the wrong way, and it is the most transferable
+finding here: the selection metric for cross-sectional model work is
+top-minus-bottom decile spread, not IC.
+
+### The imbalance was real, and correcting it cost more than it bought
+
+The raw-target LSTM is better than the booster on longs (+0.348% against
++0.276%) and worse on shorts (−0.221% against −0.295%), and the two cancel almost
+exactly — spread 0.568% against 0.571%. The mechanism was measurable: the
+demeaned target is skewed +2.59 with kurtosis 45, its top decile holds 46.5% of
+each date's squared variation against the bottom's 25.8%, and a Pearson
+correlation loss allocates gradient in exactly that proportion. The model learns
+winners 1.8× as hard as losers.
+
+Rank-transforming the target equalises that influence. It **improved the short
+leg slightly (−0.221% → −0.242%) and wrecked the long leg (+0.348% → +0.200%)**,
+for a net spread of 0.443%. So the skew is not purely a nuisance: return
+magnitude carries genuine signal for identifying big winners, and discarding it
+costs more than the balance is worth. The diagnosis was right and the fix was
+wrong.
+
+### Blending and side-assignment do not rescue it
+
+| weight on LSTM | return | Sharpe | maxDD |
+|---|---|---|---|
+| 0.00 (z-scored GBM) | +782.6% | 2.41 | −26.3% |
+| 0.20 | +954.9% | 2.67 | −21.8% |
+| 0.50 | +807.6% | 2.56 | −14.2% |
+| 1.00 (pure LSTM) | +386.7% | 1.84 | −19.1% |
+| *both sides from GBM, raw scores* | *+733.3%* | *2.60* | *−17.5%* |
+
+**The sweep is confounded and should not be quoted as a result.** `blend(0.0)`
+scores 2.41 where the same model on raw scores gives 2.60 — blending z-scores
+each date, which shifts which names clear the cost threshold, so part of the
+curve is threshold interaction rather than model mixing. Against the correct
+2.60 baseline the best blend is worth about **+0.07 Sharpe, inside noise**.
+
+A side-specific assignment — the booster on shorts where it is stronger, the
+LSTM on longs — scored 2.05, but **that test was built wrong**: when the two
+models disagreed on direction the construction assigned a score of zero, which
+silently drops the name instead of resolving the disagreement. It is a bug, not
+a refutation, and the idea remains untested.
+
+### Verdict
+
+**The gradient booster ships alone.** The LSTM costs a torch dependency, roughly
+two orders of magnitude more training time, and a second set of hyperparameters,
+for at most +0.07 Sharpe on a confounded comparison.
+
+Two things were never tested and would have to be, before any of this is
+revisited: capacity and epochs (training IC was still climbing at epoch 8, so the
+model may simply be undertrained — the configs were dropped when they proved to
+cost ~5 hours), and a correctly-built side-specific assignment.
