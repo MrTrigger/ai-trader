@@ -28,6 +28,7 @@
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
@@ -52,7 +53,7 @@ pub type AssetId = String;
 ///
 /// The engine reads these. It does not ask "is this Hyperliquid" — it asks
 /// "can I short this", which is the question it actually has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     /// Whether sub-lot sizing is possible at all. Independent of [`Market::lot`],
     /// which says *how* granular: a market can be non-fractional with lot 1.
@@ -78,7 +79,7 @@ impl Capabilities {
 }
 
 /// A tradable market, in the engine's vocabulary rather than the venue's.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub asset: AssetId,
     /// The venue's own symbol. Carried so an adapter can map back; nothing
@@ -118,7 +119,7 @@ fn on_grid(value: Decimal, increment: Decimal) -> bool {
 // --- account state ---------------------------------------------------------
 
 /// A currency or asset balance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balance {
     /// Quote currency (`USD`) or an [`AssetId`] — a balance does not care which.
     pub currency: String,
@@ -132,7 +133,7 @@ pub struct Balance {
 }
 
 /// A position, always derived from fills — see [`derive_positions`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub asset: AssetId,
     /// Signed. Negative is short.
@@ -144,7 +145,7 @@ pub struct Position {
 // --- orders and fills ------------------------------------------------------
 
 /// An order as the engine asks for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderRequest {
     /// Caller-chosen, unique, and stable across retries of the *same* order.
     ///
@@ -163,7 +164,8 @@ pub struct OrderRequest {
     pub reason: OrderReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OrderState {
     /// Accepted and resting at the venue.
     Open,
@@ -176,16 +178,17 @@ pub enum OrderState {
 
 /// The venue's acknowledgement. Returning this means the venue has the order —
 /// not that it filled.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderAck {
     pub client_order_id: String,
     pub venue_order_id: String,
     pub state: OrderState,
+    #[serde(with = "time::serde::rfc3339")]
     pub accepted_at: OffsetDateTime,
 }
 
 /// An execution. Append-only, everywhere, forever (spec §0.7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fill {
     pub venue_fill_id: String,
     pub venue_order_id: String,
@@ -198,6 +201,7 @@ pub struct Fill {
     /// Always positive — a fee is a cost. Charged in `fee_currency`.
     pub fee: Decimal,
     pub fee_currency: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub ts: OffsetDateTime,
 }
 

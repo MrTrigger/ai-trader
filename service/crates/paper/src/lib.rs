@@ -44,6 +44,7 @@
 
 use async_trait::async_trait;
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -84,7 +85,7 @@ impl Default for PaperConfig {
 }
 
 /// An order accepted and still waiting for the mark to reach it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Resting {
     venue_order_id: String,
     client_order_id: String,
@@ -100,13 +101,13 @@ struct Resting {
 
 /// One order this venue has seen, kept so a replayed `client_order_id`
 /// returns the original answer instead of placing a second order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Placed {
     request: OrderRequest,
     ack: OrderAck,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     /// Append-only. The only stored truth in this venue; everything else —
     /// positions, cash, balances — is folded out of it (spec §0.7).
@@ -146,6 +147,46 @@ impl<P: PriceSource, C: Clock> PaperVenue<P, C> {
             clock,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The venue's whole state as JSON.
+    ///
+    /// A real venue keeps its own books; this one keeps them in memory, so
+    /// without this a restart silently resets the account to flat and cash to
+    /// its initial value. That is not a small inconvenience — the fill log is
+    /// the *only* stored truth here (spec §0.7), and losing it means the
+    /// executor reconciles a real intention against a book that has forgotten
+    /// everything.
+    ///
+    /// The whole state, not just the fills: resting orders and the
+    /// idempotency map are what make a replayed `client_order_id` return its
+    /// original answer, and a restart that dropped them would place the order
+    /// again.
+    pub async fn snapshot(&self) -> String {
+        let state = self.state.lock().await;
+        serde_json::to_string_pretty(&*state).expect("paper state serialises")
+    }
+
+    /// Rebuild from [`snapshot`](Self::snapshot).
+    ///
+    /// Config, markets, prices and clock come from the caller as usual: those
+    /// are deployment choices, and restoring a stale copy of them alongside the
+    /// book is how a venue ends up trading yesterday's fee schedule.
+    pub fn restore(
+        config: PaperConfig,
+        markets: Vec<Market>,
+        prices: P,
+        clock: C,
+        snapshot: &str,
+    ) -> Result<Self, serde_json::Error> {
+        let state: State = serde_json::from_str(snapshot)?;
+        Ok(Self {
+            config,
+            markets,
+            prices,
+            clock,
+            state: Mutex::new(state),
+        })
     }
 
     fn market(&self, asset: &str) -> Result<&Market, VenueError> {

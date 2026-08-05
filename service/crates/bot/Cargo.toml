@@ -1,0 +1,22 @@
+[package]
+name = "bot"
+description = "The executor process: runs a plan against a venue, and the controls a human uses to stop it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bot"
+path = "src/main.rs"
+
+[dependencies]
+plan.workspace = true
+venue.workspace = true
+paper.workspace = true
+executor.workspace = true
+runner.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

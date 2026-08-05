@@ -370,7 +370,10 @@ fn the_client_order_id_is_a_pure_function_of_the_plan_and_order() {
     let p = plan::Plan::parse(&plan_json(&order("BTC", "buy", "1.5", "entry"))).unwrap();
     let a = client_order_id(&p.plan_id.to_string(), &p.orders[0]);
     let b = client_order_id(&p.plan_id.to_string(), &p.orders[0]);
-    assert_eq!(a, b, "a replay must produce the same id or a restart doubles up");
+    assert_eq!(
+        a, b,
+        "a replay must produce the same id or a restart doubles up"
+    );
 }
 
 #[test]
@@ -430,7 +433,11 @@ async fn a_failed_order_stops_the_run_and_names_what_was_skipped() {
         .unwrap();
 
     assert!(!rec.is_complete());
-    assert_eq!(rec.submitted.len(), 2, "BTC succeeded, ETH failed, SOL untried");
+    assert_eq!(
+        rec.submitted.len(),
+        2,
+        "BTC succeeded, ETH failed, SOL untried"
+    );
     assert!(rec.submitted[1].error.is_some());
     assert_eq!(
         rec.not_attempted,

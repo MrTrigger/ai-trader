@@ -9,10 +9,11 @@ rust-version.workspace = true
 venue.workspace = true
 async-trait.workspace = true
 rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 plan.workspace = true
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

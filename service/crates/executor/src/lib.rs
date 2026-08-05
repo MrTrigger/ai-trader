@@ -168,6 +168,25 @@ impl ExecutionRecord {
 /// one plan would otherwise collide — which the plan contract forbids, but an
 /// id scheme that depends on that invariant holding is a worse scheme.
 pub fn client_order_id(plan_id: &str, order: &Order) -> String {
+    id_for(plan_id, order, None)
+}
+
+/// The same id, qualified by which slice of a spread-out execution it belongs
+/// to.
+///
+/// An order split into equal time slices produces slices that are identical in
+/// asset, side and quantity — so without this they would share an id, and the
+/// venue's idempotency guarantee would helpfully collapse the second slice into
+/// the first. The book would end up holding half of what was planned, and every
+/// record would say it succeeded.
+///
+/// The slice index is part of the plan's fixed schedule, not a counter, so it
+/// stays deterministic across a restart.
+pub fn client_order_id_for_slice(plan_id: &str, order: &Order, slice: u8) -> String {
+    id_for(plan_id, order, Some(slice))
+}
+
+fn id_for(plan_id: &str, order: &Order, slice: Option<u8>) -> String {
     let side = match order.side {
         Side::Buy => "B",
         Side::Sell => "S",
@@ -175,7 +194,11 @@ pub fn client_order_id(plan_id: &str, order: &Order) -> String {
     // Plan ids are uuids; the first segment is ample to disambiguate and keeps
     // the id inside the length limits venues impose.
     let short = plan_id.split('-').next().unwrap_or(plan_id);
-    format!("{short}-{}-{side}-{}", order.asset, order.qty.normalize())
+    let base = format!("{short}-{}-{side}-{}", order.asset, order.qty.normalize());
+    match slice {
+        Some(n) => format!("{base}-s{n}"),
+        None => base,
+    }
 }
 
 /// Whether an order reduces exposure.
@@ -205,9 +228,9 @@ fn check_sequence(orders: &[Order]) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn to_request(plan_id: &str, order: &Order) -> OrderRequest {
+fn to_request(plan_id: &str, order: &Order, slice: Option<u8>) -> OrderRequest {
     OrderRequest {
-        client_order_id: client_order_id(plan_id, order),
+        client_order_id: id_for(plan_id, order, slice),
         asset: AssetId::from(order.asset.clone()),
         side: order.side,
         qty: order.qty,
@@ -263,6 +286,26 @@ pub fn reconcile(ours: &[Position], theirs: &[Position]) -> Result<(), ExecError
 pub async fn execute<V: VenueAdapter>(
     venue: &V,
     plan: &Plan,
+    known_fills: &[Fill],
+    controls: Controls,
+    now: OffsetDateTime,
+) -> Result<ExecutionRecord, ExecError> {
+    execute_slice(venue, plan, None, known_fills, controls, now).await
+}
+
+/// Execute one slice of a plan whose orders are spread over time.
+///
+/// Identical to [`execute`] except that order ids carry the slice index, so two
+/// equal slices of the same order do not collide under the venue's idempotency
+/// rule. `plan` must already hold the sliced quantities — this function does not
+/// divide anything, because an executor that resizes orders is a second strategy.
+///
+/// `known_fills` must include the fills from earlier slices. Reconciliation runs
+/// per slice, and stale fills would report drift the moment slice one filled.
+pub async fn execute_slice<V: VenueAdapter>(
+    venue: &V,
+    plan: &Plan,
+    slice: Option<u8>,
     known_fills: &[Fill],
     controls: Controls,
     now: OffsetDateTime,
@@ -331,7 +374,7 @@ pub async fn execute<V: VenueAdapter>(
             record.not_attempted.push(order.asset.clone());
             continue;
         }
-        let req = to_request(&plan_id, order);
+        let req = to_request(&plan_id, order, slice);
         let coid = req.client_order_id.clone();
         match venue.place_order(&req).await {
             Ok(ack) => record.submitted.push(OrderOutcome {

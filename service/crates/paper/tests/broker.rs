@@ -628,3 +628,99 @@ async fn the_venue_is_usable_behind_a_trait_object() {
     assert_eq!(adapter.get_positions().await.unwrap().len(), 1);
     assert_eq!(adapter.get_markets().await.unwrap().len(), 2);
 }
+
+// --- surviving a restart ---------------------------------------------------
+
+#[tokio::test]
+async fn a_snapshot_restores_the_book_the_cash_and_the_idempotency_map() {
+    // The fill log is the only stored truth here. A restart that lost it would
+    // reconcile a real intention against a book that had forgotten everything.
+    let h = harness("100000");
+    h.venue
+        .place_order(&order("r1", "BTC", Side::Buy, "0.5"))
+        .await
+        .unwrap();
+    let before_pos = h.venue.get_positions().await.unwrap();
+    let before_cash = h.venue.get_balances().await.unwrap();
+    let snapshot = h.venue.snapshot().await;
+
+    let back = PaperVenue::restore(
+        PaperConfig {
+            initial_cash: dec("100000"),
+            ..Default::default()
+        },
+        markets(),
+        h.prices.clone(),
+        h.clock.clone(),
+        &snapshot,
+    )
+    .expect("a snapshot this venue wrote is one it can read");
+
+    assert_eq!(back.get_positions().await.unwrap(), before_pos);
+    assert_eq!(back.get_balances().await.unwrap(), before_cash);
+    assert_eq!(back.get_fills(None).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_replayed_order_after_a_restart_does_not_place_a_second_one() {
+    // The idempotency map is part of the state for exactly this reason: a
+    // process that died between submitting and recording must be safe to
+    // restart, and a restored venue that had forgotten the order would fill it
+    // twice.
+    let h = harness("100000");
+    let req = order("r2", "BTC", Side::Buy, "0.5");
+    let first = h.venue.place_order(&req).await.unwrap();
+    let snapshot = h.venue.snapshot().await;
+
+    let back = PaperVenue::restore(
+        PaperConfig {
+            initial_cash: dec("100000"),
+            ..Default::default()
+        },
+        markets(),
+        h.prices.clone(),
+        h.clock.clone(),
+        &snapshot,
+    )
+    .unwrap();
+
+    let again = back.place_order(&req).await.unwrap();
+    assert_eq!(again.venue_order_id, first.venue_order_id);
+    assert_eq!(
+        back.get_fills(None).await.unwrap().len(),
+        1,
+        "the replay returned the original ack rather than doubling the position"
+    );
+}
+
+#[tokio::test]
+async fn a_restored_venue_keeps_resting_orders_waiting() {
+    let h = harness("100000");
+    h.venue
+        .place_order(&OrderRequest {
+            order_type: OrderType::Limit,
+            limit_price: Some(dec("50000")),
+            ..order("r3", "BTC", Side::Buy, "0.5")
+        })
+        .await
+        .unwrap();
+    assert!(h.venue.get_fills(None).await.unwrap().is_empty());
+
+    let back = PaperVenue::restore(
+        PaperConfig {
+            initial_cash: dec("100000"),
+            ..Default::default()
+        },
+        markets(),
+        h.prices.clone(),
+        h.clock.clone(),
+        &h.venue.snapshot().await,
+    )
+    .unwrap();
+
+    // The mark reaches the limit only after the restart; the order is still
+    // there to be filled.
+    h.prices.set("BTC", dec("49000"));
+    h.clock.advance(Duration::minutes(1));
+    assert_eq!(back.get_fills(None).await.unwrap().len(), 1);
+}

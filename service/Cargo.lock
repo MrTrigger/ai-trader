@@ -73,6 +73,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bot"
+version = "0.1.0"
+dependencies = [
+ "executor",
+ "paper",
+ "plan",
+ "runner",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "venue",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,6 +289,7 @@ dependencies = [
  "async-trait",
  "plan",
  "rust_decimal",
+ "serde",
  "serde_json",
  "time",
  "tokio",
@@ -431,6 +448,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "runner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "executor",
+ "plan",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "venue",
 ]
 
 [[package]]
@@ -696,6 +729,7 @@ dependencies = [
  "async-trait",
  "plan",
  "rust_decimal",
+ "serde",
  "thiserror",
  "time",
  "tokio",

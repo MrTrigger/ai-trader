@@ -1,0 +1,42 @@
+{
+  "notes": {
+    "file": "Copy, edit, point `bot --config` at it. Every number here costs money, so none of them defaults: a fee rate that quietly defaults is a fee rate nobody checked.",
+    "fees": "Hyperliquid perp taker, measured on two venues rather than assumed - see config/default.toml and docs/phase-1-findings.md.",
+    "schedule": "lag_hours is the gap between the signal and the first fill: phase 1 measured Sharpe 2.22 at one hour against 0.29 at twenty-four. slices spreads the orders over that many hours; impact falls as 1/sqrt(N) while the signal decays, so the window widens with the account - two at $30k, four at $300k, eight at $3M.",
+    "markets": "An asset absent from `markets` cannot be traded at all. That is the safe direction: an unknown lot size becomes a rejected order rather than a guessed one.",
+    "marks": "Prices are read from state_dir/marks.json, written by whatever holds the price feed. This process does not fetch them - a bot with its own feed is a bot with its own opinion about value."
+  },
+
+  "state_dir": "var/bot",
+  "venue": "paper",
+  "quote_currency": "USD",
+  "initial_cash": "30000",
+
+  "taker_fee_bps": "4.5",
+  "maker_fee_bps": "1.5",
+  "slippage_bps": "5",
+
+  "schedule": { "lag_hours": 1, "slices": 2 },
+
+  "max_plan_age_minutes": 120,
+  "cadence_hours": 24,
+
+  "markets": [
+    {
+      "asset": "BTC",
+      "venue_symbol": "BTC",
+      "tick": "0.01",
+      "lot": "0.00001",
+      "min_notional": "10",
+      "short": true
+    },
+    {
+      "asset": "ETH",
+      "venue_symbol": "ETH",
+      "tick": "0.01",
+      "lot": "0.0001",
+      "min_notional": "10",
+      "short": true
+    }
+  ]
+}
