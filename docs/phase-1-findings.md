@@ -1464,3 +1464,58 @@ happen to land.
 Conviction weighting — size proportional to |prediction| within each side — more
 than doubles the return to +1124% and triples the drawdown to −51.5%. That is a
 leverage decision, not a free improvement.
+
+## Position sizing: expectancy per unit of risk, not expectancy
+
+Two objections drove this, both correct. A fixed count is arbitrary — a name
+whose expected edge cannot pay its own round-trip cost should not be held, and
+that capital does more good enlarging a better position. But raw conviction
+weighting concentrates, and the book has to stay balanced.
+
+Raw conviction does exactly what was feared, and the pair below isolates why:
+
+| sizing | k | return | Sharpe | maxDD | names | eff N |
+|---|---|---|---|---|---|---|
+| equal | 0 | +250.4% | 2.39 | −9.5% | 23.9 | 23.1 |
+| conviction | 0 | +836.9% | 1.78 | **−48.7%** | 23.9 | 12.3 |
+| **risk-adj** | **1** | **+875.5%** | **2.70** | **−17.3%** | 20.3 | 12.7 |
+| risk-adj | 2 | +1147.9% | 2.52 | −22.6% | 13.3 | 9.5 |
+| inv-vol | 1 | +342.2% | **2.78** | **−9.1%** | 20.3 | 15.7 |
+| *shipped: equal, fixed 6L/6S* | | *+497.0%* | *2.19* | *−17.7%* | *12* | *12* |
+
+`conviction` and `risk-adj` return roughly the same and hold the same number of
+names at almost the same effective N — 12.3 against 12.7 — yet draw down 48.7%
+versus 17.3%. **The concentration was never in name count; it was in risk.**
+Predictions scale with volatility, so weighting by raw |prediction| quietly buys
+the most volatile names. Dividing by volatility removes that without giving up
+the return.
+
+Effective N is 1 / Σw², the number of equally weighted names the book behaves
+like. Reporting it is what made the diagnosis visible: name count alone said the
+two books were equally diversified.
+
+**Recommended construction:** weight ∝ |expected return| / volatility, hold only
+names whose edge exceeds one round-trip cost, floating count between 6 and 24,
+dollar-neutral. +875.5% at Sharpe 2.70 and −17.3% drawdown, against the shipped
+book's +497% at 2.19 and −17.7% — the same risk for 76% more return.
+
+The threshold helps but is the smaller effect: k=1 beats k=0 modestly, k=2 buys
+return at the cost of drawdown, and k=4 stands the book down on 566 of ~1,400
+days and degrades. Sizing is the lever; the threshold is a refinement.
+
+`inv-vol` — pure risk parity, expectancy discarded — posts the highest Sharpe
+(2.78) and shallowest drawdown (−9.1%) at +342%. Worth recording as the
+conservative end of the same family.
+
+## The LSTM returned a negative IC and is not yet trustworthy
+
+A shared LSTM over 168-hour sequences of six cross-sectionally normalised hourly
+quantities, concatenated with the 58 slow features, trained with a listwise
+ranking loss on identical folds and purge, scored **IC −0.0347, negative in all
+six folds (t = −5.03)** against the booster's +0.0643.
+
+A consistently *inverted* result is far more likely an implementation error than
+a finding about recurrent models, so it is recorded as unresolved rather than as
+evidence. The diagnostic that would settle it is the training IC: strongly
+positive with negative test means overfitting, negative in both means the loss or
+the wiring is wrong. That has not been run.
