@@ -1571,3 +1571,49 @@ effective N of 12.7, turning over 98% of the book per day.
 
 That turnover is the dominant operational risk and **market impact is not
 modelled at all** — the largest unmeasured exposure in the whole result.
+
+## Why it only matches buy-and-hold, and what that actually means
+
+The equity curves run together from 2022-09 to 2025-04 and separate afterwards.
+Two explanations were proposed and both were **refuted by measurement**.
+
+**Not residual beta.** A dollar-neutral book need not be beta-neutral, since the
+legs can carry different betas — but this one is. Regressing daily strategy
+returns on BTC gives **beta +0.015, R² 0.001, alpha +60.9%/yr**, with residual
+volatility equal to total volatility. The curves tracking each other was
+coincidence: two things compounding at similar rates, not a shared exposure.
+
+**Not dispersion.** A cross-sectional book monetises the gap between winners and
+losers, so its edge might be expected to scale with cross-sectional dispersion.
+Correlation is **−0.044 (t = −1.65)** and the *lowest*-dispersion quartile has the
+best Sharpe at 6.24. The edge does not need volatile markets.
+
+**The real answer is risk, not return.**
+
+| | ann return | ann vol | Sharpe |
+|---|---|---|---|
+| strategy | 61.5% | **22.8%** | 2.70 |
+| BTC | 40.7% | **46.4%** | 0.88 |
+
+The strategy runs at **0.49× BTC's volatility**. It is not keeping pace, it is
+keeping pace while deploying half the risk. Scaled to the benchmark's own
+volatility — 2.04× leverage, gross 1.63× NAV:
+
+| | return | maxDD |
+|---|---|---|
+| strategy at BTC's vol | **+8,219%** | −33.0% |
+| BTC | +219% | −53.1% |
+
+Thirty-seven times the return at a lower drawdown. The flat stretch is
+under-deployment, not underperformance.
+
+The late breakaway is also mostly BTC falling rather than the strategy
+accelerating: it earns +0.218%/day on BTC-up days and +0.118%/day on BTC-down
+days, making money in both. It is an uncorrelated absolute-return stream, not a
+hedge.
+
+**The constraint is policy, not strategy.** Gross 1.63× NAV exceeds
+`max_gross_exposure = 1.00`, and §9.2 puts leverage above 1× out of scope before
+Phase 3. Beating buy-and-hold in every regime is available and requires a
+deliberate decision — taken, if at all, on a Sharpe estimate that is still
+selection-inflated and against a strategy whose market impact remains unmodelled.
