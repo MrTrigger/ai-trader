@@ -1133,3 +1133,101 @@ Two limits remain, and neither is closed:
   volatile and whose venue gap may differ.
 - **Hyperliquid did not exist before 2023-05-12**, which is 53% of the backtest
   window. For that half there is no substitution to make, at any level of effort.
+
+---
+
+# A learned ranker, and the first out-of-sample signal in the project
+
+## Why a model, and why not the one first proposed
+
+The objection to feeding a model many features was that none of the features had
+demonstrated predictive power. That objection was half wrong: an IC screen picks
+winners from fifteen candidates and carries its own selection bias, so a
+regularised model with honest cross-validation is the *better* filter, not a
+premature one.
+
+The objection to an LSTM specifically survives. The candidate features
+autocorrelate at 0.98–0.999 at a one-day lag, so there is almost no sequential
+variation for a recurrent model to learn, and its advantage over a cross-sectional
+learner is exactly sequence structure. Gradient boosting was used instead: same
+job, orders of magnitude fewer parameters.
+
+## Does daily sampling give seven times the training data?
+
+Only if the target changes with it.
+
+| sampling / horizon | rows | mean IC | naive t | eff n | honest t |
+|---|---|---|---|---|---|
+| weekly, 7d target | 338 | −0.1461 | −8.40 | 338 | **−8.40** |
+| daily, 7d target | 2,370 | −0.1446 | −21.62 | 339 | **−8.17** |
+| daily, 1d target | 2,370 | −0.0994 | −14.35 | 2,370 | **−14.35** |
+
+With a 7-day target, daily sampling inflates the naive t by 2.57× — almost exactly
+√7, which is the signature of counting overlapping windows as independent. Deflate
+for overlap and the information is unchanged.
+
+With a 1-day target the observations really are independent, and the weaker
+per-observation IC is more than repaid by having seven times as many: honest t
+−14.35 against −8.40. **Training frequency and trading frequency are separable** —
+a ranker can be trained on daily non-overlapping targets and applied at any
+rebalance cadence.
+
+## The setup
+
+70,062 rows, 2,364 dates, 215 assets, 16 features. Features rank-normalised
+*within each date*, so the model learns ordering rather than calendar level.
+Targets are forward return minus that date's cross-sectional mean, because the
+book is long/short and predicting the market is the tilt's job. Expanding-window
+folds with a purge of one horizon either side of every test block — without the
+purge a 7-day target leaks across the boundary, and the results look **better**,
+which is how that mistake survives.
+
+## Out-of-sample IC, positive in every fold
+
+| model | mean OOS IC | folds positive | fold-level t |
+|---|---|---|---|
+| weekly (7d target) | +0.0760 | 6 / 6 | +5.36 |
+| daily (1d target) | +0.0511 | 6 / 6 | +7.50 |
+
+For scale: `ret_30_skip_7` has IC ≈ 0, and the channel spread is flat at t = +0.27.
+This is the first thing measured in this project with consistent out-of-sample
+cross-sectional predictive power.
+
+## The cadence question, answered
+
+Traded only on walk-forward test blocks, 2022-09 to 2026-07:
+
+| | n | return | Sharpe | maxDD | t | turnover/yr | cost/yr |
+|---|---|---|---|---|---|---|---|
+| ML weekly (tranched) | 201 | +82.5% | 1.17 | −17.3% | 2.30 | 4,627% | 3.0% |
+| **ML daily** | 1,419 | **+381.9%** | **1.92** | −22.4% | 3.78 | 26,453% | 17.2% |
+| BTC buy & hold | 200 | +233.3% | 0.90 | −51.8% | | | |
+
+**The daily book pays 14.2%/yr more in fees and returns 4.6× as much.** The
+earlier rejection of daily rebalancing was correct for the channel signal and
+wrong as a general conclusion: even then daily had more gross alpha (1200.8%
+against 918.8% at zero cost) and lost only on turnover. A better predictor tips it.
+
+## Why this is not yet a recommendation
+
+| | break-even vs zero | break-even vs BTC | assumed |
+|---|---|---|---|
+| daily | 21.8bps | **10.1bps** | 6.5bps |
+| weekly | 40.2bps | — | 6.5bps |
+
+The daily book beats the benchmark only below about 10bps all-in, a margin of
+1.5×. The weekly channel book had 14×. The result has moved from resting on the
+signal to resting on the execution assumption, and that assumption is weak in a
+specific, identifiable way: the 2bps spread is described in config as *"a
+placeholder for liquid majors"*, this book trades alts at a **1.1-day** mean
+holding period, and no impact term is modelled at all. At a 5bps spread the daily
+advantage over buy-and-hold disappears.
+
+**The next measurement is realised spread on the assets actually traded**, not
+another model. Until that exists, the defensible claim is that the ranking has
+out-of-sample content — which is new and worth having — and not that the daily
+cadence is profitable.
+
+`lightgbm` and `numpy` are installed in the venv for research and deliberately
+NOT added to `pyproject.toml`. Nothing enters the shipped dependency set before
+the thing it enables has passed a gate.
