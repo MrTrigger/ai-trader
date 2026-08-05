@@ -1391,3 +1391,76 @@ All-in cost falls from 6.5bp to about 4.9bp. At a one-hour fill lag:
 Against buy-and-hold's +233.3% at Sharpe 0.90. The strategy still fails at a
 24-hour lag under every cost assumption, so the latency requirement is a property
 of the signal rather than of the fee schedule.
+
+---
+
+# Hourly features, and the shape of the book
+
+## Hourly features did not help, and the first attempt made things worse
+
+With hourly bars available, thirty features that daily bars cannot express were
+built: realised volatility from 24 hourly returns rather than a high-low range,
+upside and downside semivariance separately, skew, path efficiency
+(|net move| / sum|hourly moves|), largest single hourly move, intraday volume
+concentration, and trade-size surprise from the trade COUNT the hourly bars
+carry.
+
+Replacing the daily features with them cost most of the edge — Sharpe 2.33 to
+0.74. The cause was an error rather than a finding: **the strongest features in
+the IC screen are slow** (30-day volatility, 20-day turnover, 90-day beta) and
+the hourly windows built here top out at 168 hours, so the swap deleted the
+long-horizon information and kept only the short.
+
+Merged, the two sets give IC +0.0643 at fold-level **t = +9.92**, the highest
+recorded here, and against the harder lag-adjusted target. But the backtest lands
+at Sharpe 2.19 against the daily-only model's 2.33 — indistinguishable given the
+±10% estimation noise. **Hourly features did not improve the result.** The daily
+aggregates were already capturing what matters at a 24-hour horizon.
+
+The exercise still paid for itself twice: the target is now the return from a
+fill one hour AFTER the signal rather than at the same instant, and the hourly
+sequences a recurrent model needs now exist.
+
+## The fixed long/short split, finally settled
+
+The objection - that pinning the book at six long and six short is arbitrary when
+one could rank every asset by expected trade return and take the top N, direction
+following the sign - was right, and an earlier dismissal of it was answering a
+different construction. Ranking the RELATIVE score and taking the top N as longs
+does give a long-only book of least-bad assets. Ranking by expected TRADE return
+with a direction per line does not: in a falling market most lines are short and
+the book goes short. That criticism was misapplied.
+
+The real problem is with the absolute-return target such a list needs:
+
+| | sd of daily MEAN prediction | median within-day sd |
+|---|---|---|
+| absolute target | 0.279% | 0.529% |
+| relative target | 0.080% | 0.469% |
+
+More than half the absolute model's prediction variance is a common market
+factor. Ranking by |prediction| therefore ranks partly by **beta** — in a
+predicted-down market the largest |prediction| values are the highest-beta names
+— so the book becomes a leveraged market call. Drawdowns of −45% to −51% against
+BTC's −53% follow directly.
+
+Separating the ranking from the exposure confirms it is the exposure that breaks:
+
+| target | exposure | take | return | Sharpe | maxDD |
+|---|---|---|---|---|---|
+| absolute | lean | 20 | +280.0% | 1.25 | −45.4% |
+| absolute | neutral | 20 | +195.9% | 1.37 | −30.0% |
+| relative | neutral | 12 | +502.2% | 2.14 | −15.6% |
+| **relative** | **neutral** | **20** | **+287.8%** | **2.27** | **−12.4%** |
+| relative | conviction | 12 | **+1124.2%** | 1.78 | −51.5% |
+| *current 6L/6S fixed* | | | *+497.0%* | *2.19* | *−17.7%* |
+
+**The proposed construction wins**, on the relative score with dollar-neutrality
+imposed: top twenty by |score| with the direction from the sign gives Sharpe 2.27
+and a −12.4% drawdown against the fixed book's 2.19 and −17.7%. More names and a
+floating split, but neutrality enforced rather than left to fall where the signs
+happen to land.
+
+Conviction weighting — size proportional to |prediction| within each side — more
+than doubles the return to +1124% and triples the drawdown to −51.5%. That is a
+leverage decision, not a free improvement.
