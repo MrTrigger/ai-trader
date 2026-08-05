@@ -14,7 +14,7 @@ import pytest
 
 from planner import report
 
-RECORD = Path(__file__).resolve().parents[2] / "docs" / "research" / "phase-1-record.json"
+RECORD = Path(__file__).resolve().parents[2] / "docs" / "research" / "backtest.json"
 
 
 @pytest.fixture(scope="module")
@@ -31,12 +31,21 @@ def page(record) -> str:
 
 
 def test_the_committed_record_is_readable(record):
-    assert record["data"]["assets"] > 0
-    assert record["current"]["decomposition"] and record["spread"]
-    # The page is the current state, not a log. Sections describing retired
-    # candidates belong in docs/phase-1-findings.md and must not creep back.
-    for archived in ("runs", "ic", "combined"):
-        assert archived not in record, f"{archived} is history, not current state"
+    assert record["strategy"]["params"]
+    assert record["metrics"]["weeks"] > 0
+    assert record["exposure"]["gross"] and record["series"]["compounded"]
+
+
+def test_the_record_describes_one_run_only(record):
+    """The page reports the latest backtest, not a history of attempts.
+
+    Every earlier version of this page accumulated sections - retired
+    candidates, superseded windows, an IC study of a dead signal - until a
+    reader could not tell which numbers described the thing currently being
+    run. Keys belonging to other runs must not reappear.
+    """
+    for archived in ("runs", "ic", "combined", "candidates", "phases", "current"):
+        assert archived not in record, f"{archived} belongs to another run"
 
 
 def test_rendering_needs_nothing_but_the_record(page):
@@ -71,12 +80,12 @@ def test_every_svg_is_closed(page):
 def test_disclosures_precede_every_number(page):
     """§12, and harder to honour on a page than in a terminal because a page
     invites scrolling straight to the chart."""
-    assert page.index("Read before any number below") < page.index("Current result")
+    assert page.index("Read before any number below") < page.index("What was run")
 
 
 def test_the_disclosures_are_not_collapsible(page):
     # A caveat behind a toggle is a caveat nobody read.
-    head = page[: page.index("Current result")]
+    head = page[: page.index("What was run")]
     assert "<details" not in head
     assert "uncalibrated" in head
 
@@ -144,28 +153,36 @@ def test_both_themes_are_defined(page):
 # --- the numbers reach the page --------------------------------------------
 
 
-def test_the_open_questions_are_not_softened(page):
-    """The page states what is unsettled, above the fold of its own section."""
-    for unresolved in ("parameters were chosen on a single phase", "null test"):
-        assert unresolved in page
+def test_the_parameters_are_on_the_page(page, record):
+    """A backtest number without its parameters is a rumour."""
+    for key, value in record["strategy"]["params"]:
+        assert key in page, f"parameter {key} not shown"
 
 
-def test_the_headline_returns_are_rendered(page, record):
-    for row in record["current"]["decomposition"]:
-        pct = f"{row['orig']['final'] * 100:.1f}%"
-        assert pct in page, f"{row['name']} return {pct} missing from the page"
+def test_the_headline_metrics_are_rendered(page, record):
+    m = record["metrics"]
+    assert f"{m['sharpe']:.2f}" in page
+    assert f"{m['max_drawdown'] * 100:.1f}%" in page
+    assert f"{m['cagr'] * 100:.1f}%" in page
 
 
-def test_the_phase_spread_is_shown_not_just_the_median(page, record):
-    """A single-phase number is one draw; the range has to be visible."""
-    rows = record["phases"]["rows"]
-    for extreme in (min(r["combined"] for r in rows), max(r["combined"] for r in rows)):
-        assert f"{extreme * 100:.1f}%" in page
+def test_both_equity_conventions_are_shown(page, record):
+    """Compounded alone cannot answer whether the edge is holding up."""
+    m = record["metrics"]
+    assert f"{m['total_return'] * 100:,.1f}%" in page
+    assert f"{m['fixed_budget_return'] * 100:,.1f}%" in page
 
 
-def test_the_effective_sample_is_shown_beside_the_raw_one(page):
-    # The correction that changed the IC verdict must be visible, not implied.
-    assert "eff n" in page.lower() or "EFF N" in page.upper()
+def test_exposure_and_leverage_are_reported(page, record):
+    """Gross above 1.0 would be leverage and must never be silent."""
+    e = record["exposure"]
+    assert e["max_gross"] <= 1.0 + 1e-9, "gross exceeded 1x NAV"
+    assert f"{e['max_gross']:.2f}x NAV" in page
+    assert f"{e['max_net_short']:+.2f}x NAV" in page
+
+
+def test_the_disclosure_that_nothing_is_out_of_sample_is_present(page):
+    assert "No result below is" in page and "out-of-sample" in page
 
 
 def test_wide_tables_scroll_inside_their_own_container(page):

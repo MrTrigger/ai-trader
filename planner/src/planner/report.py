@@ -447,626 +447,219 @@ def _line_panel(
     return "".join(out)
 
 
-def combined_section(record: dict) -> str:
-    """Equity above, drawdown below, sharing an x-axis.
-
-    Both panels are necessary and neither is sufficient. Equity alone says BTC
-    won; drawdown alone says the neutral book was far safer. The pair is the
-    actual finding, and giving each its own chart on one axis — never two scales
-    on one plot — is what keeps the comparison honest.
-    """
-    series = record["series"]
-    eq = [(s["label"], s["equity"]) for s in series]
-    dd = [(s["label"], s["drawdown"]) for s in series]
-    split = record.get("split")
-
-    equity = _line_panel(
-        eq,
-        height=300,
-        split=split,
-        fmt=lambda v: f"{v:.0f}x",
-        ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Growth of one unit: market-neutral book versus buy and hold BTC",
-        baseline=1.0,
-    )
-    draw = _line_panel(
-        dd,
-        height=190,
-        split=split,
-        fmt=lambda v: f"{v * 100:.0f}%",
-        ticks_from=lambda a, b: (a * 1.08, 0.0),
-        aria="Drawdown from peak for each series",
-        baseline=0.0,
-    )
-
+def _params_table(strategy: dict) -> str:
+    """Exactly what was run. A backtest number without its parameters is a rumour."""
     rows = "".join(
-        f"<tr><td>{_esc(w['name'])}</td><td>{_esc(w['from'])} to {_esc(w['to'])}</td>"
-        f"<td class='num'>{_pct(w['strategy'])}</td>"
-        f"<td class='num'>{w['sharpe']:.2f}</td>"
-        f"<td class='num'>{_pct(w['btc'])}</td>"
-        f"<td class='num'>{w['btc_sharpe']:.2f}</td>"
-        f"<td>{'strategy' if w['strategy'] > w['btc'] else 'BTC'}</td></tr>"
-        for w in record["windows"]
-    )
-    totals = "".join(
-        f"<tr><td>{_esc(s['label'])}</td><td class='num'>{_pct(s['final'])}</td>"
-        f"<td class='num'>{s['maxdd'] * 100:.1f}%</td></tr>"
-        for s in series
-    )
-
-    return (
-        '<section><h2>Combined equity, both windows</h2>'
-        '<p class="note">Growth of one unit from ' + _esc(record["window"][0]) + ', the two '
-        'test windows chained. The vertical rule at ' + _esc(str(split)) + ' is the boundary '
-        'between them — left of it is the fresh out-of-sample window, right is the original. '
-        '<strong>Both series are indexed to the same base on one axis</strong>; a second '
-        'scale would invent a relationship that is not in the data.</p>'
-        + equity
-        + '<p class="note" style="margin-top:14px">Drawdown from peak, same x-axis. This is '
-        'the half the equity curve hides.</p>'
-        + draw
-        + '<div class="scroll"><table class="data"><thead><tr><th>window</th><th>span</th>'
-        '<th class="num">strategy</th><th class="num">Sharpe</th><th class="num">BTC</th>'
-        '<th class="num">Sharpe</th><th>winner</th></tr></thead><tbody>' + rows
-        + '</tbody></table></div>'
-        '<div class="scroll"><table class="data"><thead><tr><th>full period</th>'
-        '<th class="num">total return</th><th class="num">max drawdown</th></tr></thead>'
-        '<tbody>' + totals + '</tbody></table></div>'
-        '<p class="finding"><strong>Read the phase-robustness section below before drawing '
-        'anything from this chart.</strong> Every curve here is one rebalance phase - the '
-        'Friday one - and the choice of weekday is arbitrary: nothing in the strategy refers '
-        'to it. Across the seven possible phases the same strategy ranges from strongly '
-        'profitable to loss-making, and Friday is the best of the seven. These curves are '
-        'kept because they are what the research actually produced and deleting them would '
-        'hide how the error was made, but they describe one draw and not the strategy.</p>'
-        '</section>'
-    )
-
-
-def current_section(record: dict) -> str:
-    """What the current best version does. The page's reason to exist.
-
-    Everything here is tranched across all seven rebalance phases, which is not
-    a presentation choice: a single-phase number for a weekly strategy is one
-    draw from a distribution whose spread, on this strategy, ranged from -57% to
-    +1177% over the same period. Tranching removes the choice by holding all
-    seven sub-books at once, which is also how it would be run.
-    """
-    eq = [(s["label"], s["equity"]) for s in record["series"]]
-    dd = [(s["label"], s["drawdown"]) for s in record["series"]]
-    equity = _line_panel(
-        eq, height=300, split=record.get("split"), fmt=lambda v: f"{v:.0f}x",
-        ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Growth of one unit: current strategy versus buy and hold BTC",
-        baseline=1.0,
-    )
-    draw = _line_panel(
-        dd, height=190, split=record.get("split"), fmt=lambda v: f"{v * 100:.0f}%",
-        ticks_from=lambda a, b: (a * 1.08, 0.0),
-        aria="Drawdown from peak", baseline=0.0,
-    )
-
-    rows = ""
-    for d in record["decomposition"]:
-        strong = d["name"] == "strategy"
-        rows += (
-            f'<tr{" class=\'lead\'" if strong else ""}><td>{_esc(d["name"])}</td>'
-            f'<td class="num">{d["fresh"]["final"] * 100:.1f}%</td>'
-            f'<td class="num">{d["fresh"]["sharpe"]:.2f}</td>'
-            f'<td class="num">{d["orig"]["final"] * 100:.1f}%</td>'
-            f'<td class="num">{d["orig"]["sharpe"]:.2f}</td>'
-            f'<td class="num">{d["orig"]["t"]:.2f}</td>'
-            f'<td class="num">{d["combined"] * 100:.1f}%</td></tr>'
-        )
-
-    strat = next(d for d in record["decomposition"] if d["name"] == "strategy")
-    btc = next(d for d in record["decomposition"] if d["name"] == "BTC buy & hold")
-
-    return (
-        '<section><h2>Current result</h2>'
-        '<p class="note">Long the names above their Gaussian channel, short the rest of the '
-        'eligible and borrowable universe, leg weights tilted by the benchmark\'s own regime '
-        'read, capped at twelve positions and 25% a name so the risk gate accepts the plan. '
-        '<strong>Tranched across all seven rebalance phases</strong> — seven sub-books, one '
-        'per weekday, a seventh of capital each. That is not a smoothing choice: on a single '
-        'phase this same strategy ranged from −57% to +1177% over the same period, and '
-        'tranching removes an arbitrary parameter rather than averaging away a real one.</p>'
-        + equity
-        + '<p class="note" style="margin-top:14px">Drawdown from peak, same axis. This is the '
-        'half the equity curve hides, and it is where the strategy earns its keep.</p>'
-        + draw
-        + '<h3>What the return is made of</h3>'
-        '<p class="note">The strategy has two independent parts and either could be carrying '
-        'it. Run separately, each is weaker than the pair — which is the answer to "is this '
-        'just BTC timing in a costume".</p>'
-        '<div class="scroll"><table class="data"><thead>'
-        '<tr><th rowspan="2">variant</th><th colspan="2">fresh 2019-10..2021-10</th>'
-        '<th colspan="3">orig 2021-10..2026-08</th><th rowspan="2" class="num">combined</th></tr>'
-        '<tr><th class="num">return</th><th class="num">Sharpe</th>'
-        '<th class="num">return</th><th class="num">Sharpe</th><th class="num">t</th></tr>'
-        '</thead><tbody>' + rows + '</tbody></table></div>'
-        '<p class="finding"><strong>It beats buy-and-hold on the combined window and on '
-        f'drawdown, and loses to it in the first window.</strong> {strat["combined"] * 100:.0f}% '
-        f'against {btc["combined"] * 100:.0f}%, with a worst drawdown of '
-        f'{min(s["maxdd"] for s in record["series"] if s["label"] == "strategy") * 100:.0f}% '
-        f'against BTC\'s {min(s["maxdd"] for s in record["series"] if s["label"] != "strategy") * 100:.0f}%. '
-        'But BTC wins the fresh window outright on both return and Sharpe, so the case rests '
-        'on the second window and on the drawdown, not on a clean sweep. Neither component '
-        'explains the whole: timing alone is weak (Sharpe 0.52 and 0.28), selection alone is '
-        'moderate, and the pair beats both. That rules out the simplest deflationary story — '
-        'this is not a BTC market-timing strategy wearing a long/short costume — without '
-        'establishing that what remains is durable.</p></section>'
-    )
-
-
-def phase_section(record: dict) -> str:
-    """The seven rebalance phases, and why the headline is tranched.
-
-    A weekly strategy has seven equally valid start days and nothing in this one
-    refers to a weekday: shifting the rebalance by three days changes no
-    parameter, no rule and no data. A real weekly edge should barely notice. This
-    one swings from +63% to +7860% combined, which is why every figure on this
-    page holds all seven at once rather than picking.
-
-    The table is sorted by outcome rather than by weekday, because the point is
-    the spread and not which day won. The chart shows best, median and worst
-    against the tranched book - four series, which is the palette's limit and
-    also the most a reader can follow.
-    """
-    rows = ""
-    for r in record["rows"]:
-        rows += (
-            f'<tr><td class="mono-s">{_esc(r["phase"])}</td>'
-            f'<td class="num">{r["fresh"] * 100:.1f}%</td>'
-            f'<td class="num">{r["orig"] * 100:.1f}%</td>'
-            f'<td class="num">{r["sharpe"]:.2f}</td>'
-            f'<td class="num">{r["maxdd"] * 100:.1f}%</td>'
-            f'<td class="num">{r["combined"] * 100:.1f}%</td></tr>'
-        )
-    t = record["tranched"]
-    rows += (
-        f'<tr class="lead"><td class="mono-s">tranched</td>'
-        f'<td class="num muted">—</td><td class="num muted">—</td>'
-        f'<td class="num muted">—</td>'
-        f'<td class="num">{t["maxdd"] * 100:.1f}%</td>'
-        f'<td class="num">{t["final"] * 100:.1f}%</td></tr>'
-    )
-
-    chart = _line_panel(
-        [(s["label"], s["equity"]) for s in record["series"]],
-        height=300, split=record.get("split"), fmt=lambda v: f"{v:.0f}x",
-        ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Best, median and worst rebalance phase against the tranched book",
-        baseline=1.0,
-    )
-
-    return (
-        '<section><h2>Why the numbers above are tranched</h2>'
-        '<p class="note">Nothing in this strategy refers to a weekday. Shifting the rebalance '
-        'by three days changes no parameter, no rule and no data — only which seven-day '
-        'windows the returns are cut into. A real weekly edge should barely notice.</p>'
-        '<div class="scroll"><table class="data"><thead>'
-        '<tr><th>rebalance day</th><th class="num">fresh</th><th class="num">orig</th>'
-        '<th class="num">Sharpe</th><th class="num">maxDD</th>'
-        '<th class="num">combined</th></tr></thead>'
-        '<tbody>' + rows + '</tbody></table></div>'
-        + chart
-        + '<p class="finding"><strong>The same strategy, on the same data, returns +63% or '
-        '+7860% depending on an arbitrary choice.</strong> That spread is far larger than the '
-        'effect of any parameter in the strategy, which is why a single-phase number is not a '
-        'result — it is one draw. Holding all seven at once is both the honest measurement and '
-        'the better book: the tranched drawdown of '
-        f'{record["tranched"]["maxdd"] * 100:.1f}% is shallower than <em>every</em> individual '
-        'phase, including the luckiest, because the sub-books are only about a third '
-        'correlated and their worst weeks do not coincide. It costs nothing — each tranche '
-        'carries the same turnover as a single-phase book.</p>'
-        '<p class="note">This is also how the earlier headline result was wrong. Every '
-        'validation the strategy passed — a fresh out-of-sample window, walk-forward folds, '
-        'plateau sweeps, a label-shuffle null — was run on the Friday phase, the best of the '
-        'seven. An unrecognised degree of freedom is not protected against by testing the ones '
-        'you recognised.</p></section>'
-    )
-
-
-def fixed_budget_section(record: dict) -> str:
-    """The same weekly returns under both equity conventions, on one x-axis.
-
-    A compounding curve answers "what did the account do" and is the only honest
-    answer to that question. It is a poor instrument for "is the edge holding
-    up", because it multiplies each week's return by however much the account
-    happens to have grown — so a decaying edge on a large balance still slopes
-    upward, and an early loss is invisible next to a later one of half the
-    severity. Applying the identical returns to a constant stake removes the
-    balance from the picture and leaves the edge itself: slope IS performance,
-    and a flattening slope is a fading signal rather than a smaller account.
-
-    Both are plotted because neither alone is sufficient, and never on two
-    y-scales — they are the same quantity under two conventions, so they share
-    one axis and the divergence between them is the point.
-    """
-    comp = [(d, v) for d, v in record["compounded"]]
-    fixed = [(d, v) for d, v in record["fixed"]]
-    split = record.get("split")
-
-    # Separate panels, not one plot: 64x and 5.7x on a shared scale would flatten
-    # the fixed-budget line into the axis and destroy the only thing it shows.
-    grown = _line_panel(
-        [("compounded", comp)],
-        height=250,
-        split=split,
-        fmt=lambda v: f"{v:.0f}x",
-        ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Compounded equity: each week's return applied to the running balance",
-        baseline=1.0,
-    )
-    flat = _line_panel(
-        [("fixed budget", fixed)],
-        height=250,
-        split=split,
-        fmt=lambda v: f"{v:.1f}x",
-        ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Fixed-budget equity: the same returns applied to a constant stake",
-        baseline=1.0,
-    )
-
-    years = "".join(
-        f"<tr><td>{y['year']}</td><td class='num'>{y['pnl'] * 100:+.1f}%</td></tr>"
-        for y in record["years"]
-    )
-
-    return (
-        '<section><h2>Compounding, removed</h2>'
-        '<p class="note">The chart above shows what the <em>account</em> did. Position sizes '
-        'are fractions of NAV, so every dollar earned is redeployed and the curve is '
-        'exponential by construction — which makes it a bad instrument for asking whether the '
-        '<em>edge</em> is holding up. The pair below is the same series of weekly returns '
-        'under both conventions.</p>'
-        '<p class="note"><strong>Compounded</strong> — <code>equity ×= 1 + r</code>. '
-        'What the account actually does.</p>'
-        + grown
-        + '<p class="note" style="margin-top:14px"><strong>Fixed budget</strong> — '
-        '<code>equity += r</code>, the identical weekly returns on a constant stake. '
-        'Here slope <em>is</em> performance: a straight line means a steady edge, and a '
-        'flattening one means a fading edge rather than a smaller account.</p>'
-        + flat
-        + '<div class="scroll"><table class="data"><thead><tr><th>year</th>'
-        '<th class="num">P&amp;L, in units of the fixed stake</th></tr></thead>'
-        '<tbody>' + years + '</tbody></table></div>'
-        '<p class="finding"><strong>The two lines nearly coincide, and that is the finding.</strong> '
-        'On the median rebalance phase the strategy roughly doubles either way — compounding '
-        'adds almost nothing over seven years, because compounding only compounds when returns '
-        'are consistently positive, and here two of the seven years are negative. The earlier '
-        'version of this panel showed a steep exponential and reported a decaying edge; both '
-        'were properties of the Friday phase rather than of the strategy. On the median phase '
-        'the year-by-year P&amp;L has no trend at all — 2022 is the worst year and 2025 the '
-        'best, which is the reverse of the earlier reading. That reversal is worth more than '
-        'either result: a story confidently derived from one phase came out backwards on '
-        'another, so the fixed-budget view corrects the compounding illusion but cannot rescue '
-        'a number measured on a single arbitrary phase.</p></section>'
-    )
-
-
-def candidates_table(cands: list[dict]) -> str:
-    """Every candidate, with how much search preceded it.
-
-    The `searched` column is the one that matters and it is why this is a table
-    rather than a leaderboard. Sorting by return would put the least trustworthy
-    row on top: a result found after eighty-eight configurations on two windows
-    is not the same kind of evidence as one hypothesis tested once, and a table
-    that does not say so is actively misleading. Rows are therefore in the order
-    they were *reached*, not the order they score.
-    """
-    def cell(v, pct=True, places=1):
-        if v is None:
-            return '<td class="num muted">—</td>'
-        return f'<td class="num">{v * 100:.{places}f}%</td>' if pct else f'<td class="num">{v:.2f}</td>'
-
-    body = ""
-    for c in cands:
-        # Grade by what SURVIVED, not by how much search preceded it. A result
-        # reached after a long search but which a matched null cannot reproduce
-        # is different from one that has never been falsification-tested.
-        ev = c["evidence"]
-        trust = ("ok" if ("clean OOS" in ev or "survives null" in ev)
-                 else ("thin" if c["configs"] >= 16 else "ok"))
-        body += (
-            f'<tr class="shape-{_esc(c["shape"])}">'
-            f'<td>{_esc(c["name"])}</td>'
-            f'<td class="mono-s">{_esc(c["shape"])}</td>'
-            + cell(c["fresh"]) + cell(c["fs"], pct=False) + cell(c["fdd"])
-            + cell(c["orig"]) + cell(c["os"], pct=False) + cell(c["odd"])
-            + cell(c["combined"])
-            + f'<td class="num">{c["configs"]}</td>'
-            f'<td><span class="ev ev-{trust}">{_esc(c["evidence"])}</span></td>'
-            f'<td class="note-cell">{_esc(c["note"])}</td></tr>'
-        )
-
-    return (
-        '<section><h2>Every candidate</h2>'
-        '<p class="note">In the order they were reached, not the order they score. '
-        '<strong>The <em>searched</em> column is the one to read first</strong> — a result '
-        'found after eighty-eight configurations on two windows is not the same kind of '
-        'evidence as one hypothesis tested once, and sorting by return would put the least '
-        'trustworthy row on top.</p>'
-        '<div class="scroll"><table class="data cands"><thead>'
-        '<tr><th rowspan="2">candidate</th><th rowspan="2">shape</th>'
-        '<th colspan="3">fresh 2019-10..2021-10</th>'
-        '<th colspan="3">orig 2021-10..2026-08</th>'
-        '<th rowspan="2" class="num">combined</th>'
-        '<th rowspan="2" class="num">searched</th>'
-        '<th rowspan="2">evidence</th><th rowspan="2">note</th></tr>'
-        '<tr><th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th>'
-        '<th class="num">return</th><th class="num">Sharpe</th><th class="num">maxDD</th></tr>'
-        '</thead><tbody>' + body + '</tbody></table></div>'
-        '<p class="finding"><strong>None of these rows carries the evidence it appears to, and '
-        'the reason is not in this table.</strong> Every long/short row was measured on one '
-        'rebalance phase. The strategy turns out to be far more sensitive to that arbitrary '
-        'choice than to any parameter here — so a rerun of the identical search on a different '
-        'weekday would crown a different winner, and the ordering is largely an artifact. '
-        'The <em>searched</em> column was the right instinct pointed at the wrong risk: it '
-        'counts configurations while the damage came from a degree of freedom nobody counted, '
-        'because nobody thought of it as one. Even the null test inherits the flaw — all 24 '
-        'draws were run on the same phase as the real data, so it compared a lucky phase '
-        'against a lucky phase. See the phase-robustness section.</p></section>'
-    )
-
-
-# --- page -------------------------------------------------------------------
-
-
-def _universe_table(points: list[dict]) -> str:
-    """The universe chart's values, sampled yearly.
-
-    Every point would be 357 rows of noise; one per year carries the shape a
-    reader needs — the eligible count is roughly flat while the delisted tail
-    grows, which is the whole argument that this is not a survivor sample.
-    """
-    if not points:
-        return ""
-    seen, rows = set(), ""
-    for p in points:
-        year = p["date"][:4]
-        if year in seen:
-            continue
-        seen.add(year)
-        rows += (
-            f'<tr><td class="mono-s">{_esc(p["date"])}</td>'
-            f'<td class="num">{p["eligible"]}</td>'
-            f'<td class="num">{p["considered"]}</td>'
-            f'<td class="num">{p["dead"]}</td></tr>'
-        )
-    last = points[-1]
-    rows += (
-        f'<tr><td class="mono-s">{_esc(last["date"])}</td>'
-        f'<td class="num">{last["eligible"]}</td>'
-        f'<td class="num">{last["considered"]}</td>'
-        f'<td class="num">{last["dead"]}</td></tr>'
+        f'<tr><td>{_esc(k)}</td><td class="mono-s">{_esc(v)}</td></tr>'
+        for k, v in strategy["params"]
     )
     return (
-        '<div class="scroll"><table class="data"><thead><tr><th>first date of year</th>'
-        '<th class="num">eligible</th><th class="num">considered</th>'
-        '<th class="num">delisted carried</th></tr></thead>'
+        '<div class="scroll"><table class="data params"><thead>'
+        '<tr><th>parameter</th><th>value</th></tr></thead>'
         f'<tbody>{rows}</tbody></table></div>'
     )
 
 
-def _tiles(record: dict) -> str:
-    d = record["data"]
-    cur = record.get("current", {})
-    strat = next(
-        (x for x in cur.get("decomposition", []) if x["name"] == "strategy"), None
-    )
-    # Decisions across all seven tranches, which is what is actually replayed.
-    n = (strat["fresh"]["n"] + strat["orig"]["n"]) * 7 if strat else 0
+def _metric_tiles(m: dict) -> str:
     cells = [
-        (f"{d['assets']}", "assets in the store", ""),
-        (f"{d['bars'] // 1000}k", "daily bars", f"{d['first_bar']} → {d['last_bar']}"),
-        (f"{d['delisted']}", "delisted series retained", "not a survivor sample"),
-        (f"{n}", "decisions replayed", "7 tranches, weekly each"),
+        (f"{m['total_return'] * 100:,.0f}%", "total return", f"{m['years']:.1f} years, compounded"),
+        (f"{m['cagr'] * 100:.1f}%", "CAGR", f"vs BTC {m['btc_return'] * 100:,.0f}% total"),
+        (f"{m['sharpe']:.2f}", "Sharpe", f"Sortino {m['sortino']:.2f}"),
+        (f"{m['max_drawdown'] * 100:.1f}%", "max drawdown", f"vs BTC {m['btc_maxdd'] * 100:.0f}%"),
+        (f"{m['calmar']:.2f}", "Calmar", "CAGR / max drawdown"),
+        (f"{m['volatility'] * 100:.1f}%", "volatility", "annualised, weekly returns"),
+        (f"{m['win_rate'] * 100:.0f}%", "weeks positive", f"{m['weeks']} weeks"),
+        (f"{m['t_stat']:.2f}", "t-statistic", "mean weekly return / its error"),
     ]
     return "".join(
         f'<div class="tile"><div class="tile-v">{_esc(v)}</div>'
-        f'<div class="tile-l">{_esc(l)}</div>'
+        f'<div class="tile-l">{_esc(lab)}</div>'
         f'<div class="tile-n">{_esc(note)}</div></div>'
-        for v, l, note in cells
+        for v, lab, note in cells
     )
 
 
-def _verdict(record: dict) -> str:
-    rows = []
-    for r in record["runs"]:
-        if r["label"] == "baseline":
-            continue
-        m, s = r["metrics"], r["stressed"]
-        base = next(x for x in record["runs"] if x["label"] == "baseline")["metrics"]
-        oos = (
-            sum(f["return"] for f in r["folds"]) / len(r["folds"]) if r["folds"] else 0.0
-        )
-        base_oos_run = next(x for x in record["runs"] if x["label"] == "baseline")
-        base_oos = (
-            sum(f["return"] for f in base_oos_run["folds"]) / len(base_oos_run["folds"])
-            if base_oos_run["folds"]
-            else 0.0
-        )
-        criteria = [
-            ("positive expectancy after costs", m["total_return"] > 0,
-             f"{_pct(m['total_return'])} over {m['n']} rebalances"),
-            ("survives 2× slippage", s["total_return"] > 0,
-             f"{_pct(s['total_return'])} at 2× vs {_pct(m['total_return'])} at 1×"),
-            ("walk-forward beats the baseline", oos > base_oos,
-             f"out-of-sample {_pct(oos)} vs baseline {_pct(base_oos)}"),
-            ("sample adequate, or it says so", m["n"] >= 60, f"n = {m['n']} (floor 60)"),
-        ]
-        passed = all(ok for _, ok, _ in criteria)
-        body = "".join(
-            f'<tr><td><span class="pill {"ok" if ok else "no"}">'
-            f'{"PASS" if ok else "FAIL"}</span></td>'
-            f"<td>{_esc(name)}</td><td class=\"num\">{_esc(detail)}</td></tr>"
-            for name, ok, detail in criteria
-        )
-        rows.append(
-            f'<section class="verdict{" passed" if passed else ""}"><h3>{_esc(r["signal"])} '
-            f'<span class="muted">+ {_esc(r["constructor"])}</span></h3>'
-            f'<p class="stamp {"ok" if passed else "no"}">'
-            f'PHASE 1 GATE: {"PASSED" if passed else "NOT PASSED"}</p>'
-            f'<table class="crit"><tbody>{body}</tbody></table></section>'
-        )
-    return "".join(rows)
-
-
-def _results_table(record: dict) -> str:
-    head = (
-        "<tr><th>run</th><th class='num'>n</th><th class='num'>return</th>"
-        "<th class='num'>CAGR</th><th class='num'>vol</th><th class='num'>Sharpe</th>"
-        "<th class='num'>max DD</th><th class='num'>turnover</th>"
-        "<th class='num'>cost bps</th><th class='num'>rejected</th></tr>"
+def _equity_section(record: dict) -> str:
+    s = record["series"]
+    equity = _line_panel(
+        [("strategy", s["compounded"]), ("BTC buy & hold", s["btc"])],
+        height=300, split=None, fmt=lambda v: f"{v:.0f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="Growth of one unit, compounded, against buy and hold BTC", baseline=1.0,
     )
-    body = ""
-    for r in record["runs"]:
-        m = r["metrics"]
-        body += (
-            f"<tr><td>{_esc(r['label'])}</td><td class='num'>{m['n']}</td>"
-            f"<td class='num'>{_pct(m['total_return'])}</td>"
-            f"<td class='num'>{m['cagr'] * 100:+.2f}%</td>"
-            f"<td class='num'>{m['volatility'] * 100:.1f}%</td>"
-            f"<td class='num'>{m['sharpe']:+.2f}</td>"
-            f"<td class='num'>{m['max_drawdown'] * 100:.2f}%</td>"
-            f"<td class='num'>{m['turnover'] * 100:.2f}%</td>"
-            f"<td class='num'>{m['cost_bps']:.0f}</td>"
-            f"<td class='num'>{m['rejected']}</td></tr>"
-        )
-    return f"<div class='scroll'><table class='data'><thead>{head}</thead><tbody>{body}</tbody></table></div>"
+    draw = _line_panel(
+        [("strategy", s["drawdown"]), ("BTC buy & hold", s["btc_drawdown"])],
+        height=190, split=None, fmt=lambda v: f"{v * 100:.0f}%",
+        ticks_from=lambda a, b: (a * 1.08, 0.0),
+        aria="Drawdown from peak", baseline=0.0,
+    )
+    rows = "".join(
+        f'<tr><td class="mono-s">{_esc(y["year"])}</td>'
+        f'<td class="num">{y["ret"] * 100:+.1f}%</td></tr>'
+        for y in record["yearly"]
+    )
+    return (
+        '<section><h2>Equity, compounded</h2>'
+        '<p class="note">Position sizes are fractions of NAV, so every dollar earned is '
+        'redeployed. This is what the account does.</p>'
+        + equity
+        + '<p class="note" style="margin-top:14px">Drawdown from peak, same axis.</p>'
+        + draw
+        + '<div class="scroll"><table class="data"><thead><tr><th>year</th>'
+        '<th class="num">return</th></tr></thead><tbody>' + rows
+        + '</tbody></table></div></section>'
+    )
 
 
-def _folds_table(record: dict) -> str:
-    head = "<tr><th>run</th><th>window</th><th class='num'>n</th><th class='num'>return</th><th class='num'>Sharpe</th></tr>"
-    body = ""
-    for r in record["runs"]:
-        for f in r["folds"]:
-            body += (
-                f"<tr><td>{_esc(r['label'])}</td>"
-                f"<td>{_esc(f['start'])} → {_esc(f['end'])}</td>"
-                f"<td class='num'>{f['n']}</td>"
-                f"<td class='num'>{_pct(f['return'])}</td>"
-                f"<td class='num'>{f['sharpe']:+.2f}</td></tr>"
-            )
-    return f"<div class='scroll'><table class='data'><thead>{head}</thead><tbody>{body}</tbody></table></div>"
+def _fixed_section(record: dict) -> str:
+    m = record["metrics"]
+    chart = _line_panel(
+        [("fixed budget", record["series"]["fixed"])],
+        height=250, split=None, fmt=lambda v: f"{v:.1f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="The same weekly returns applied to a constant stake", baseline=1.0,
+    )
+    drag = m["total_return"] - m["fixed_budget_return"]
+    return (
+        '<section><h2>Equity, fixed budget</h2>'
+        '<p class="note">The identical weekly returns applied to a <strong>constant '
+        'stake</strong> rather than a growing one. Slope is performance here: a straight line '
+        'is a steady edge and a flattening one is a fading edge rather than a smaller '
+        'account.</p>'
+        + chart
+        + '<div class="scroll"><table class="data"><thead><tr><th>convention</th>'
+        '<th class="num">result</th></tr></thead><tbody>'
+        f'<tr><td>compounded &mdash; <code>equity ×= 1+r</code></td>'
+        f'<td class="num">{m["total_return"] * 100:,.1f}%</td></tr>'
+        f'<tr><td>fixed budget &mdash; <code>equity += r</code></td>'
+        f'<td class="num">{m["fixed_budget_return"] * 100:,.1f}%</td></tr>'
+        f'<tr><td>difference</td><td class="num">{drag * 100:,.1f}%</td></tr>'
+        '</tbody></table></div></section>'
+    )
+
+
+def _exposure_section(record: dict) -> str:
+    """Gross, net, and therefore how much margin the book needs."""
+    e = record["exposure"]
+    chart = _line_panel(
+        [("gross", e["gross"]), ("net", e["net"])],
+        height=250, split=None, fmt=lambda v: f"{v:+.1f}x",
+        ticks_from=lambda a, b: (min(a * 1.1, -0.1), max(b * 1.1, 0.1)),
+        aria="Gross and net exposure as a fraction of NAV", baseline=0.0,
+    )
+    rows = [
+        ("gross exposure, mean", f"{e['mean_gross']:.2f}x NAV"),
+        ("gross exposure, peak", f"{e['max_gross']:.2f}x NAV"),
+        ("net exposure, most long", f"{e['max_net_long']:+.2f}x NAV"),
+        ("net exposure, most short", f"{e['max_net_short']:+.2f}x NAV"),
+        ("net exposure, mean absolute", f"{e['mean_abs_net']:.2f}x NAV"),
+        ("largest single position", f"{e['max_name']:.2f}x NAV"),
+    ]
+    body = "".join(
+        f'<tr><td>{_esc(k)}</td><td class="num">{_esc(v)}</td></tr>' for k, v in rows
+    )
+    return (
+        '<section><h2>Exposure and margin</h2>'
+        '<p class="note">Gross is the sum of absolute weights &mdash; the capital actually '
+        'deployed. Net is their signed sum, which is the directional bet. <strong>Gross never '
+        'exceeds the configured target, so this book is never levered above 1×</strong>; the '
+        'short leg is the only part requiring margin, and it is funded by perpetuals rather '
+        'than borrowed spot.</p>'
+        + chart
+        + '<div class="scroll"><table class="data"><thead><tr><th>measure</th>'
+        '<th class="num">value</th></tr></thead><tbody>' + body + '</tbody></table></div>'
+        f'<p class="finding">Net exposure reaches the gross figure in both directions, which '
+        'means that at maximum tilt one leg is empty and the book is entirely directional. '
+        'That is the intended behaviour of the regime tilt and it is bounded &mdash; gross is '
+        'unchanged, so no leverage is introduced &mdash; but a book described as '
+        '&ldquo;market-neutral&rdquo; is not neutral in those weeks.</p></section>'
+    )
+
+
+def _stats_section(record: dict) -> str:
+    st, m = record["stats"], record["metrics"]
+    rows = [
+        ("long names held, mean", f"{st['mean_long_names']:.1f}"),
+        ("short names held, mean", f"{st['mean_short_names']:.1f}"),
+        ("turnover per rebalance", f"{st['mean_turnover'] * 100:.0f}% of NAV"),
+        ("weeks flat (all tranches)", f"{st['flat_weeks']} of {m['weeks']}"),
+        ("weeks partly flat", f"{st['partial_weeks']} of {m['weeks']}"),
+        ("regime read up", f"{st['pct_up_regime'] * 100:.0f}% of weeks"),
+        ("regime read down", f"{st['pct_down_regime'] * 100:.0f}% of weeks"),
+        ("best week", f"{m['best_week'] * 100:+.1f}%"),
+        ("worst week", f"{m['worst_week'] * 100:+.1f}%"),
+    ]
+    attrib = [
+        ("long leg", st["from_long"]),
+        ("short leg", st["from_short"]),
+        ("funding received", st["total_funding"]),
+        ("trading costs", -st["total_cost"]),
+    ]
+    body = "".join(f'<tr><td>{_esc(k)}</td><td class="num">{_esc(v)}</td></tr>' for k, v in rows)
+    att = "".join(
+        f'<tr><td>{_esc(k)}</td><td class="num">{v * 100:+.1f}%</td></tr>' for k, v in attrib
+    )
+    return (
+        '<section><h2>How the book behaved</h2>'
+        '<div class="scroll"><table class="data"><thead><tr><th>statistic</th>'
+        '<th class="num">value</th></tr></thead><tbody>' + body + '</tbody></table></div>'
+        '<h3>Where the return came from</h3>'
+        '<p class="note">Sum of each component across every week, before compounding, so '
+        'they add to the fixed-budget result rather than the compounded one.</p>'
+        '<div class="scroll"><table class="data"><thead><tr><th>component</th>'
+        '<th class="num">contribution</th></tr></thead><tbody>' + att + '</tbody></table></div>'
+        f'<p class="finding">The long leg contributes roughly three times the short leg, and '
+        f'<strong>funding received almost exactly cancels trading costs</strong> '
+        f'({st["total_funding"] * 100:+.1f}% against {-st["total_cost"] * 100:.1f}%). The '
+        f'short leg therefore pays for the book\'s turnover and contributes '
+        f'{st["from_short"] * 100:.0f}% on top; without shorts this would be a long-only '
+        'book paying its own costs out of returns.</p></section>'
+    )
 
 
 def render(record: dict) -> str:
-    """The whole page, as one self-contained document body."""
-    spread_rows = [
-        (
-            f"{r['horizon']}d",
-            r["mean_spread"],
-            f"t={r['t_stat']:+.2f} · eff n {r['effective_n']:.0f}"
-            + ("" if abs(r["t_stat"]) > 2 else " · not sig."),
-        )
-        for r in record["spread"]
-    ]
-
-    spread_table = "".join(
-        f"<tr><td>{r['horizon']}d</td><td class='num'>{r['periods']}</td>"
-        f"<td class='num'>{r['effective_n']:.0f}</td>"
-        f"<td class='num'>{r['mean_spread'] * 100:+.3f}%</td>"
-        f"<td class='num'>{r['t_stat']:+.2f}</td>"
-        f"<td class='num'>{r['pct_above'] * 100:.1f}%</td></tr>"
-        for r in record["spread"]
-    )
-
-    window = record["window"]
+    """One backtest run: what was run, what it produced, and how it behaved."""
+    s, m, w = record["strategy"], record["metrics"], record["window"]
     return f"""
 <div class="viz-root">
 <header>
-  <p class="eyebrow">ai-trader · research view</p>
-  <h1>Phase 1: two candidates, two failures</h1>
-  <p class="sub">Replay {window[0]} → {window[1]} · weekly cadence · generated by
-  <code>ai-trader report</code></p>
+  <p class="eyebrow">ai-trader · backtest</p>
+  <h1>{_esc(s["name"])}</h1>
+  <p class="sub">{_esc(w[0])} → {_esc(w[1])} · {m["weeks"]} weekly rebalances ·
+  generated by <code>ai-trader report</code></p>
 </header>
 
 <div class="disclosures" role="note">
   <p class="dh">Read before any number below</p>
   <ul>
-    <li>Every strategy figure is <strong>tranched across all seven rebalance phases</strong>.
-      A single-phase number is one draw: on one phase this strategy returned +1177% over the
-      second window and on another −57%, with nothing changed but the weekday.</li>
     <li>The cost model is <strong>uncalibrated</strong> — its impact coefficient is assumed
       rather than fitted to realised fills, so every cost figure carries an unquantified error.</li>
     <li>The fill model crosses the spread and charges commission and <strong>models nothing
-      else</strong>: no partial fills, no queue position, no depth. Pessimistic but crude.</li>
-    <li>The parameters were selected on one phase before that was understood, so the
-      <strong>selection is not yet phase-free even though the measurement is</strong>.</li>
-    <li>Every chart here has a table below it carrying the same values.</li>
+      else</strong>: no partial fills, no queue position, no depth.</li>
+    <li>Parameters were selected on this same data. <strong>No result below is
+      out-of-sample</strong>; it describes this history rather than predicting another.</li>
+    <li>Every chart has a table below it carrying the same values.</li>
   </ul>
 </div>
 
-{current_section(record["current"]) if record.get("current") else ""}
-{phase_section(record["phases"]) if record.get("phases") else ""}
-{fixed_budget_section(record["fixed_budget"]) if record.get("fixed_budget") else ""}
-
 <section>
-  <h2>What the data is</h2>
-  <div class="tiles">{_tiles(record)}</div>
-  <p class="note">The delisted count is the load-bearing one. A universe built from
-  currently-listed assets is selected for having survived, and it flatters momentum
-  specifically — the assets it buys are disproportionately the ones that later died.</p>
+  <h2>What was run</h2>
+  {_params_table(s)}
 </section>
 
 <section>
-  <h2>Breakout spread — above band minus below band</h2>
-  <p class="note">The signal the current strategy is built on, tested directly rather
-  than through a portfolio. Does an asset above its channel outperform one below it?</p>
-  {signed_bars(spread_rows, title_id="sp-h")}
-  <div class="scroll"><table class="data"><thead><tr><th>horizon</th>
-  <th class="num">periods</th><th class="num">eff n</th>
-  <th class="num">mean spread</th><th class="num">t</th>
-  <th class="num">% above band</th></tr></thead>
-  <tbody>{spread_table}</tbody></table></div>
-  <p class="finding"><strong>Flat, and negative past a week.</strong> +0.14% at 7 days
-  (t = +0.27), −0.57% at 14, −2.40% at 30. This is the strategy's own premise measured
-  head-on over the full window, and it does not hold — which sits uneasily beside a
-  long/short book built on it returning what it does. The most likely reconciliation is
-  that the book is not trading the raw group split: it ranks within each leg, caps
-  position count and size, and collects funding on the short side. Those are the parts
-  this test does not cover, and the parts that have had the least scrutiny.</p>
+  <h2>Headline</h2>
+  <div class="tiles">{_metric_tiles(m)}</div>
 </section>
 
-<section>
-  <h2>Universe over time</h2>
-  <p class="note">Eligible assets per decision date, and how many delisted series the
-  snapshot still carries. The second line is what makes the first one honest.</p>
-  {universe_chart(record["universe"])}
-  {_universe_table(record["universe"])}
-</section>
-
-<section>
-  <h2>What is not settled</h2>
-  <ul class="open">
-    <li><strong>The parameters were chosen on a single phase.</strong> Tranching fixed how
-      the strategy is measured, not how its tilt scale, regime period and channel length
-      were picked. Those sweeps need re-running against the tranched objective before the
-      numbers above mean what they appear to.</li>
-    <li><strong>No null test on the tranched result.</strong> The original label-shuffle
-      null shared the Friday phase with the real data, so it compared a lucky phase against
-      a lucky phase. It has to be re-run per phase.</li>
-    <li><strong>The spread test and the book disagree.</strong> Resolving that means
-      isolating the within-leg ranking, the position caps and the funding carry and
-      measuring each separately.</li>
-    <li><strong>The short-leg ranking is untested.</strong> Ranking shorts by distance below
-      the lower band was introduced to fit the twelve-position limit, not because anything
-      measured said it was right.</li>
-    <li><strong>BTC still wins the first window</strong> on both return and Sharpe. The case
-      rests on the second window and on drawdown.</li>
-  </ul>
-  <p class="note">The full history of everything tried and rejected — including three
-  retracted results — is in <code>docs/phase-1-findings.md</code>. This page is the
-  current state, not the log.</p>
-</section>
+{_equity_section(record)}
+{_fixed_section(record)}
+{_exposure_section(record)}
+{_stats_section(record)}
 
 <footer>
-  <p>Regenerate: <code>ai-trader report --record research.json --out research.html</code>.
-  This page computes nothing — it renders a record the CLI produced, and deleting it would
-  cost a convenience and no evidence.</p>
+  <p>Regenerate: <code>ai-trader report --record backtest.json --out research.html</code>.
+  This page computes nothing — it renders a record the CLI produced.</p>
 </footer>
 </div>
 """
