@@ -1617,3 +1617,46 @@ hedge.
 Phase 3. Beating buy-and-hold in every regime is available and requires a
 deliberate decision — taken, if at all, on a Sharpe estimate that is still
 selection-inflated and against a strategy whose market impact remains unmodelled.
+
+## Market impact, and therefore capacity
+
+Impact had been modelled as zero against a book replacing ~98% of itself daily,
+which was the largest unmeasured exposure in the result. It cannot be *measured*
+without real fills, but it can be modelled, and the useful output is not a
+number — it is the account size at which the edge dies.
+
+    impact_bps = Y * sigma_1h * sqrt(order / volume in the execution hour)
+
+Two choices keep this honest. The window is the **hour actually traded in**, not
+the day: the book fills one hour after the signal, so using daily ADV would
+divide by 24× more liquidity than is really available and understate impact
+roughly fivefold. And **Y is swept rather than assumed** — config's 0.10 sits at
+the optimistic edge of the equity literature's 0.3–1.0, and crypto alts are
+unlikely to be kinder.
+
+| NAV | Y=0.1 | Y=0.3 | Y=1.0 | median participation | 99th |
+|---|---|---|---|---|---|
+| $30,000 | 2.65 | 2.54 | **2.15** | 0.05% | 1.38% |
+| $300,000 | 2.53 | 2.18 | 0.95 | 0.49% | 13.83% |
+| $3,000,000 | 2.15 | 1.04 | −2.78 | 4.95% | **138%** |
+| $30,000,000 | 0.95 | −2.51 | −13.29 | 49.5% | 1383% |
+
+*(Sharpe; unimpacted baseline is 2.70.)*
+
+**At $30,000 impact is negligible** — Sharpe 2.70 → 2.15 even at four times the
+assumed coefficient, with the worst 1% of orders reaching 1.38% of the execution
+hour's volume.
+
+**Above roughly $300,000 the binding constraint stops being cost and becomes
+feasibility.** At $3M the 99th-percentile order is 138% of that hour's entire
+volume: not expensive, impossible. A square-root model returns a finite cost for
+such an order, which is a quiet lie, so the numbers below the participation
+threshold are the only ones worth reading.
+
+**Practical capacity is $200k–$300k** for this construction, taking the point
+where the worst 1% of orders reach ~10% of hourly volume and a price-taker stops
+being one.
+
+Three levers extend it, each trading edge for capacity: execute across several
+hours rather than one (participation falls linearly), hold more names (smaller
+orders each), or drop the least liquid assets from the universe.
