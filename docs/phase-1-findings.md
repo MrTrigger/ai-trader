@@ -1728,3 +1728,76 @@ passively rather than crossing (maker fills alone were worth about +110pp
 earlier). **These numbers are therefore a floor, not a forecast.** Modelling
 anything better requires order-book data the store does not have and cannot
 backfill, so TWAP is the most that can honestly be claimed.
+
+## The LSTM: a broken loss, then a real answer
+
+The earlier result — IC −0.0347, negative in all six folds — was **an
+implementation error, not a finding about recurrent models**, and recording it as
+unresolved rather than as evidence turned out to be right.
+
+### The bug
+
+The diagnostic that settles it is the *training* IC. Strongly positive train with
+negative test means overfitting; negative on both means the loss or the wiring is
+wrong. Training IC was **also negative**, and the loss moved 3.2606 → 3.2399
+across eight epochs — a 0.6% reduction. The model never learned anything.
+
+The cause was the listwise objective. `q = softmax(target / target.std())` over a
+~30-name cross-section is nearly uniform, `q_i ≈ 1/30`, so the loss sat at its
+uniform value of ~3.40 with almost no gradient to descend. A separate detail
+explains the *sign*: most informative features carry negative IC (`vol_30`
+−0.146, `band_width` −0.124, `beta_bench` −0.074), so a random projection of them
+inherits a negative tilt — the untrained model already scored −0.034.
+
+| loss | train IC | test IC |
+|---|---|---|
+| listwise softmax (original) | −0.012 | −0.048 |
+| MSE, as the booster uses | −0.014 | −0.016 (unstable) |
+| **negative Pearson correlation** | **+0.173** | **+0.075** |
+
+Optimising the correlation directly has no flat region and is exactly the
+quantity being reported, so nothing is lost in translation.
+
+### It beats the booster on IC and loses on P&L
+
+| | mean OOS IC | folds positive | fold-level t |
+|---|---|---|---|
+| LSTM | **+0.0942** | 6/6 | **+13.44** |
+| GBM | +0.0643 | 6/6 | +9.92 |
+
+Through the identical construction — risk-adjusted sizing, cost threshold,
+liquidity cap and waterfall, one-hour fill lag, $30k:
+
+| model | return | Sharpe | maxDD |
+|---|---|---|---|
+| GBM | +733.3% | 2.60 | −17.5% |
+| LSTM | +405.3% | 1.98 | −17.0% |
+| **blend 50/50** | **+890.1%** | **2.64** | **−16.3%** |
+
+**IC was the wrong yardstick.** It scores the whole cross-section; the book holds
+only the extremes. The decile breakdown shows exactly where the LSTM's IC comes
+from and why it does not pay:
+
+| decile | GBM | LSTM |
+|---|---|---|
+| 1 (shorted) | **−0.295%** | −0.180% |
+| 10 (longed) | +0.276% | **+0.305%** |
+| **top − bottom** | **+0.571%** | +0.485% |
+| middle six, spread | 0.333% | 0.264% |
+
+The LSTM is *better* on longs and *much worse* on shorts, and orders the middle
+more smoothly — which lifts IC and earns nothing. Failing to identify the worst
+names costs it half the book.
+
+### Verdict
+
+The two models correlate at +0.470 within date, so they genuinely make different
+errors, and the blend is the best single configuration measured. But it beats the
+booster alone by 2.60 → 2.64 Sharpe, which is inside the noise, for a large
+increase in moving parts, a torch dependency and roughly two orders of magnitude
+more training time.
+
+**The gradient booster stays the primary model.** The LSTM is worth keeping in
+the record as a demonstrated alternative rather than a shipped component — and as
+a reminder that a model reported as failing had a bug in its objective, not in
+its premise.
