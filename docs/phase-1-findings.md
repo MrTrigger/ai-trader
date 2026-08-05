@@ -1519,3 +1519,55 @@ a finding about recurrent models, so it is recorded as unresolved rather than as
 evidence. The diagnostic that would settle it is the training IC: strongly
 positive with negative test means overfitting, negative in both means the loss or
 the wiring is wrong. That has not been run.
+
+## The null test the ML strategy actually passes
+
+Sharpe 2.70 was selected across roughly twenty configurations on one
+out-of-sample window, which is precisely the situation where a number looks
+established and is not. Two nulls, each holding everything else fixed.
+
+**Null A — predictions permuted within each date.** Same dates, same universe,
+same weighting machinery, same costs, same turnover profile; only which asset
+receives which score is randomised. Twenty draws.
+
+**Null B — training labels permuted within each training date, model retrained,
+evaluated against the real test returns.** The model has nothing to learn, so any
+out-of-sample edge is leakage or an artifact of the cross-validation itself. Ten
+draws. This is the stronger test because it examines the harness, not the signal.
+
+| | median Sharpe | best draw | beat the real result |
+|---|---|---|---|
+| Null A | −1.42 | −0.16 | 0 / 20 |
+| Null B | −1.20 | −0.48 | 0 / 10 |
+| **real** | **+2.70** | | |
+
+**Both nulls are systematically negative, not merely lower**, and that is the
+informative part. Had the construction been generating the return — dollar-neutral,
+volatility-weighted, cost-thresholded — Null A would sit near zero or above. It
+sits at −1.42, because a random ranking pays turnover for nothing. Null B loses
+28–79% out of sample.
+
+The p-values (0.048 and 0.091) are bounded by the number of draws rather than by
+proximity: the gap between +2.70 and the best null draw of −0.16 is not marginal.
+This is a considerably stronger test than the channel strategy ever passed, and
+unlike that one it is not compromised by sharing a rebalance phase with the real
+data.
+
+**What this does and does not establish.** It establishes that the ranking has
+content and the harness is not manufacturing it. It does not make 2.70 an
+unbiased estimate of future Sharpe — that number was chosen after inspecting the
+same window about twenty times, so the honest expectation is lower.
+
+## Current state
+
+| | return | CAGR | Sharpe | Sortino | maxDD | t |
+|---|---|---|---|---|---|---|
+| **strategy** | **+875.5%** | **80.3%** | **2.70** | 2.64 | **−17.3%** | 5.31 |
+| BTC buy & hold | +218.7% | | 0.88 | | −53.1% | |
+
+1,412 daily rebalances over 3.9 years, out-of-sample only, executed one hour
+after each signal, net of measured costs. Holds ~11 long and ~10 short at an
+effective N of 12.7, turning over 98% of the book per day.
+
+That turnover is the dominant operational risk and **market impact is not
+modelled at all** — the largest unmeasured exposure in the whole result.
