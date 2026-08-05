@@ -11,6 +11,12 @@ dependencies = [
     # region names without it. Crypto is UTC-anchored, but the equities
     # calendar (Phase 6) is not, and the dependency is cheap now.
     "tzdata>=2024.1; platform_system == 'Windows'",
+    # The learned ranker. Added in Phase 2, not Phase 1, and the distinction is
+    # the point: nothing joins the shipped dependency set before the thing it
+    # enables has passed a gate. This one did - out-of-sample IC positive in all
+    # six folds, and both nulls returning systematically negative.
+    "lightgbm>=4.0",
+    "numpy>=1.26",
     # Added in Phase 1, not now: a path dependency on
     # ../../trading-journal/backtest for the validation harness
     # (design spec section 2 - depend in place, do not extract yet).

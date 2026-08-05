@@ -91,7 +91,18 @@ turnover_budget = "0.50"
 # see turnover_budget above.
 max_gross_exposure = "1.00"
 max_position = "0.25"
-max_position_count = 12
+# Raised from 12 in Phase 2, on measurement rather than convenience. The limit
+# exists to keep the book auditable by a human, and 12 was set for a
+# concentrated long-only book. The learned ranker is long/short and its name
+# count was swept explicitly: 12, 24 and 40 across 72 construction variants.
+# More names was better on risk-adjusted terms at every setting - the best
+# configurations in that search all held 40 - because the gain is
+# diversification rather than signal. Holding ~31 rather than ~20 lifted Sharpe
+# 2.53 to 2.65 and cut drawdown 17.5% to 16.0% at a $30k book, where liquidity
+# never binds, so it is not a capacity workaround.
+#
+# 40 remains auditable: it is one screen of positions.
+max_position_count = 40
 min_position_notional = "25"
 
 # Gross exposure per correlated group. NOT OPTIONAL per spec 6: a hundred crypto

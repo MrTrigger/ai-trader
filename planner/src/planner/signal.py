@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Protocol
 
 import polars as pl
@@ -585,6 +586,129 @@ class GaussianChannelLongShort:
         )
 
 
+class MLRanker:
+    """Score the cross-section with a trained model. Emits a relative view.
+
+    The strategy Phase 1 arrived at, and the first thing in this project with
+    measured out-of-sample content: IC positive in all six walk-forward folds,
+    and both nulls come back systematically NEGATIVE - shuffling the ranking
+    gives -1.42 Sharpe, because a random book pays turnover for nothing.
+
+    ## What the score means, and what it does not
+
+    The model is trained on returns **demeaned within each date**, so a score
+    says "beats today's cross-section by this much". It never says "goes up".
+    That distinction is the reason the book is long/short and dollar-neutral: an
+    absolute forecast was tested and is much worse, because over half its
+    prediction variance turns out to be a common market factor, so ranking by it
+    ranks partly by beta and the book becomes a leveraged market call - drawdowns
+    of 45-51% against a benchmark's 53%.
+
+    Conviction is therefore `|score|` and direction is its sign. The constructor
+    turns that into weights; nothing here knows about sizes.
+
+    ## The model is loaded, never trained here
+
+    Training needs the whole history and takes minutes; a decision must be
+    reproducible and instant. The artefact records the date it was trained
+    through and **refuses** to score on or before it, so a model that has seen
+    the answer cannot silently produce a backtest. See `model.py`.
+
+    ## How this most likely dies
+
+    The edge was selected across roughly seventy construction variants on one
+    window, and the honest expectation is below what that window showed. Two
+    guards exist for the failure that matters: the artefact's cutoff stops
+    look-ahead, and the risk gate stops a plan the limits do not allow. Neither
+    stops the edge simply decaying, and the most recent walk-forward fold was
+    already the weakest measured.
+    """
+
+    name = "ml_ranker"
+
+    #: A cross-section smaller than this cannot support a two-sided book.
+    MIN_CROSS_SECTION = 12
+
+    def __init__(self, artefact=None):
+        # Injected for tests; production loads from the configured path.
+        self._artefact = artefact
+
+    def _load(self, config: Config):
+        if self._artefact is not None:
+            return self._artefact
+        from . import model
+        path = getattr(config, "model_path", None)
+        if not path:
+            raise model.ModelError(
+                "no model_path configured. `ml_ranker` cannot invent a model, and "
+                "falling back to an untrained one would produce a plan that looks "
+                "identical to a real one."
+            )
+        self._artefact = model.load(Path(path))
+        return self._artefact
+
+    def generate(self, cross: pl.DataFrame, *, config: Config) -> SignalResult:
+        from . import model as model_mod
+
+        rows, notes = _eligible(cross, config)
+        warnings: list[Warning] = []
+        if len(rows) < self.MIN_CROSS_SECTION:
+            return SignalResult(
+                signals=[],
+                notes=notes + [
+                    f"{len(rows)} eligible assets against a {self.MIN_CROSS_SECTION} "
+                    "minimum; a relative score over a handful of names is not a "
+                    "cross-section - target is flat"
+                ],
+                warnings=warnings,
+            )
+
+        artefact = self._load(config)
+        frame = pl.DataFrame(rows)
+        # The artefact's feature names are the normalised `x_` columns; the
+        # cross-section carries the raw ones. Normalise here, with the same
+        # transform training used.
+        raw = [f[2:] for f in artefact.features]
+        missing = [f for f in raw if f not in frame.columns]
+        if missing:
+            raise model_mod.ModelError(
+                f"the cross-section is missing {len(missing)} input(s) the artefact "
+                f"needs: {missing[:5]}. Most likely the store has no hourly bars, "
+                "which this feature set requires."
+            )
+        frame = model_mod.normalise_cross_section(frame, raw)
+        as_of = frame["ts_utc"].max()
+        as_of_date = as_of.date() if hasattr(as_of, "date") else as_of
+        # `model.predict` refuses if the artefact was trained through this date.
+        scores = artefact.predict(frame, as_of=as_of_date)
+
+        signals: list[AssetSignal] = []
+        no_vol = 0
+        for r in rows:
+            score = scores.get(r["asset"])
+            if score is None:
+                continue
+            vol = r.get("rv_24h") or r.get("vol_30")
+            if vol is None or float(vol) <= 0:
+                no_vol += 1
+                continue
+            signals.append(
+                AssetSignal(
+                    asset=r["asset"],
+                    direction="long" if score > 0 else "short",
+                    conviction=Decimal(str(abs(score))),
+                    volatility=Decimal(str(vol)),
+                )
+            )
+        if no_vol:
+            notes.append(f"{no_vol} scored asset(s) had no volatility estimate and were dropped")
+        notes.append(
+            f"scored {len(signals)} of {len(rows)} eligible with artefact "
+            f"{artefact.model_version} trained through {artefact.trained_through}"
+        )
+        return SignalResult(signals=signals, notes=notes, warnings=warnings)
+
+
 _REGISTRY: dict[str, SignalGenerator] = {
     generator.name: generator
     for generator in (
@@ -593,6 +717,7 @@ _REGISTRY: dict[str, SignalGenerator] = {
         CrossSectionalMomentum(),
         GaussianChannelBreakout(),
         GaussianChannelLongShort(),
+        MLRanker(),
     )
 }
 

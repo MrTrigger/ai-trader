@@ -132,6 +132,10 @@ class Config:
     #: Below this many rankable assets, a cross-sectional signal declines to
     #: rank rather than pretending a handful of names is a cross-section.
     min_cross_section: int = 8
+    #: Where the trained ranker lives. A learned signal loads this and refuses
+    #: to run without it - see `model.py`. Deliberately not defaulted to a path
+    #: that might exist: a model found by accident is worse than none.
+    model_path: str | None = None
     #: Annualised realised volatility below which an asset is treated as a peg
     #: rather than a position.
     #:
@@ -170,6 +174,7 @@ class Config:
             signal=p.get("signal", "placeholder_equal_long"),
             max_holdings=int(p.get("max_holdings", 10)),
             min_cross_section=int(p.get("min_cross_section", 8)),
+            model_path=p.get("model_path") or None,
             rebalance_every=int(p.get("rebalance_every", 1)),
             min_volatility=_dec(p.get("min_volatility", "0.10")),
             benchmark=(p.get("benchmark") or None),

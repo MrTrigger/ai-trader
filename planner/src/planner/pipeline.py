@@ -170,6 +170,34 @@ def run(
         perp_listed_from=borrow.listings(root=data_root),
     )
     marked = features.latest(frame)
+
+    # Hourly-derived features, when the store has them. A day collapsed to four
+    # numbers throws away the path, and several of these have no daily
+    # equivalent - realised volatility from 24 actual returns, upside and
+    # downside deviation separately, path efficiency.
+    #
+    # Absent hourly bars this is skipped rather than failing: the long-only and
+    # channel signals do not use them, and a store with only daily data should
+    # still produce a plan. A signal that NEEDS them says so when they are
+    # missing, which is the honest place for that error.
+    hourly = store.read(root=data_root, interval_s=3600, until=horizon)
+    if not hourly.is_empty():
+        hframe = features.build_hourly(
+            hourly.filter(pl.col("asset").is_in(sorted(featurizable))),
+            benchmark=config.benchmark,
+        )
+        hlatest = features.latest(hframe).select(
+            ["asset"] + [c for c in features.HOURLY_FEATURES if c in hframe.columns]
+        )
+        marked = marked.join(hlatest, on="asset", how="left")
+        notes.append(
+            f"{hourly.height:,} hourly bars featurized alongside the daily frame"
+        )
+    else:
+        notes.append(
+            "no hourly bars in the store: hourly-derived features are absent from "
+            "this cross-section"
+        )
     # The signal sees only what is eligible; everything else here is marked and
     # priced so it can be valued and sold.
     cross = marked.filter(pl.col("asset").is_in(eligible_by_config))

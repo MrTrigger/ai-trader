@@ -20,7 +20,7 @@ import polars as pl
 
 from .bars import mark_discontinuities
 
-FEATURE_SET_VERSION = "fs-phase1-6"
+FEATURE_SET_VERSION = "fs-phase2-1"
 
 # Windows in bars. At the daily interval these are calendar days.
 _RETURN_WINDOWS = (7, 30, 90)
@@ -329,3 +329,113 @@ def latest(features: pl.DataFrame) -> pl.DataFrame:
         .group_by("asset", maintain_order=True)
         .last()
     )
+
+
+# --- hourly-derived features ------------------------------------------------
+#
+# A day collapsed to four numbers throws away the path. These are computed from
+# hourly bars and have no daily equivalent: realised volatility from 24 actual
+# returns rather than a high-low range, upside and downside deviation
+# separately, and path efficiency - whether a move was made directly or through
+# thrashing. Two assets that both close +5% are different animals and the daily
+# bar cannot tell them apart.
+#
+# Phase 1 measured these as roughly neutral on their own: merged with the daily
+# set they lifted out-of-sample IC but left backtest Sharpe unchanged within
+# noise. They are kept because the merged set is what was validated, and because
+# dropping inputs after selecting on them is its own bias.
+
+#: Rolling windows in HOURS.
+_HOURLY_WINDOWS = {"6h": 6, "24h": 24, "72h": 72, "168h": 168}
+
+HOURLY_FEATURES = (
+    [f"rv_{k}" for k in _HOURLY_WINDOWS]
+    + [f"ret_{k}" for k in _HOURLY_WINDOWS]
+    + [f"eff_{k}" for k in _HOURLY_WINDOWS]
+    + [f"jump_{k}" for k in _HOURLY_WINDOWS]
+    + [f"dv_{k}" for k in _HOURLY_WINDOWS]
+    + [
+        "semi_dn", "semi_up", "semi_ratio", "skew_24h", "trade_size_surp",
+        "trades_24h", "dd_168h", "vol_concentration", "rel_ret_24h", "rel_vol_24h",
+    ]
+)
+
+
+def build_hourly(bars: pl.DataFrame, *, benchmark: str | None = None) -> pl.DataFrame:
+    """Features from hourly bars, one row per (asset, hour).
+
+    Causal by the same rule as `build`: every window looks backwards only, so
+    deleting the future cannot change an earlier row. The test suite holds this
+    to the same prefix-equality check.
+    """
+    if bars.is_empty():
+        return bars
+
+    a = "asset"
+    df = bars.sort([a, "ts_utc"]).with_columns(
+        (pl.col("close") / pl.col("close").shift(1).over(a) - 1).alias("r1")
+    )
+
+    exprs = []
+    for name, n in _HOURLY_WINDOWS.items():
+        exprs += [
+            (pl.col("r1").rolling_std(n, min_samples=n).over(a) * (24 * 365) ** 0.5)
+            .alias(f"rv_{name}"),
+            (pl.col("close") / pl.col("close").shift(n).over(a) - 1).alias(f"ret_{name}"),
+            # Path efficiency: |net move| / sum|hourly moves|. A straight line
+            # scores 1; the same net move made by thrashing scores near 0.
+            (
+                (pl.col("close") / pl.col("close").shift(n).over(a) - 1).abs()
+                / (pl.col("r1").abs().rolling_sum(n, min_samples=n).over(a) + 1e-12)
+            ).alias(f"eff_{name}"),
+            (pl.col("r1").abs().rolling_max(n, min_samples=n).over(a)).alias(f"jump_{name}"),
+            (pl.col("quote_volume").rolling_sum(n, min_samples=n).over(a)).alias(f"dv_{name}"),
+        ]
+    df = df.with_columns(exprs)
+
+    # Upside and downside are not symmetric, and one volatility number asserts
+    # they are.
+    neg = pl.when(pl.col("r1") < 0).then(pl.col("r1")).otherwise(0.0)
+    pos = pl.when(pl.col("r1") > 0).then(pl.col("r1")).otherwise(0.0)
+    df = df.with_columns([
+        neg.pow(2).rolling_sum(24, min_samples=24).over(a).sqrt().alias("semi_dn"),
+        pos.pow(2).rolling_sum(24, min_samples=24).over(a).sqrt().alias("semi_up"),
+        pl.col("r1").rolling_skew(24).over(a).alias("skew_24h"),
+        # Trade intensity. The hourly bars carry a trade COUNT, so average trade
+        # size is available for the first time - it is not derivable from daily.
+        (pl.col("quote_volume") / (pl.col("trades") + 1)).alias("_trade_size"),
+    ])
+    df = df.with_columns([
+        (pl.col("semi_up") / (pl.col("semi_dn") + 1e-12)).alias("semi_ratio"),
+        (
+            pl.col("_trade_size")
+            / (pl.col("_trade_size").rolling_median(168, min_samples=48).over(a) + 1e-12)
+        ).alias("trade_size_surp"),
+        pl.col("trades").rolling_sum(24, min_samples=24).over(a).alias("trades_24h"),
+        (pl.col("close") / pl.col("close").rolling_max(168, min_samples=168).over(a) - 1)
+        .alias("dd_168h"),
+        # Was the last day's volume one spike or steady flow? Different markets.
+        (
+            pl.col("quote_volume").rolling_max(24, min_samples=24).over(a)
+            / (pl.col("quote_volume").rolling_sum(24, min_samples=24).over(a) + 1e-12)
+        ).alias("vol_concentration"),
+    ]).drop("_trade_size")
+
+    # Benchmark-relative, hour by hour rather than from a 90-day daily beta.
+    if benchmark:
+        bench = df.filter(pl.col(a) == benchmark).select([
+            "ts_utc",
+            pl.col("ret_24h").alias("_b_ret24"),
+            pl.col("rv_24h").alias("_b_rv24"),
+        ])
+        df = df.join(bench, on="ts_utc", how="left").with_columns([
+            (pl.col("ret_24h") - pl.col("_b_ret24")).alias("rel_ret_24h"),
+            (pl.col("rv_24h") / (pl.col("_b_rv24") + 1e-12)).alias("rel_vol_24h"),
+        ]).drop(["_b_ret24", "_b_rv24"])
+    else:
+        df = df.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias("rel_ret_24h"),
+            pl.lit(None, dtype=pl.Float64).alias("rel_vol_24h"),
+        ])
+
+    return df.drop("r1")

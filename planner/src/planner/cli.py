@@ -71,6 +71,44 @@ def cmd_data_pull(args) -> int:
     return 0
 
 
+def cmd_model_train(args) -> int:
+    """Train the ranker and write an artefact.
+
+    The cutoff is required rather than defaulted to "today". A default would
+    quietly produce a model that has seen every date a backtest then scores,
+    which is the one mistake this whole module exists to prevent.
+    """
+    from datetime import date as _date
+
+    from . import features as _feat, model as _model
+
+    config = _config(args)
+    root = Path(args.data_root)
+    start = _date.fromisoformat(args.start)
+    through = _date.fromisoformat(args.through)
+    end = _date.fromisoformat(args.end) if args.end else through
+
+    print(f"building training frame {start} .. {end} ...", flush=True)
+    frame, names = _model.build_training_frame(
+        config=config, root=root, start=start, end=end
+    )
+    print(f"  {frame.height:,} rows, {frame['date'].n_unique():,} dates, "
+          f"{len(names)} features")
+
+    print(f"training through {through} ...", flush=True)
+    artefact = _model.train(
+        frame, features=names, target="y", trained_through=through,
+        feature_set_version=_feat.FEATURE_SET_VERSION,
+    )
+    out = _model.save(artefact, Path(args.out))
+    print(f"\nwrote {out}")
+    print(f"  trained on {artefact.n_rows:,} rows over {artefact.n_dates:,} dates")
+    print(f"  cutoff {artefact.trained_through} - it will REFUSE to score on or "
+          f"before that date")
+    print(f"  set `model_path = \"{out}\"` in config to use it")
+    return 0
+
+
 def cmd_data_inspect(args) -> int:
     config = _config(args)
     inv = store.inventory(root=Path(args.data_root))
@@ -594,6 +632,19 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_parser(
         "verify", help="check ts_utc is the bar OPEN"
     ).set_defaults(func=cmd_data_verify)
+
+    mdl = sub.add_parser("model", help="the learned ranker").add_subparsers(
+        dest="cmd", required=True
+    )
+    mtr = mdl.add_parser("train", help="fit the ranker and write an artefact")
+    mtr.add_argument("--start", default="2019-10-01", help="first decision date")
+    mtr.add_argument("--through", required=True,
+                     help="TRAINING CUTOFF (UTC date). The artefact refuses to "
+                          "score on or before this, so set it before any period "
+                          "you intend to evaluate on.")
+    mtr.add_argument("--end", help="last decision date to build (default: --through)")
+    mtr.add_argument("--out", default="data/models/ranker.pkl")
+    mtr.set_defaults(func=cmd_model_train)
 
     uni = sub.add_parser("universe", help="point-in-time membership").add_subparsers(
         dest="cmd", required=True
