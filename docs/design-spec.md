@@ -506,7 +506,52 @@ Crypto arguably needs it more than equities do. A long book of alts with no beta
 leveraged BTC position wearing a diversification costume, and the P&L attribution (step 11) will
 credit "alpha" for what was simply beta in a bull market. Constrain it, then attribute against it.
 
-### 6.3 Gates that stop the run
+### 6.3 Capacity (deferred, but the numbers are known)
+
+**Not a Phase 1 problem.** At a $30k book impact is negligible — Sharpe falls from
+2.70 to 2.15 even at four times the assumed impact coefficient, and the median order
+is 0.05% of the volume in the hour it trades. This section exists so the work is not
+re-derived when it matters, which is above roughly **$300k**.
+
+The binding constraint above that is not cost but **feasibility**. A square-root
+impact model returns a finite number for an order larger than all the liquidity
+available, so cost-based sizing fails silently: at $3M the 99th-percentile order was
+138% of its execution hour's entire volume. Participation has to be a constraint in
+its own right, not an output.
+
+Three mechanisms, measured in Phase 1 and recorded here rather than built:
+
+**Cap by liquidity, not only by NAV.** A position's cap is the lower of
+`max_single_position` and `participation_limit × hourly_volume / NAV`. 5% of an
+hour's volume is the workable limit; 2% strands more capital than the impact it
+avoids.
+
+**Spill the remainder down the ranking.** Whatever a capped name cannot absorb goes
+to names with headroom, extending *past* the profitability threshold when — and only
+when — the alternative is idle capital. A marginal name beats no position; it does
+not beat a good one. This raised Sharpe from 2.53 to 2.65 **at $30k, where liquidity
+never binds**, purely from holding ~31 names instead of ~20, so it is worth adopting
+before capacity is the reason.
+
+**Scale in and out over several hours.** N slices divide each order by N against the
+same per-hour liquidity, so impact falls as `1/√N` while the cap rises
+proportionally. The cost is signal decay — measured at Sharpe 2.22 at a one-hour
+fill lag, 2.09 at four, 1.86 at eight — so the optimal window grows with the
+account: 2h at $30k, 8h at $3M, 4h at $10M. Exits need this as much as entries.
+
+Together these move practical capacity from about $300k to about $10M.
+
+**What is deliberately not modelled.** A fixed time-slice schedule is the crudest
+execution that works. Real execution reads the order book — accelerating into depth,
+waiting out thin patches, posting passively rather than crossing — and maker fills
+alone were worth roughly +110pp over the Phase 1 window. **Every capacity number
+above is therefore a floor.** Modelling better needs order-book depth history, which
+the store does not have and the public archives do not publish at a size worth
+pulling. That is an execution-layer concern (§9, Phase 3+), not a research one.
+
+---
+
+### 6.4 Gates that stop the run
 
 Fail closed, alert, exit non-zero:
 
@@ -910,7 +955,7 @@ Fail-closed on any data fetch; a freshness gate requiring the signal date to be 
 **completeness gate** (fewer rows than expected → stop, do not evaluate exits) which correctly
 identifies that a truncated universe manufactures false "dropped out" exits; exits before entries;
 declarative target-state convergence rather than imperative order placement; no re-entry into an
-asset exited in the same run. All of these are in §3.2 and §6.3.
+asset exited in the same run. All of these are in §3.2 and §6.4.
 
 **Rejected:** the LLM is doing arithmetic. Every rule is a hard float comparison, so the model adds
 nondeterminism and inference cost while contributing no judgment. Compounding problems: no
