@@ -824,18 +824,31 @@ absorbed: adopting whatever the venue reports is exactly the auto-repair the exe
 default when there are fills we never authorised. It exists because the alternative is a system that
 can never be pointed at a funded account at all.
 
-### 8.2 The dashboard is a lens, and it can only ever stop things
+### 8.2 The dashboard is a lens with hands, and the hands belong to the bot
 
-The `api` process serves an operations dashboard on loopback: control state, NAV and P&L folded
-from the fill log, positions, fills, run history with what went wrong, health, and live performance
-against the backtest. It holds no venue credentials and reads only files the bot has already
-written, so it cannot place an order however it is asked, and the bot does not know it exists.
+The `api` process serves an operations dashboard on loopback: control state, NAV and P&L folded from
+the fill log, positions, balances with what resting orders have claimed, open orders, fills, run
+history with what went wrong, reconciliation, health, and live performance against the backtest.
 
-Its controls are deliberately asymmetric. **Halt and pause are on the page; resume and flatten are
-not.** Halting and pausing only ever reduce what the system may do, so they should be one click
-away in an emergency. Resume grants trading authority and flatten moves capital — neither belongs
-one mis-click away in a tab that has been open since Tuesday, so both require the CLI, which is to
-say a human at a terminal who has read why it stopped. The page prints the exact command.
+It carries the full control set — halt, pause, resume, flatten, adopt — and holds **no venue
+credentials**. It performs none of them: it invokes the `bot` binary, which owns the key, the gates
+and the run record. That is principle 5 taken literally — *every action the system can take is a CLI
+command you can run yourself; interactive surfaces are lenses over that CLI, never a dependency of
+it.* A button and a shell are the same code path, so there is exactly one implementation of what
+"flatten" means and no second one to drift.
+
+The properties that make this safe are worth stating, because "the web page can flatten the book" is
+otherwise alarming:
+
+- the argument vector is assembled from a closed list of actions; nothing the browser sends becomes
+  a flag, an option or a path, and the only free text is the reason and the operator's name;
+- the subprocess is spawned without a shell and with a cleared environment;
+- every action requires a name and a reason, passes the bot's own gates, and lands in the run
+  history;
+- flatten asks the operator to type the word back, being the one control whose effect cannot be
+  undone by pressing something else;
+- started without `--bot`, the dashboard shows everything and changes nothing — and that is the
+  default.
 
 Live performance is shown with its sample size in the column header, not in a footnote. Below the
 threshold the live column is greyed and the Sharpe reads *not yet*: a ratio from a few weeks is

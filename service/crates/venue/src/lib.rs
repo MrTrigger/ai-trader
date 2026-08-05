@@ -187,6 +187,20 @@ pub struct OrderAck {
     pub accepted_at: OffsetDateTime,
 }
 
+/// An order the venue has accepted and not yet filled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenOrder {
+    pub venue_order_id: String,
+    pub client_order_id: String,
+    pub asset: AssetId,
+    pub side: Side,
+    pub qty: Decimal,
+    pub limit_price: Decimal,
+    /// What placing it claimed from the account, and in what currency.
+    pub reserved: Decimal,
+    pub reserved_currency: String,
+}
+
 /// An execution. Append-only, everywhere, forever (spec §0.7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fill {
@@ -366,6 +380,14 @@ pub trait VenueAdapter: Send + Sync {
     /// Cancel a resting order. Cancelling one that is already gone is an
     /// error, not a no-op: it means our view of the venue is wrong.
     async fn cancel_order(&self, venue_order_id: &str) -> Result<(), VenueError>;
+
+    /// Orders accepted and not yet filled.
+    ///
+    /// Required rather than optional because flattening depends on it. A
+    /// flatten that closed every position and left the resting orders alive
+    /// would let one of them fill an hour later and re-open a book somebody had
+    /// just decided to be out of — and it would look like it worked.
+    async fn get_open_orders(&self) -> Result<Vec<OpenOrder>, VenueError>;
 
     /// Fills at or after `since`, oldest first. `None` means everything.
     async fn get_fills(&self, since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError>;

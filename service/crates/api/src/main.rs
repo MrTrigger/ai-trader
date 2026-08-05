@@ -1,30 +1,39 @@
 //! The operations dashboard, and the read-mostly API under it.
 //!
 //! ```text
-//! api --state-dir var/bot --initial-cash 30000
-//! api --state-dir var/bot --initial-cash 30000 --port 7434 \
-//!     --expectation docs/research/backtest.json
+//! api --state-dir var/bot --initial-cash 30000            # read-only
+//! api --state-dir var/bot --initial-cash 30000 \
+//!     --bot ./bot --bot-config config/bot.json \
+//!     --expectation docs/research/backtest.json           # with controls
 //! ```
 //!
 //! # It is a lens, never a dependency
 //!
 //! Design spec §8 puts the CLI first: the scheduler runs the same commands a
 //! human does, and nothing has a private path into the engine. This process
-//! reads files the bot has already written and holds no venue credentials, so
-//! it cannot place an order however it is asked. If it is down, wrong, or
-//! overloaded, the bot neither notices nor cares.
+//! reads files the bot has already written, and for anything that changes the
+//! world it runs `bot` — the same binary, with the same gates, writing the same
+//! run record. If this process is down, wrong, or overloaded, the bot neither
+//! notices nor cares.
 //!
-//! # The dashboard can stop trading; it cannot start it
+//! # Full controls, and still no credentials here
 //!
-//! Halt and pause reduce what the system is permitted to do, and both are
-//! reachable from the page. Resume and flatten are not: resume grants authority
-//! and flatten moves capital, and neither should be one mis-click away in a
-//! browser tab that has been open since Tuesday. The page shows the exact CLI
-//! command instead.
+//! Halt, pause, resume, flatten and adopt are all on the page. None of them is
+//! performed in this process: it holds no venue key, and
+//! [`control`] assembles a fixed argument vector for a subprocess rather than
+//! doing the work. That is the difference between a dashboard that can ask for
+//! a flatten and a web server that can place an order — the first is a
+//! convenience, the second is an attack surface wearing a convenience's clothes.
 //!
-//! That asymmetry is the point — the emergency control is always available, and
-//! the recovery control requires a human at a terminal who has looked at why it
-//! stopped.
+//! Two consequences worth stating. There is exactly one implementation of what
+//! "flatten" means, so a button and a shell cannot drift apart. And every
+//! action still requires a name and a reason, still passes the bot's own gates,
+//! and still lands in the run history — the page is a faster way to type the
+//! command, not a second way to act.
+//!
+//! Started without `--bot`, the dashboard shows everything and changes nothing.
+//! That is the default, because a process that could act the moment it was
+//! pointed at a state directory would be one nobody chose to give authority to.
 //!
 //! # Loopback only, with no flag to change it
 //!
@@ -32,6 +41,7 @@
 //! trading system. The bind address is a constant and there is no host flag,
 //! because a flag is a thing that gets set.
 
+mod control;
 mod page;
 mod state;
 
@@ -40,7 +50,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use runner::ControlFile;
+use control::{Action, BotCommand};
 use rust_decimal::Decimal;
 
 /// Never configurable. See the module docs.
@@ -54,15 +64,23 @@ const MAX_BODY: u64 = 64 * 1024;
 const REQUEST_TIMEOUT_S: u64 = 10;
 
 const USAGE: &str = "\
-usage: api --state-dir <dir> --initial-cash <amount> [--port N] [--expectation <file>]
+usage: api --state-dir <dir> --initial-cash <amount>
+           [--bot <path> --bot-config <file>]
+           [--port N] [--expectation <file>] [--quote-currency USD]
 
 Serves the operations dashboard on http://127.0.0.1:7434 until you stop it.
 Loopback only - nothing outside this machine can reach it.
+
+Without --bot and --bot-config the page is read-only: it shows everything and
+can change nothing. With them, its controls run that bot binary.
 ";
 
 struct Config {
     state_dir: PathBuf,
+    /// How to invoke the bot. `None` makes this a read-only dashboard.
+    bot: Option<BotCommand>,
     initial_cash: Decimal,
+    quote_currency: String,
     expectation: Option<PathBuf>,
     cadence_hours: i64,
     port: u16,
@@ -93,6 +111,14 @@ fn main() -> ExitCode {
     println!("dashboard for {}", cfg.state_dir.display());
     println!("  http://127.0.0.1:{}", cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
+    match &cfg.bot {
+        Some(b) => println!(
+            "  controls run {} --config {}",
+            b.binary.display(),
+            b.config.display()
+        ),
+        None => println!("  read-only: no --bot given, so the controls are disabled"),
+    }
 
     // A thread per connection, and a read timeout on each.
     //
@@ -142,7 +168,9 @@ fn parse(args: &[String]) -> Result<Config, String> {
     };
     Ok(Config {
         state_dir,
+        bot: BotCommand::new(get("--bot"), get("--bot-config"))?,
         initial_cash,
+        quote_currency: get("--quote-currency").unwrap_or_else(|| "USD".into()),
         expectation: get("--expectation").map(PathBuf::from),
         cadence_hours: get("--cadence-hours")
             .and_then(|c| c.parse().ok())
@@ -155,8 +183,10 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
     state::build(&state::Inputs {
         state_dir: &cfg.state_dir,
         initial_cash: cfg.initial_cash,
+        quote_currency: &cfg.quote_currency,
         cadence_hours: cfg.cadence_hours,
         expectation_path: cfg.expectation.as_deref(),
+        controls_enabled: cfg.bot.is_some(),
         run_limit: 200,
         // Enough to see the last run or two land, not enough to bury everything
         // below it. The full log is `bot positions` and the fill store; this is
@@ -200,20 +230,10 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             Ok(s) => json(&mut stream, 200, &serde_json::to_vec(&s).unwrap()),
             Err(e) => json_error(&mut stream, 500, &e),
         },
-        ("POST", "/api/halt") => {
-            control(&mut stream, cfg, &mut reader, content_length, true, false)
+        ("POST", r) if Action::parse(r).is_some() => {
+            let action = Action::parse(r).expect("just matched");
+            control(&mut stream, cfg, &mut reader, content_length, action)
         }
-        ("POST", "/api/pause") => {
-            control(&mut stream, cfg, &mut reader, content_length, false, true)
-        }
-        // Deliberately absent: resume and flatten. See the module docs.
-        ("POST", "/api/resume" | "/api/flatten") => json_error(
-            &mut stream,
-            403,
-            "resume and flatten are CLI-only. This process holds no venue credentials and will \
-             not grant trading authority from a browser tab; run `bot --config <file> resume` or \
-             `bot --config <file> flatten --confirm` at a terminal.",
-        ),
         ("GET" | "HEAD", "/favicon.ico") => {
             respond(&mut stream, 404, "text/plain; charset=utf-8", b"", true)
         }
@@ -222,26 +242,48 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
     }
 }
 
-/// Write a control file. The only mutation this process performs, and both
-/// callers reduce what the system may do.
+/// Run one control, by invoking the bot.
+///
+/// Nothing here touches the venue or the control file directly. The bot owns
+/// the credential, the gates and the run record, so a button and a shell are
+/// the same code path — see the [`control`] module docs.
 fn control(
     stream: &mut TcpStream,
     cfg: &Config,
     reader: &mut BufReader<TcpStream>,
     content_length: usize,
-    kill_switch: bool,
-    paused: bool,
+    action: Action,
 ) -> std::io::Result<()> {
+    let Some(bot) = cfg.bot.as_ref() else {
+        return json_error(
+            stream,
+            503,
+            &format!(
+                "this dashboard was started without --bot and --bot-config, so it can only \
+                 show. Run `{}` at a terminal, or restart the api with both flags.",
+                control::as_typed(None, action)
+            ),
+        );
+    };
+
     let mut body = vec![0u8; content_length.min(MAX_BODY as usize)];
     reader.read_exact(&mut body)?;
     let parsed: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-    let by = parsed.get("by").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = parsed
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let by = parsed
+        .get("by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
 
     // Both required, same as the CLI. "Halted" with no name and no reason is
     // the thing the next operator cannot act on.
-    if reason.trim().is_empty() || by.trim().is_empty() {
+    if reason.is_empty() || by.is_empty() {
         return json_error(
             stream,
             400,
@@ -250,20 +292,35 @@ fn control(
         );
     }
 
-    let control = ControlFile {
-        kill_switch,
-        paused,
-        reason: Some(reason.trim().to_string()),
-        set_by: Some(by.trim().to_string()),
-        set_at: Some(
-            time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-        ),
-    };
-    match control.write(&cfg.state_dir.join("controls.json")) {
-        Ok(()) => json(stream, 200, &serde_json::to_vec(&control).unwrap()),
-        Err(e) => json_error(stream, 500, &e.to_string()),
+    // The api's console becomes the audit trail for anything done from a
+    // browser. Consequential actions are marked, because "who flattened the
+    // book at 02:14" is a question that gets asked.
+    eprintln!(
+        "  control: {}{} by {by}: {reason}",
+        control::as_typed(Some(bot), action),
+        if action.is_consequential() {
+            "  [moves capital or grants authority]"
+        } else {
+            ""
+        }
+    );
+
+    match control::run(bot, action, reason, by) {
+        Ok(out) => {
+            // The bot's own stdout is the answer. Reformatting it here would be
+            // a second account of what happened, and the two would drift.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&out.stdout).unwrap_or(serde_json::Value::Null);
+            let payload = serde_json::json!({
+                "ok": out.ok,
+                "record": parsed,
+                "error": (!out.ok).then(|| out.stderr.clone()),
+                "command": control::as_typed(Some(bot), action),
+            });
+            let code = if out.ok { 200 } else { 409 };
+            json(stream, code, &serde_json::to_vec(&payload).unwrap())
+        }
+        Err(e) => json_error(stream, 500, &e),
     }
 }
 
@@ -345,15 +402,22 @@ mod tests {
     #[test]
     fn this_process_cannot_place_an_order() {
         // The security boundary from spec §3.3, asserted against the source
-        // rather than assumed from the dependency list: `api` holds no venue
-        // credentials, so nothing here may reach an order-placing call.
-        let source = concat!(include_str!("main.rs"), include_str!("state.rs"));
+        // rather than assumed from the dependency list. The dashboard gained
+        // full controls, and the way it did that must stay "ask the bot" — the
+        // moment any of these appear here, the process serving a web page has
+        // become one that can trade.
+        let source = concat!(
+            include_str!("main.rs"),
+            include_str!("state.rs"),
+            include_str!("control.rs")
+        );
         for needle in [
             concat!("place_", "order"),
             concat!("cancel_", "order"),
             concat!("Order", "Request"),
             concat!("api_", "key"),
             concat!("Paper", "Venue::new"),
+            concat!("Venue", "Adapter"),
         ] {
             assert!(
                 !source.contains(needle),
@@ -363,14 +427,38 @@ mod tests {
     }
 
     #[test]
-    fn resume_and_flatten_are_not_reachable_over_http() {
-        // The asymmetry the dashboard is built on: it can always stop trading,
-        // and can never start it.
-        let source = include_str!("main.rs");
-        assert!(source.contains("(\"POST\", \"/api/resume\" | \"/api/flatten\")"));
-        assert!(
-            !source.contains("kill_switch: false,\n        paused: false"),
-            "nothing in this process may write a control file that permits trading"
-        );
+    fn every_control_is_delegated_and_none_is_performed_here() {
+        // The contract the full-control dashboard rests on: this process runs
+        // the bot, and never writes a control file or a ledger itself. Two
+        // implementations of "halt" would eventually disagree about what it
+        // means, and the one nobody tested would be the web one.
+        let source = concat!(include_str!("main.rs"), include_str!("control.rs"));
+        for needle in [
+            concat!("Control", "File {"),
+            concat!("Control", "File::"),
+            concat!("Ledger", "::"),
+            concat!("Runner", " {"),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "{needle} appears in the control path: controls must be delegated to the bot, \
+                 not reimplemented here"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dashboard_without_a_bot_offers_no_controls() {
+        // Read-only is a supported way to run this, and it has to be the
+        // default: a dashboard that could act the moment it was pointed at a
+        // state directory would be one nobody chose to give authority to.
+        let cfg = parse(&[
+            "--state-dir".into(),
+            ".".into(),
+            "--initial-cash".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        assert!(cfg.bot.is_none());
     }
 }

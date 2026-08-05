@@ -22,8 +22,8 @@ use runner::{
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use venue::{
-    derive_positions, AssetId, Balance, Capabilities, Fill, Market, OrderAck, OrderRequest,
-    OrderState, Position, Side, VenueAdapter, VenueError,
+    derive_positions, AssetId, Balance, Capabilities, Fill, Market, OpenOrder, OrderAck,
+    OrderRequest, OrderState, Position, Side, VenueAdapter, VenueError,
 };
 
 fn dec(s: &str) -> Decimal {
@@ -87,6 +87,10 @@ struct FakeVenue {
     preexisting: Vec<Position>,
     /// Reads fail with `Unreachable` this many times before working.
     unreachable_for: Mutex<u32>,
+    /// Orders the venue is holding but has not filled.
+    resting: Mutex<Vec<OpenOrder>>,
+    /// Cancel requests fail for this order id.
+    uncancellable: Option<String>,
 }
 
 impl FakeVenue {
@@ -97,7 +101,25 @@ impl FakeVenue {
             fail_on: None,
             preexisting: Vec::new(),
             unreachable_for: Mutex::new(0),
+            resting: Mutex::new(Vec::new()),
+            uncancellable: None,
         }
+    }
+
+    /// An order the venue is holding. A flatten that ignored these would leave
+    /// one live to fill later and re-open the book.
+    fn resting_order(self, id: &str, asset: &str, qty: &str) -> Self {
+        self.resting.lock().unwrap().push(OpenOrder {
+            venue_order_id: id.into(),
+            client_order_id: format!("c-{id}"),
+            asset: asset.into(),
+            side: Side::Buy,
+            qty: dec(qty),
+            limit_price: dec("50"),
+            reserved: dec("100"),
+            reserved_currency: "USD".into(),
+        });
+        self
     }
 
     fn failing_on(mut self, asset: &str) -> Self {
@@ -111,6 +133,11 @@ impl FakeVenue {
             qty: dec(qty),
             avg_price: dec("100"),
         });
+        self
+    }
+
+    fn uncancellable(mut self, id: &str) -> Self {
+        self.uncancellable = Some(id.into());
         self
     }
 
@@ -246,8 +273,25 @@ impl VenueAdapter for FakeVenue {
         })
     }
 
-    async fn cancel_order(&self, _venue_order_id: &str) -> Result<(), VenueError> {
-        Ok(())
+    async fn cancel_order(&self, id: &str) -> Result<(), VenueError> {
+        if self.uncancellable.as_deref() == Some(id) {
+            return Err(VenueError::Unreachable("cancel rejected".into()));
+        }
+        let mut resting = self.resting.lock().unwrap();
+        match resting.iter().position(|o| o.venue_order_id == id) {
+            Some(i) => {
+                resting.remove(i);
+                Ok(())
+            }
+            // Cancelling something already gone means our view is wrong, and
+            // the trait says that is an error rather than a no-op.
+            None => Err(VenueError::UnknownOrder(id.to_string())),
+        }
+    }
+
+    async fn get_open_orders(&self) -> Result<Vec<OpenOrder>, VenueError> {
+        self.flaky()?;
+        Ok(self.resting.lock().unwrap().clone())
     }
 
     async fn get_fills(&self, _since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError> {
@@ -874,6 +918,8 @@ async fn flatten_keeps_going_after_a_failed_exit() {
         fail_on: Some("BTC".into()),
         preexisting: Vec::new(),
         unreachable_for: Mutex::new(0),
+        resting: Mutex::new(Vec::new()),
+        uncancellable: None,
     };
     let rec = runner(
         &venue,
@@ -890,7 +936,12 @@ async fn flatten_keeps_going_after_a_failed_exit() {
     assert_eq!(rec.outcome, "partial");
     assert_eq!(rec.orders_submitted, 1, "SOL still got out");
     assert_eq!(rec.orders_skipped, 1);
-    assert!(rec.detail.unwrap().contains("still open"));
+    let detail = rec.detail.unwrap();
+    assert!(detail.contains("NOT FLAT"), "got {detail}");
+    assert!(
+        detail.contains("1 position(s) are still open"),
+        "got {detail}"
+    );
 }
 
 #[tokio::test]
@@ -1580,4 +1631,122 @@ async fn a_run_that_did_submit_is_never_replayed() {
     r.run(&plan).await.unwrap();
     let err = r.run(&plan).await.expect_err("orders already went out");
     assert!(matches!(err, RunnerError::AlreadyExecuted { .. }));
+}
+
+#[tokio::test]
+async fn flatten_cancels_resting_orders_before_closing_positions() {
+    // The gap this closes: a flatten that only sold the positions left a
+    // working buy alive, which could fill an hour later and re-open a book
+    // somebody had just decided to be out of - and every record would say the
+    // flatten succeeded.
+    let dir = tmpdir("flatten-cancels");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().resting_order("V-REST", "BTC", "0.3");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls.clone(),
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+    assert_eq!(venue.get_open_orders().await.unwrap().len(), 1);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("get me out", "magnus")
+    .await
+    .unwrap();
+
+    assert_eq!(rec.outcome, "flattened");
+    assert!(
+        venue.get_open_orders().await.unwrap().is_empty(),
+        "a live order after a flatten is a position waiting to happen"
+    );
+    let open: Vec<_> = venue
+        .get_positions()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| !p.qty.is_zero())
+        .collect();
+    assert!(open.is_empty(), "still holding: {open:?}");
+    assert_eq!(rec.slices[0]["cancelled"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cancel_that_fails_makes_the_flatten_say_the_account_is_not_flat() {
+    // Half a flatten is the dangerous outcome, because it looks like a whole
+    // one. The record has to say so in words an operator will not skim past.
+    let dir = tmpdir("flatten-cancel-fails");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new()
+        .resting_order("V-STUCK", "BTC", "0.3")
+        .uncancellable("V-STUCK");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("get me out", "magnus")
+    .await
+    .unwrap();
+
+    assert_eq!(rec.outcome, "partial");
+    let detail = rec.detail.unwrap();
+    assert!(detail.contains("NOT FLAT"), "got {detail}");
+    assert!(detail.contains("may still fill"), "got {detail}");
+}
+
+#[tokio::test]
+async fn a_flatten_does_not_make_the_system_accuse_itself() {
+    // The flatten path originates its own orders rather than taking them from a
+    // plan, and it skipped the ledger. Its fills then came back under ids the
+    // ledger had never seen, so every use of the emergency exit left the system
+    // reporting an intrusion and refusing to trade.
+    let dir = tmpdir("flatten-self-accuse");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+
+    r.run(&standard_plan("2026-08-01T00:00:00Z")).await.unwrap();
+    r.flatten("weekend risk", "magnus").await.unwrap();
+
+    let after = r.inspect().await.unwrap();
+    assert!(
+        after.unknown_fills.is_empty(),
+        "the flatten's own fills are ours: {:?}",
+        after.unknown_fills
+    );
+    assert!(after.agrees, "{:?}", after.disagreements);
 }

@@ -43,10 +43,15 @@ double-run, but refusing is not a schedule.
 
 ```bash
 api --state-dir var/bot --initial-cash 30000 \
+    --bot ./bot --bot-config config/bot.json \
     --expectation docs/research/backtest.json
 ```
 
 Then <http://127.0.0.1:7434>. Loopback only, with no flag to change that.
+
+Without `--bot` and `--bot-config` the page shows everything and changes nothing. That is the
+default: a dashboard that could act the moment it was pointed at a state directory would be one
+nobody chose to give authority to.
 
 Everything on the page is folded from the fill log, which is the only stored truth. There is no
 cached NAV anywhere, because a cached NAV is a second opinion about the account with no way to
@@ -107,13 +112,17 @@ up.
 
 ## Stopping it
 
-| | What it does | Where |
-|---|---|---|
-| **halt** | Plans, never executes. The strongest stop. | dashboard **or** CLI |
-| **pause** | Only orders that reduce exposure go out. A paused book can still get out. | dashboard **or** CLI |
-| **resume** | Permits trading again. | CLI only |
-| **flatten** | Closes every open position at market, now. | CLI only |
-| **adopt** | Takes pre-existing venue positions on as our opening state. | CLI only |
+| | What it does |
+|---|---|
+| **halt** | Plans, never executes. The strongest stop. |
+| **pause** | Only orders that reduce exposure go out. A paused book can still get out. |
+| **resume** | Permits trading again. |
+| **flatten** | Cancels every resting order, then closes every open position at market. |
+| **adopt** | Takes pre-existing venue positions on as our opening state. |
+
+All five are on the dashboard and all five are CLI commands. They are the same thing: the page runs
+the `bot` binary, so there is exactly one implementation of what each control means and a button
+cannot drift from a shell.
 
 ```bash
 bot --config config/bot.json halt    --reason "drawdown breach" --by magnus
@@ -129,12 +138,25 @@ the worst available response, which is to clear it and see.
 risk already on the book. Getting flat is `flatten`, which works even while halted — the moment you
 most want to stop trading is usually the moment you most want to be out.
 
-### Why the dashboard cannot resume
+**Flatten cancels before it sells.** Resting orders go first, then positions close, and the
+positions are re-read in between because cancelling releases inventory a resting sell had claimed.
+A flatten that only sold would leave a working buy alive to fill an hour later and re-open the book
+— and every record would say it worked. If any part fails the record says THE ACCOUNT IS NOT FLAT
+and names what is still live.
 
-Halting and pausing only ever reduce what the system may do, so they should be one click away.
-Resuming grants trading authority and flattening moves capital. Neither belongs one mis-click away
-in a browser tab that has been open since Tuesday, so both require a terminal — which in practice
-means a human who has read *why* it stopped before restarting it.
+### How the dashboard can do this without holding a key
+
+It does not perform controls; it runs `bot`, which holds the credential. The `api` process still
+has none, and the argument vector it builds comes from a closed list — nothing the browser sends
+becomes a flag, an option or a path. That is the difference between a page that can *ask* for a
+flatten and a web server that can place an order.
+
+Every action still needs a name and a reason, still passes the bot's own gates, and still lands in
+the run history. Flatten additionally asks you to type FLATTEN, because it is the one control whose
+effect cannot be undone by pressing something else.
+
+The api's console log records every control run from the page, marking the ones that move capital
+or grant authority — "who flattened the book at 02:14" is a question that gets asked.
 
 ## Failing closed
 

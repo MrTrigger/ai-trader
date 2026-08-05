@@ -150,6 +150,9 @@
   }
   tbody tr:last-child td { border-bottom: none; }
   .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  /* A timestamp is a label, not a quantity. Right-aligning it in a wide column
+     strands it in the middle of the table. */
+  .time { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-3); }
   .sym { font-family: var(--mono); font-weight: 600; }
   .dim { color: var(--ink-3); }
   .wrapcell { min-width: 260px; color: var(--ink-2); font-size: 12.5px; }
@@ -218,6 +221,16 @@
     outline: 2px solid var(--accent); outline-offset: 1px;
   }
   .field { margin-bottom: 10px; }
+  /* Controls are grouped by what they do to the system, not by how dangerous
+     they look. Stopping, starting, and changing the book are three different
+     decisions and a single row of buttons makes them look like one. */
+  .ctlgroup { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 12px; }
+  .ctllabel {
+    font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; margin-bottom: 7px;
+  }
+  .ctlgroup .note { margin: 8px 0 0; }
+  .ctlgroup button[disabled] { opacity: .45; }
   .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
   button {
     font-family: var(--sans); font-size: 13px; font-weight: 550; cursor: pointer;
@@ -228,6 +241,7 @@
      salmon and white-on-salmon is unreadable; the ground is dark there and
      light here, so it stays legible against both. */
   button.danger { background: var(--bad); border-color: var(--bad); color: var(--bg); }
+  button.go { background: var(--accent); border-color: var(--accent); color: var(--bg); }
   button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   pre.cmd {
@@ -280,6 +294,16 @@
       </section>
 
       <section class="panel">
+        <h2>Balances <span class="hint" id="balhint"></span></h2>
+        <div class="scroll"><table id="balances"></table></div>
+      </section>
+
+      <section class="panel" id="openorders-panel">
+        <h2>Open orders <span class="hint">accepted by the venue, not yet filled</span></h2>
+        <div class="scroll"><table id="openorders"></table></div>
+      </section>
+
+      <section class="panel">
         <h2>Recent fills</h2>
         <div class="scroll"><table id="fills"></table></div>
       </section>
@@ -287,7 +311,7 @@
 
     <div>
       <section class="panel" id="controls">
-        <h2>Controls <span class="hint">this page can stop trading, never start it</span></h2>
+        <h2>Controls <span class="hint" id="controlhint"></span></h2>
         <div class="body">
           <div class="field">
             <label for="who">Your name</label>
@@ -297,22 +321,44 @@
             <label for="why">Reason</label>
             <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off">
           </div>
-          <div class="btnrow">
-            <button class="danger" id="halt">Halt</button>
-            <button class="warn" id="pause">Pause</button>
+
+          <div class="ctlgroup">
+            <div class="ctllabel">Stop</div>
+            <div class="btnrow">
+              <button class="danger" data-action="halt">Halt</button>
+              <button class="warn" data-action="pause">Pause</button>
+            </div>
+            <p class="note">
+              <strong>Halt</strong> stops execution; planning continues.
+              <strong>Pause</strong> permits only orders that reduce exposure.
+              Neither closes what is already open.
+            </p>
           </div>
+
+          <div class="ctlgroup">
+            <div class="ctllabel">Start</div>
+            <div class="btnrow">
+              <button class="go" data-action="resume">Resume trading</button>
+            </div>
+            <p class="note">
+              Grants trading authority again. The next scheduled run will trade.
+            </p>
+          </div>
+
+          <div class="ctlgroup">
+            <div class="ctllabel">Position</div>
+            <div class="btnrow">
+              <button class="danger" data-action="flatten">Flatten everything</button>
+              <button data-action="adopt">Adopt venue positions</button>
+            </div>
+            <p class="note">
+              <strong>Flatten</strong> closes every open position at market, now, and works even
+              while halted. <strong>Adopt</strong> takes positions the venue already holds on as
+              our opening state — for a fresh install or a restored backup.
+            </p>
+          </div>
+
           <div class="result" id="ctlresult"></div>
-          <p class="note" style="margin-top:12px">
-            <strong>Halt</strong> stops execution; planning continues.
-            <strong>Pause</strong> permits only orders that reduce exposure.
-            Neither closes what is already open.
-          </p>
-          <p class="note" style="margin-top:8px">
-            Resuming grants trading authority and flattening moves capital, so
-            neither is one mis-click away in a browser tab. Both are CLI-only:
-          </p>
-          <pre class="cmd">bot --config &lt;file&gt; resume --reason "..." --by you
-bot --config &lt;file&gt; flatten --reason "..." --by you --confirm</pre>
         </div>
       </section>
 
@@ -381,11 +427,14 @@ function render(s) {
   renderTiles(s);
   renderChart(s.runs);
   renderPositions(s);
+  renderBalances(s.book);
+  renderOpenOrders(s.book.open_orders);
   renderFills(s.fills);
   renderRuns(s.runs);
   renderHealth(s.health, s.controls);
   renderReconciliation(s.reconciliation);
   renderExpectation(s.expectation, s.live);
+  renderControlAvailability(s.controls_enabled, s.control_state);
 }
 
 /* Shown in full only when the two sides disagree. When they agree there is one
@@ -452,10 +501,17 @@ function renderReconciliation(r) {
     // The remedy, in the operator's hands rather than in a log they have to go
     // and find. This process cannot run it - it holds no venue credentials.
     (r.unadopted.length || r.unknown_fills.length
-      ? "<p class='note' style='margin-top:10px'>Check the account, then take it on at a terminal:</p>" +
-        "<pre class='cmd'>bot --config &lt;file&gt; reconcile\nbot --config &lt;file&gt; adopt --reason \"...\" --by you --confirm" +
-        (r.unknown_fills.length ? " \\\n    --accept-unknown-fills" : "") +
-        "</pre>"
+      ? "<p class='note' style='margin-top:10px'>Check the account first. Then take it on — " +
+        "fill in your name and a reason in Controls, and:</p>" +
+        (controlsEnabled
+          ? "<div class='btnrow' style='margin-top:8px'>" +
+            (r.unknown_fills.length
+              ? "<button class='danger' id='adopt-unknown'>Adopt, accepting these fills</button>"
+              : "<button data-action='adopt' class='go'>Adopt venue positions</button>") +
+            "</div>"
+          : "<pre class='cmd'>bot --config &lt;file&gt; adopt --reason \"...\" --by you --confirm" +
+            (r.unknown_fills.length ? " \\\n    --accept-unknown-fills" : "") +
+            "</pre>")
       : "<p class='note' style='margin-top:10px'>Drift is never auto-corrected. Investigate before " +
         "anything else — the next run will refuse to trade until this agrees.</p>") +
     "</div></section>";
@@ -649,6 +705,53 @@ function renderPositions(s) {
     "<th class='num'>Unrealised</th></tr></thead><tbody>" + rows + "</tbody>";
 }
 
+function renderBalances(book) {
+  const b = book.balances || [];
+  $("balhint").textContent = b.length ? b.length + " held" : "";
+  if (!b.length) {
+    $("balances").innerHTML = '<tbody><tr><td class="empty">no balances</td></tr></tbody>';
+    return;
+  }
+  const rows = b
+    .map(
+      (r) =>
+        "<tr><td class='sym'>" + esc(r.currency) +
+        (r.is_quote ? " <span class='dim'>cash</span>" : "") + "</td>" +
+        "<td class='num'>" + (r.is_quote ? fmtNum(r.total) : esc(r.total)) + "</td>" +
+        // Available is the number that matters when sizing: two resting buys
+        // must not both look affordable against the same cash.
+        "<td class='num'>" + (r.is_quote ? fmtNum(r.available) : esc(r.available)) + "</td>" +
+        "<td class='num " + (Number(r.reserved) ? "" : "dim") + "'>" +
+        (r.is_quote ? fmtNum(r.reserved) : esc(r.reserved)) + "</td></tr>")
+    .join("");
+  $("balances").innerHTML =
+    "<thead><tr><th>Currency</th><th class='num'>Total</th><th class='num'>Available</th>" +
+    "<th class='num'>Reserved</th></tr></thead><tbody>" + rows + "</tbody>";
+}
+
+function renderOpenOrders(o) {
+  // The panel disappears when there is nothing resting. An empty table every
+  // day is a thing people stop seeing, and this one matters on the day it is
+  // not empty.
+  const panel = $("openorders-panel");
+  if (!o || !o.length) { panel.style.display = "none"; return; }
+  panel.style.display = "";
+  const rows = o
+    .map(
+      (r) =>
+        "<tr><td class='sym'>" + esc(r.asset) + "</td>" +
+        '<td><span class="side ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
+        "<td class='num'>" + esc(r.qty) + "</td>" +
+        "<td class='num'>" + fmtNum(r.limit_price) + "</td>" +
+        "<td class='num dim'>" + fmtNum(r.reserved) + "</td>" +
+        "<td class='dim ellipsis' title='" + esc(r.client_order_id) + "'>" +
+        esc(r.client_order_id) + "</td></tr>")
+    .join("");
+  $("openorders").innerHTML =
+    "<thead><tr><th>Asset</th><th>Side</th><th class='num'>Qty</th><th class='num'>Limit</th>" +
+    "<th class='num'>Reserved</th><th>Order id</th></tr></thead><tbody>" + rows + "</tbody>";
+}
+
 function renderFills(f) {
   if (!f || !f.length) {
     $("fills").innerHTML = '<tbody><tr><td class="empty">nothing has filled</td></tr></tbody>';
@@ -657,7 +760,7 @@ function renderFills(f) {
   const rows = f
     .map(
       (r) =>
-        "<tr><td class='num dim'>" + shortTime(r.ts) + "</td>" +
+        "<tr><td class='time'>" + shortTime(r.ts) + "</td>" +
         "<td class='sym'>" + esc(r.asset) + "</td>" +
         '<td><span class="side ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
         "<td class='num'>" + esc(r.qty) + "</td>" +
@@ -684,7 +787,7 @@ function renderRuns(runs) {
     .map(
       (r) =>
         '<tr class="out-' + esc(r.outcome) + '">' +
-        "<td class='num dim'>" + shortTime(r.recorded_at) + "</td>" +
+        "<td class='time'>" + shortTime(r.recorded_at) + "</td>" +
         '<td><span class="chip">' + esc(r.outcome) + "</span></td>" +
         "<td class='num'>" + r.slices_completed + "/" + r.slices_planned + "</td>" +
         "<td class='num'>" + r.orders_submitted + "</td>" +
@@ -756,33 +859,107 @@ function cmp(k, a, b, emphasiseLive) {
 }
 
 /* --- controls -------------------------------------------------------- */
-async function sendControl(path, verb) {
+
+/* What each button does, in the operator's words, and how hard it is to press.
+   `confirm` is the sentence in the dialog; `typed` demands the word back before
+   anything is sent. Flatten earns that: it is the one control whose effect
+   cannot be undone by pressing something else. */
+const ACTIONS = {
+  halt:    { path: "/api/halt",    verb: "Halt",
+             confirm: "Stop executing. Planning continues, and nothing already open is closed." },
+  pause:   { path: "/api/pause",   verb: "Pause",
+             confirm: "Only orders that reduce exposure will go out from now on." },
+  resume:  { path: "/api/resume",  verb: "Resume",
+             confirm: "Grant trading authority again. The next scheduled run will trade." },
+  flatten: { path: "/api/flatten", verb: "Flatten", typed: "FLATTEN",
+             confirm: "Close EVERY open position at market, right now, at whatever price the book offers." },
+  adopt:   { path: "/api/adopt",   verb: "Adopt",
+             confirm: "Write the venue's current positions into our own record as an opening baseline." },
+};
+
+let controlsEnabled = false;
+
+function renderControlAvailability(enabled, state) {
+  controlsEnabled = !!enabled;
+  const hint = $("controlhint");
+  document.querySelectorAll("#controls button[data-action]").forEach((b) => {
+    b.disabled = !controlsEnabled;
+  });
+  hint.textContent = controlsEnabled
+    ? "every action runs the bot, records a run, and needs a name"
+    : "read-only: this dashboard was started without --bot";
+  // Nudge toward the control that matches the current state rather than
+  // making every button look equally likely.
+  const resume = document.querySelector('#controls button[data-action="resume"]');
+  if (resume) resume.classList.toggle("go", state !== "running");
+}
+
+async function sendControl(name, extra) {
+  const spec = ACTIONS[name];
+  if (!spec || !controlsEnabled) return;
   const by = $("who").value.trim();
   const reason = $("why").value.trim();
   const out = $("ctlresult");
   if (!by || !reason) {
     out.innerHTML = '<span class="neg">A name and a reason are both required.</span>';
+    $(by ? "why" : "who").focus();
     return;
   }
-  if (!window.confirm(verb + " the bot?\n\n" + reason + "\n\nThis takes effect before the next slice.")) return;
-  out.textContent = "…";
+  if (!window.confirm(spec.verb + "?\n\n" + spec.confirm + "\n\nReason: " + reason)) return;
+  if (spec.typed) {
+    const typed = window.prompt("Type " + spec.typed + " to confirm.");
+    if (typed !== spec.typed) {
+      out.innerHTML = '<span class="dim">Cancelled.</span>';
+      return;
+    }
+  }
+
+  out.textContent = "running " + spec.verb.toLowerCase() + "…";
   try {
-    const res = await fetch(path, {
+    const res = await fetch(extra || spec.path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ by, reason }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
-    out.innerHTML = '<span class="pos">' + esc(verb) + "ed at " + esc(shortTime(data.set_at)) + ".</span>";
+    if (!res.ok || data.ok === false) {
+      // The bot's own refusal, verbatim. Those messages name the remedy, and
+      // paraphrasing them here would lose the part that helps.
+      out.innerHTML =
+        '<span class="neg">' + esc(data.error || "HTTP " + res.status) + "</span>" +
+        (data.command ? "<pre class='cmd'>" + esc(data.command) + "</pre>" : "");
+      return;
+    }
+    const rec = data.record || {};
+    out.innerHTML =
+      '<span class="pos">' + esc(spec.verb) + " done" +
+      (rec.outcome ? " · " + esc(rec.outcome) : "") + ".</span>" +
+      (rec.detail ? "<p class='note' style='margin-top:8px'>" + esc(rec.detail) + "</p>" : "");
     refresh();
   } catch (e) {
     out.innerHTML = '<span class="neg">' + esc(e.message) + "</span>";
   }
 }
 
-$("halt").addEventListener("click", () => sendControl("/api/halt", "Halt"));
-$("pause").addEventListener("click", () => sendControl("/api/pause", "Paus"));
+document.querySelectorAll("#controls button[data-action]").forEach((b) => {
+  b.addEventListener("click", () => sendControl(b.dataset.action));
+});
+
+/* Adoption after a lost ledger needs the stronger form, and it is offered from
+   the reconciliation panel where the problem is visible rather than from the
+   generic control list. */
+document.addEventListener("click", (ev) => {
+  if (!ev.target) return;
+  if (ev.target.id === "adopt-unknown") {
+    sendControl("adopt", "/api/adopt-accepting-unknown-fills");
+    return;
+  }
+  // Buttons rendered into panels after load are not covered by the sweep over
+  // #controls, so they are handled here.
+  if (ev.target.dataset && ev.target.dataset.action && !ev.target.closest("#controls")) {
+    sendControl(ev.target.dataset.action);
+  }
+});
 
 refresh();
 setInterval(refresh, 10000);

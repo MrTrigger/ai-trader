@@ -49,8 +49,8 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use venue::{
-    derive_positions, AssetId, Balance, Clock, Fill, Market, OrderAck, OrderRequest, OrderState,
-    OrderType, Position, PriceSource, Side, VenueAdapter, VenueError,
+    derive_positions, AssetId, Balance, Clock, Fill, Market, OpenOrder, OrderAck, OrderRequest,
+    OrderState, OrderType, Position, PriceSource, Side, VenueAdapter, VenueError,
 };
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -84,6 +84,18 @@ impl Default for PaperConfig {
     }
 }
 
+/// Orders still resting inside a snapshot, without rebuilding the venue.
+///
+/// For readers with no business holding one — the `api` process shows open
+/// orders and must not be able to construct a broker to ask.
+pub fn open_orders_in_snapshot(snapshot: &str) -> Result<Vec<OpenOrder>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct JustResting {
+        resting: Vec<OpenOrder>,
+    }
+    Ok(serde_json::from_str::<JustResting>(snapshot)?.resting)
+}
+
 /// The fill log inside a snapshot, without rebuilding the venue.
 ///
 /// For readers that have no business holding a venue at all: the `api` process
@@ -111,6 +123,21 @@ struct Resting {
     /// Released when the order fills or is cancelled.
     reserved: Decimal,
     reserved_currency: String,
+}
+
+impl Resting {
+    fn as_open(&self) -> OpenOrder {
+        OpenOrder {
+            venue_order_id: self.venue_order_id.clone(),
+            client_order_id: self.client_order_id.clone(),
+            asset: self.asset.clone(),
+            side: self.side,
+            qty: self.qty,
+            limit_price: self.limit_price,
+            reserved: self.reserved,
+            reserved_currency: self.reserved_currency.clone(),
+        }
+    }
 }
 
 /// One order this venue has seen, kept so a replayed `client_order_id`
@@ -598,6 +625,12 @@ impl<P: PriceSource, C: Clock> VenueAdapter for PaperVenue<P, C> {
             },
         );
         Ok(ack)
+    }
+
+    async fn get_open_orders(&self) -> Result<Vec<OpenOrder>, VenueError> {
+        let mut state = self.state.lock().await;
+        self.settle(&mut state).await?;
+        Ok(state.resting.iter().map(Resting::as_open).collect())
     }
 
     async fn cancel_order(&self, venue_order_id: &str) -> Result<(), VenueError> {

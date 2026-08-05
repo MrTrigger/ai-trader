@@ -231,6 +231,31 @@ impl Ledger {
         })
     }
 
+    /// Record an exit the runner originated itself, before sending it.
+    ///
+    /// `flatten` does not come from a plan, but its orders are just as much
+    /// ours as any other. Without this the flatten's own fills come back
+    /// carrying ids the ledger has never seen, and the system accuses itself of
+    /// an intrusion every time somebody uses the emergency exit.
+    pub fn authorise_exit(
+        &self,
+        client_order_id: &str,
+        asset: &str,
+        side: venue::Side,
+        qty: Decimal,
+        now: OffsetDateTime,
+    ) -> Result<(), RunnerError> {
+        self.append(&Entry::Submitted {
+            client_order_id: client_order_id.to_string(),
+            asset: asset.to_string(),
+            side: format!("{side:?}").to_lowercase(),
+            qty,
+            at: stamp(now),
+            plan_id: "flatten".into(),
+            slice: 0,
+        })
+    }
+
     /// Adopt the venue's current positions as our opening state.
     ///
     /// Returns the entries written. Refuses nothing on its own — the caller

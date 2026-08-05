@@ -945,10 +945,40 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
     /// It reads positions from the **venue**, not from a plan. Flattening
     /// against our own view of the book would leave behind exactly the position
     /// our view was wrong about.
+    ///
+    /// Resting orders are cancelled first, then positions closed. Both halves
+    /// are required for "flat" to mean anything.
     pub async fn flatten(&self, reason: &str, by: &str) -> Result<RunRecord, RunnerError> {
         let now = self.clock.now();
         let controls = ControlFile::read(&self.controls_path);
-        let positions = self.venue.get_positions().await?;
+
+        // Resting orders go first. A flatten that closed every position and
+        // left the working orders alive would let one fill an hour later and
+        // re-open a book somebody had just decided to be out of — and every
+        // record would say the flatten worked.
+        let resting = read_with_retry(|| self.venue.get_open_orders()).await?;
+        let mut cancelled = Vec::new();
+        let mut cancel_failures = 0usize;
+        for o in &resting {
+            match self.venue.cancel_order(&o.venue_order_id).await {
+                Ok(()) => cancelled.push(serde_json::json!({
+                    "asset": o.asset, "qty": o.qty.normalize().to_string(),
+                    "venue_order_id": o.venue_order_id, "error": serde_json::Value::Null,
+                })),
+                Err(e) => {
+                    cancel_failures += 1;
+                    cancelled.push(serde_json::json!({
+                        "asset": o.asset, "qty": o.qty.normalize().to_string(),
+                        "venue_order_id": o.venue_order_id, "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        // Positions are read *after* cancelling: a cancel releases inventory a
+        // resting sell had claimed, and sizing the exit off the earlier view
+        // would leave part of the book behind.
+        let positions = read_with_retry(|| self.venue.get_positions()).await?;
         let open: Vec<_> = positions.iter().filter(|p| !p.qty.is_zero()).collect();
 
         let mut record = RunRecord {
@@ -958,9 +988,9 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
             recorded_at: stamp(now),
             outcome: "flattened".into(),
             detail: Some(format!("flatten requested by {by}: {reason}")),
-            orders_planned: open.len(),
+            orders_planned: open.len() + resting.len(),
             orders_submitted: 0,
-            orders_skipped: 0,
+            orders_skipped: cancel_failures,
             slices_completed: 0,
             slices_planned: 0,
             nav: None,
@@ -991,6 +1021,15 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
                 limit_price: None,
                 reason: plan::OrderReason::Exit,
             };
+            // Written before the order goes out, exactly as in a planned run.
+            self.ledger.authorise_exit(
+                &req.client_order_id,
+                &req.asset,
+                req.side,
+                req.qty,
+                self.clock.now(),
+            )?;
+
             match self.venue.place_order(&req).await {
                 Ok(ack) => {
                     record.orders_submitted += 1;
@@ -1013,14 +1052,28 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
             }
         }
 
+        if cancel_failures > 0 {
+            record.outcome = "partial".into();
+        }
         if record.orders_skipped > 0 {
+            let exits_failed = record.orders_skipped - cancel_failures;
+            let mut what = Vec::new();
+            if exits_failed > 0 {
+                what.push(format!("{exits_failed} position(s) are still open"));
+            }
+            if cancel_failures > 0 {
+                what.push(format!(
+                    "{cancel_failures} resting order(s) could not be cancelled and may still fill"
+                ));
+            }
             record.detail = Some(format!(
-                "flatten requested by {by}: {reason}. {} of {} exits failed and those positions \
-                 are still open.",
-                record.orders_skipped, record.orders_planned
+                "flatten requested by {by}: {reason}. THE ACCOUNT IS NOT FLAT: {}.",
+                what.join("; ")
             ));
         }
-        record.slices.push(serde_json::json!({"exits": outcomes}));
+        record
+            .slices
+            .push(serde_json::json!({"cancelled": cancelled, "exits": outcomes}));
         record.recorded_at = stamp(self.clock.now());
         self.store.record(&record)?;
         Ok(record)

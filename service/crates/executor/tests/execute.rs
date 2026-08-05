@@ -132,6 +132,11 @@ impl VenueAdapter for FakeVenue {
         Ok(())
     }
 
+    async fn get_open_orders(&self) -> Result<Vec<venue::OpenOrder>, VenueError> {
+        // This fake fills immediately; nothing ever rests.
+        Ok(Vec::new())
+    }
+
     async fn get_fills(
         &self,
         _since: Option<time::OffsetDateTime>,

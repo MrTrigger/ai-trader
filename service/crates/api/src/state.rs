@@ -19,7 +19,7 @@ use runner::{ControlFile, Health, RunRecord, RunStore};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use venue::{derive_positions, Fill};
+use venue::{derive_positions, Fill, OpenOrder};
 
 /// What the account is worth, and how it is placed.
 #[derive(Debug, Clone, Serialize)]
@@ -39,11 +39,37 @@ pub struct Book {
     /// Σ position notional / NAV. Zero is the dollar-neutral target.
     pub net_exposure: String,
     pub positions: Vec<PositionView>,
+    /// Every currency and asset the account holds, with what resting orders
+    /// have already claimed. `available` is separate from `total` because two
+    /// resting buys must not both look affordable against the same cash.
+    pub balances: Vec<BalanceView>,
+    /// Accepted by the venue, not yet filled.
+    pub open_orders: Vec<OpenOrderView>,
     /// Assets held with no mark. Named, not silently zeroed: a position priced
     /// at nothing is indistinguishable from no position, and the difference is
     /// the whole account.
     pub unpriced: Vec<String>,
     pub fills_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BalanceView {
+    pub currency: String,
+    pub total: String,
+    pub available: String,
+    /// `total - available`: what resting orders have claimed.
+    pub reserved: String,
+    pub is_quote: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenOrderView {
+    pub asset: String,
+    pub side: String,
+    pub qty: String,
+    pub limit_price: String,
+    pub reserved: String,
+    pub client_order_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +118,9 @@ pub struct Snapshot {
     /// state is the single most common reason a run refuses to trade, so it is
     /// on the page rather than only in a log.
     pub reconciliation: Option<serde_json::Value>,
+    /// Whether this dashboard was given a bot to run. False means it can show
+    /// everything and change nothing.
+    pub controls_enabled: bool,
     /// Anything that made a number here less trustworthy than it looks.
     pub warnings: Vec<String>,
 }
@@ -123,8 +152,10 @@ const MEANINGFUL_DAYS: i64 = 60;
 pub struct Inputs<'a> {
     pub state_dir: &'a Path,
     pub initial_cash: Decimal,
+    pub quote_currency: &'a str,
     pub cadence_hours: i64,
     pub expectation_path: Option<&'a Path>,
+    pub controls_enabled: bool,
     pub run_limit: usize,
     pub fill_limit: usize,
 }
@@ -141,7 +172,15 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
 
     let marks = read_marks(&inputs.state_dir.join("marks.json"), &mut warnings);
     let fills = read_fills(&inputs.state_dir.join("venue-state.json"), &mut warnings);
-    let book = fold_book(&fills, &marks, inputs.initial_cash, &mut warnings);
+    let open_orders = read_open_orders(&inputs.state_dir.join("venue-state.json"));
+    let book = fold_book(
+        &fills,
+        &marks,
+        inputs.initial_cash,
+        inputs.quote_currency,
+        &open_orders,
+        &mut warnings,
+    );
 
     let expectation = inputs
         .expectation_path
@@ -214,6 +253,7 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         expectation,
         live,
         reconciliation,
+        controls_enabled: inputs.controls_enabled,
         warnings,
     })
 }
@@ -287,10 +327,21 @@ fn read_fills(path: &Path, warnings: &mut Vec<String>) -> Vec<Fill> {
     }
 }
 
+/// Resting orders, or none if the venue state is missing. A missing file is
+/// already reported by `read_fills`; saying it twice adds noise, not detail.
+fn read_open_orders(path: &Path) -> Vec<OpenOrder> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| paper::open_orders_in_snapshot(&t).ok())
+        .unwrap_or_default()
+}
+
 fn fold_book(
     fills: &[Fill],
     marks: &BTreeMap<String, Decimal>,
     initial_cash: Decimal,
+    quote_currency: &str,
+    open_orders: &[OpenOrder],
     warnings: &mut Vec<String>,
 ) -> Book {
     let cash = fills.iter().fold(initial_cash, |acc, f| {
@@ -357,6 +408,36 @@ fn fold_book(
         }
     }
 
+    // What resting orders have claimed, by currency. Folded from the orders
+    // themselves rather than stored: a reservation total kept alongside them
+    // is a second opinion that can disagree.
+    let mut reserved: BTreeMap<String, Decimal> = BTreeMap::new();
+    for o in open_orders {
+        *reserved.entry(o.reserved_currency.clone()).or_default() += o.reserved;
+    }
+    let claim = |c: &str| reserved.get(c).copied().unwrap_or_default();
+
+    let mut balances = vec![BalanceView {
+        currency: quote_currency.to_string(),
+        total: money(cash),
+        available: money(cash - claim(quote_currency)),
+        reserved: money(claim(quote_currency)),
+        is_quote: true,
+    }];
+    for p in derive_positions(fills)
+        .into_iter()
+        .filter(|p| !p.qty.is_zero())
+    {
+        let c = claim(&p.asset);
+        balances.push(BalanceView {
+            currency: p.asset.clone(),
+            total: p.qty.normalize().to_string(),
+            available: (p.qty - c).normalize().to_string(),
+            reserved: c.normalize().to_string(),
+            is_quote: false,
+        });
+    }
+
     Book {
         nav: money(nav),
         cash: money(cash),
@@ -367,6 +448,18 @@ fn fold_book(
         gross_exposure: pct_of(gross, nav),
         net_exposure: pct_of(long_notional + short_notional, nav),
         positions,
+        balances,
+        open_orders: open_orders
+            .iter()
+            .map(|o| OpenOrderView {
+                asset: o.asset.clone(),
+                side: format!("{:?}", o.side).to_lowercase(),
+                qty: o.qty.normalize().to_string(),
+                limit_price: o.limit_price.to_string(),
+                reserved: o.reserved.normalize().to_string(),
+                client_order_id: o.client_order_id.clone(),
+            })
+            .collect(),
         unpriced,
         fills_count: fills.len(),
     }
@@ -507,6 +600,16 @@ mod tests {
         }
     }
 
+    /// `fold_book` with the arguments a test never varies.
+    fn book(
+        fills: &[Fill],
+        marks: &BTreeMap<String, Decimal>,
+        initial_cash: Decimal,
+        w: &mut Vec<String>,
+    ) -> Book {
+        fold_book(fills, marks, initial_cash, "USD", &[], w)
+    }
+
     fn marks(pairs: &[(&str, &str)]) -> BTreeMap<String, Decimal> {
         pairs
             .iter()
@@ -519,7 +622,7 @@ mod tests {
         // Buy 1 BTC at 100 with a 1 fee, mark it at 110.
         let fills = vec![fill("BTC", Side::Buy, "1", "100", "1")];
         let mut w = Vec::new();
-        let b = fold_book(&fills, &marks(&[("BTC", "110")]), dec("1000"), &mut w);
+        let b = book(&fills, &marks(&[("BTC", "110")]), dec("1000"), &mut w);
         assert_eq!(b.cash, "899.00"); // 1000 - 100 - 1
         assert_eq!(b.nav, "1009.00"); // 899 + 110
         assert_eq!(b.total_pnl, "9.00");
@@ -536,7 +639,7 @@ mod tests {
             fill("ETH", Side::Sell, "10", "10", "0"),
         ];
         let mut w = Vec::new();
-        let b = fold_book(
+        let b = book(
             &fills,
             &marks(&[("BTC", "100"), ("ETH", "10")]),
             dec("1000"),
@@ -554,7 +657,7 @@ mod tests {
         // nothing looks exactly like no holding at all.
         let fills = vec![fill("DOGE", Side::Buy, "1000", "1", "0")];
         let mut w = Vec::new();
-        let b = fold_book(&fills, &marks(&[]), dec("5000"), &mut w);
+        let b = book(&fills, &marks(&[]), dec("5000"), &mut w);
         assert_eq!(b.unpriced, vec!["DOGE".to_string()]);
         assert_eq!(b.positions.len(), 1);
         assert!(b.positions[0].mark.is_none());
@@ -572,7 +675,7 @@ mod tests {
             fill("BTC", Side::Sell, "1", "120", "0"),
         ];
         let mut w = Vec::new();
-        let b = fold_book(&fills, &marks(&[("BTC", "120")]), dec("1000"), &mut w);
+        let b = book(&fills, &marks(&[("BTC", "120")]), dec("1000"), &mut w);
         assert!(b.positions.is_empty(), "flat is flat");
         assert_eq!(b.total_pnl, "20.00");
         assert_eq!(b.unrealised_pnl, "0.00");
@@ -583,11 +686,11 @@ mod tests {
     fn weights_are_signed_shares_of_nav() {
         let fills = vec![fill("BTC", Side::Buy, "1", "100", "0")];
         let mut w = Vec::new();
-        let b = fold_book(&fills, &marks(&[("BTC", "100")]), dec("1000"), &mut w);
+        let b = book(&fills, &marks(&[("BTC", "100")]), dec("1000"), &mut w);
         assert!((b.positions[0].weight.unwrap() - 0.1).abs() < 1e-9);
 
         let short = vec![fill("BTC", Side::Sell, "1", "100", "0")];
-        let b = fold_book(&short, &marks(&[("BTC", "100")]), dec("1000"), &mut w);
+        let b = book(&short, &marks(&[("BTC", "100")]), dec("1000"), &mut w);
         assert!(b.positions[0].weight.unwrap() < 0.0, "short is negative");
     }
 
