@@ -1288,3 +1288,51 @@ at eight concurrent, and is the only way to turn that bracket into a measurement
 The learned ranker is the first thing here with out-of-sample cross-sectional
 content, and that survives. What does not survive is any claim that the daily
 cadence beats the benchmark.
+
+## Hourly bars settle it, and reverse the retraction
+
+The backfill landed: 8,661,693 hourly bars across the 215 traded assets,
+2019-10 to 2026-07, 23.2x the daily count over the same span. Zero misaligned
+timestamps, and on 359,368 full days the hourly close reproduces the daily close
+to a median error of 0.000000% with 24 days (0.007%) differing by more than 0.1%.
+
+With hourly prices the execution question becomes a curve instead of a bracket.
+Everything held constant except the delay between the timestamp the signal was
+computed on and the price paid:
+
+| fill lag | daily return | Sharpe | maxDD | weekly return | Sharpe |
+|---|---|---|---|---|---|
+| 0h | +726.8% | 2.57 | −20.1% | +108.1% | 1.49 |
+| **1h** | **+518.8%** | **2.22** | **−17.8%** | +108.3% | 1.49 |
+| 2h | +564.7% | 2.32 | −16.7% | | |
+| 4h | +465.2% | 2.09 | −19.8% | +103.8% | 1.44 |
+| 8h | +382.0% | 1.86 | −19.1% | | |
+| 12h | +281.3% | 1.73 | −16.1% | +104.8% | 1.47 |
+| 24h | +16.6% | 0.29 | −34.7% | +70.2% | 1.12 |
+
+**The previous retraction was an over-correction.** The `(H+L+C)/3` proxy used to
+stand in for "filled sometime during the day" gave Sharpe 1.28, which the curve
+now places at a 12–24 hour lag: a typical-price fill averages the entire day
+rather than approximating a prompt one. It was the wrong instrument, and it
+penalised the daily book by more than the truth.
+
+The daily strategy is **latency-bound but not latency-extreme**. At a one-hour
+lag — ordinary for a systematic daily rebalance, needing no special
+infrastructure — it returns +518.8% at Sharpe 2.22 net of 21%/yr in fees,
+beating buy-and-hold on return, Sharpe and drawdown at once. Between 1h and 8h
+Sharpe only falls 2.22 to 1.86. The collapse is at the 24-hour boundary, which is
+precisely the region a daily-bar backtest cannot resolve.
+
+The weekly book is flat out to twelve hours, confirming its edge never depended
+on latency.
+
+Read the shape rather than the points: the curve is not monotone (2h scores above
+1h), so there is roughly ±10% estimation noise in the return column.
+
+### What is still not modelled
+
+Market impact is absent entirely, the 2bps half-spread is config's placeholder
+for liquid majors while this book trades alts at a one-day holding period, and
+the out-of-sample window is 2022-09 to 2026-07 on a single hyperparameter set.
+The hourly store now makes realised spread measurable per asset per hour, which
+is the next thing worth doing and no longer requires new data.
