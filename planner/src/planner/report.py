@@ -523,91 +523,148 @@ def combined_section(record: dict) -> str:
     )
 
 
-def phase_section(record: dict) -> str:
-    """The seven rebalance phases, and what they do to every result on this page.
+def current_section(record: dict) -> str:
+    """What the current best version does. The page's reason to exist.
 
-    A weekly strategy has seven equally valid start days. Nothing in this one
-    refers to a weekday: shifting the rebalance by three days changes no
-    parameter, no rule, and no data - only which Friday-to-Friday or
-    Tuesday-to-Tuesday windows the returns are chopped into. A real weekly edge
-    is therefore close to invariant across the seven, and the spread across them
-    is a lower bound on the noise in any single-phase number.
-
-    This spread turned out to dominate everything else measured here, which is
-    why the section exists and why it sits above the older results rather than
-    beneath them. The failure is not that a wrong number was computed - each
-    phase is computed correctly - but that one draw was reported as though it
-    were the quantity of interest, and every subsequent test reused that same
-    draw. Out-of-sample windows, walk-forward folds, plateau sweeps and the
-    label-shuffle null were all run on the Friday phase, so none of them was
-    capable of detecting it. A validation suite is only as good as the degrees of
-    freedom it knows about.
-
-    The benchmark row is the control that makes the reading unambiguous. Buy-and-
-    hold BTC is the same asset in all seven phases, so its spread is pure
-    sampling noise and everything wider than it is the strategy's own.
+    Everything here is tranched across all seven rebalance phases, which is not
+    a presentation choice: a single-phase number for a weekly strategy is one
+    draw from a distribution whose spread, on this strategy, ranged from -57% to
+    +1177% over the same period. Tranching removes the choice by holding all
+    seven sub-books at once, which is also how it would be run.
     """
+    eq = [(s["label"], s["equity"]) for s in record["series"]]
+    dd = [(s["label"], s["drawdown"]) for s in record["series"]]
+    equity = _line_panel(
+        eq, height=300, split=record.get("split"), fmt=lambda v: f"{v:.0f}x",
+        ticks_from=lambda a, b: (0.0, b * 1.05),
+        aria="Growth of one unit: current strategy versus buy and hold BTC",
+        baseline=1.0,
+    )
+    draw = _line_panel(
+        dd, height=190, split=record.get("split"), fmt=lambda v: f"{v * 100:.0f}%",
+        ticks_from=lambda a, b: (a * 1.08, 0.0),
+        aria="Drawdown from peak", baseline=0.0,
+    )
+
     rows = ""
-    for c in record["candidates"]:
-        spread = c["orig_max"] - c["orig_min"]
-        cls = "ev-no" if spread > 3.0 else ("ev-thin" if spread > 1.0 else "ev-ok")
+    for d in record["decomposition"]:
+        strong = d["name"] == "strategy"
         rows += (
-            f'<tr><td>{_esc(c["name"])}</td>'
-            f'<td class="num">{c["fresh_median"] * 100:.1f}%</td>'
-            f'<td class="num">{c["orig_median"] * 100:.1f}%</td>'
-            f'<td class="num">{c["sharpe_median"]:.2f}</td>'
-            f'<td class="num muted">{c["orig_min"] * 100:.1f}%</td>'
-            f'<td class="num muted">{c["orig_max"] * 100:.1f}%</td>'
-            f'<td class="num"><span class="ev {cls}">{spread * 100:.0f} pts</span></td>'
-            f'<td class="num">{c["sharpe_min"]:.2f} … {c["sharpe_max"]:.2f}</td></tr>'
+            f'<tr{" class=\'lead\'" if strong else ""}><td>{_esc(d["name"])}</td>'
+            f'<td class="num">{d["fresh"]["final"] * 100:.1f}%</td>'
+            f'<td class="num">{d["fresh"]["sharpe"]:.2f}</td>'
+            f'<td class="num">{d["orig"]["final"] * 100:.1f}%</td>'
+            f'<td class="num">{d["orig"]["sharpe"]:.2f}</td>'
+            f'<td class="num">{d["orig"]["t"]:.2f}</td>'
+            f'<td class="num">{d["combined"] * 100:.1f}%</td></tr>'
         )
 
-    # Three lines, not six. The argument here is benchmark vs base construction
-    # vs final, and the intermediate tuning steps are table rows - putting all
-    # six on one axis crowds four of them into a band narrower than their own
-    # labels, which reads as precision that is not there.
-    shown = record.get("chart_series") or [s["label"] for s in record["series"]]
-    series = [(s["label"], s["equity"]) for s in record["series"] if s["label"] in shown]
+    strat = next(d for d in record["decomposition"] if d["name"] == "strategy")
+    btc = next(d for d in record["decomposition"] if d["name"] == "BTC buy & hold")
+
+    return (
+        '<section><h2>Current result</h2>'
+        '<p class="note">Long the names above their Gaussian channel, short the rest of the '
+        'eligible and borrowable universe, leg weights tilted by the benchmark\'s own regime '
+        'read, capped at twelve positions and 25% a name so the risk gate accepts the plan. '
+        '<strong>Tranched across all seven rebalance phases</strong> — seven sub-books, one '
+        'per weekday, a seventh of capital each. That is not a smoothing choice: on a single '
+        'phase this same strategy ranged from −57% to +1177% over the same period, and '
+        'tranching removes an arbitrary parameter rather than averaging away a real one.</p>'
+        + equity
+        + '<p class="note" style="margin-top:14px">Drawdown from peak, same axis. This is the '
+        'half the equity curve hides, and it is where the strategy earns its keep.</p>'
+        + draw
+        + '<h3>What the return is made of</h3>'
+        '<p class="note">The strategy has two independent parts and either could be carrying '
+        'it. Run separately, each is weaker than the pair — which is the answer to "is this '
+        'just BTC timing in a costume".</p>'
+        '<div class="scroll"><table class="data"><thead>'
+        '<tr><th rowspan="2">variant</th><th colspan="2">fresh 2019-10..2021-10</th>'
+        '<th colspan="3">orig 2021-10..2026-08</th><th rowspan="2" class="num">combined</th></tr>'
+        '<tr><th class="num">return</th><th class="num">Sharpe</th>'
+        '<th class="num">return</th><th class="num">Sharpe</th><th class="num">t</th></tr>'
+        '</thead><tbody>' + rows + '</tbody></table></div>'
+        '<p class="finding"><strong>It beats buy-and-hold on the combined window and on '
+        f'drawdown, and loses to it in the first window.</strong> {strat["combined"] * 100:.0f}% '
+        f'against {btc["combined"] * 100:.0f}%, with a worst drawdown of '
+        f'{min(s["maxdd"] for s in record["series"] if s["label"] == "strategy") * 100:.0f}% '
+        f'against BTC\'s {min(s["maxdd"] for s in record["series"] if s["label"] != "strategy") * 100:.0f}%. '
+        'But BTC wins the fresh window outright on both return and Sharpe, so the case rests '
+        'on the second window and on the drawdown, not on a clean sweep. Neither component '
+        'explains the whole: timing alone is weak (Sharpe 0.52 and 0.28), selection alone is '
+        'moderate, and the pair beats both. That rules out the simplest deflationary story — '
+        'this is not a BTC market-timing strategy wearing a long/short costume — without '
+        'establishing that what remains is durable.</p></section>'
+    )
+
+
+def phase_section(record: dict) -> str:
+    """The seven rebalance phases, and why the headline is tranched.
+
+    A weekly strategy has seven equally valid start days and nothing in this one
+    refers to a weekday: shifting the rebalance by three days changes no
+    parameter, no rule and no data. A real weekly edge should barely notice. This
+    one swings from +63% to +7860% combined, which is why every figure on this
+    page holds all seven at once rather than picking.
+
+    The table is sorted by outcome rather than by weekday, because the point is
+    the spread and not which day won. The chart shows best, median and worst
+    against the tranched book - four series, which is the palette's limit and
+    also the most a reader can follow.
+    """
+    rows = ""
+    for r in record["rows"]:
+        rows += (
+            f'<tr><td class="mono-s">{_esc(r["phase"])}</td>'
+            f'<td class="num">{r["fresh"] * 100:.1f}%</td>'
+            f'<td class="num">{r["orig"] * 100:.1f}%</td>'
+            f'<td class="num">{r["sharpe"]:.2f}</td>'
+            f'<td class="num">{r["maxdd"] * 100:.1f}%</td>'
+            f'<td class="num">{r["combined"] * 100:.1f}%</td></tr>'
+        )
+    t = record["tranched"]
+    rows += (
+        f'<tr class="lead"><td class="mono-s">tranched</td>'
+        f'<td class="num muted">—</td><td class="num muted">—</td>'
+        f'<td class="num muted">—</td>'
+        f'<td class="num">{t["maxdd"] * 100:.1f}%</td>'
+        f'<td class="num">{t["final"] * 100:.1f}%</td></tr>'
+    )
+
     chart = _line_panel(
-        series,
-        height=300,
-        split=record.get("split"),
-        fmt=lambda v: f"{v:.1f}x",
+        [(s["label"], s["equity"]) for s in record["series"]],
+        height=300, split=record.get("split"), fmt=lambda v: f"{v:.0f}x",
         ticks_from=lambda a, b: (0.0, b * 1.05),
-        aria="Equity of the median rebalance phase: benchmark, base construction, final",
+        aria="Best, median and worst rebalance phase against the tranched book",
         baseline=1.0,
     )
 
     return (
-        '<section><h2>Phase robustness — the result that supersedes the rest</h2>'
-        '<p class="note">A weekly strategy has seven equally valid rebalance days, and '
-        '<strong>nothing in this strategy refers to a weekday</strong>. Shifting the rebalance '
-        'by three days changes no parameter, no rule and no data. A real weekly edge should '
-        'barely notice. Every other number on this page was measured on the Friday phase.</p>'
+        '<section><h2>Why the numbers above are tranched</h2>'
+        '<p class="note">Nothing in this strategy refers to a weekday. Shifting the rebalance '
+        'by three days changes no parameter, no rule and no data — only which seven-day '
+        'windows the returns are cut into. A real weekly edge should barely notice.</p>'
         '<div class="scroll"><table class="data"><thead>'
-        '<tr><th rowspan="2">candidate</th><th colspan="3">median across 7 phases</th>'
-        '<th colspan="3">orig window, across phases</th>'
-        '<th rowspan="2" class="num">Sharpe range</th></tr>'
-        '<tr><th class="num">fresh</th><th class="num">orig</th><th class="num">Sharpe</th>'
-        '<th class="num">worst</th><th class="num">best</th><th class="num">spread</th></tr>'
-        '</thead><tbody>' + rows + '</tbody></table></div>'
-        '<p class="note" style="margin-top:14px">Equity on the <strong>median</strong> phase — '
-        'not the best one, so the chart and the table describe the same thing. Three lines '
-        'rather than all six: the benchmark, the base market-neutral construction, and the '
-        'configuration actually shipped. The tuning steps between them are table rows above, '
-        'because on one axis they crowd into a band narrower than their own labels.</p>'
+        '<tr><th>rebalance day</th><th class="num">fresh</th><th class="num">orig</th>'
+        '<th class="num">Sharpe</th><th class="num">maxDD</th>'
+        '<th class="num">combined</th></tr></thead>'
+        '<tbody>' + rows + '</tbody></table></div>'
         + chart
-        + '<p class="finding"><strong>The headline result was a sampling artifact.</strong> '
-        'The strategy swings from strongly profitable to loss-making across the seven phases, '
-        'and Friday — the phase every result on this page was built on — is the best of the '
-        'seven in <em>both</em> test windows. Buy-and-hold BTC is the control: it is the same '
-        'asset in all seven phases, so its spread is the sampling noise floor, and the '
-        'strategy\'s is many times wider. What survives is much smaller than what was claimed '
-        'and its range still includes losing money. The deeper lesson is about the validation '
-        'rather than the strategy: a fresh out-of-sample window, walk-forward folds, plateau '
-        'sweeps and a label-shuffle null were all run on this same phase, so the entire '
-        'apparatus was blind to it by construction. An unrecognised degree of freedom is not '
-        'protected against by testing the ones you did recognise.</p></section>'
+        + '<p class="finding"><strong>The same strategy, on the same data, returns +63% or '
+        '+7860% depending on an arbitrary choice.</strong> That spread is far larger than the '
+        'effect of any parameter in the strategy, which is why a single-phase number is not a '
+        'result — it is one draw. Holding all seven at once is both the honest measurement and '
+        'the better book: the tranched drawdown of '
+        f'{record["tranched"]["maxdd"] * 100:.1f}% is shallower than <em>every</em> individual '
+        'phase, including the luckiest, because the sub-books are only about a third '
+        'correlated and their worst weeks do not coincide. It costs nothing — each tranche '
+        'carries the same turnover as a single-phase book.</p>'
+        '<p class="note">This is also how the earlier headline result was wrong. Every '
+        'validation the strategy passed — a fresh out-of-sample window, walk-forward folds, '
+        'plateau sweeps, a label-shuffle null — was run on the Friday phase, the best of the '
+        'seven. An unrecognised degree of freedom is not protected against by testing the ones '
+        'you recognised.</p></section>'
     )
 
 
@@ -757,15 +814,55 @@ def candidates_table(cands: list[dict]) -> str:
 # --- page -------------------------------------------------------------------
 
 
+def _universe_table(points: list[dict]) -> str:
+    """The universe chart's values, sampled yearly.
+
+    Every point would be 357 rows of noise; one per year carries the shape a
+    reader needs — the eligible count is roughly flat while the delisted tail
+    grows, which is the whole argument that this is not a survivor sample.
+    """
+    if not points:
+        return ""
+    seen, rows = set(), ""
+    for p in points:
+        year = p["date"][:4]
+        if year in seen:
+            continue
+        seen.add(year)
+        rows += (
+            f'<tr><td class="mono-s">{_esc(p["date"])}</td>'
+            f'<td class="num">{p["eligible"]}</td>'
+            f'<td class="num">{p["considered"]}</td>'
+            f'<td class="num">{p["dead"]}</td></tr>'
+        )
+    last = points[-1]
+    rows += (
+        f'<tr><td class="mono-s">{_esc(last["date"])}</td>'
+        f'<td class="num">{last["eligible"]}</td>'
+        f'<td class="num">{last["considered"]}</td>'
+        f'<td class="num">{last["dead"]}</td></tr>'
+    )
+    return (
+        '<div class="scroll"><table class="data"><thead><tr><th>first date of year</th>'
+        '<th class="num">eligible</th><th class="num">considered</th>'
+        '<th class="num">delisted carried</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table></div>'
+    )
+
+
 def _tiles(record: dict) -> str:
     d = record["data"]
-    runs = {r["label"]: r for r in record["runs"]}
-    n = runs["baseline"]["metrics"]["n"] if "baseline" in runs else 0
+    cur = record.get("current", {})
+    strat = next(
+        (x for x in cur.get("decomposition", []) if x["name"] == "strategy"), None
+    )
+    # Decisions across all seven tranches, which is what is actually replayed.
+    n = (strat["fresh"]["n"] + strat["orig"]["n"]) * 7 if strat else 0
     cells = [
         (f"{d['assets']}", "assets in the store", ""),
         (f"{d['bars'] // 1000}k", "daily bars", f"{d['first_bar']} → {d['last_bar']}"),
         (f"{d['delisted']}", "delisted series retained", "not a survivor sample"),
-        (f"{n}", "decisions replayed", "weekly cadence"),
+        (f"{n}", "decisions replayed", "7 tranches, weekly each"),
     ]
     return "".join(
         f'<div class="tile"><div class="tile-v">{_esc(v)}</div>'
@@ -858,18 +955,6 @@ def _folds_table(record: dict) -> str:
 
 def render(record: dict) -> str:
     """The whole page, as one self-contained document body."""
-    momentum = next((r for r in record["runs"] if r["label"] == "momentum"), None)
-    folds = momentum["folds"] if momentum else []
-
-    ic_rows = [
-        (
-            f"{r['horizon']}d",
-            r["mean_ic"],
-            f"t={r['t_stat']:+.2f} · eff n {r['effective_n']:.0f}"
-            + ("" if r["significant"] else " · not sig."),
-        )
-        for r in record["ic"]
-    ]
     spread_rows = [
         (
             f"{r['horizon']}d",
@@ -880,15 +965,6 @@ def render(record: dict) -> str:
         for r in record["spread"]
     ]
 
-    ic_table = "".join(
-        f"<tr><td>{r['horizon']}d</td><td class='num'>{r['periods']}</td>"
-        f"<td class='num'>{r['effective_n']:.0f}</td>"
-        f"<td class='num'>{r['observations']}</td>"
-        f"<td class='num'>{r['mean_ic']:+.4f}</td>"
-        f"<td class='num'>{r['t_stat']:+.2f}</td>"
-        f"<td class='num'>{r['hit_rate'] * 100:.1f}%</td></tr>"
-        for r in record["ic"]
-    )
     spread_table = "".join(
         f"<tr><td>{r['horizon']}d</td><td class='num'>{r['periods']}</td>"
         f"<td class='num'>{r['effective_n']:.0f}</td>"
@@ -911,18 +987,22 @@ def render(record: dict) -> str:
 <div class="disclosures" role="note">
   <p class="dh">Read before any number below</p>
   <ul>
+    <li>Every strategy figure is <strong>tranched across all seven rebalance phases</strong>.
+      A single-phase number is one draw: on one phase this strategy returned +1177% over the
+      second window and on another −57%, with nothing changed but the weekday.</li>
     <li>The cost model is <strong>uncalibrated</strong> — its impact coefficient is assumed
       rather than fitted to realised fills, so every cost figure carries an unquantified error.</li>
     <li>The fill model crosses the spread and charges commission and <strong>models nothing
       else</strong>: no partial fills, no queue position, no depth. Pessimistic but crude.</li>
-    <li>The window starts near the 2021 cycle top. A long-only crypto book loses over it
-      almost regardless — <strong>the comparison against the baseline travels; the absolute
-      number does not</strong>.</li>
-    <li>No run of this length establishes a modest edge in either direction (spec §7.5).
-      It can establish <strong>gross failure</strong>, which is what these are.</li>
+    <li>The parameters were selected on one phase before that was understood, so the
+      <strong>selection is not yet phase-free even though the measurement is</strong>.</li>
     <li>Every chart here has a table below it carrying the same values.</li>
   </ul>
 </div>
+
+{current_section(record["current"]) if record.get("current") else ""}
+{phase_section(record["phases"]) if record.get("phases") else ""}
+{fixed_budget_section(record["fixed_budget"]) if record.get("fixed_budget") else ""}
 
 <section>
   <h2>What the data is</h2>
@@ -933,64 +1013,22 @@ def render(record: dict) -> str:
 </section>
 
 <section>
-  <h2>The verdict</h2>
-  {_verdict(record)}
-</section>
-
-<section>
-  <h2>Equity curves</h2>
-  <p class="note">Shaded bands are the walk-forward out-of-sample windows. Both candidates
-  end below the baseline, which is the informative comparison — not the absolute loss.</p>
-  <div class="chart-wrap" id="navwrap">{nav_chart(record["runs"], folds)}
-    <div class="tip" id="navtip"></div>
-  </div>
-  {_results_table(record)}
-</section>
-
-{phase_section(record["phases"]) if record.get("phases") else ""}
-{combined_section(record["combined"]) if record.get("combined") else ""}
-{fixed_budget_section(record["fixed_budget"]) if record.get("fixed_budget") else ""}
-{candidates_table(record["combined"]["candidates"]) if record.get("combined", {}).get("candidates") else ""}
-
-<section>
-  <h2>Walk-forward, out of sample</h2>
-  <p class="note">Momentum is consistently poor. The breakout signal swings hard
-  — it captures trends when they exist and bleeds through chop.</p>
-  {_folds_table(record)}
-</section>
-
-<section>
-  <h2>Information coefficient — <code>ret_30_skip_7</code></h2>
-  <p class="note">Rank correlation between the momentum score and the subsequent return:
-  one observation per asset per period rather than one per rebalance. <strong>The t-stat is
-  computed on the overlap-deflated effective sample</strong>; uncorrected, the 30d figure
-  reads −3.55 and would look established.</p>
-  {signed_bars(ic_rows, title_id="ic-h")}
-  <div class="scroll"><table class="data"><thead><tr><th>horizon</th>
-  <th class="num">periods</th><th class="num">eff n</th><th class="num">obs</th>
-  <th class="num">mean IC</th><th class="num">t</th>
-  <th class="num">hit rate</th></tr></thead>
-  <tbody>{ic_table}</tbody></table></div>
-  <p class="finding">No horizon shows positive predictive content. This is the
-  &ldquo;signal is dead&rdquo; branch: sweeping holding counts or cadences on it would be
-  tuning the packaging of noise.</p>
-</section>
-
-<section>
   <h2>Breakout spread — above band minus below band</h2>
-  <p class="note">Rank IC is the wrong instrument for an absolute signal, which is a
-  <em>state</em> rather than an ordering. The question is whether assets above their
-  channel outperform those below it.</p>
+  <p class="note">The signal the current strategy is built on, tested directly rather
+  than through a portfolio. Does an asset above its channel outperform one below it?</p>
   {signed_bars(spread_rows, title_id="sp-h")}
   <div class="scroll"><table class="data"><thead><tr><th>horizon</th>
   <th class="num">periods</th><th class="num">eff n</th>
   <th class="num">mean spread</th><th class="num">t</th>
   <th class="num">% above band</th></tr></thead>
   <tbody>{spread_table}</tbody></table></div>
-  <p class="finding">Suggestive at the short end, gone by 30 days, nothing clearing
-  |t| &gt; 2. The structural point: <strong>the spread is relative and the book is
-  absolute</strong>. Picking assets that fall less still loses money long-only when
-  everything falls — which is why a relative edge needs a short leg.</p>
+  <p class="finding"><strong>Flat, and negative past a week.</strong> +0.14% at 7 days
+  (t = +0.27), −0.57% at 14, −2.40% at 30. This is the strategy's own premise measured
+  head-on over the full window, and it does not hold — which sits uneasily beside a
+  long/short book built on it returning what it does. The most likely reconciliation is
+  that the book is not trading the raw group split: it ranks within each leg, caps
+  position count and size, and collects funding on the short side. Those are the parts
+  this test does not cover, and the parts that have had the least scrutiny.</p>
 </section>
 
 <section>
@@ -998,6 +1036,31 @@ def render(record: dict) -> str:
   <p class="note">Eligible assets per decision date, and how many delisted series the
   snapshot still carries. The second line is what makes the first one honest.</p>
   {universe_chart(record["universe"])}
+  {_universe_table(record["universe"])}
+</section>
+
+<section>
+  <h2>What is not settled</h2>
+  <ul class="open">
+    <li><strong>The parameters were chosen on a single phase.</strong> Tranching fixed how
+      the strategy is measured, not how its tilt scale, regime period and channel length
+      were picked. Those sweeps need re-running against the tranched objective before the
+      numbers above mean what they appear to.</li>
+    <li><strong>No null test on the tranched result.</strong> The original label-shuffle
+      null shared the Friday phase with the real data, so it compared a lucky phase against
+      a lucky phase. It has to be re-run per phase.</li>
+    <li><strong>The spread test and the book disagree.</strong> Resolving that means
+      isolating the within-leg ranking, the position caps and the funding carry and
+      measuring each separately.</li>
+    <li><strong>The short-leg ranking is untested.</strong> Ranking shorts by distance below
+      the lower band was introduced to fit the twelve-position limit, not because anything
+      measured said it was right.</li>
+    <li><strong>BTC still wins the first window</strong> on both return and Sharpe. The case
+      rests on the second window and on drawdown.</li>
+  </ul>
+  <p class="note">The full history of everything tried and rejected — including three
+  retracted results — is in <code>docs/phase-1-findings.md</code>. This page is the
+  current state, not the log.</p>
 </section>
 
 <footer>

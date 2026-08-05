@@ -930,3 +930,88 @@ Any future backtest of a strategy that rebalances on a period of N units must be
 reported across all N phases, median and range, with the benchmark measured the
 same way as its noise floor. A single-phase number is one draw from a
 distribution and is not a result. This belongs in the gate, not in a convention.
+
+---
+
+# Where this actually stands
+
+Two further results, both from questions that turned out to matter more than the
+answers I had.
+
+## Tranching, and why the strategy should be run that way
+
+Rebalancing weekly means choosing one of seven decision grids and discarding six.
+Holding all seven at once - seven sub-books, one per weekday, a seventh of capital
+each - removes the choice rather than justifying it. Each sub-book has the same
+weekly holding period and the same turnover, so it costs nothing.
+
+| rebalance day | fresh | orig | Sharpe | maxDD | combined |
+|---|---|---|---|---|---|
+| Tue | +201.2% | −45.9% | 0.04 | −76.6% | +63.0% |
+| Sun | −17.0% | +185.4% | 0.70 | −43.9% | +136.9% |
+| Mon | −9.1% | +210.2% | 0.73 | −51.1% | +182.0% |
+| Wed | +349.7% | +47.6% | 0.40 | −52.4% | +563.6% |
+| Sat | +179.7% | +494.5% | 1.10 | −38.8% | +1562.8% |
+| Thu | +301.4% | +970.3% | 1.35 | −38.0% | +4196.3% |
+| Fri | +295.3% | +1913.9% | 1.75 | −31.3% | +7860.3% |
+| **tranched** | | | | **−27.8%** | **+1515.1%** |
+
+The tranched drawdown is shallower than *every* individual phase including the
+luckiest, because the sub-books are only about a third correlated (mean
+off-diagonal 0.334) and their worst weeks do not coincide. That correlation is
+itself the cleanest measure of how thin the signal is: seven runs of the same
+strategy on the same period should move together if they were tracking something
+persistent.
+
+## The current best version, and what it is made of
+
+Tranched, twelve positions, 25% per-name cap - the configuration the risk gate
+accepts.
+
+| variant | fresh ret | fresh Sh | orig ret | orig Sh | orig t | combined |
+|---|---|---|---|---|---|---|
+| strategy | +227.4% | 1.67 | +393.3% | 1.25 | 2.74 | **+1515.1%** |
+| BTC buy & hold | +558.7% | 1.87 | +64.3% | 0.46 | 1.00 | +982.0% |
+| selection only | +124.9% | 2.08 | +90.4% | 0.77 | 1.69 | +328.2% |
+| timing only | +30.3% | 0.52 | +20.5% | 0.28 | 0.61 | +56.9% |
+
+It beats buy-and-hold on the combined window and on drawdown (−27.8% against
+−72.9%), and **loses the fresh window outright** on both return and Sharpe. The
+case rests on the second window and the drawdown, not on a sweep.
+
+Neither component explains the whole. Timing alone is weak, which kills the
+simplest deflationary story - this is not BTC market-timing in a long/short
+costume. Stripping the perp funding carry from the selection leg leaves Sharpe
+1.70 and 0.71, so it is not a funding harvester either. Funding carry alone was
+strongly positive before 2021 and turned negative after: trading costs now exceed
+funding income.
+
+**This sits badly against the spread test**, which is flat over the full window
+(+0.14% at 7d, t=+0.27; negative at 14d and 30d). The book is not trading the raw
+group split - it ranks within each leg, caps count and size, and collects
+funding - and those parts have had the least scrutiny. Resolving the
+contradiction is the most informative thing left to do.
+
+## Two failure modes in the drawdowns, one of which must not be "fixed"
+
+The book stood down 13 of 40 weeks across late 2025 and 2026 with 27-34 shortable
+candidates available and the tilt pinned at maximum bearish, including a week BTC
+fell 16.2%. The three weeks before the first stand-down earned +8.4%, +13.5% and
++10.8% entirely from shorts. It looks self-evidently wrong.
+
+Running the surviving leg instead is **worse**: combined +729% against +1513%,
+orig Sharpe 0.62 against 1.23, drawdown −53.6% against −26.9%. The ledger shows
+why - BTC rallied +6.8%, +3.0%, +3.4% and +4.1% during those flat weeks. Bear
+rallies are where a fully-short crypto book dies, and `MIN_LEG = 3` is an
+accidental but effective filter against taking a large directional position when
+nothing at all is trending up.
+
+The second failure is unexplained: through July 2026 the long leg lost 10-13% a
+week while the regime read "flat", so no tilt protected it.
+
+## What the record is now
+
+`planner/research.py` builds the whole record in one pass, over one window, from
+the store. The research page shows the current state only; this document is the
+log. Retracted along the way: +6884%, the p=0.040 null, "the edge is decaying",
+min-Sharpe 2.05, and "beats buy-and-hold" as an unqualified claim.
