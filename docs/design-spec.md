@@ -801,15 +801,28 @@ path into the engine.
 
 Two binaries implement this today. `ai-trader` (Python) is the planner — it decides and emits a
 Plan. `bot` (Rust) is the executor — it takes a plan file and does steps 9–10, and owns
-`halt | pause | resume | flatten`. The split is §3.3's security boundary, not a packaging
+`halt | pause | resume | flatten | adopt`. The split is §3.3's security boundary, not a packaging
 preference: the process that decides never holds a key that can trade.
 
 ```
   bot --config bot.json run --plan plan.json   # execute, across the slice window
-  bot --config bot.json status | history | positions
+  bot --config bot.json status | history | positions | reconcile
   bot --config bot.json halt | pause | resume  --reason R --by WHO
   bot --config bot.json flatten --reason R --by WHO --confirm
+  bot --config bot.json adopt   --reason R --by WHO --confirm
 ```
+
+**Our record is kept apart from the venue's, or the reconcile in §0.6 is theatre.** The bot writes
+every order id it authorises to an append-only ledger *before* submitting it. Folding "our"
+positions from the venue's own fill log — which is what it did first — puts the venue on both sides
+of the comparison, and a check that cannot disagree with itself would never catch a compromised key,
+a second process on the account, or a stale order from an earlier deployment.
+
+Connecting to an account that already holds positions is therefore a **halt**, not something
+absorbed: adopting whatever the venue reports is exactly the auto-repair the executor refuses to do.
+`adopt` is the one sanctioned exception — manual, attributed, recorded as a run, and refusing by
+default when there are fills we never authorised. It exists because the alternative is a system that
+can never be pointed at a funded account at all.
 
 ### 8.2 The dashboard is a lens, and it can only ever stop things
 

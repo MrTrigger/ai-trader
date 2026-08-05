@@ -9,6 +9,7 @@ Three processes, none of which knows about the others at runtime. They meet thro
         │                        │                          │
         └──── plan.json ────────►│                          │
                                  ├──► runs/*.json ─────────►│
+                                 ├──► ledger.jsonl ────────►│
                                  ├──► venue-state.json ────►│
                                  │◄─── controls.json ◄──────┘
 ```
@@ -62,6 +63,48 @@ bot --config config/bot.json positions   # what the venue says we hold
 `status` carries its answer in the exit code as well as the JSON, so a monitoring script does not
 have to parse anything to know something is wrong.
 
+## Connecting to an account that already has a book
+
+A fresh install, a new machine, a restored backup, or the first connection to a funded venue all
+look the same from inside: the venue holds positions and our ledger explains none of them.
+
+**That is a halt, not something absorbed.** Adopting whatever the venue says is exactly the
+auto-repair the executor refuses to do — it would turn evidence of a bug into an opening position.
+But a permanent halt is no good either, or the system could never be pointed at a real account at
+all. So there is one deliberate, attributed command:
+
+```bash
+bot --config config/bot.json reconcile     # what do the two sides say? changes nothing
+bot --config config/bot.json adopt --reason "first connection, checked the account" \
+    --by magnus --confirm
+```
+
+`adopt` writes an opening baseline into the ledger, with the name and the reason attached, and
+records it as a run. From then on the ledger explains the book and reconciliation has teeth again.
+
+### The order ledger
+
+`state_dir/ledger.jsonl` is **our** record, kept deliberately apart from the venue's. Every order id
+is written there *before* it is sent, so a venue fill carrying an id we never issued is visible.
+
+That check is the point. Without it, "our" positions would be folded from the venue's own fill log —
+the venue on both sides of the comparison, which cannot disagree with itself — and the reconcile that
+exists to catch a compromised key, a second process on the account, or a stale order from an earlier
+deployment would pass every time.
+
+A fill we never authorised means one of: someone else trading the account, a stale order, a stolen
+key — or, benignly, that this bot's ledger was lost and the venue still remembers what it did. Those
+are indistinguishable from in here, so the system stops and a human decides:
+
+```bash
+bot --config config/bot.json adopt --reason "restored from backup; checked by hand" \
+    --by magnus --confirm --accept-unknown-fills
+```
+
+The fills are recorded as acknowledged, with who and why, rather than erased. They are not folded
+into our position — the baseline written alongside them already accounts for where the book ended
+up.
+
 ## Stopping it
 
 | | What it does | Where |
@@ -70,6 +113,7 @@ have to parse anything to know something is wrong.
 | **pause** | Only orders that reduce exposure go out. A paused book can still get out. | dashboard **or** CLI |
 | **resume** | Permits trading again. | CLI only |
 | **flatten** | Closes every open position at market, now. | CLI only |
+| **adopt** | Takes pre-existing venue positions on as our opening state. | CLI only |
 
 ```bash
 bot --config config/bot.json halt    --reason "drawdown breach" --by magnus
@@ -100,9 +144,16 @@ means a human who has read *why* it stopped before restarting it.
   longer exist.
 - **A plan that already ran is refused.** Re-running it would submit against a book that has moved,
   and none of the order ids would collide because the quantities differ.
-- **Reconciliation drift halts and is never repaired.** Our fill-log positions against the venue's;
-  a mismatch means one of our assumptions is wrong, and trading on top of it turns a bug into a
-  loss.
+- **Reconciliation drift halts and is never repaired.** Our ledger against the venue's book, before
+  every slice rather than once per run — the execution window is hours long, and the account can
+  change underneath it. A mismatch means one of our assumptions is wrong, and trading on top of it
+  turns a bug into a loss.
+- **A venue we cannot read is a halt, not a guess.** Reads are retried three times while the venue
+  is unreachable; writes never are, because a submission that may or may not have landed is how a
+  position gets doubled. Order ids carry the idempotency instead.
+- **A run that submitted nothing leaves its plan runnable.** The replay guard exists to stop a
+  double submission; blocking a retry after a halt would force a re-plan at exactly the moment
+  something has gone wrong.
 - **A failed order stops the run** with the remaining orders named. A partially applied plan
   matches no plan at all; the next run diffs from wherever the book actually is.
 - **Every run is recorded, including the ones that did nothing.** A halted run and a run that never
@@ -116,6 +167,7 @@ means a human who has read *why* it stopped before restarting it.
 | `marks.json` | the price feed | `{"BTC": "64000.50"}`; the bot only reads it |
 | `venue-state.json` | `bot` | the paper venue's books — fill log, resting orders, idempotency map |
 | `runs/*.json` | `bot` | one file per run; timestamp-prefixed, so a listing is chronological |
+| `ledger.jsonl` | `bot` | our own append-only record: order ids we authorised, positions we adopted, fills we acknowledged |
 
 One file per run rather than one growing log: a half-written line in a shared log corrupts the
 whole history, and a run that died mid-write should cost its own record and no others.

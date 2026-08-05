@@ -85,6 +85,13 @@ pub struct Snapshot {
     /// The backtest this is supposed to be reproducing, if a record was found.
     pub expectation: Option<serde_json::Value>,
     pub live: LiveStats,
+    /// Our ledger against the venue's book.
+    ///
+    /// The dashboard's job here is to make a stopped bot legible, and "halted"
+    /// with no cause is the least legible thing it could show. Reconciliation
+    /// state is the single most common reason a run refuses to trade, so it is
+    /// on the page rather than only in a log.
+    pub reconciliation: Option<serde_json::Value>,
     /// Anything that made a number here less trustworthy than it looks.
     pub warnings: Vec<String>,
 }
@@ -153,6 +160,29 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
 
     let live = live_stats(&runs, &book, inputs.initial_cash);
 
+    // Reconciled against the venue's positions as the bot last recorded them:
+    // this process holds no venue credentials and cannot ask the venue itself.
+    // Comparing our ledger against a stale book would be worse than saying
+    // nothing, so the ledger is compared against the same fills everything else
+    // on this page is folded from.
+    let mut health = health;
+    let reconciliation = reconcile_view(inputs.state_dir, &fills, &mut warnings);
+    // Health has to account for this. `runner::health` is about controls and
+    // cadence and knows nothing of the ledger, so a dashboard showing "ok"
+    // beside "reconciliation disagrees" would be telling an operator the system
+    // is fine while it refuses to trade.
+    if reconciliation
+        .as_ref()
+        .and_then(|r| r.get("agrees"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        health.ok = false;
+        health.notes.push(
+            "our record and the venue disagree; no run will trade until that is settled".into(),
+        );
+    }
+
     // Newest first: the question a dashboard answers is "what just happened".
     let recent_fills: Vec<FillView> = fills
         .iter()
@@ -183,8 +213,32 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
             .collect(),
         expectation,
         live,
+        reconciliation,
         warnings,
     })
+}
+
+/// Our ledger against the book, for display only.
+fn reconcile_view(
+    state_dir: &Path,
+    fills: &[Fill],
+    warnings: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let ledger = runner::Ledger::open(state_dir);
+    let eps: rust_decimal::Decimal = "0.00000001".parse().ok()?;
+    let positions = derive_positions(fills);
+    match ledger.reconcile(&positions, fills, eps) {
+        Ok(r) => {
+            if !r.agrees {
+                warnings.push(r.explain());
+            }
+            serde_json::to_value(&r).ok()
+        }
+        Err(e) => {
+            warnings.push(format!("cannot read the order ledger: {e}"));
+            None
+        }
+    }
 }
 
 fn stamp(t: time::OffsetDateTime) -> String {

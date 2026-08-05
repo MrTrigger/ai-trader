@@ -350,8 +350,9 @@ async fn execution_reconciles_before_trading_not_after() {
     // The venue holds 2 BTC; our fill log says 1. Nothing may be submitted.
     let venue = FakeVenue::new(vec![position("BTC", "2.0")]);
     let p = plan::Plan::parse(&plan_json(&order("BTC", "buy", "1", "entry"))).unwrap();
-    let fills = vec![fill("BTC", Side::Buy, "1")];
-    let err = execute(&venue, &p, &fills, Controls::default(), now())
+    // Our record, derived from our own fill log the way the runner does.
+    let ours = venue::derive_positions(&[fill("BTC", Side::Buy, "1")]);
+    let err = execute(&venue, &p, &ours, Controls::default(), now())
         .await
         .unwrap_err();
     assert!(matches!(err, ExecError::Reconciliation { .. }));

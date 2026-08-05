@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use config::BotConfig;
 use paper::{PaperConfig, PaperVenue};
-use runner::{ControlFile, RunStore, Runner};
+use runner::{ControlFile, Ledger, RunStore, Runner};
 use venue::{ManualPrices, SystemClock, VenueAdapter};
 
 type Venue = PaperVenue<Arc<ManualPrices>, SystemClock>;
@@ -67,6 +67,9 @@ commands:
   status                             health, controls and the last run
   history [--limit N]                recent runs, newest first
   positions                          what the venue says we hold
+  reconcile                          our record against the venue's; changes nothing
+  adopt --reason R --by WHO --confirm [--accept-unknown-fills]
+                                     take pre-existing venue positions on as ours
   halt   --reason R --by WHO         stop executing (planning continues)
   pause  --reason R --by WHO         risk-reducing orders only
   resume --reason R --by WHO         permit trading again
@@ -110,6 +113,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "status" => cmd_status(&cfg),
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
         "positions" => block_on(cmd_positions(&cfg)),
+        "reconcile" => block_on(cmd_reconcile(&cfg)),
+        "adopt" => {
+            if !flags.has("--confirm") {
+                return Err(
+                    "adopt writes the venue's current positions into our own record as an \
+                     opening baseline. That is the one repair this system will not do on its \
+                     own, so look at the account first and re-run with --confirm."
+                        .into(),
+                );
+            }
+            block_on(cmd_adopt(&cfg, &flags))
+        }
         "halt" => cmd_control(&cfg, true, false, &flags),
         "pause" => cmd_control(&cfg, false, true, &flags),
         "resume" => cmd_control(&cfg, false, false, &flags),
@@ -236,10 +251,12 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
     let venue = open_venue(cfg)?;
     let store = RunStore::new(&cfg.state_dir);
     let clock = SystemClock;
+    let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
         venue: &venue,
         clock: &clock,
         store: &store,
+        ledger: &ledger,
         controls_path: cfg.controls_path(),
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
@@ -319,6 +336,67 @@ async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Report our record against the venue's. Places no orders, writes nothing.
+///
+/// The exit code carries the answer: zero when the two agree, non-zero when
+/// they do not, so this can be a cron check as well as something a human runs
+/// after an incident.
+async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
+    let (venue, store, ledger) = (
+        open_venue(cfg)?,
+        RunStore::new(&cfg.state_dir),
+        Ledger::open(&cfg.state_dir),
+    );
+    let clock = SystemClock;
+    let runner = Runner {
+        venue: &venue,
+        clock: &clock,
+        store: &store,
+        ledger: &ledger,
+        controls_path: cfg.controls_path(),
+        schedule: cfg.schedule,
+        max_plan_age_minutes: cfg.max_plan_age_minutes,
+    };
+    let report = runner
+        .inspect()
+        .await
+        .map_err(|e| format!("cannot reconcile: {e}"))?;
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    if report.agrees {
+        eprintln!("{}", report.explain());
+        Ok(())
+    } else {
+        Err(report.explain())
+    }
+}
+
+/// Take pre-existing venue positions on as our opening state.
+async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
+    let reason = flags.need("--reason")?;
+    let by = flags.need("--by")?;
+    let (venue, store, ledger) = (
+        open_venue(cfg)?,
+        RunStore::new(&cfg.state_dir),
+        Ledger::open(&cfg.state_dir),
+    );
+    let clock = SystemClock;
+    let runner = Runner {
+        venue: &venue,
+        clock: &clock,
+        store: &store,
+        ledger: &ledger,
+        controls_path: cfg.controls_path(),
+        schedule: cfg.schedule,
+        max_plan_age_minutes: cfg.max_plan_age_minutes,
+    };
+    let record = runner
+        .adopt(&reason, &by, flags.has("--accept-unknown-fills"))
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("{}", serde_json::to_string_pretty(&record).unwrap());
+    Ok(())
+}
+
 fn cmd_control(
     cfg: &BotConfig,
     kill_switch: bool,
@@ -353,10 +431,12 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let venue = open_venue(cfg)?;
     let store = RunStore::new(&cfg.state_dir);
     let clock = SystemClock;
+    let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
         venue: &venue,
         clock: &clock,
         store: &store,
+        ledger: &ledger,
         controls_path: cfg.controls_path(),
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,

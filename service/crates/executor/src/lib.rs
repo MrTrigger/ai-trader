@@ -5,8 +5,9 @@
 //!
 //! # Reconciliation drift is never repaired
 //!
-//! Our positions come from folding our own append-only fill log. The venue's
-//! come from the venue. When they disagree, one of our assumptions is wrong —
+//! Our positions are handed in by the caller, which owns an independent record
+//! of what it authorised. The venue's come from the venue. When they disagree,
+//! one of our assumptions is wrong —
 //! and the tempting response, adjusting our record to match, is the worst
 //! available: it destroys the evidence of what went wrong and leaves the system
 //! trading on top of a bug it has just concealed.
@@ -47,8 +48,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use time::OffsetDateTime;
 use venue::{
-    derive_positions, AssetId, Fill, OrderRequest, OrderType as VenueOrderType, Position,
-    VenueAdapter, VenueError,
+    AssetId, OrderRequest, OrderType as VenueOrderType, Position, VenueAdapter, VenueError,
 };
 
 /// A tolerance for position comparison, in base units.
@@ -61,9 +61,9 @@ pub const POSITION_EPSILON: &str = "0.00000001";
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     #[error(
-        "reconciliation failed for {asset}: we derive {ours} from our fill log, the venue \
-         reports {theirs}. STOPPED. One of our assumptions is wrong and trading on top of \
-         it would turn a bug into a loss. This is never auto-corrected."
+        "reconciliation failed for {asset}: our record says {ours}, the venue reports \
+         {theirs}. STOPPED. One of our assumptions is wrong and trading on top of it would \
+         turn a bug into a loss. This is never auto-corrected."
     )]
     Reconciliation {
         asset: String,
@@ -286,11 +286,11 @@ pub fn reconcile(ours: &[Position], theirs: &[Position]) -> Result<(), ExecError
 pub async fn execute<V: VenueAdapter>(
     venue: &V,
     plan: &Plan,
-    known_fills: &[Fill],
+    ours: &[Position],
     controls: Controls,
     now: OffsetDateTime,
 ) -> Result<ExecutionRecord, ExecError> {
-    execute_slice(venue, plan, None, known_fills, controls, now).await
+    execute_slice(venue, plan, None, ours, controls, now).await
 }
 
 /// Execute one slice of a plan whose orders are spread over time.
@@ -300,13 +300,16 @@ pub async fn execute<V: VenueAdapter>(
 /// rule. `plan` must already hold the sliced quantities — this function does not
 /// divide anything, because an executor that resizes orders is a second strategy.
 ///
-/// `known_fills` must include the fills from earlier slices. Reconciliation runs
-/// per slice, and stale fills would report drift the moment slice one filled.
+/// `ours` is our own view of the book, derived by the caller rather than here.
+/// It was once folded from the venue's own fill log, which meant reconciliation
+/// compared the venue against itself and could never disagree — the check has
+/// teeth only if the caller owns an independent record. It must also account for
+/// earlier slices, or slice two reports drift the moment slice one fills.
 pub async fn execute_slice<V: VenueAdapter>(
     venue: &V,
     plan: &Plan,
     slice: Option<u8>,
-    known_fills: &[Fill],
+    ours: &[Position],
     controls: Controls,
     now: OffsetDateTime,
 ) -> Result<ExecutionRecord, ExecError> {
@@ -360,8 +363,7 @@ pub async fn execute_slice<V: VenueAdapter>(
     // Reconcile BEFORE trading. Submitting into a book we do not understand is
     // how a small discrepancy becomes a large one.
     let theirs = venue.get_positions().await?;
-    let ours = derive_positions(known_fills);
-    if let Err(e) = reconcile(&ours, &theirs) {
+    if let Err(e) = reconcile(ours, &theirs) {
         record.halted_reason = Some(e.to_string());
         return Err(e);
     }

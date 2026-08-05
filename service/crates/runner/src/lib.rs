@@ -38,6 +38,10 @@
 //! incident is always "what did it do at 14:00", and "nothing is stored" is not
 //! an answer.
 
+mod ledger;
+
+pub use ledger::{Entry, Ledger, Reconciliation};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -47,7 +51,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use venue::{Fill, VenueAdapter};
+use venue::{Fill, VenueAdapter, VenueError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
@@ -88,6 +92,23 @@ pub enum RunnerError {
 
     #[error("venue: {0}")]
     Venue(#[from] venue::VenueError),
+
+    /// Our record and the venue's do not line up. Carries the full comparison
+    /// and a sentence naming the remedy — see [`Reconciliation::explain`].
+    #[error("{}", .0.explain())]
+    Reconciliation(Box<Reconciliation>),
+
+    #[error(
+        "the venue was unreachable {attempts} times in a row: {last}. Not trading on a view of \
+         the account we could not confirm."
+    )]
+    VenueUnreachable { attempts: u32, last: String },
+
+    #[error(
+        "there is nothing to adopt. {detail} Adopting anyway would write a second baseline on \
+         top of the first and double every position in our own record."
+    )]
+    NothingToAdopt { detail: String },
 }
 
 fn io(path: &Path) -> impl Fn(std::io::Error) -> RunnerError + '_ {
@@ -95,6 +116,45 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> RunnerError + '_ {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// How many times a read of venue state is retried before giving up.
+///
+/// Reads only. A failed *read* is a question we can safely ask again; a failed
+/// *write* may or may not have landed, and retrying it is how a position gets
+/// doubled. Order submission keeps its idempotency contract instead.
+const READ_ATTEMPTS: u32 = 3;
+
+/// Retry a venue read while it is unreachable.
+///
+/// Only [`VenueError::Unreachable`] is retried. A rejection is an answer — the
+/// venue has told us something true about the request — and asking again just
+/// gets the same answer more slowly.
+async fn read_with_retry<T, F, Fut>(mut f: F) -> Result<T, RunnerError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, VenueError>>,
+{
+    let mut last = String::new();
+    for attempt in 1..=READ_ATTEMPTS {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(VenueError::Unreachable(e)) => {
+                last = e;
+                if attempt == READ_ATTEMPTS {
+                    return Err(RunnerError::VenueUnreachable {
+                        attempts: READ_ATTEMPTS,
+                        last,
+                    });
+                }
+            }
+            Err(e) => return Err(RunnerError::Venue(e)),
+        }
+    }
+    Err(RunnerError::VenueUnreachable {
+        attempts: READ_ATTEMPTS,
+        last,
+    })
 }
 
 fn stamp(t: OffsetDateTime) -> String {
@@ -463,9 +523,17 @@ impl RunStore {
     /// Guards what idempotent order ids do not. Re-running an old plan would
     /// submit against a book that has since moved, and every id would be new
     /// because the quantities differ.
+    /// A plan counts as executed only if something actually reached the venue.
+    ///
+    /// The guard exists to stop a double submission, so a run that halted before
+    /// sending anything — a kill switch, a reconciliation stop, an unreachable
+    /// venue — must leave the plan runnable. Otherwise fixing the cause and
+    /// retrying is impossible, and the operator's only route back is to
+    /// re-plan, which is a strictly worse thing to force at the moment
+    /// something has just gone wrong.
     pub fn executed_at(&self, plan_id: &str) -> Result<Option<String>, RunnerError> {
         Ok(self.recent(500)?.into_iter().find_map(|r| {
-            (r.plan_id.as_deref() == Some(plan_id) && r.outcome != "refused")
+            (r.plan_id.as_deref() == Some(plan_id) && r.orders_submitted > 0)
                 .then_some(r.recorded_at)
         }))
     }
@@ -570,6 +638,9 @@ pub struct Runner<'a, V: VenueAdapter, C: Timer> {
     pub venue: &'a V,
     pub clock: &'a C,
     pub store: &'a RunStore,
+    /// Our own record of what we authorised. The independent half of
+    /// reconciliation — see the [`ledger`] module docs.
+    pub ledger: &'a Ledger,
     pub controls_path: PathBuf,
     pub schedule: Schedule,
     /// How old a plan may be when the first slice goes out.
@@ -658,15 +729,38 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
                 break;
             }
 
-            // Our side of reconciliation must include earlier slices' fills, or
-            // slice two reports drift against a venue that correctly filled
-            // slice one.
-            let known = self.venue.get_fills(None).await?;
+            // Reconcile our ledger against the venue before every slice, not
+            // just at the top of the run. The window is long enough for the
+            // account to change underneath us, and the whole point of slicing
+            // is that we are still deciding to trade an hour later.
+            if let Err(e) = self.reconcile().await {
+                record.outcome = "halted".into();
+                record.detail = Some(e.to_string());
+                record.orders_skipped += slice.plan.orders.len();
+                break;
+            }
+
+            // Authorise the ids before sending them. Written first so that a
+            // crash between the two leaves an order we asked for and never
+            // sent — recoverable — rather than a fill we cannot account for,
+            // which reads as an intrusion.
+            let plan_id = slice.plan.plan_id.to_string();
+            for o in &slice.plan.orders {
+                let coid = executor::client_order_id_for_slice(&plan_id, o, slice.index);
+                self.ledger
+                    .authorise(&coid, o, &plan_id, slice.index, self.clock.now())?;
+            }
+
+            // The executor reconciles too, against the same venue fills. Ours
+            // is the check with teeth; its is the last line before an order and
+            // stays exactly as it was.
+            let known = read_with_retry(|| self.venue.get_fills(None)).await?;
+            let ours = self.ledger.our_positions(&known)?;
             let outcome = executor::execute_slice(
                 self.venue,
                 &slice.plan,
                 Some(slice.index),
-                &known,
+                &ours,
                 controls.as_controls(),
                 self.clock.now(),
             )
@@ -704,6 +798,133 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
         }
 
         record.recorded_at = stamp(self.clock.now());
+        self.store.record(&record)?;
+        Ok(record)
+    }
+
+    /// Compare our ledger against the venue, and report rather than act.
+    ///
+    /// Safe to call at any time — it places no orders and writes nothing. This
+    /// is what `bot reconcile` runs, and what every slice runs before it
+    /// submits.
+    pub async fn inspect(&self) -> Result<Reconciliation, RunnerError> {
+        let positions = read_with_retry(|| self.venue.get_positions()).await?;
+        let fills = read_with_retry(|| self.venue.get_fills(None)).await?;
+        let eps: Decimal = executor::POSITION_EPSILON
+            .parse()
+            .expect("epsilon is a literal");
+        self.ledger.reconcile(&positions, &fills, eps)
+    }
+
+    /// [`inspect`](Self::inspect), but a disagreement is an error.
+    pub async fn reconcile(&self) -> Result<Reconciliation, RunnerError> {
+        let report = self.inspect().await?;
+        if report.agrees {
+            Ok(report)
+        } else {
+            Err(RunnerError::Reconciliation(Box::new(report)))
+        }
+    }
+
+    /// Take the venue's current positions on as our opening state.
+    ///
+    /// This is the one operation that changes our record to match the venue —
+    /// precisely the auto-repair the executor refuses to do — so it is manual,
+    /// attributed, and recorded as a run. It exists because the alternative is
+    /// worse: without it, connecting to an account that already holds anything
+    /// is a permanent halt, and the system could never be pointed at a funded
+    /// account at all.
+    ///
+    /// It refuses when there is nothing unexplained to adopt. Adopting a book
+    /// we already agree about would write a second baseline on top of the
+    /// first and double every position in our own record.
+    pub async fn adopt(
+        &self,
+        reason: &str,
+        by: &str,
+        accept_unknown_fills: bool,
+    ) -> Result<RunRecord, RunnerError> {
+        let now = self.clock.now();
+        let controls = ControlFile::read(&self.controls_path);
+        let report = self.inspect().await?;
+
+        if !report.unknown_fills.is_empty() && !accept_unknown_fills {
+            // By default adoption would launder these into a legitimate-looking
+            // opening position, so it refuses. The override exists because a
+            // lost ledger produces exactly this signature and the alternative
+            // would be halted forever — but it has to be asked for by name, and
+            // it writes down who asked.
+            return Err(RunnerError::Reconciliation(Box::new(report)));
+        }
+        if report.unadopted.is_empty() && report.unknown_fills.is_empty() {
+            return Err(RunnerError::NothingToAdopt {
+                detail: report.explain(),
+            });
+        }
+
+        // Acknowledge first. If this is interrupted half-way the fills stay
+        // alarming, which is the direction to fail in.
+        let mut acknowledged = Vec::new();
+        if accept_unknown_fills {
+            for f in &report.unknown_fills {
+                let e = Entry::Acknowledged {
+                    venue_fill_id: f.venue_fill_id.clone(),
+                    client_order_id: f.client_order_id.clone(),
+                    asset: f.asset.clone(),
+                    qty: f.qty.parse().unwrap_or_default(),
+                    fill_at: f.at.clone(),
+                    at: stamp(now),
+                    by: by.to_string(),
+                    reason: reason.to_string(),
+                };
+                self.ledger.append(&e)?;
+                acknowledged.push(e);
+            }
+        }
+
+        // Re-derive what still needs a baseline: acknowledging the unknown
+        // fills has already changed the answer, and adopting against the stale
+        // view would write a baseline for a position now explained twice.
+        let after = self.inspect().await?;
+        let positions = read_with_retry(|| self.venue.get_positions()).await?;
+        let adopting: Vec<_> = positions
+            .into_iter()
+            .filter(|p| after.unadopted.iter().any(|a| a == &p.asset))
+            .collect();
+        let written = self.ledger.adopt(&adopting, by, reason, now)?;
+
+        let record = RunRecord {
+            run_id: format!("adopt-{}", stamp(now)),
+            plan_id: None,
+            as_of: stamp(now),
+            recorded_at: stamp(now),
+            outcome: "adopted".into(),
+            detail: Some(format!(
+                "{by} adopted {} pre-existing position(s) as an opening baseline{}. Reason: {reason}",
+                written.len(),
+                if acknowledged.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", and accepted {} venue fill(s) we never authorised as our own",
+                        acknowledged.len()
+                    )
+                },
+            )),
+            orders_planned: 0,
+            orders_submitted: 0,
+            orders_skipped: 0,
+            slices_completed: 0,
+            slices_planned: 0,
+            nav: None,
+            gross_exposure: None,
+            net_exposure: None,
+            control_state: controls.state().into(),
+            slices: vec![serde_json::json!({
+                "adopted": written,
+                "acknowledged": acknowledged,
+            })],
+        };
         self.store.record(&record)?;
         Ok(record)
     }

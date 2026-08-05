@@ -321,6 +321,8 @@ bot --config &lt;file&gt; flatten --reason "..." --by you --confirm</pre>
         <div class="body" id="health"></div>
       </section>
 
+      <div id="reconciliation"></div>
+
       <section class="panel">
         <h2>Live against the backtest</h2>
         <div class="body" id="expectation"></div>
@@ -382,7 +384,81 @@ function render(s) {
   renderFills(s.fills);
   renderRuns(s.runs);
   renderHealth(s.health, s.controls);
+  renderReconciliation(s.reconciliation);
   renderExpectation(s.expectation, s.live);
+}
+
+/* Shown in full only when the two sides disagree. When they agree there is one
+   line to read, because a panel that looks the same whether or not anything is
+   wrong trains people to stop looking at it. */
+function renderReconciliation(r) {
+  const el = $("reconciliation");
+  if (!r) { el.innerHTML = ""; return; }
+  if (r.agrees) {
+    el.innerHTML =
+      '<section class="panel"><h2>Reconciliation</h2><div class="body">' +
+      '<span class="lamp running">agrees</span>' +
+      '<p class="note" style="margin-top:10px">Our order ledger and the venue agree on ' +
+      r.theirs.length + " position(s), from " + r.ledger_entries + " ledger entries.</p>" +
+      "</div></section>";
+    return;
+  }
+
+  // Both sides always render, even when one is empty. An absent row reads as
+  // "not checked"; "flat" is the fact.
+  const rows = (title, list) =>
+    "<tr><td class='dim' style='padding-left:0'>" + esc(title) + "</td><td class='num'>" +
+    (list.length ? list.map((p) => esc(p.asset) + " " + esc(p.qty)).join("<br>") : "flat") +
+    "</td></tr>";
+
+  let detail = "";
+  if (r.unknown_fills.length) {
+    detail +=
+      "<p class='note' style='margin-top:10px'><strong>Fills we never authorised:</strong></p>" +
+      "<table><tbody>" +
+      r.unknown_fills
+        .map((f) =>
+          "<tr><td class='sym'>" + esc(f.asset) + "</td><td class='num'>" + esc(f.qty) +
+          "</td><td class='dim ellipsis' title='" + esc(f.client_order_id) + "'>" +
+          esc(f.client_order_id) + "</td></tr>")
+        .join("") +
+      "</tbody></table>";
+  }
+  if (r.disagreements.length) {
+    detail +=
+      "<table style='margin-top:8px'><thead><tr><th></th><th class='num'>Ours</th>" +
+      "<th class='num'>Venue</th></tr></thead><tbody>" +
+      r.disagreements
+        .map((d) =>
+          "<tr><td class='sym'>" + esc(d.asset) + "</td><td class='num'>" + esc(d.ours) +
+          "</td><td class='num neg'>" + esc(d.theirs) + "</td></tr>")
+        .join("") +
+      "</tbody></table>";
+  }
+
+  el.innerHTML =
+    '<section class="panel warnings"><h2>Reconciliation</h2><div class="body">' +
+    '<span class="lamp halted">disagrees</span>' +
+    detail +
+    // The per-asset table above already shows both sides, so the summary is
+    // only worth the space when there is no such table — that is, when the
+    // positions agree and only the fills are unexplained.
+    (r.disagreements.length
+      ? ""
+      : "<table style='margin-top:8px'><tbody>" +
+        rows("Our record", r.ours) +
+        rows("Venue", r.theirs) +
+        "</tbody></table>") +
+    // The remedy, in the operator's hands rather than in a log they have to go
+    // and find. This process cannot run it - it holds no venue credentials.
+    (r.unadopted.length || r.unknown_fills.length
+      ? "<p class='note' style='margin-top:10px'>Check the account, then take it on at a terminal:</p>" +
+        "<pre class='cmd'>bot --config &lt;file&gt; reconcile\nbot --config &lt;file&gt; adopt --reason \"...\" --by you --confirm" +
+        (r.unknown_fills.length ? " \\\n    --accept-unknown-fills" : "") +
+        "</pre>"
+      : "<p class='note' style='margin-top:10px'>Drift is never auto-corrected. Investigate before " +
+        "anything else — the next run will refuse to trade until this agrees.</p>") +
+    "</div></section>";
 }
 
 function renderWarnings(w) {

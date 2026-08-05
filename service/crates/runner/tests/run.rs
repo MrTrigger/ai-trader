@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use runner::{
-    check_freshness, fills_for_plan, health, slice_plan, ControlFile, RunRecord, RunStore, Runner,
-    RunnerError, Schedule, Timer,
+    check_freshness, fills_for_plan, health, slice_plan, ControlFile, Ledger, RunRecord, RunStore,
+    Runner, RunnerError, Schedule, Timer,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -80,6 +80,13 @@ struct FakeVenue {
     fills: Mutex<Vec<Fill>>,
     seen: Mutex<Vec<OrderRequest>>,
     fail_on: Option<String>,
+    /// Positions the account already held, whose fills predate anything
+    /// `get_fills` will return. This is what reconnecting to a funded venue
+    /// actually looks like: a real fill API is windowed, so the history that
+    /// explains an old position is simply not available.
+    preexisting: Vec<Position>,
+    /// Reads fail with `Unreachable` this many times before working.
+    unreachable_for: Mutex<u32>,
 }
 
 impl FakeVenue {
@@ -88,12 +95,53 @@ impl FakeVenue {
             fills: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
             fail_on: None,
+            preexisting: Vec::new(),
+            unreachable_for: Mutex::new(0),
         }
     }
 
     fn failing_on(mut self, asset: &str) -> Self {
         self.fail_on = Some(asset.into());
         self
+    }
+
+    fn holding(mut self, asset: &str, qty: &str) -> Self {
+        self.preexisting.push(Position {
+            asset: asset.into(),
+            qty: dec(qty),
+            avg_price: dec("100"),
+        });
+        self
+    }
+
+    fn unreachable_for(self, n: u32) -> Self {
+        *self.unreachable_for.lock().unwrap() = n;
+        self
+    }
+
+    /// A fill the venue reports that we never asked for.
+    fn inject_foreign_fill(&self, asset: &str, qty: &str) {
+        self.fills.lock().unwrap().push(Fill {
+            venue_fill_id: "FOREIGN".into(),
+            venue_order_id: "FOREIGN".into(),
+            client_order_id: "not-one-of-ours".into(),
+            asset: asset.into(),
+            side: Side::Buy,
+            qty: dec(qty),
+            price: dec("100"),
+            fee: dec("0"),
+            fee_currency: "USD".into(),
+            ts: OffsetDateTime::UNIX_EPOCH,
+        });
+    }
+
+    fn flaky(&self) -> Result<(), VenueError> {
+        let mut n = self.unreachable_for.lock().unwrap();
+        if *n > 0 {
+            *n -= 1;
+            return Err(VenueError::Unreachable("connection reset".into()));
+        }
+        Ok(())
     }
 
     fn submitted_ids(&self) -> Vec<String> {
@@ -140,7 +188,15 @@ impl VenueAdapter for FakeVenue {
     }
 
     async fn get_positions(&self) -> Result<Vec<Position>, VenueError> {
-        Ok(derive_positions(&self.fills.lock().unwrap()))
+        self.flaky()?;
+        let mut out = derive_positions(&self.fills.lock().unwrap());
+        for p in &self.preexisting {
+            match out.iter_mut().find(|q| q.asset == p.asset) {
+                Some(q) => q.qty += p.qty,
+                None => out.push(p.clone()),
+            }
+        }
+        Ok(out)
     }
 
     async fn place_order(&self, o: &OrderRequest) -> Result<OrderAck, VenueError> {
@@ -195,6 +251,7 @@ impl VenueAdapter for FakeVenue {
     }
 
     async fn get_fills(&self, _since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError> {
+        self.flaky()?;
         Ok(self.fills.lock().unwrap().clone())
     }
 }
@@ -391,10 +448,12 @@ fn the_window_widens_with_the_account() {
 
 // --- the run ----------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn runner<'a>(
     venue: &'a FakeVenue,
     clock: &'a TestClock,
     store: &'a RunStore,
+    ledger: &'a Ledger,
     controls: PathBuf,
     schedule: Schedule,
 ) -> Runner<'a, FakeVenue, TestClock> {
@@ -402,6 +461,7 @@ fn runner<'a>(
         venue,
         clock,
         store,
+        ledger,
         controls_path: controls,
         schedule,
         max_plan_age_minutes: 120,
@@ -415,12 +475,20 @@ async fn every_slice_reaches_the_venue_with_its_own_id() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect("the run completes");
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("the run completes");
 
     assert_eq!(rec.outcome, "executed");
     assert_eq!(rec.slices_completed, 2);
@@ -448,12 +516,20 @@ async fn reconciliation_between_slices_uses_the_fills_slice_one_produced() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect("slice two must not see phantom drift");
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("slice two must not see phantom drift");
     assert_eq!(rec.outcome, "executed");
     assert!(!venue.get_positions().await.unwrap().is_empty());
 }
@@ -464,6 +540,7 @@ async fn a_kill_switch_thrown_mid_window_stops_the_remaining_slices() {
     let controls = running_controls(&dir);
     let venue = FakeVenue::new();
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
     // The operator throws the switch while the runner waits for slice two.
@@ -487,6 +564,7 @@ async fn a_kill_switch_thrown_mid_window_stops_the_remaining_slices() {
         &venue,
         &clock,
         &store,
+        &ledger,
         controls,
         Schedule {
             lag_hours: 1,
@@ -515,12 +593,20 @@ async fn a_kill_switch_set_before_the_run_submits_nothing_and_is_still_recorded(
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    let err = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect_err("a halted runner does not execute");
+    let err = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect_err("a halted runner does not execute");
     assert!(matches!(err, RunnerError::Execution(_)));
     assert!(venue.submitted_ids().is_empty());
 
@@ -537,12 +623,20 @@ async fn a_stale_plan_is_refused_and_the_refusal_is_recorded() {
     // Six hours after the plan's as_of, well past the two-hour limit.
     let clock = TestClock::at("2026-08-01T06:00:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    let err = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect_err("a stale plan is refused");
+    let err = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect_err("a stale plan is refused");
     assert!(matches!(err, RunnerError::PlanTooOld { .. }));
     assert!(venue.submitted_ids().is_empty());
     assert_eq!(store.recent(1).unwrap()[0].outcome, "refused");
@@ -555,12 +649,14 @@ async fn the_same_plan_is_never_executed_twice() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
     runner(
         &venue,
         &clock,
         &store,
+        &ledger,
         controls.clone(),
         Schedule::default(),
     )
@@ -569,10 +665,17 @@ async fn the_same_plan_is_never_executed_twice() {
     .unwrap();
     let submitted = venue.submitted_ids().len();
 
-    let err = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect_err("a plan already executed must not run again");
+    let err = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect_err("a plan already executed must not run again");
     assert!(matches!(err, RunnerError::AlreadyExecuted { .. }));
     assert_eq!(
         venue.submitted_ids().len(),
@@ -588,12 +691,20 @@ async fn a_failed_order_stops_the_run_and_names_the_slice() {
     let venue = FakeVenue::new().failing_on("BTC");
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .unwrap();
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .unwrap();
 
     assert_eq!(rec.outcome, "partial");
     assert_eq!(
@@ -611,12 +722,20 @@ async fn the_stored_record_keeps_each_slice_separately() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    runner(&venue, &clock, &store, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .unwrap();
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .unwrap();
 
     let back = store.recent(10).unwrap();
     assert_eq!(back.len(), 1);
@@ -637,12 +756,14 @@ async fn flatten_closes_every_open_position_in_the_opposite_direction() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
 
     // Put a book on: one long, one short.
     runner(
         &venue,
         &clock,
         &store,
+        &ledger,
         controls.clone(),
         Schedule::default(),
     )
@@ -651,10 +772,17 @@ async fn flatten_closes_every_open_position_in_the_opposite_direction() {
     .unwrap();
     assert_eq!(venue.filled_qty("BTC"), dec("0.4"));
 
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .flatten("drawdown breach", "magnus")
-        .await
-        .unwrap();
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("drawdown breach", "magnus")
+    .await
+    .unwrap();
 
     assert_eq!(rec.outcome, "flattened");
     assert_eq!(rec.orders_planned, 2, "one order per open position");
@@ -678,11 +806,13 @@ async fn flatten_works_while_the_kill_switch_is_engaged() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
 
     runner(
         &venue,
         &clock,
         &store,
+        &ledger,
         controls.clone(),
         Schedule::default(),
     )
@@ -700,10 +830,17 @@ async fn flatten_works_while_the_kill_switch_is_engaged() {
     .write(&controls)
     .unwrap();
 
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .flatten("get me out", "magnus")
-        .await
-        .unwrap();
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("get me out", "magnus")
+    .await
+    .unwrap();
     assert_eq!(rec.orders_submitted, 2);
     assert_eq!(rec.control_state, "halted", "the halt is still recorded");
 }
@@ -717,11 +854,13 @@ async fn flatten_keeps_going_after_a_failed_exit() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
 
     runner(
         &venue,
         &clock,
         &store,
+        &ledger,
         controls.clone(),
         Schedule::default(),
     )
@@ -733,11 +872,20 @@ async fn flatten_keeps_going_after_a_failed_exit() {
         fills: Mutex::new(venue.get_fills(None).await.unwrap()),
         seen: Mutex::new(Vec::new()),
         fail_on: Some("BTC".into()),
+        preexisting: Vec::new(),
+        unreachable_for: Mutex::new(0),
     };
-    let rec = runner(&venue, &clock, &store, controls, Schedule::default())
-        .flatten("get me out", "magnus")
-        .await
-        .unwrap();
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("get me out", "magnus")
+    .await
+    .unwrap();
 
     assert_eq!(rec.outcome, "partial");
     assert_eq!(rec.orders_submitted, 1, "SOL still got out");
@@ -752,11 +900,19 @@ async fn flatten_records_who_asked_and_why() {
     let venue = FakeVenue::new();
     let clock = TestClock::at("2026-08-01T00:30:00Z");
     let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
 
-    runner(&venue, &clock, &store, controls, Schedule::default())
-        .flatten("weekend risk", "magnus")
-        .await
-        .unwrap();
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("weekend risk", "magnus")
+    .await
+    .unwrap();
 
     let back = store.recent(1).unwrap();
     let detail = back[0].detail.clone().unwrap();
@@ -777,6 +933,7 @@ fn a_fresh_plan_passes_the_freshness_gate() {
 fn run_history_comes_back_most_recent_first() {
     let dir = tmpdir("history-order");
     let store = RunStore::new(&dir);
+
     let controls = ControlFile::default();
     for (i, when) in ["2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z"]
         .iter()
@@ -796,6 +953,7 @@ fn run_history_comes_back_most_recent_first() {
 fn health_is_not_ok_when_nothing_has_ever_run() {
     let dir = tmpdir("health-empty");
     let store = RunStore::new(&dir);
+
     let c = ControlFile::running("live", "tests", OffsetDateTime::UNIX_EPOCH);
     let h = health(&c, &store, 24, t("2026-08-01T00:00:00Z")).unwrap();
     assert!(!h.ok);
@@ -809,6 +967,7 @@ fn health_is_not_ok_when_nothing_has_ever_run() {
 fn health_is_not_ok_when_the_last_run_is_older_than_the_cadence() {
     let dir = tmpdir("health-stale");
     let store = RunStore::new(&dir);
+
     let controls = ControlFile::running("live", "tests", OffsetDateTime::UNIX_EPOCH);
     let plan = standard_plan("2026-08-01T00:00:00Z");
     let mut r = RunRecord::refused(&plan, "ok".into(), &controls, t("2026-08-01T00:00:00Z"));
@@ -826,6 +985,7 @@ fn health_is_not_ok_when_the_last_run_is_older_than_the_cadence() {
 fn health_is_ok_when_a_clean_run_is_recent_and_controls_permit_trading() {
     let dir = tmpdir("health-ok");
     let store = RunStore::new(&dir);
+
     let controls = ControlFile::running("live", "tests", OffsetDateTime::UNIX_EPOCH);
     let plan = standard_plan("2026-08-01T00:00:00Z");
     let mut r = RunRecord::refused(&plan, "ok".into(), &controls, t("2026-08-01T00:00:00Z"));
@@ -843,6 +1003,7 @@ fn health_is_ok_when_a_clean_run_is_recent_and_controls_permit_trading() {
 fn a_kill_switch_makes_health_report_not_ok_with_the_reason() {
     let dir = tmpdir("health-killed");
     let store = RunStore::new(&dir);
+
     let c = ControlFile {
         kill_switch: true,
         paused: false,
@@ -877,4 +1038,546 @@ fn fills_are_attributed_to_their_plan_by_order_id() {
     let got = fills_for_plan("5227e5a9-d91b-50b0-9275-ce7ca4c3ddf8", &all);
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].client_order_id, "5227e5a9-BTC-B-0.2");
+}
+
+// --- reconnecting to an account that already has a book ---------------------
+//
+// Every test here is a situation the system meets on its first day against a
+// real venue, and each one has exactly two acceptable outcomes: work, or stop
+// with a sentence that names the next command. Silently absorbing the venue's
+// version is never one of them.
+
+#[tokio::test]
+async fn a_venue_holding_positions_we_have_no_record_of_stops_the_run() {
+    let dir = tmpdir("unadopted");
+    let controls = running_controls(&dir);
+    // The account was funded and traded before this bot ever ran.
+    let venue = FakeVenue::new().holding("SOL", "25");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+
+    assert_eq!(rec.outcome, "halted");
+    assert!(venue.submitted_ids().is_empty(), "nothing was sent");
+    let detail = rec.detail.expect("a halt says why");
+    assert!(detail.contains("SOL"), "names the position: {detail}");
+    assert!(
+        detail.contains("bot adopt"),
+        "and names the command that fixes it: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn adopting_takes_the_position_on_and_the_next_run_proceeds() {
+    let dir = tmpdir("adopt-then-run");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().holding("SOL", "25");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+
+    let adopted = r
+        .adopt("first connection to the live account", "magnus", false)
+        .await
+        .unwrap();
+    assert_eq!(adopted.outcome, "adopted");
+    assert!(adopted.detail.unwrap().contains("magnus"));
+
+    // Our record now explains the book, so reconciliation passes.
+    assert!(r.inspect().await.unwrap().agrees);
+
+    // The plan sells 10 SOL out of the 25 we adopted; it goes through.
+    let rec = r.run(&standard_plan("2026-08-01T00:00:00Z")).await.unwrap();
+    assert_eq!(rec.outcome, "executed", "{:?}", rec.detail);
+    assert_eq!(venue.filled_qty("SOL"), dec("10.0"));
+}
+
+#[tokio::test]
+async fn adopting_is_attributed_and_recorded() {
+    let dir = tmpdir("adopt-recorded");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().holding("SOL", "25");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .adopt(
+        "legacy holding, checked against the venue UI",
+        "magnus",
+        false,
+    )
+    .await
+    .unwrap();
+
+    let back = store.recent(1).unwrap();
+    assert_eq!(back[0].outcome, "adopted");
+    let entries = ledger.read().unwrap();
+    assert_eq!(entries.len(), 1);
+    match &entries[0] {
+        runner::Entry::Baseline {
+            asset,
+            qty,
+            by,
+            reason,
+            ..
+        } => {
+            assert_eq!(asset, "SOL");
+            assert_eq!(*qty, dec("25"));
+            assert_eq!(by, "magnus");
+            assert!(reason.contains("legacy holding"));
+        }
+        other => panic!("expected a baseline, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn adopting_twice_is_refused_rather_than_doubling_the_book() {
+    let dir = tmpdir("adopt-twice");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().holding("SOL", "25");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+
+    r.adopt("first", "magnus", false).await.unwrap();
+    let err = r
+        .adopt("again", "magnus", false)
+        .await
+        .expect_err("there is nothing left to adopt");
+    assert!(matches!(err, RunnerError::NothingToAdopt { .. }));
+    assert_eq!(ledger.read().unwrap().len(), 1, "no second baseline");
+}
+
+#[tokio::test]
+async fn a_fill_we_never_authorised_stops_everything() {
+    // The most serious thing this system can observe: the venue filled an order
+    // under an id our ledger has never seen. Another process on the account, a
+    // stale order from an earlier deployment, or a stolen key.
+    let dir = tmpdir("foreign-fill");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    venue.inject_foreign_fill("DOGE", "1000");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+
+    assert_eq!(rec.outcome, "halted");
+    assert!(venue.submitted_ids().is_empty());
+    let detail = rec.detail.unwrap();
+    assert!(detail.contains("never authorised"), "got {detail}");
+    assert!(detail.contains("not-one-of-ours"), "names the id: {detail}");
+}
+
+#[tokio::test]
+async fn adopting_will_not_launder_a_fill_we_never_authorised() {
+    // Adoption is the sanctioned way to absorb the venue's view, which makes it
+    // exactly the wrong tool for an unexplained fill: it would turn evidence of
+    // an intrusion into a legitimate-looking opening position.
+    let dir = tmpdir("adopt-launder");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    venue.inject_foreign_fill("DOGE", "1000");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let err = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .adopt("just make it go away", "magnus", false)
+    .await
+    .expect_err("adoption must refuse this");
+    assert!(err.to_string().contains("never authorised"), "{err}");
+    assert!(ledger.read().unwrap().is_empty(), "nothing was written");
+}
+
+#[tokio::test]
+async fn order_ids_are_in_our_ledger_before_the_venue_sees_them() {
+    // The crash-safety ordering. If we submitted first and recorded after, a
+    // process that died in between would restart, find a fill it could not
+    // account for, and halt as if the account had been compromised.
+    let dir = tmpdir("write-ahead");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+
+    let authorised: Vec<String> = ledger
+        .read()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e {
+            runner::Entry::Submitted {
+                client_order_id, ..
+            } => Some(client_order_id),
+            _ => None,
+        })
+        .collect();
+    for id in venue.submitted_ids() {
+        assert!(
+            authorised.contains(&id),
+            "the venue saw {id}, which our ledger never authorised"
+        );
+    }
+    assert_eq!(authorised.len(), 4, "two orders over two slices");
+}
+
+#[tokio::test]
+async fn a_venue_that_flaps_is_retried_rather_than_failed() {
+    let dir = tmpdir("flaky-venue");
+    let controls = running_controls(&dir);
+    // Two failed reads, then it comes back.
+    let venue = FakeVenue::new().unreachable_for(2);
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .expect("a couple of dropped reads is not a reason to stop");
+    assert_eq!(rec.outcome, "executed", "{:?}", rec.detail);
+}
+
+#[tokio::test]
+async fn a_venue_that_stays_down_stops_rather_than_guessing() {
+    let dir = tmpdir("venue-down");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().unreachable_for(99);
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+    assert_eq!(rec.outcome, "halted");
+    assert!(
+        rec.detail.unwrap().contains("unreachable"),
+        "a venue we cannot read is a recorded halt, not a silent one"
+    );
+    assert!(
+        venue.submitted_ids().is_empty(),
+        "we never trade on an account state we could not read"
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_runs_before_every_slice_not_just_the_first() {
+    // The execution window is hours long. An account that changes underneath us
+    // at minute forty must stop slice two.
+    let dir = tmpdir("check-each-slice");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    // Nothing wrong yet, so slice one goes out. The foreign fill lands while we
+    // are waiting for slice two.
+    let handle = async {
+        venue.inject_foreign_fill("DOGE", "1");
+        r.run(&standard_plan("2026-08-01T00:00:00Z")).await
+    };
+    let rec = handle.await.unwrap();
+    assert_eq!(rec.outcome, "halted");
+    assert_eq!(rec.slices_completed, 0, "it never got as far as slice one");
+}
+
+#[test]
+fn a_truncated_ledger_line_is_an_error_rather_than_a_silent_gap() {
+    // Half a line is what a crash mid-append leaves. Skipping it would quietly
+    // drop an authorised order id and turn its fill into a phantom intrusion.
+    let dir = tmpdir("torn-ledger");
+    let ledger = Ledger::open(&dir);
+    let plan = standard_plan("2026-08-01T00:00:00Z");
+    ledger
+        .authorise(
+            "a-1",
+            &plan.orders[0],
+            "plan",
+            1,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+    let mut text = std::fs::read_to_string(ledger.path()).unwrap();
+    text.push_str("{\"kind\":\"submitted\",\"client_order_i");
+    std::fs::write(ledger.path(), text).unwrap();
+
+    let err = ledger.read().expect_err("a torn line must not be skipped");
+    assert!(matches!(err, RunnerError::Malformed { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn a_lost_ledger_can_be_recovered_by_a_human_who_says_so() {
+    // The dead end this exists to remove. A wiped disk against a venue that
+    // still reports our old fills is, from in here, indistinguishable from
+    // someone else trading the account - so the default is a halt. But without
+    // a way out, "halted" would be the permanent state of a bot that lost a
+    // file, and nobody would ever be able to reconnect one.
+    let dir = tmpdir("lost-ledger");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    // Trade normally, then lose the ledger.
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls.clone(),
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+    std::fs::remove_file(ledger.path()).unwrap();
+
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    let before = r.inspect().await.unwrap();
+    assert!(!before.agrees);
+    assert!(
+        !before.unknown_fills.is_empty(),
+        "our own fills now look foreign"
+    );
+    assert!(
+        before.explain().contains("--accept-unknown-fills"),
+        "and the message names the way out: {}",
+        before.explain()
+    );
+
+    // Refused without the explicit acknowledgement.
+    assert!(r.adopt("recovering", "magnus", false).await.is_err());
+
+    let rec = r
+        .adopt(
+            "restored from backup; checked the account by hand",
+            "magnus",
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rec.outcome, "adopted");
+
+    // Reconciliation is clean again, and the evidence is kept.
+    let after = r.inspect().await.unwrap();
+    assert!(after.agrees, "{:?}", after);
+    let acknowledged: Vec<_> = ledger
+        .read()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, runner::Entry::Acknowledged { .. }))
+        .collect();
+    assert!(
+        !acknowledged.is_empty(),
+        "the fills are recorded, not erased"
+    );
+    match &acknowledged[0] {
+        runner::Entry::Acknowledged { by, reason, .. } => {
+            assert_eq!(by, "magnus");
+            assert!(reason.contains("restored from backup"));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn an_acknowledged_fill_is_not_counted_twice() {
+    // Acknowledging says "stop being alarmed"; the baseline written alongside
+    // it already accounts for the position. Folding the fill in as well would
+    // double our own record of the book.
+    let dir = tmpdir("no-double-count");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls.clone(),
+        Schedule::default(),
+    )
+    .run(&standard_plan("2026-08-01T00:00:00Z"))
+    .await
+    .unwrap();
+    std::fs::remove_file(ledger.path()).unwrap();
+
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    r.adopt("recovered", "magnus", true).await.unwrap();
+
+    let after = r.inspect().await.unwrap();
+    assert!(after.agrees, "{:?}", after.disagreements);
+    let ours: Vec<_> = after.ours.iter().map(|p| (&p.asset, &p.qty)).collect();
+    let theirs: Vec<_> = after.theirs.iter().map(|p| (&p.asset, &p.qty)).collect();
+    assert_eq!(
+        ours, theirs,
+        "our record must equal the venue's, not double it"
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_submitted_nothing_leaves_the_plan_runnable() {
+    // The replay guard exists to stop a double submission. A halt before
+    // anything was sent - a kill switch, a reconciliation stop, an unreachable
+    // venue - has nothing to double, and blocking the retry would force a
+    // re-plan at the exact moment something has just gone wrong.
+    let dir = tmpdir("retry-after-halt");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().holding("SOL", "25");
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let plan = standard_plan("2026-08-01T00:00:00Z");
+
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    let halted = r.run(&plan).await.unwrap();
+    assert_eq!(halted.outcome, "halted");
+    assert_eq!(halted.orders_submitted, 0);
+
+    // Fix the cause, then run the same plan again.
+    r.adopt("checked the account", "magnus", false)
+        .await
+        .unwrap();
+    let rec = r.run(&plan).await.expect("the same plan may be retried");
+    assert_eq!(rec.outcome, "executed", "{:?}", rec.detail);
+}
+
+#[tokio::test]
+async fn a_run_that_did_submit_is_never_replayed() {
+    let dir = tmpdir("no-replay-after-submit");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let plan = standard_plan("2026-08-01T00:00:00Z");
+
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    r.run(&plan).await.unwrap();
+    let err = r.run(&plan).await.expect_err("orders already went out");
+    assert!(matches!(err, RunnerError::AlreadyExecuted { .. }));
 }
