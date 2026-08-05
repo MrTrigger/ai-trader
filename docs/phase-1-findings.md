@@ -1868,3 +1868,49 @@ Two things were never tested and would have to be, before any of this is
 revisited: capacity and epochs (training IC was still climbing at epoch 8, so the
 model may simply be undertrained — the configs were dropped when they proved to
 cost ~5 hours), and a correctly-built side-specific assignment.
+
+## How much of Sharpe 2.53 is selection?
+
+A true holdout no longer exists — every window has been inspected — so the next
+best thing is to measure the search instead of pretending it did not happen. The
+shipped configuration was chosen across a space of construction decisions, and
+running that whole space shows how much the choice was worth.
+
+72 configurations: four sizing rules × three cost thresholds × three name limits
+× liquidity cap on/off, all on identical model predictions.
+
+| | Sharpe |
+|---|---|
+| worst configuration | 1.59 |
+| 25th percentile | 1.66 |
+| **median** | **2.32** |
+| 75th percentile | 2.45 |
+| best | 2.73 |
+| mean / sd | 2.15 / 0.39 |
+| **shipped** (risk-adj, k=1, 24 names, capped) | **2.53** — rank 13 of 72, 83rd percentile |
+
+**Every configuration in the search beats buy-and-hold.** The worst scores 1.59
+against BTC's 0.88, so the edge is in the signal rather than in how the book is
+assembled. The shipped configuration sits at the 83rd percentile rather than the
+100th, **+0.22 Sharpe above the median** — and regressing it fully to the median
+would still leave 2.32.
+
+This is a **lower bound** on the total selection effect. Model predictions are
+held fixed, so it prices the construction search only; the feature set, target
+definition, horizon, execution lag and model family were each searched too.
+
+### Two things the table says that the headline does not
+
+**`inv-vol` tops it** — ranks 1 through 4 — at 2.73 with 40 names. Pure risk
+parity, using the model only to choose names and sides and ignoring prediction
+magnitude entirely. Switching on rank alone would be exactly the behaviour that
+inflates results, but it carries an independent argument: strictly fewer degrees
+of freedom than risk-adjusted sizing, and prediction magnitude is the part
+already known to be noisy. Topping the search *and* being simpler a priori is a
+different case from topping the search.
+
+**The weakest fold is the most recent.** Per-fold Sharpe for the shipped
+configuration runs 2.32, 5.01, 1.73, 2.96, 2.30, **1.26** — positive throughout,
+but fold 6 (2025-12 to 2026-07) is half the average. Whether that is noise in a
+seven-month window or the start of decay cannot be settled with this data. It is
+the number to watch first in paper trading.
