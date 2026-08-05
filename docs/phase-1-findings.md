@@ -1094,3 +1094,42 @@ across venues but not identical, and listing dates differ, so a Hyperliquid pull
 should replace this before the numbers are trusted. The fee rates were read from
 published schedules rather than the venue API and should be confirmed the same
 way.
+
+## The Binance funding proxy, checked against Hyperliquid's own API
+
+`app.hyperliquid.xyz/fundingComparison` is a client-rendered page and fetches as
+an empty shell, but it is driven by a public API that serves the same data:
+`POST api.hyperliquid.xyz/info` with `{"type":"fundingHistory","coin":...}`,
+paginated at 500 records, funding hourly.
+
+**Hyperliquid funding is roughly double Binance's**, consistently:
+
+| asset | Binance | Hyperliquid | gap |
+|---|---|---|---|
+| BTC | +7.3%/yr | +14.2%/yr | +7.0% |
+| ETH | +7.4%/yr | +14.3%/yr | +7.0% |
+| SOL | +5.0%/yr | +12.3%/yr | +7.3% |
+| DOGE | +8.0%/yr | +16.9%/yr | +9.0% |
+| AVAX | +4.6%/yr | +8.0%/yr | +3.4% |
+| **pooled** | **+6.45%/yr** | **+13.15%/yr** | **+6.71%** |
+
+5,885 asset-days, daily correlation 0.716.
+
+A snapshot of `predictedFundings` had shown no gap at all, because its median is
+dominated by both venues sitting at the same default rate. The history is the
+honest measurement and it disagrees with the snapshot — which is a reminder that
+a point-in-time comparison of a mean-reverting quantity says very little.
+
+**The proxy survives, for a structural reason rather than a lucky one.** Net
+funding is `ws*f_short - wl*f_long`, so a constant added to every rate
+contributes `gap * (ws - wl)` — the gap times minus the net exposure. Mean signed
+net exposure here is −0.03x NAV, so the shift cancels between the legs: about
+**+1.3% across the whole run**, against a total return of 783.7%. The venue that
+pays more on the shorts charges more on the longs.
+
+Two limits remain, and neither is closed:
+
+- Only five majors were sampled. The book trades alts, whose funding is more
+  volatile and whose venue gap may differ.
+- **Hyperliquid did not exist before 2023-05-12**, which is 53% of the backtest
+  window. For that half there is no substitution to make, at any level of effort.
