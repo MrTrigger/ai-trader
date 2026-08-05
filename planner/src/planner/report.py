@@ -444,7 +444,8 @@ def _line_panel(
         f'x2="{c.pad_left + c.plot_w}" y2="{c.pad_top + c.plot_h}" class="axis"/>'
     )
     out.append("</svg>")
-    return "".join(out)
+    # Framed so the plot sits on the raised surface rather than the page ground.
+    return '<div class="chart-frame">' + "".join(out) + "</div>"
 
 
 def _params_table(strategy: dict) -> str:
@@ -471,8 +472,12 @@ def _metric_tiles(m: dict) -> str:
         (f"{m['win_rate'] * 100:.0f}%", "weeks positive", f"{m['weeks']} weeks"),
         (f"{m['t_stat']:.2f}", "t-statistic", "mean weekly return / its error"),
     ]
+    # Semantic colour on the two tiles where sign carries meaning, and nowhere
+    # else. Colouring every number would make none of them stand out.
+    tone = {"total return": "good" if m["total_return"] > 0 else "bad",
+            "max drawdown": "bad"}
     return "".join(
-        f'<div class="tile"><div class="tile-v">{_esc(v)}</div>'
+        f'<div class="tile {tone.get(lab, "")}"><div class="tile-v">{_esc(v)}</div>'
         f'<div class="tile-l">{_esc(lab)}</div>'
         f'<div class="tile-n">{_esc(note)}</div></div>'
         for v, lab, note in cells
@@ -708,7 +713,68 @@ CSS = """
   --rule: #2c2c2a; --axis: #383835; --hair: rgba(255,255,255,0.10);
   --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
 }
+/* The document itself, not just our container. Without these the page sits in
+   a white gutter on a dark ground, because the body keeps the UA canvas colour
+   while .viz-root paints only its own 860px column. */
+html { background: var(--page-bg, #0d0d0d); }
+body { margin: 0; background: transparent; min-height: 100vh; }
+@media (prefers-color-scheme: light) {
+  html:where(:not([data-theme="dark"])) { --page-bg: #f9f9f7; }
+}
+html[data-theme="light"] { --page-bg: #f9f9f7; }
+html[data-theme="dark"] { --page-bg: #0d0d0d; }
+
 .viz-root * { box-sizing: border-box; }
+
+/* Quirks mode used to strip colour from unstyled cells; a doctype fixes that,
+   but stating it here means a future shell change cannot silently undo it. */
+.data td { color: var(--ink); }
+.data td.num { font-variant-numeric: tabular-nums; }
+
+/* Give charts a defined box so a viewBox can never collapse to the
+   replaced-element default height. */
+.chart { min-height: 120px; }
+
+/* --- polish ---------------------------------------------------------------
+   The page is a readout, so the work goes into hierarchy and rhythm rather
+   than ornament: one accent, hairline rules instead of cards, and numerals
+   that line up in columns. */
+
+/* Charts sit on the raised surface so the plot area reads as an instrument
+   panel rather than floating on the page ground. */
+.chart-frame { background: var(--surface); border: 1px solid var(--rule);
+  padding: 14px 10px 6px; margin: 0 0 4px; }
+
+/* Tiles: a quiet grid, with the number doing all the talking. */
+.tiles { display: grid; gap: 1px; background: var(--rule);
+  border: 1px solid var(--rule); grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
+.tile { background: var(--surface); padding: 16px 16px 14px; }
+.tile-v { font-variant-numeric: tabular-nums; }
+.tile.good .tile-v { color: var(--good); }
+.tile.bad .tile-v { color: var(--critical); }
+
+/* Tables: zebra-free, but a hover row so the eye can track across a wide one. */
+.data tbody tr:hover td { background: var(--hair); }
+.data th.num, .data td.num { text-align: right; }
+.params td:first-child { font-family: var(--sans); font-size: 13px;
+  color: var(--ink-2); white-space: normal; }
+.params td:last-child { color: var(--ink); }
+
+/* Section rhythm. A rule above each heading rather than a box around it. */
+section { margin-top: 46px; padding-top: 26px; border-top: 1px solid var(--rule); }
+section:first-of-type { border-top: 0; }
+h2 { font-size: 19px; font-weight: 600; letter-spacing: -.01em; margin: 0 0 4px;
+  text-wrap: balance; }
+h3 { font-size: 14px; font-weight: 600; margin: 30px 0 6px;
+  font-family: var(--mono); letter-spacing: .01em; }
+
+/* The disclosure block is the one place colour is allowed to raise its voice. */
+.disclosures { border-left: 3px solid var(--critical); padding: 2px 0 2px 18px;
+  margin: 26px 0 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
 .viz-root :focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
 
 /* type scale: 11 / 12.5 / 13.5 / 15 / 20 / 32 */
@@ -836,7 +902,36 @@ footer { margin-top: 50px; padding-top: 18px; border-top: 1px solid var(--rule);
 
 
 def build(record: dict) -> str:
-    return f"<style>{CSS}</style>\n{render(record)}"
+    """A complete HTML document, not a fragment.
+
+    This used to emit a bare body fragment on the assumption that a publisher
+    would supply the shell. Nothing publishes it — it is served from loopback and
+    opened from file:// — so the browser was left to infer a document, which puts
+    it in **quirks mode**, and quirks mode broke the page in two ways that looked
+    unrelated:
+
+    - Tables do not inherit colour from their ancestors, so any `<td>` without an
+      explicit colour reset to black. On a dark ground the parameter names were
+      invisible while the cells that happened to carry a colour class were fine.
+    - `height: auto` on an SVG with a viewBox collapses to the replaced-element
+      default, so every chart rendered as a strip of axis labels with no plot.
+
+    A doctype fixes both, and there is no cost: an explicit `<head>` also carries
+    the viewport and colour-scheme hints the page wants anyway.
+    """
+    title = _esc(record.get("strategy", {}).get("name", "backtest"))
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="color-scheme" content="dark light">\n'
+        f"<title>{title} · ai-trader</title>\n"
+        f"<style>{CSS}</style>\n"
+        "</head>\n<body>\n"
+        f"{render(record)}\n"
+        "</body>\n</html>\n"
+    )
 
 
 def write(record_path: Path, out_path: Path) -> Path:

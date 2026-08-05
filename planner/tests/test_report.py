@@ -63,10 +63,31 @@ def test_the_page_carries_no_external_reference(page):
         assert forbidden not in page, f"{forbidden} would not load"
 
 
-def test_the_page_is_a_body_fragment(page):
-    # The publisher supplies the document shell; emitting our own would nest.
-    for tag in ("<!doctype", "<html", "<body"):
-        assert tag not in page.lower()
+def test_the_page_is_a_complete_document(page):
+    """Not a fragment.
+
+    Emitting a bare fragment left the browser to infer a document, which puts
+    it in quirks mode. Quirks mode stops tables inheriting colour - so unstyled
+    cells rendered black on a dark ground - and collapses `height: auto` on an
+    SVG with a viewBox, so every chart became a strip of axis labels with no
+    plot. Both looked like unrelated CSS bugs. The doctype is the fix.
+    """
+    low = page.lower()
+    assert low.startswith("<!doctype html>")
+    for tag in ("<html", "<head", "<body", "</html>"):
+        assert tag in low
+    assert '<meta name="viewport"' in low
+
+
+def test_the_document_paints_its_own_background(page):
+    """Otherwise .viz-root's 860px column sits in a white UA gutter."""
+    assert "html { background:" in page
+    assert "body { margin: 0" in page
+
+
+def test_table_cells_state_their_colour(page):
+    """Belt and braces against the quirks-mode inheritance failure returning."""
+    assert ".data td { color: var(--ink); }" in page
 
 
 def test_every_svg_is_closed(page):
