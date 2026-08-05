@@ -1,0 +1,19 @@
+[package]
+name = "api"
+description = "Read-mostly HTTP over stored state. Holds no venue credentials and serves the operations dashboard on loopback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "api"
+path = "src/main.rs"
+
+[dependencies]
+venue.workspace = true
+paper.workspace = true
+runner.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true

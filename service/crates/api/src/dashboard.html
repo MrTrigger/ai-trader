@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-trader — operations</title>
+<style>
+  :root {
+    --bg: #f5f7f6;
+    --surface: #ffffff;
+    --surface-2: #eef1f0;
+    --ink: #131819;
+    --ink-2: #4a595c;
+    --ink-3: #7d8c8f;
+    --line: #dce3e2;
+    --accent: #14705f;
+    --good: #2c7a4b;
+    --warn: #9a6512;
+    --bad: #a83a2b;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --radius: 3px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1113;
+      --surface: #141a1c;
+      --surface-2: #1b2325;
+      --ink: #e4ebe9;
+      --ink-2: #a3b1b3;
+      --ink-3: #74858a;
+      --line: #232d30;
+      --accent: #3fae95;
+      --good: #4fae74;
+      --warn: #d09a3c;
+      --bad: #d9705e;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1113; --surface: #141a1c; --surface-2: #1b2325;
+    --ink: #e4ebe9; --ink-2: #a3b1b3; --ink-3: #74858a; --line: #232d30;
+    --accent: #3fae95; --good: #4fae74; --warn: #d09a3c; --bad: #d9705e;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f7f6; --surface: #ffffff; --surface-2: #eef1f0;
+    --ink: #131819; --ink-2: #4a595c; --ink-3: #7d8c8f; --line: #dce3e2;
+    --accent: #14705f; --good: #2c7a4b; --warn: #9a6512; --bad: #a83a2b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px 20px 64px; }
+
+  /* --- header --------------------------------------------------------- */
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 18px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--line); margin-bottom: 20px;
+  }
+  h1 {
+    font-size: 15px; font-weight: 620; margin: 0; letter-spacing: .01em;
+  }
+  h1 span { color: var(--ink-3); font-weight: 400; }
+  .grow { flex: 1 1 auto; }
+  .meta { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+
+  .lamp {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em;
+    text-transform: uppercase; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--surface);
+  }
+  .lamp::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3);
+  }
+  .lamp.running::before { background: var(--good); }
+  .lamp.paused::before  { background: var(--warn); }
+  .lamp.halted::before  { background: var(--bad); }
+  .lamp.running { color: var(--good); }
+  .lamp.paused  { color: var(--warn); }
+  .lamp.halted  { color: var(--bad); }
+
+  /* --- panels --------------------------------------------------------- */
+  .panel {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); margin-bottom: 16px;
+  }
+  .panel > h2 {
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; margin: 0;
+    padding: 11px 14px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  .panel > h2 .hint {
+    letter-spacing: 0; text-transform: none; font-weight: 400; font-size: 11.5px;
+  }
+  .panel .body { padding: 14px; }
+  .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 1000px) { .cols { grid-template-columns: 1.35fr 1fr; } }
+
+  /* --- tiles ---------------------------------------------------------- */
+  .tiles {
+    display: grid; gap: 1px; background: var(--line);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    grid-template-columns: repeat(2, 1fr); margin-bottom: 16px; overflow: hidden;
+  }
+  @media (min-width: 720px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+  @media (min-width: 1000px) { .tiles { grid-template-columns: repeat(6, 1fr); } }
+  .tile { background: var(--surface); padding: 12px 14px; }
+  .tile .k {
+    font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600;
+  }
+  .tile .v {
+    font-family: var(--mono); font-size: 19px; font-variant-numeric: tabular-nums;
+    margin-top: 4px; letter-spacing: -.01em;
+  }
+  .tile .s { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
+  .pos { color: var(--good); } .neg { color: var(--bad); }
+
+  /* --- tables --------------------------------------------------------- */
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; padding: 9px 14px;
+    border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td {
+    padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .sym { font-family: var(--mono); font-weight: 600; }
+  .dim { color: var(--ink-3); }
+  .wrapcell { min-width: 260px; color: var(--ink-2); font-size: 12.5px; }
+
+  .chip {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px;
+    border-radius: 2px; border: 1px solid var(--line); color: var(--ink-2);
+  }
+  .chip.long  { color: var(--good); border-color: currentColor; }
+  .chip.short { color: var(--bad);  border-color: currentColor; }
+  .chip.buy   { color: var(--good); border-color: currentColor; }
+  .chip.sell  { color: var(--bad);  border-color: currentColor; }
+
+  /* Outcome carries a stripe as well as a word, so a bad run is visible
+     before it is read. */
+  tr.out-executed  td:first-child { box-shadow: inset 3px 0 0 var(--good); }
+  tr.out-partial   td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+  tr.out-halted    td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+  tr.out-refused   td:first-child { box-shadow: inset 3px 0 0 var(--ink-3); }
+  tr.out-flattened td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+
+  .bar { height: 5px; background: var(--surface-2); border-radius: 1px; position: relative; min-width: 60px; }
+  .bar i { position: absolute; top: 0; bottom: 0; border-radius: 1px; }
+  .bar i.l { background: var(--good); left: 50%; }
+  .bar i.s { background: var(--bad); right: 50%; }
+
+  /* --- notes and warnings --------------------------------------------- */
+  .note {
+    font-size: 12.5px; color: var(--ink-2); padding: 10px 14px;
+    background: var(--surface-2); border-radius: var(--radius);
+  }
+  .warnings { border-color: var(--warn); }
+  .warnings > h2 { color: var(--warn); }
+  .warnings li { margin-bottom: 6px; color: var(--ink-2); font-size: 12.5px; }
+  .warnings ul { margin: 0; padding-left: 18px; }
+
+  /* --- controls ------------------------------------------------------- */
+  label { display: block; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; margin-bottom: 4px; }
+  input[type=text] {
+    width: 100%; padding: 7px 9px; font-family: var(--sans); font-size: 13px;
+    color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+    border-radius: var(--radius);
+  }
+  input[type=text]:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+  .field { margin-bottom: 10px; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font-family: var(--sans); font-size: 13px; font-weight: 550; cursor: pointer;
+    padding: 8px 14px; border-radius: var(--radius); border: 1px solid var(--line);
+    background: var(--surface-2); color: var(--ink);
+  }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  pre.cmd {
+    font-family: var(--mono); font-size: 12px; background: var(--bg); color: var(--ink-2);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 8px 10px; margin: 6px 0 0; overflow-x: auto;
+  }
+  .result { margin-top: 10px; font-size: 12.5px; }
+
+  /* --- chart ----------------------------------------------------------- */
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: 150px; }
+  .grid { stroke: var(--line); stroke-width: 1; }
+  .navline { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .navfill { fill: var(--accent); opacity: .1; }
+  .navend { fill: var(--accent); }
+  .axis { fill: var(--ink-3); font-family: var(--mono); font-size: 10px; }
+  .crosshair { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 5px 8px; font-family: var(--mono); font-size: 11.5px;
+    white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.14);
+  }
+  .empty { color: var(--ink-3); font-size: 12.5px; padding: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ai-trader <span>/ operations</span></h1>
+    <span id="lamp" class="lamp">loading</span>
+    <span class="grow"></span>
+    <span class="meta" id="stamp"></span>
+  </header>
+
+  <div id="warnings"></div>
+  <div class="tiles" id="tiles"></div>
+
+  <div class="cols">
+    <div>
+      <section class="panel">
+        <h2>Net asset value <span class="hint" id="navhint"></span></h2>
+        <div class="chart" id="chart"><div class="empty">no runs yet</div></div>
+      </section>
+
+      <section class="panel">
+        <h2>Positions <span class="hint" id="poshint"></span></h2>
+        <div class="scroll"><table id="positions"></table></div>
+      </section>
+
+      <section class="panel">
+        <h2>Recent fills</h2>
+        <div class="scroll"><table id="fills"></table></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="panel" id="controls">
+        <h2>Controls <span class="hint">this page can stop trading, never start it</span></h2>
+        <div class="body">
+          <div class="field">
+            <label for="who">Your name</label>
+            <input type="text" id="who" placeholder="who is doing this" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="why">Reason</label>
+            <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off">
+          </div>
+          <div class="btnrow">
+            <button class="danger" id="halt">Halt</button>
+            <button class="warn" id="pause">Pause</button>
+          </div>
+          <div class="result" id="ctlresult"></div>
+          <p class="note" style="margin-top:12px">
+            <strong>Halt</strong> stops execution; planning continues.
+            <strong>Pause</strong> permits only orders that reduce exposure.
+            Neither closes what is already open.
+          </p>
+          <p class="note" style="margin-top:8px">
+            Resuming grants trading authority and flattening moves capital, so
+            neither is one mis-click away in a browser tab. Both are CLI-only:
+          </p>
+          <pre class="cmd">bot --config &lt;file&gt; resume --reason "..." --by you
+bot --config &lt;file&gt; flatten --reason "..." --by you --confirm</pre>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Health</h2>
+        <div class="body" id="health"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Live against the backtest</h2>
+        <div class="body" id="expectation"></div>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h2>Run history</h2>
+    <div class="scroll"><table id="runs"></table></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const fmtNum = (v, dp = 2) => {
+  const n = Number(v);
+  return Number.isFinite(n)
+    ? n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp })
+    : String(v ?? "—");
+};
+const fmtPct = (v, dp = 1) =>
+  Number.isFinite(Number(v)) ? (Number(v) * 100).toFixed(dp) + "%" : "—";
+const signClass = (v) => (Number(v) > 0 ? "pos" : Number(v) < 0 ? "neg" : "");
+const shortTime = (iso) => (iso ? iso.replace("T", " ").replace(/(\.\d+)?Z$/, "Z") : "—");
+const esc = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+let latest = null;
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/state", { headers: { accept: "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    latest = await res.json();
+    render(latest);
+  } catch (e) {
+    // A dashboard that silently keeps showing the last good state is worse
+    // than one that says it lost contact.
+    $("stamp").textContent = "cannot reach the api: " + e.message;
+    $("lamp").className = "lamp halted";
+    $("lamp").textContent = "unknown";
+  }
+}
+
+function render(s) {
+  $("stamp").textContent = "as of " + shortTime(s.generated_at) + " · refreshes every 10s";
+  const lamp = $("lamp");
+  lamp.className = "lamp " + s.control_state;
+  lamp.textContent = s.control_state;
+
+  renderWarnings(s.warnings);
+  renderTiles(s);
+  renderChart(s.runs);
+  renderPositions(s);
+  renderFills(s.fills);
+  renderRuns(s.runs);
+  renderHealth(s.health, s.controls);
+  renderExpectation(s.expectation, s.live);
+}
+
+function renderWarnings(w) {
+  const el = $("warnings");
+  if (!w || !w.length) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    '<section class="panel warnings"><h2>Read this first</h2><div class="body"><ul>' +
+    w.map((x) => "<li>" + esc(x) + "</li>").join("") +
+    "</ul></div></section>";
+}
+
+function tile(k, v, sub, cls) {
+  return (
+    '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v ' + (cls || "") + '">' +
+    esc(v) + '</div><div class="s">' + esc(sub || "") + "</div></div>"
+  );
+}
+
+function renderTiles(s) {
+  const b = s.book;
+  const pnl = Number(b.total_pnl);
+  const start = Number(b.nav) - pnl;
+  const pnlPct = start > 0 ? pnl / start : NaN;
+  $("tiles").innerHTML =
+    tile("NAV", fmtNum(b.nav), b.fills_count + " fills") +
+    tile("Total P&L", fmtNum(b.total_pnl), Number.isFinite(pnlPct) ? fmtPct(pnlPct) : "", signClass(pnl)) +
+    tile("Unrealised", fmtNum(b.unrealised_pnl), "realised " + fmtNum(b.realised_pnl), signClass(b.unrealised_pnl)) +
+    tile("Gross exposure", b.gross_exposure === "n/a" ? "—" : fmtPct(b.gross_exposure), "of NAV") +
+    tile("Net exposure", b.net_exposure === "n/a" ? "—" : fmtPct(b.net_exposure), "0% is neutral") +
+    tile("Fees paid", fmtNum(b.fees_paid), "since inception");
+}
+
+/* --- NAV chart ------------------------------------------------------- */
+function renderChart(runs) {
+  const el = $("chart");
+  const pts = (runs || [])
+    .slice()
+    .reverse()
+    .filter((r) => r.nav != null)
+    .map((r) => ({ t: r.recorded_at, v: Number(r.nav), outcome: r.outcome }))
+    .filter((p) => Number.isFinite(p.v));
+
+  $("navhint").textContent =
+    pts.length > 1
+      ? "as the plan saw it at each run — the account is only marked when something runs, so this is not a continuous curve"
+      : "";
+
+  if (pts.length < 2) {
+    el.innerHTML = '<div class="empty">' +
+      (pts.length ? "one run recorded; a curve needs at least two" : "no runs yet") + "</div>";
+    return;
+  }
+
+  const W = 900, H = 150, PADL = 56, PADR = 12, PADT = 12, PADB = 22;
+  const lo = Math.min(...pts.map((p) => p.v));
+  const hi = Math.max(...pts.map((p) => p.v));
+  const span = hi - lo || Math.abs(hi) || 1;
+  const y0 = lo - span * 0.12, y1 = hi + span * 0.12;
+  const x = (i) => PADL + (i / (pts.length - 1)) * (W - PADL - PADR);
+  const y = (v) => PADT + (1 - (v - y0) / (y1 - y0)) * (H - PADT - PADB);
+
+  const line = pts.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
+  const area = line + " L" + x(pts.length - 1).toFixed(1) + " " + (H - PADB) + " L" + PADL + " " + (H - PADB) + " Z";
+
+  const ticks = [y0, (y0 + y1) / 2, y1];
+  const grid = ticks
+    .map((t) =>
+      '<line class="grid" x1="' + PADL + '" x2="' + (W - PADR) + '" y1="' + y(t).toFixed(1) +
+      '" y2="' + y(t).toFixed(1) + '"></line>' +
+      '<text class="axis" x="' + (PADL - 6) + '" y="' + (y(t) + 3).toFixed(1) + '" text-anchor="end">' +
+      fmtNum(t, 0) + "</text>")
+    .join("");
+
+  el.innerHTML =
+    '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img" ' +
+    'aria-label="net asset value at each recorded run">' + grid +
+    '<path class="navfill" d="' + area + '"></path>' +
+    '<path class="navline" d="' + line + '"></path>' +
+    '<circle class="navend" cx="' + x(pts.length - 1).toFixed(1) + '" cy="' + y(pts[pts.length - 1].v).toFixed(1) + '" r="3.5"></circle>' +
+    '<line class="crosshair" id="ch" x1="0" x2="0" y1="' + PADT + '" y2="' + (H - PADB) + '" style="display:none"></line>' +
+    "</svg>";
+
+  const svg = el.querySelector("svg");
+  const ch = el.querySelector("#ch");
+  const tip = document.createElement("div");
+  tip.className = "tip";
+  tip.style.display = "none";
+  el.appendChild(tip);
+
+  svg.addEventListener("mousemove", (ev) => {
+    const box = svg.getBoundingClientRect();
+    const px = ((ev.clientX - box.left) / box.width) * W;
+    let i = Math.round(((px - PADL) / (W - PADL - PADR)) * (pts.length - 1));
+    i = Math.max(0, Math.min(pts.length - 1, i));
+    ch.setAttribute("x1", x(i));
+    ch.setAttribute("x2", x(i));
+    ch.style.display = "";
+    tip.style.display = "";
+    tip.textContent = shortTime(pts[i].t) + "  ·  " + fmtNum(pts[i].v);
+    const left = (x(i) / W) * box.width;
+    tip.style.left = Math.min(Math.max(left - 60, 0), box.width - tip.offsetWidth) + "px";
+    tip.style.top = "6px";
+  });
+  svg.addEventListener("mouseleave", () => {
+    ch.style.display = "none";
+    tip.style.display = "none";
+  });
+}
+
+/* --- tables ---------------------------------------------------------- */
+function renderPositions(s) {
+  const p = s.book.positions || [];
+  $("poshint").textContent = p.length ? p.length + " open" : "";
+  if (!p.length) {
+    $("positions").innerHTML = '<tbody><tr><td class="empty">flat — nothing open</td></tr></tbody>';
+    return;
+  }
+  const rows = p
+    .map((r) => {
+      const w = Number(r.weight);
+      const wpct = Number.isFinite(w) ? w : 0;
+      const width = Math.min(Math.abs(wpct) * 100, 50);
+      const bar =
+        '<div class="bar"><i class="' + (wpct >= 0 ? "l" : "s") + '" style="width:' + width.toFixed(1) + '%"></i></div>';
+      return (
+        "<tr>" +
+        '<td class="sym">' + esc(r.asset) + "</td>" +
+        '<td><span class="chip ' + r.side + '">' + r.side + "</span></td>" +
+        '<td class="num">' + esc(r.qty) + "</td>" +
+        '<td class="num dim">' + fmtNum(r.avg_price) + "</td>" +
+        '<td class="num">' + (r.mark ? fmtNum(r.mark) : '<span class="dim">no mark</span>') + "</td>" +
+        '<td class="num">' + (r.notional ? fmtNum(r.notional) : "—") + "</td>" +
+        '<td class="num">' + (Number.isFinite(w) ? fmtPct(w) : "—") + "</td>" +
+        "<td>" + bar + "</td>" +
+        '<td class="num ' + signClass(r.unrealised_pnl) + '">' + (r.unrealised_pnl ? fmtNum(r.unrealised_pnl) : "—") + "</td>" +
+        "</tr>"
+      );
+    })
+    .join("");
+  $("positions").innerHTML =
+    "<thead><tr><th>Asset</th><th>Side</th><th class='num'>Qty</th><th class='num'>Avg</th>" +
+    "<th class='num'>Mark</th><th class='num'>Notional</th><th class='num'>Weight</th><th></th>" +
+    "<th class='num'>Unrealised</th></tr></thead><tbody>" + rows + "</tbody>";
+}
+
+function renderFills(f) {
+  if (!f || !f.length) {
+    $("fills").innerHTML = '<tbody><tr><td class="empty">nothing has filled</td></tr></tbody>';
+    return;
+  }
+  const rows = f
+    .map(
+      (r) =>
+        "<tr><td class='num dim'>" + shortTime(r.ts) + "</td>" +
+        "<td class='sym'>" + esc(r.asset) + "</td>" +
+        '<td><span class="chip ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
+        "<td class='num'>" + esc(r.qty) + "</td>" +
+        "<td class='num'>" + fmtNum(r.price) + "</td>" +
+        "<td class='num dim'>" + fmtNum(r.fee) + "</td>" +
+        "<td class='num dim'>" + esc(r.client_order_id) + "</td></tr>")
+    .join("");
+  $("fills").innerHTML =
+    "<thead><tr><th>Time</th><th>Asset</th><th>Side</th><th class='num'>Qty</th>" +
+    "<th class='num'>Price</th><th class='num'>Fee</th><th class='num'>Order id</th></tr></thead><tbody>" +
+    rows + "</tbody>";
+}
+
+function renderRuns(runs) {
+  if (!runs || !runs.length) {
+    $("runs").innerHTML = '<tbody><tr><td class="empty">nothing has run yet</td></tr></tbody>';
+    return;
+  }
+  const rows = runs
+    .map(
+      (r) =>
+        '<tr class="out-' + esc(r.outcome) + '">' +
+        "<td class='num dim'>" + shortTime(r.recorded_at) + "</td>" +
+        '<td><span class="chip">' + esc(r.outcome) + "</span></td>" +
+        "<td class='num'>" + r.slices_completed + "/" + r.slices_planned + "</td>" +
+        "<td class='num'>" + r.orders_submitted + "</td>" +
+        "<td class='num " + (r.orders_skipped ? "neg" : "dim") + "'>" + r.orders_skipped + "</td>" +
+        "<td class='num dim'>" + (r.nav ? fmtNum(r.nav) : "—") + "</td>" +
+        // An empty cell reads as missing data. A clean run says so.
+        '<td class="wrapcell">' +
+        (r.detail ? esc(r.detail) : '<span class="dim">clean</span>') +
+        "</td></tr>")
+    .join("");
+  $("runs").innerHTML =
+    "<thead><tr><th>Recorded</th><th>Outcome</th><th class='num'>Slices</th>" +
+    "<th class='num'>Sent</th><th class='num'>Skipped</th><th class='num'>NAV</th>" +
+    "<th>What happened</th></tr></thead><tbody>" + rows + "</tbody>";
+}
+
+function renderHealth(h, c) {
+  const notes = (h.notes || []).map((n) => "<li>" + esc(n) + "</li>").join("");
+  $("health").innerHTML =
+    '<div class="lamp ' + (h.ok ? "running" : "halted") + '">' + (h.ok ? "ok" : "needs attention") + "</div>" +
+    '<table style="margin-top:10px"><tbody>' +
+    row("Control state", h.control_state) +
+    row("Set by", (c && c.set_by) || "—") +
+    row("Reason", (c && c.reason) || "—") +
+    row("Last run", shortTime(h.last_run_at) + (h.last_run_outcome ? " · " + h.last_run_outcome : "")) +
+    row("Hours since", h.hours_since_last_run == null ? "—" : h.hours_since_last_run) +
+    "</tbody></table>" +
+    (notes ? '<ul style="margin:10px 0 0;padding-left:18px;font-size:12.5px;color:var(--ink-2)">' + notes + "</ul>" : "");
+}
+
+function row(k, v) {
+  return "<tr><td class='dim' style='padding-left:0'>" + esc(k) + "</td><td>" + esc(v) + "</td></tr>";
+}
+
+function renderExpectation(m, live) {
+  const el = $("expectation");
+  let html = "";
+  if (!m) {
+    html +=
+      '<p class="note">No backtest record was loaded, so there is nothing to compare against. ' +
+      "Pass <code>--expectation docs/research/backtest.json</code>.</p>";
+  } else {
+    // The sample size goes in the column header, not only in a footnote. A
+    // number that cannot support the comparison it is placed next to should
+    // say so where the eye lands, which is the header.
+    const days = live.days_live == null ? 0 : live.days_live;
+    const liveHead = live.meaningful
+      ? "Live · " + days + "d"
+      : "<span class='dim'>Live · " + days + "d, too short</span>";
+    html +=
+      "<table><thead><tr><th></th><th class='num'>Backtest · " +
+      fmtNum(m.years, 1) + "y</th><th class='num'>" + liveHead + "</th></tr></thead><tbody>" +
+      cmp("Return", fmtPct(m.total_return), live.return_since_start == null ? "—" : fmtPct(live.return_since_start), live.meaningful) +
+      cmp("Sharpe", fmtNum(m.sharpe), live.sharpe == null ? "not yet" : fmtNum(live.sharpe), live.meaningful) +
+      cmp("Max drawdown", fmtPct(m.max_drawdown), live.max_drawdown == null ? "—" : fmtPct(live.max_drawdown), live.meaningful) +
+      cmp("Clean runs", "—", live.clean_runs + " of " + live.runs_recorded, true) +
+      "</tbody></table>";
+  }
+  html += '<p class="note" style="margin-top:10px">' + esc(live.note) + "</p>";
+  el.innerHTML = html;
+}
+
+function cmp(k, a, b, emphasiseLive) {
+  return (
+    "<tr><td class='dim'>" + esc(k) + "</td>" +
+    "<td class='num dim'>" + esc(a) + "</td>" +
+    "<td class='num" + (emphasiseLive ? "" : " dim") + "'>" + esc(b) + "</td></tr>"
+  );
+}
+
+/* --- controls -------------------------------------------------------- */
+async function sendControl(path, verb) {
+  const by = $("who").value.trim();
+  const reason = $("why").value.trim();
+  const out = $("ctlresult");
+  if (!by || !reason) {
+    out.innerHTML = '<span class="neg">A name and a reason are both required.</span>';
+    return;
+  }
+  if (!window.confirm(verb + " the bot?\n\n" + reason + "\n\nThis takes effect before the next slice.")) return;
+  out.textContent = "…";
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ by, reason }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    out.innerHTML = '<span class="pos">' + esc(verb) + "ed at " + esc(shortTime(data.set_at)) + ".</span>";
+    refresh();
+  } catch (e) {
+    out.innerHTML = '<span class="neg">' + esc(e.message) + "</span>";
+  }
+}
+
+$("halt").addEventListener("click", () => sendControl("/api/halt", "Halt"));
+$("pause").addEventListener("click", () => sendControl("/api/pause", "Paus"));
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

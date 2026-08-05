@@ -84,6 +84,20 @@ impl Default for PaperConfig {
     }
 }
 
+/// The fill log inside a snapshot, without rebuilding the venue.
+///
+/// For readers that have no business holding a venue at all: the `api` process
+/// holds no credentials and must not be able to place an order, but it still
+/// has to show what the account did. A free function rather than a method
+/// because reading a file should not require constructing a broker.
+pub fn fills_in_snapshot(snapshot: &str) -> Result<Vec<Fill>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct JustFills {
+        fills: Vec<Fill>,
+    }
+    Ok(serde_json::from_str::<JustFills>(snapshot)?.fills)
+}
+
 /// An order accepted and still waiting for the mark to reach it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Resting {

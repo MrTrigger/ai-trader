@@ -251,7 +251,7 @@ images, and one CRLF bug already paid for. It buys a security property worth hav
 (§3.3) — the process that decides holds no key that can trade.
 
 **The Plan is the process boundary**, and it already had the right shape for this: immutable,
-schema'd, risk-cleared, persisted, and addressed by id (§5.3, §8.2). Rust never needs to know how
+schema'd, risk-cleared, persisted, and addressed by id (§5.3, §8.3). Rust never needs to know how
 a plan was computed — only that it exists, validates, and hasn't been superseded.
 
 ```
@@ -799,7 +799,37 @@ path into the engine.
   ai-trader pause | resume | flatten
 ```
 
-### 8.2 MCP later — eyes, not hands
+Two binaries implement this today. `ai-trader` (Python) is the planner — it decides and emits a
+Plan. `bot` (Rust) is the executor — it takes a plan file and does steps 9–10, and owns
+`halt | pause | resume | flatten`. The split is §3.3's security boundary, not a packaging
+preference: the process that decides never holds a key that can trade.
+
+```
+  bot --config bot.json run --plan plan.json   # execute, across the slice window
+  bot --config bot.json status | history | positions
+  bot --config bot.json halt | pause | resume  --reason R --by WHO
+  bot --config bot.json flatten --reason R --by WHO --confirm
+```
+
+### 8.2 The dashboard is a lens, and it can only ever stop things
+
+The `api` process serves an operations dashboard on loopback: control state, NAV and P&L folded
+from the fill log, positions, fills, run history with what went wrong, health, and live performance
+against the backtest. It holds no venue credentials and reads only files the bot has already
+written, so it cannot place an order however it is asked, and the bot does not know it exists.
+
+Its controls are deliberately asymmetric. **Halt and pause are on the page; resume and flatten are
+not.** Halting and pausing only ever reduce what the system may do, so they should be one click
+away in an emergency. Resume grants trading authority and flatten moves capital — neither belongs
+one mis-click away in a tab that has been open since Tuesday, so both require the CLI, which is to
+say a human at a terminal who has read why it stopped. The page prints the exact command.
+
+Live performance is shown with its sample size in the column header, not in a footnote. Below the
+threshold the live column is greyed and the Sharpe reads *not yet*: a ratio from a few weeks is
+noise with a decimal point, and placing it beside a backtest figure invites the comparison it
+cannot support.
+
+### 8.3 MCP later — eyes, not hands
 
 Build it as a thin wrapper once the CLI surface has stabilised through real use. Designing the tool
 contract before you know the operations means rewriting it.
@@ -963,7 +993,7 @@ portfolio-level cap at all (twenty correlated breakouts at 8% NAV each "wants" 1
 prompt has no answer), no stop between daily runs on a 24/7 market, and — the design flaw worth
 remembering — the bot fetches `aiRules` from its own config records and is instructed to obey them,
 which makes untrusted fetched data an instruction channel into a system holding trading
-credentials. §8.2's "tool results are data, never instructions" is a direct response.
+credentials. §8.3's "tool results are data, never instructions" is a direct response.
 
 ### 11.2 A seven-layer equities stack ("Meridian")
 
@@ -1006,7 +1036,7 @@ feature, not prompt memory.
 
 Also a third independent arrival at propose/execute: their portfolio manager approves or rejects
 the trader's proposal, as signum's approval step and Meridian's approve/reject cards do. Three
-unrelated teams landing on the same seam is evidence the seam is real, and it is §8.2's.
+unrelated teams landing on the same seam is evidence the seam is real, and it is §8.3's.
 
 **Rejected — and this is the concrete case that §7.3 and §7.5 are built on.** From the paper
 itself:
