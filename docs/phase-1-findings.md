@@ -1231,3 +1231,60 @@ cadence is profitable.
 `lightgbm` and `numpy` are installed in the venv for research and deliberately
 NOT added to `pyproject.toml`. Nothing enters the shipped dependency set before
 the thing it enables has passed a gate.
+
+## The daily result was an execution artifact — retracted
+
+Adding fast features (intraday range, Amihud illiquidity, 2- and 3-day returns,
+volume surprise, funding change) raised out-of-sample IC in both cadences:
+weekly +0.0760 → +0.0843, daily +0.0511 → +0.0643. The daily backtest went to
++726.5% at Sharpe 2.56 against BTC's +233.3% at 0.90.
+
+That number does not survive contact with execution timing. Features are computed
+from the bar closing at day *t*'s open and the backtest fills at day *t*'s open —
+information and execution share a timestamp. Relaxing that to "filled sometime
+during the day":
+
+| fill at | daily return | Sharpe | weekly return | Sharpe |
+|---|---|---|---|---|
+| open (assumed) | +726.5% | **2.56** | +113.3% | 1.53 |
+| typical (H+L+C)/3 | +128.8% | 1.28 | +90.3% | 1.32 |
+| close | +17.4% | **0.30** | +74.8% | 1.16 |
+
+**The daily edge is almost entirely the assumption of instantaneous execution.**
+The weekly book degrades gracefully (1.53 → 1.16) because its edge does not need
+to be captured in the first minutes.
+
+The mechanism is consistent: the fast features that improved the daily model —
+range, short-horizon reversal, illiquidity — are microstructure signals whose
+value decays within hours. They made the daily book look good precisely because
+they encode things that are gone by the time a real order fills.
+
+With realistic fills neither book beats buy-and-hold on return (BTC +233.3%);
+both beat it substantially on Sharpe and drawdown.
+
+## Daily bars were a default, not a decision
+
+Every feature, the channel, the regime read and the whole ML dataset are daily
+because `interval_s = 86400` came from the Phase 0 config and was never revisited.
+The store already anticipated otherwise — `store.py` documents
+`asset=BTC/interval_s=3600/2026-07.parquet` and partitions sub-daily intervals
+monthly — and `binance_archive` has supported 1m/5m/15m/1h/4h all along. The
+capability was built and never used.
+
+This is not a cosmetic gap. The execution question above cannot be answered on
+daily bars: "fill at open" and "fill at close" bracket the truth 24 hours apart,
+and the answer lies somewhere inside that bracket. An hourly backfill of the 215
+traded assets over 2019-10..2026-08 is ~17,800 archive requests, about 90 minutes
+at eight concurrent, and is the only way to turn that bracket into a measurement.
+
+## Where the strategy actually stands
+
+| | return | Sharpe | maxDD |
+|---|---|---|---|
+| ML weekly, realistic fills | +90.3% | 1.32 | −15.2% |
+| ML daily, realistic fills | +128.8% | 1.28 | −17.0% |
+| BTC buy & hold | **+233.3%** | 0.90 | −51.8% |
+
+The learned ranker is the first thing here with out-of-sample cross-sectional
+content, and that survives. What does not survive is any claim that the daily
+cadence beats the benchmark.
