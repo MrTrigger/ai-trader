@@ -158,7 +158,10 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
         cadence_hours: cfg.cadence_hours,
         expectation_path: cfg.expectation.as_deref(),
         run_limit: 200,
-        fill_limit: 50,
+        // Enough to see the last run or two land, not enough to bury everything
+        // below it. The full log is `bot positions` and the fill store; this is
+        // a glance, and fifty rows of it pushed the run history off the page.
+        fill_limit: 12,
     })
 }
 

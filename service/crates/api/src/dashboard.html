@@ -97,13 +97,25 @@
     color: var(--ink-3); font-weight: 600; margin: 0;
     padding: 11px 14px; border-bottom: 1px solid var(--line);
     display: flex; align-items: baseline; gap: 10px;
+    /* The label is two or three words and must never wrap; the hint beside it
+       is a sentence and always may. */
+    white-space: nowrap;
   }
   .panel > h2 .hint {
     letter-spacing: 0; text-transform: none; font-weight: 400; font-size: 11.5px;
+    white-space: normal;
   }
-  .panel .body { padding: 14px; }
+  /* The health and expectation tables live in a .body rather than a .scroll
+     wrapper; below about 420px they are what pushes the page sideways. Wide
+     content scrolls inside its own panel, never by moving the page. */
+  .panel .body { padding: 14px; overflow-x: auto; }
   .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
   @media (min-width: 1000px) { .cols { grid-template-columns: 1.35fr 1fr; } }
+  /* Grid items default to min-width:auto, so one wide child - here the <pre>
+     holding the CLI commands - sizes the whole track to its longest line and
+     pushes the page sideways. This is the fix, and it has to be on the items
+     rather than the container. */
+  .cols > *, .panel { min-width: 0; }
 
   /* --- tiles ---------------------------------------------------------- */
   .tiles {
@@ -141,6 +153,10 @@
   .sym { font-family: var(--mono); font-weight: 600; }
   .dim { color: var(--ink-3); }
   .wrapcell { min-width: 260px; color: var(--ink-2); font-size: 12.5px; }
+  .ellipsis {
+    font-family: var(--mono); font-size: 12px;
+    max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
   .chip {
     display: inline-block; font-family: var(--mono); font-size: 10.5px;
@@ -149,8 +165,12 @@
   }
   .chip.long  { color: var(--good); border-color: currentColor; }
   .chip.short { color: var(--bad);  border-color: currentColor; }
-  .chip.buy   { color: var(--good); border-color: currentColor; }
-  .chip.sell  { color: var(--bad);  border-color: currentColor; }
+  /* A fills table is a dozen rows of the same two words. Bordered chips there
+     turn into a wall of boxes that reads as texture rather than as sides, so
+     the side is carried by colour and weight alone. */
+  .side { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600; }
+  .side.buy  { color: var(--good); }
+  .side.sell { color: var(--bad); }
 
   /* Outcome carries a stripe as well as a word, so a bad run is visible
      before it is read. */
@@ -160,7 +180,19 @@
   tr.out-refused   td:first-child { box-shadow: inset 3px 0 0 var(--ink-3); }
   tr.out-flattened td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 
-  .bar { height: 5px; background: var(--surface-2); border-radius: 1px; position: relative; min-width: 60px; }
+  /* Weight, drawn from a centre line: long right, short left. The number is
+     already in the column beside it, so this exists to make the shape of the
+     book readable at a glance rather than to be read off. */
+  .weightcell .bar { margin-top: 4px; margin-left: auto; }
+  .weightcell .sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+  .bar {
+    height: 6px; background: var(--surface-2); border-radius: 1px;
+    position: relative; width: 84px;
+  }
+  .bar::before {
+    content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px;
+    border-left: 1px solid var(--ink-3); opacity: .5;
+  }
   .bar i { position: absolute; top: 0; bottom: 0; border-radius: 1px; }
   .bar i.l { background: var(--good); left: 50%; }
   .bar i.s { background: var(--bad); right: 50%; }
@@ -192,7 +224,10 @@
     padding: 8px 14px; border-radius: var(--radius); border: 1px solid var(--line);
     background: var(--surface-2); color: var(--ink);
   }
-  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  /* The label takes the page ground, not white. In dark mode --bad is a light
+     salmon and white-on-salmon is unreadable; the ground is dark there and
+     light here, so it stays legible against both. */
+  button.danger { background: var(--bad); border-color: var(--bad); color: var(--bg); }
   button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   pre.cmd {
@@ -204,7 +239,7 @@
 
   /* --- chart ----------------------------------------------------------- */
   .chart { position: relative; }
-  .chart svg { display: block; width: 100%; height: 150px; }
+  .chart svg { display: block; width: 100%; }
   .grid { stroke: var(--line); stroke-width: 1; }
   .navline { fill: none; stroke: var(--accent); stroke-width: 2; }
   .navfill { fill: var(--accent); opacity: .1; }
@@ -381,6 +416,29 @@ function renderTiles(s) {
 }
 
 /* --- NAV chart ------------------------------------------------------- */
+
+/* Axis bounds a human would have chosen: round numbers, one of 1/2/2.5/5 times
+   a power of ten. Padding the raw min and max instead produced labels like
+   "108,384" and "21,754", which are precise about nothing and read as noise. */
+function niceScale(lo, hi) {
+  if (!(hi > lo)) {
+    const v = hi || 1;
+    return [v * 0.9, v * 1.1, [v * 0.9, v, v * 1.1]];
+  }
+  const pad = (hi - lo) * 0.1;
+  // Five intervals, not three. Three produced steps so coarse that the floor
+  // rounded down to zero and half the plot was empty space below the data —
+  // and a NAV chart anchored at zero shows a flat line for any move worth
+  // looking at.
+  const rawStep = (hi - lo + 2 * pad) / 5;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const step = [1, 2, 2.5, 5, 10].find((m) => m * mag >= rawStep) * mag;
+  const y0 = Math.floor((lo - pad) / step) * step;
+  const y1 = Math.ceil((hi + pad) / step) * step;
+  const ticks = [];
+  for (let t = y0; t <= y1 + step / 2; t += step) ticks.push(t);
+  return [y0, y1, ticks];
+}
 function renderChart(runs) {
   const el = $("chart");
   const pts = (runs || [])
@@ -401,29 +459,44 @@ function renderChart(runs) {
     return;
   }
 
-  const W = 900, H = 150, PADL = 56, PADR = 12, PADT = 12, PADB = 22;
+  // Draw at the element's own pixel size. A fixed viewBox stretched with
+  // preserveAspectRatio="none" scales x and y differently, which makes a 2px
+  // stroke thicker vertically than horizontally and turns the endpoint dot into
+  // an ellipse — small, but it is the kind of wrongness that reads as sloppy.
+  const W = Math.max(el.clientWidth || 900, 320);
+  const H = 170, PADL = 60, PADR = 16, PADT = 12, PADB = 26;
   const lo = Math.min(...pts.map((p) => p.v));
   const hi = Math.max(...pts.map((p) => p.v));
-  const span = hi - lo || Math.abs(hi) || 1;
-  const y0 = lo - span * 0.12, y1 = hi + span * 0.12;
+  const [y0, y1, ticks] = niceScale(lo, hi);
   const x = (i) => PADL + (i / (pts.length - 1)) * (W - PADL - PADR);
   const y = (v) => PADT + (1 - (v - y0) / (y1 - y0)) * (H - PADT - PADB);
 
   const line = pts.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
   const area = line + " L" + x(pts.length - 1).toFixed(1) + " " + (H - PADB) + " L" + PADL + " " + (H - PADB) + " Z";
 
-  const ticks = [y0, (y0 + y1) / 2, y1];
   const grid = ticks
     .map((t) =>
       '<line class="grid" x1="' + PADL + '" x2="' + (W - PADR) + '" y1="' + y(t).toFixed(1) +
       '" y2="' + y(t).toFixed(1) + '"></line>' +
-      '<text class="axis" x="' + (PADL - 6) + '" y="' + (y(t) + 3).toFixed(1) + '" text-anchor="end">' +
+      '<text class="axis" x="' + (PADL - 8) + '" y="' + (y(t) + 3.5).toFixed(1) + '" text-anchor="end">' +
       fmtNum(t, 0) + "</text>")
     .join("");
 
+  // Two time labels, at the ends. A dashboard needs to know what window it is
+  // looking at; it does not need a tick per run. Within a single day the dates
+  // would be identical and say nothing, so the label falls back to the clock.
+  const first = pts[0].t || "", last = pts[pts.length - 1].t || "";
+  const sameDay = first.slice(0, 10) === last.slice(0, 10);
+  const label = (iso) => (sameDay ? iso.slice(11, 16) + "Z" : iso.slice(0, 10));
+  const xAxis =
+    '<text class="axis" x="' + PADL + '" y="' + (H - 8) + '">' +
+    (sameDay ? first.slice(0, 10) + " " + label(first) : label(first)) + "</text>" +
+    '<text class="axis" x="' + (W - PADR) + '" y="' + (H - 8) + '" text-anchor="end">' +
+    label(last) + "</text>";
+
   el.innerHTML =
-    '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img" ' +
-    'aria-label="net asset value at each recorded run">' + grid +
+    '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" role="img" ' +
+    'aria-label="net asset value at each recorded run">' + grid + xAxis +
     '<path class="navfill" d="' + area + '"></path>' +
     '<path class="navline" d="' + line + '"></path>' +
     '<circle class="navend" cx="' + x(pts.length - 1).toFixed(1) + '" cy="' + y(pts[pts.length - 1].v).toFixed(1) + '" r="3.5"></circle>' +
@@ -470,6 +543,9 @@ function renderPositions(s) {
       const w = Number(r.weight);
       const wpct = Number.isFinite(w) ? w : 0;
       const width = Math.min(Math.abs(wpct) * 100, 50);
+      // The bar sits under its own number rather than in a column of its own.
+      // As a separate column it pushed Unrealised off the right edge, and the
+      // P&L on a position is not the thing to lose to a decoration.
       const bar =
         '<div class="bar"><i class="' + (wpct >= 0 ? "l" : "s") + '" style="width:' + width.toFixed(1) + '%"></i></div>';
       return (
@@ -479,9 +555,13 @@ function renderPositions(s) {
         '<td class="num">' + esc(r.qty) + "</td>" +
         '<td class="num dim">' + fmtNum(r.avg_price) + "</td>" +
         '<td class="num">' + (r.mark ? fmtNum(r.mark) : '<span class="dim">no mark</span>') + "</td>" +
-        '<td class="num">' + (r.notional ? fmtNum(r.notional) : "—") + "</td>" +
-        '<td class="num">' + (Number.isFinite(w) ? fmtPct(w) : "—") + "</td>" +
-        "<td>" + bar + "</td>" +
+        // Notional and weight are the same fact in two units, so they share a
+        // cell. As separate columns the table outgrew its panel and dropped
+        // Unrealised off the edge, which is not the number to lose.
+        '<td class="num weightcell">' +
+        (r.notional ? fmtNum(r.notional) : "—") +
+        (Number.isFinite(w) ? '<div class="sub">' + fmtPct(w) + " of NAV</div>" + bar : "") +
+        "</td>" +
         '<td class="num ' + signClass(r.unrealised_pnl) + '">' + (r.unrealised_pnl ? fmtNum(r.unrealised_pnl) : "—") + "</td>" +
         "</tr>"
       );
@@ -489,7 +569,7 @@ function renderPositions(s) {
     .join("");
   $("positions").innerHTML =
     "<thead><tr><th>Asset</th><th>Side</th><th class='num'>Qty</th><th class='num'>Avg</th>" +
-    "<th class='num'>Mark</th><th class='num'>Notional</th><th class='num'>Weight</th><th></th>" +
+    "<th class='num'>Mark</th><th class='num'>Notional</th>" +
     "<th class='num'>Unrealised</th></tr></thead><tbody>" + rows + "</tbody>";
 }
 
@@ -503,15 +583,19 @@ function renderFills(f) {
       (r) =>
         "<tr><td class='num dim'>" + shortTime(r.ts) + "</td>" +
         "<td class='sym'>" + esc(r.asset) + "</td>" +
-        '<td><span class="chip ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
+        '<td><span class="side ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
         "<td class='num'>" + esc(r.qty) + "</td>" +
         "<td class='num'>" + fmtNum(r.price) + "</td>" +
         "<td class='num dim'>" + fmtNum(r.fee) + "</td>" +
-        "<td class='num dim'>" + esc(r.client_order_id) + "</td></tr>")
+        // Truncated, with the whole id on hover. It is here to be matched
+        // against a venue record when something has gone wrong, not read - and
+        // at full width it clipped the columns that are read.
+        "<td class='dim ellipsis' title='" + esc(r.client_order_id) + "'>" +
+        esc(r.client_order_id) + "</td></tr>")
     .join("");
   $("fills").innerHTML =
     "<thead><tr><th>Time</th><th>Asset</th><th>Side</th><th class='num'>Qty</th>" +
-    "<th class='num'>Price</th><th class='num'>Fee</th><th class='num'>Order id</th></tr></thead><tbody>" +
+    "<th class='num'>Price</th><th class='num'>Fee</th><th>Order id</th></tr></thead><tbody>" +
     rows + "</tbody>";
 }
 
@@ -626,6 +710,15 @@ $("pause").addEventListener("click", () => sendControl("/api/pause", "Paus"));
 
 refresh();
 setInterval(refresh, 10000);
+
+// The chart is drawn at its container's pixel width, so it has to be redrawn
+// when that changes. Debounced: a drag across the screen is one resize, not
+// eighty.
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => latest && renderChart(latest.runs), 150);
+});
 </script>
 </body>
 </html>
