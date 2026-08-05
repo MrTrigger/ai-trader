@@ -51,7 +51,7 @@ def build(
     bars: pl.DataFrame,
     *,
     benchmark: str | None = None,
-    shortable_from: dict[str, date] | None = None,
+    perp_listed_from: dict[str, date] | None = None,
 ) -> pl.DataFrame:
     """Feature frame, one row per (asset, bar).
 
@@ -66,13 +66,13 @@ def build(
     from `bars`, `beta_bench` is null everywhere and the risk gate decides what
     to do about that rather than this function guessing.
 
-    `shortable_from` maps an asset to the first date a borrow existed for it -
-    in crypto, the day its perpetual listed. It produces a `shortable` column
-    that is False before that date and True after, which is the point-in-time
-    form the question has to take: whether an asset *can* be shorted is a fact
-    about a date, not about an asset, and treating it as the latter would let a
-    2026 instrument list open a 2021 short. Omitted, `shortable` is False
-    everywhere - a book that does not know what it may borrow may not borrow.
+    `perp_listed_from` maps an asset to the first date its perpetual existed.
+    It produces a `perp_listed` column that is False before that date and True
+    after, which is the point-in-time form the question has to take: whether an
+    asset is tradeable is a fact about a DATE, not about an asset, and treating
+    it as the latter would let a 2026 listing open a 2021 position. Omitted, the
+    column is False everywhere - a book that does not know what it can trade
+    trades nothing.
     """
     if bars.is_empty():
         return bars
@@ -101,12 +101,12 @@ def build(
 
     df = df.with_columns(exprs)
 
-    # Borrow availability, as of each bar. Assets with no entry are never
-    # shortable rather than silently shortable, so a gap in the borrow table
+    # Instrument availability, as of each bar. An asset with no entry is never
+    # tradeable rather than silently tradeable, so a gap in the listing table
     # under-trades instead of inventing a position that could not be opened.
-    if shortable_from:
+    if perp_listed_from:
         first = pl.col("asset").replace_strict(
-            {a: d.isoformat() for a, d in shortable_from.items()},
+            {a: d.isoformat() for a, d in perp_listed_from.items()},
             default=None,
             return_dtype=pl.Utf8,
         )
@@ -114,10 +114,10 @@ def build(
             pl.when(first.is_null())
             .then(pl.lit(False))
             .otherwise(pl.col("ts_utc").dt.date() >= first.str.to_date())
-            .alias("shortable")
+            .alias("perp_listed")
         )
     else:
-        df = df.with_columns(pl.lit(False).alias("shortable"))
+        df = df.with_columns(pl.lit(False).alias("perp_listed"))
 
     df = df.with_columns(
         [

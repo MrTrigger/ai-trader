@@ -1,21 +1,26 @@
-"""What can be shorted, and from when.
+"""Which assets have a listed perpetual, and from when.
 
-A long-only book never has to ask this question, which is why it does not appear
-anywhere before shorts do. Once it does appear it is a *point-in-time* question
-and one of the easier places to introduce look-ahead: the set of shortable
-assets today is not the set that was shortable in 2021, and using today's list
-over history is the borrow-side equivalent of a survivorship-biased universe.
-It reads as free alpha because the instruments that got perpetual listings later
-are disproportionately the ones that did well.
+The venue is Hyperliquid, which is perps-first, so **both** legs of the book are
+perpetual futures. That makes this one table gate the entire universe rather than
+just the short side: an asset with no perp cannot be held long either.
+
+It is a *point-in-time* question and one of the easier places to introduce
+look-ahead. The set of assets with perps today is not the set that had them in
+2021, and applying today's list over history is the instrument-side equivalent of
+a survivorship-biased universe. It reads as free alpha, because the assets that
+got listings later are disproportionately the ones that did well.
 
 The honest form is a first-available date per asset, which is what this returns.
-In crypto the borrow is a perpetual future, so the perp's listing date is the
-date a short became possible - and the funding history is a faithful record of
-it, because funding is only ever paid on a contract that exists.
+Funding history is a faithful record of it, because funding is only ever paid on
+a contract that exists.
 
-An asset absent from the table is **never shortable**, not silently shortable.
-A gap here makes the book trade less, which is the failure direction that costs
-money rather than inventing it.
+An asset absent from the table is **never tradeable**, not silently tradeable. A
+gap here makes the book trade less, which is the failure direction that costs
+opportunity rather than money.
+
+**The data is Binance USD-M**, not Hyperliquid. Listing dates and funding rates
+differ between venues, so every funding figure downstream is an estimate from the
+wrong venue until a Hyperliquid pull replaces it.
 """
 
 from __future__ import annotations

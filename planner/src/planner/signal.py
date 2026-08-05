@@ -398,14 +398,21 @@ class GaussianChannelLongShort:
     ## The two legs are not symmetric, and that is deliberate
 
     - **Long** = above the upper channel. A selection.
-    - **Short** = eligible, shortable, and *not* above it. A residual.
+    - **Short** = eligible, listed, and *not* above it. A residual.
 
     Making the short leg symmetric (only names below the *lower* band) was tested
     and is worse: min-Sharpe 1.49 against 2.05, and it stands the book down for
     most of 2019-21 for want of three qualifying shorts. The residual form is
     also the more honest description of what is being claimed - the signal has an
     opinion about which assets are strong, not about which are weak, and the
-    short leg is a hedge that funds itself rather than a second forecast.
+    short leg is a hedge rather than a second forecast.
+
+    **Both legs are perpetuals.** The venue is perps-first, so an asset without
+    a listed contract is untradeable in either direction, and funding is PAID on
+    the long leg as well as received on the short. That costs roughly a third of
+    the funding income a spot long leg would have kept, and more than pays for
+    itself in fees: a perp long is charged the perp taker rate rather than the
+    materially higher spot one.
 
     The leg *sizes* need no such rule: `L` thins to three or four names by itself
     when almost nothing is trending, and the short leg fattens in the same move,
@@ -483,26 +490,30 @@ class GaussianChannelLongShort:
         rows, notes = _eligible(cross, config)
         warnings: list[Warning] = []
 
-        for needed in ("gc_breakout_age", "shortable"):
+        for needed in ("gc_breakout_age", "perp_listed"):
             if needed not in cross.columns:
                 raise ValueError(
                     f"{self.name} needs the {needed!r} column; the feature set does "
                     "not provide it"
                 )
 
-        warmed = [r for r in rows if r.get("gc_upper") is not None]
-        longs = [r for r in warmed if r.get("gc_breakout_age") is not None]
-        shorts = [
-            r for r in warmed if r.get("gc_breakout_age") is None and r.get("shortable")
+        # Both legs are perpetuals, so both need a listed contract. This used to
+        # gate the short leg only, on the assumption that the long leg was spot.
+        # It is not: the venue is perps-first, which makes an unlisted asset
+        # untradeable in either direction rather than merely unshortable.
+        warmed = [
+            r for r in rows if r.get("gc_upper") is not None and r.get("perp_listed")
         ]
+        longs = [r for r in warmed if r.get("gc_breakout_age") is not None]
+        shorts = [r for r in warmed if r.get("gc_breakout_age") is None]
 
-        unborrowable = sum(
-            1 for r in warmed if r.get("gc_breakout_age") is None and not r.get("shortable")
+        unlisted = sum(
+            1 for r in rows if r.get("gc_upper") is not None and not r.get("perp_listed")
         )
-        if unborrowable:
+        if unlisted:
             notes.append(
-                f"{unborrowable} asset(s) are below their channel but have no borrow "
-                "available and were not shorted"
+                f"{unlisted} eligible asset(s) have no listed perpetual and were not "
+                "traded on either side"
             )
 
         if len(longs) < self.MIN_LEG or len(shorts) < self.MIN_LEG:

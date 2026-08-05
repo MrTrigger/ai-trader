@@ -1,13 +1,13 @@
-"""The market-neutral signal, the borrow table, and the shortable feature.
+"""The market-neutral signal, the borrow table, and the perp_listed feature.
 
 Three properties carry most of the weight here and each has a specific way of
 failing silently:
 
-**Borrow is point-in-time.** Using today's shortable list over history is the
+**Borrow is point-in-time.** Using today's perp_listed list over history is the
 borrow-side twin of a survivorship-biased universe, and it flatters results for
 exactly the same reason - the instruments that got listings later are
 disproportionately the ones that did well. A test that only checks "is BTC
-shortable" would pass while the whole history was wrong, so the tests here check
+perp_listed" would pass while the whole history was wrong, so the tests here check
 the *boundary date*.
 
 **Both legs or neither.** A book that keeps one leg when the other cannot form
@@ -66,7 +66,7 @@ def cross(
     *,
     longs: int = 4,
     shorts: int = 6,
-    shortable: bool = True,
+    perp_listed: bool = True,
     regime: str = "flat",
     slope: float | None = 0.02,
 ) -> pl.DataFrame:
@@ -79,20 +79,20 @@ def cross(
     for i in range(longs):
         rows.append(
             dict(asset=f"L{i}", gc_breakout_age=i + 1, gc_upper=90.0, gc_lower=70.0,
-                 close=100.0, shortable=shortable)
+                 close=100.0, perp_listed=perp_listed)
         )
     for i in range(shorts):
         # Spread the shorts below their lower band so the ranking has something
         # to order by; S0 is furthest below.
         rows.append(
             dict(asset=f"S{i}", gc_breakout_age=None, gc_upper=90.0, gc_lower=70.0,
-                 close=50.0 + i, shortable=shortable)
+                 close=50.0 + i, perp_listed=perp_listed)
         )
 
     close = {"up": 100.0, "down": 50.0, "flat": 80.0}[regime]
     rows.append(
         dict(asset="BTC", gc_breakout_age=1, gc_upper=90.0, gc_lower=70.0,
-             close=close, shortable=True)
+             close=close, perp_listed=True)
     )
 
     frame = pl.DataFrame(rows)
@@ -124,7 +124,7 @@ def test_it_holds_both_legs():
 
 
 def test_the_short_leg_is_the_residual_not_a_second_selection():
-    # Everything eligible, shortable, and not above its band is shorted. If this
+    # Everything eligible, perp_listed, and not above its band is shorted. If this
     # ever becomes a selection the count will stop matching the complement.
     _, short = legs(signal.get("gc_long_short").generate(cross(shorts=6), config=config()))
     assert len(short) == 6
@@ -143,16 +143,21 @@ def test_it_stands_down_rather_than_holding_a_thin_long_leg():
     assert result.signals == []
 
 
-def test_unborrowable_assets_are_never_shorted():
-    result = signal.get("gc_long_short").generate(cross(shortable=False), config=config())
-    # No borrow means no short leg, which means no book at all.
+def test_assets_without_a_listed_perp_are_not_traded_at_all():
+    """Both legs are perpetuals, so an unlisted asset is untradeable either way.
+
+    This gated the short leg only while the long leg was assumed to be spot.
+    On a perps-first venue that assumption is wrong, and leaving it in place
+    would have the book hold longs it could not actually open.
+    """
+    result = signal.get("gc_long_short").generate(cross(perp_listed=False), config=config())
     assert result.signals == []
-    assert any("borrow" in n for n in result.notes)
+    assert any("no listed perpetual" in n for n in result.notes)
 
 
 def test_missing_shortable_column_is_an_error_not_an_assumption():
-    frame = cross().drop("shortable")
-    with pytest.raises(ValueError, match="shortable"):
+    frame = cross().drop("perp_listed")
+    with pytest.raises(ValueError, match="perp_listed"):
         signal.get("gc_long_short").generate(frame, config=config())
 
 
@@ -293,7 +298,7 @@ def test_a_borrow_at_any_venue_is_a_borrow(tmp_path: Path):
     assert borrow.listings(root=tmp_path)["AAA"] == date(2021, 6, 6)
 
 
-# --- the shortable feature --------------------------------------------------
+# --- the perp_listed feature --------------------------------------------------
 
 
 def _bars(assets: list[str], n: int = 200) -> pl.DataFrame:
@@ -321,24 +326,24 @@ def test_shortable_is_false_before_the_listing_and_true_after():
     frame = features.build(
         _bars(["AAA"]),
         benchmark=None,
-        shortable_from={"AAA": date(2020, 3, 1)},
+        perp_listed_from={"AAA": date(2020, 3, 1)},
     )
     before = frame.filter(pl.col("ts_utc") < datetime(2020, 3, 1, tzinfo=timezone.utc))
     after = frame.filter(pl.col("ts_utc") >= datetime(2020, 3, 1, tzinfo=timezone.utc))
-    assert not before["shortable"].any()
-    assert after["shortable"].all()
+    assert not before["perp_listed"].any()
+    assert after["perp_listed"].all()
 
 
 def test_an_asset_absent_from_the_borrow_table_is_never_shortable():
     frame = features.build(
-        _bars(["AAA", "BBB"]), benchmark=None, shortable_from={"AAA": date(2020, 1, 1)}
+        _bars(["AAA", "BBB"]), benchmark=None, perp_listed_from={"AAA": date(2020, 1, 1)}
     )
-    assert not frame.filter(pl.col("asset") == "BBB")["shortable"].any()
+    assert not frame.filter(pl.col("asset") == "BBB")["perp_listed"].any()
 
 
 def test_no_borrow_table_means_nothing_is_shortable():
     frame = features.build(_bars(["AAA"]), benchmark=None)
-    assert not frame["shortable"].any()
+    assert not frame["perp_listed"].any()
 
 
 def test_shortable_is_causal():
@@ -347,11 +352,11 @@ def test_shortable_is_causal():
     # in the table" rather than from a date would fail this.
     bars = _bars(["AAA"])
     table = {"AAA": date(2020, 3, 1)}
-    full = features.build(bars, benchmark=None, shortable_from=table)
+    full = features.build(bars, benchmark=None, perp_listed_from=table)
     cutoff = datetime(2020, 4, 1, tzinfo=timezone.utc)
     prefix = features.build(
-        bars.filter(pl.col("ts_utc") <= cutoff), benchmark=None, shortable_from=table
+        bars.filter(pl.col("ts_utc") <= cutoff), benchmark=None, perp_listed_from=table
     )
-    left = full.filter(pl.col("ts_utc") <= cutoff).sort(["asset", "ts_utc"])["shortable"]
-    right = prefix.sort(["asset", "ts_utc"])["shortable"]
+    left = full.filter(pl.col("ts_utc") <= cutoff).sort(["asset", "ts_utc"])["perp_listed"]
+    right = prefix.sort(["asset", "ts_utc"])["perp_listed"]
     assert left.to_list() == right.to_list()

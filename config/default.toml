@@ -141,8 +141,21 @@ l2 = ["ARB", "OP", "MATIC", "STRK"]
 defi = ["UNI", "AAVE", "LINK", "MKR", "CRV"]
 
 [costs]
-# Taker fee, roughly the level both candidate venues charge.
-commission_bps = "5.0"
+# Hyperliquid perpetual TAKER fee at the base tier, which is where this account
+# sits and will stay: the first volume tier needs roughly $5M of 14-day volume,
+# and a $30k book at this turnover generates about $86k of 30-day volume. Reaching
+# tier 1 would take a balance near $3.7M, so the tier programme is not a lever
+# here and the base rate is the only number that matters.
+#
+# The venue was chosen for self-custody rather than for price. On fees OKX and
+# Hyperliquid are within ~10bp of each other over the whole backtest, which is
+# not a difference worth trading custody for in either direction.
+#
+# MAKER fills are 1.5bps and worth about +110pp of return over the run - a far
+# larger lever than the venue choice. This stays at the taker rate because
+# passive fills are an execution capability the system does not have yet, and
+# assuming them would price in work that has not been done.
+commission_bps = "4.5"
 # Half-spread crossed on entry. A placeholder for liquid majors; per-asset
 # estimation from real quotes is Phase 1.
 spread_bps = "2.0"

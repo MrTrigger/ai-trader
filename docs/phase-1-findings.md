@@ -1015,3 +1015,82 @@ week while the regime read "flat", so no tilt protected it.
 the store. The research page shows the current state only; this document is the
 log. Retracted along the way: +6884%, the p=0.040 null, "the edge is decaying",
 min-Sharpe 2.05, and "beats buy-and-hold" as an unqualified claim.
+
+---
+
+# Venue: Hyperliquid, and what that changes
+
+Chosen for **self-custody**, not for price. On fees the two candidates are within
+about 10pp of each other across the whole backtest, which is not a margin worth
+trading custody against in either direction.
+
+## Fee tiers do not apply and will not start applying
+
+Tiers are thresholds on rolling traded volume, and traded volume is just NAV
+times turnover, so the balance required to reach one is arithmetic:
+
+| tier | window | threshold | NAV required |
+|---|---|---|---|
+| OKX VIP 1 | 30d | $5M | ~$1.75M |
+| OKX VIP 2 | 30d | $10M | ~$3.49M |
+| Hyperliquid tier 1 | 14d | $5M | ~$3.74M |
+
+A $30k book at this turnover generates **$86k** of 30-day volume. Raising the
+balance to $100k, $250k or even $1M leaves it in the base band on both venues, so
+the tier programme is not a lever at any size currently contemplated.
+
+## What the venue decision actually changed
+
+Hyperliquid is perps-first, so **both legs are now perpetual futures**. Three
+consequences, and the second is a genuine behaviour change rather than a
+re-pricing:
+
+1. **Fees fall on the long leg.** A perp long pays the perp taker rate rather
+   than the materially higher spot one.
+2. **Funding is now paid on the long leg**, not only received on the short. Over
+   the run that cuts funding from +15.6% to +7.6% — and the fee saving more than
+   covers it, so the perps-both structure is better despite losing the income.
+3. **The listing table gates the whole universe.** An asset with no perp cannot
+   be held in either direction, where previously it was merely unshortable. The
+   `shortable` column is renamed `perp_listed`, because a name that gates longs
+   while calling itself "shortable" is the kind of thing that causes a bug rather
+   than merely reading oddly.
+
+| structure | long | short | return | Sharpe |
+|---|---|---|---|---|
+| OKX spot long / perp short | 12bps | 7bps | 710.3% | 1.27 |
+| OKX perp / perp | 7bps | 7bps | 780.1% | 1.36 |
+| **HL perp / perp (shipped)** | **6.5bps** | **6.5bps** | **790.1%** | **1.36** |
+| HL perp / perp, maker fills | 1.5bps | 1.5bps | 896.9% | 1.43 |
+
+## The ranking of what matters, which is not what the question implied
+
+1. **Maker versus taker fills — about +110pp.** Far the largest lever, and the
+   only one worth engineering for. Config stays at the taker rate because passive
+   fills are an execution capability the system does not have, and assuming them
+   would price in work that has not been done.
+2. **Perps on both legs versus a spot long — about +70pp.**
+3. **OKX versus Hyperliquid — about +10pp.** Effectively a tie.
+4. **Fee tier — zero, at any plausible balance.**
+
+## Fee sensitivity, and why the cadence question turns on it
+
+Cost enters linearly in turnover, so the recorded ledger can be re-priced exactly
+at any rate. Break-even — the all-in rate at which the entire edge is consumed —
+is **98bps weekly** against an assumed 7. A 14× margin, so the weekly book is
+insensitive to getting fees wrong.
+
+The daily cadence is not: break-even **35bps**, and at zero cost daily *beats*
+weekly (1200.8% against 918.8%). Daily has more raw signal and is destroyed
+purely by its 3.1× turnover. The crossover is around **5bps all-in**, which means
+the cadence choice is really a fee question, and one worth revisiting if maker
+fills become available.
+
+## Outstanding data gap
+
+**Funding and listing dates are Binance USD-M, not Hyperliquid.** Every funding
+figure above is an estimate taken from the wrong venue. Rates are correlated
+across venues but not identical, and listing dates differ, so a Hyperliquid pull
+should replace this before the numbers are trusted. The fee rates were read from
+published schedules rather than the venue API and should be confirmed the same
+way.
