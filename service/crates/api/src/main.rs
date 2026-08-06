@@ -42,6 +42,7 @@
 //! because a flag is a thing that gets set.
 
 mod control;
+mod fleet;
 mod page;
 mod state;
 
@@ -227,6 +228,31 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             page::HTML.as_bytes(),
             method == "HEAD",
         ),
+        ("GET", "/api/bots") => match fleet::list(&std::env::current_dir().unwrap_or_default()) {
+            Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+            Err(e) => json(&mut stream, 200,
+                &serde_json::to_vec(&serde_json::json!({"available": false, "reason": e})).unwrap()),
+        },
+        ("POST", r) if r.starts_with("/api/bots/") && (r.ends_with("/halt") || r.ends_with("/resume")) => {
+            let halt = r.ends_with("/halt");
+            let id = r.trim_start_matches("/api/bots/")
+                .trim_end_matches("/halt")
+                .trim_end_matches("/resume")
+                .to_string();
+            let mut body = vec![0u8; content_length.min(64 * 1024)];
+            reader.read_exact(&mut body).ok();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+            let by = v.get("by").and_then(|s| s.as_str()).unwrap_or("");
+            if reason.is_empty() || by.is_empty() {
+                json_error(&mut stream, 400, "body must carry non-empty reason and by")
+            } else {
+                match fleet::set_halt(&std::env::current_dir().unwrap_or_default(), &id, halt, reason, by) {
+                    Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+                    Err(e) => json_error(&mut stream, 400, &e),
+                }
+            }
+        }
         ("GET", "/api/state") => match snapshot(cfg) {
             Ok(s) => json(&mut stream, 200, &serde_json::to_vec(&s).unwrap()),
             Err(e) => json_error(&mut stream, 500, &e),

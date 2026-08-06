@@ -328,6 +328,74 @@
 
 <div id="banner"></div>
 
+<!-- The fleet: every registered bot (identity registry), live status,
+     narrow controls. This process's own book views below remain the deep
+     dashboard for the bot it wraps; the fleet is the one place ALL bots
+     appear (multi-bot migration). -->
+<section class="card" style="margin:10px 14px 0">
+  <header style="display:flex;align-items:center;gap:8px;padding:8px 12px">
+    <span class="t" style="font-weight:600">Fleet</span>
+    <span class="sub" id="fleethint" style="margin-left:auto"></span>
+  </header>
+  <div class="pad" id="fleet" style="display:flex;flex-wrap:wrap;gap:10px"></div>
+</section>
+
+<script>
+async function refreshFleet() {
+  try {
+    const r = await fetch('/api/bots');
+    const d = await r.json();
+    const el = document.getElementById('fleet');
+    const hint = document.getElementById('fleethint');
+    if (!d.available) { hint.textContent = d.reason || 'registry unavailable'; return; }
+    hint.textContent = d.bots.length + ' registered';
+    el.innerHTML = '';
+    for (const b of d.bots) {
+      const s = b.status || {};
+      const halted = s.halted || (s.kill_switch === true ? 'kill switch' : null);
+      const hb = s.heartbeat_age_seconds;
+      const stale = hb != null && hb > 300;
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:10px 12px;min-width:240px;flex:1';
+      card.innerHTML =
+        '<div style="display:flex;gap:8px;align-items:center">'
+        + '<strong>' + b.bot_id + '</strong>'
+        + '<span class="pill" style="margin-left:auto">' + b.asset_class + '</span>'
+        + '<span class="pill">' + (b.enabled ? 'enabled' : 'disabled') + '</span></div>'
+        + '<div class="dim" style="font-size:11.5px;margin-top:2px">' + b.display_name + ' · ' + b.cadence + '</div>'
+        + '<div style="margin-top:6px;font-size:12.5px">'
+        + (halted ? '<span style="color:var(--bad,#e66)">HALTED (' + halted + ')</span>'
+                  : '<span>' + (s.mode || s.last_run?.outcome || 'idle') + '</span>')
+        + (s.net_total != null ? ' · net $' + Number(s.net_total).toLocaleString() : '')
+        + (hb != null ? ' · hb ' + hb + 's' + (stale ? ' ⚠' : '') : '')
+        + (s.last_run ? ' · last run ' + (s.last_run.recorded_at || '') : '')
+        + '</div>';
+      if (s.contract === 'botstate') {
+        const btn = document.createElement('button');
+        btn.textContent = halted ? 'resume' : 'halt';
+        btn.style.cssText = 'margin-top:8px';
+        btn.onclick = async () => {
+          const reason = prompt((halted ? 'Resume' : 'Halt') + ' ' + b.bot_id + ' — reason:');
+          if (!reason) return;
+          const by = prompt('Your name:');
+          if (!by) return;
+          await fetch('/api/bots/' + b.bot_id + '/' + (halted ? 'resume' : 'halt'), {
+            method: 'POST', body: JSON.stringify({ reason, by }),
+          });
+          refreshFleet();
+        };
+        card.appendChild(btn);
+      }
+      el.appendChild(card);
+    }
+  } catch (e) {
+    document.getElementById('fleethint').textContent = 'fleet fetch failed: ' + e;
+  }
+}
+refreshFleet();
+setInterval(refreshFleet, 15000);
+</script>
+
 <div class="shell">
   <!-- left rail: what is running, and against what account -->
   <div class="col">
