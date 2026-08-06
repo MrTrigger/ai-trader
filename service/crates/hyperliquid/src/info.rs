@@ -264,6 +264,17 @@ impl Info {
         Ok(out)
     }
 
+    /// Agent wallets the account has approved, and when each stops working.
+    ///
+    /// Worth asking before trading rather than after: an unapproved or expired
+    /// agent produces signatures the venue rejects without saying whose
+    /// signature it disbelieved, and Hyperliquid ages agents out on a timer, so
+    /// a setup that worked last quarter can stop without anything changing.
+    pub async fn agents(&self, user: &str) -> Result<Vec<ApprovedAgent>, VenueError> {
+        self.post(serde_json::json!({"type": "extraAgents", "user": user}))
+            .await
+    }
+
     /// Hourly bars, for a feed that wants candles rather than ticks.
     pub async fn candles(
         &self,
@@ -445,6 +456,26 @@ pub struct Candle {
     pub c: String,
     pub v: String,
     pub n: u64,
+}
+
+/// One agent wallet the account has approved.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovedAgent {
+    pub name: String,
+    pub address: String,
+    /// Milliseconds since the epoch.
+    #[serde(rename = "validUntil")]
+    pub valid_until: i64,
+}
+
+impl ApprovedAgent {
+    pub fn expires_at(&self) -> Option<OffsetDateTime> {
+        OffsetDateTime::from_unix_timestamp_nanos((self.valid_until as i128) * 1_000_000).ok()
+    }
+
+    pub fn days_left(&self, now: OffsetDateTime) -> Option<i64> {
+        self.expires_at().map(|e| (e - now).whole_days())
+    }
 }
 
 #[derive(Debug, Deserialize)]

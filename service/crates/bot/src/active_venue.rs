@@ -185,6 +185,13 @@ pub struct Env {
     pub account: Option<String>,
     pub vault: Option<String>,
     pub agent_key: Option<String>,
+    /// What the agent is called in the Hyperliquid UI. Cosmetic, and worth
+    /// having: agents expire, and "which of these three is the bot using" is
+    /// otherwise unanswerable.
+    pub agent_name: Option<String>,
+    /// The agent address the UI showed. Optional, and checked against the one
+    /// the key derives — see [`Env::agent_mismatch`].
+    pub agent_address: Option<String>,
     pub allow_live: bool,
 }
 
@@ -200,8 +207,39 @@ impl Env {
             account: get("HL_ACCOUNT_ADDRESS"),
             vault: get("HL_VAULT_ADDRESS"),
             agent_key: get("HL_AGENT_PRIVATE_KEY"),
+            agent_name: get("HL_AGENT_NAME"),
+            agent_address: get("HL_AGENT_ADDRESS"),
             allow_live: get("HL_ALLOW_LIVE").as_deref() == Some("yes"),
         }
+    }
+
+    /// The address the configured key actually signs as.
+    pub fn derived_agent(&self) -> Option<String> {
+        self.agent_key
+            .as_deref()
+            .and_then(|k| hyperliquid::Agent::from_hex(k).ok())
+            .map(|a| a.address().to_string())
+    }
+
+    /// A complaint if the declared agent address and the key disagree.
+    ///
+    /// This is the check the address is here for. A key with a character
+    /// dropped still parses, still signs, and produces signatures for a
+    /// different wallet entirely — one the account never approved. The venue
+    /// rejects those without saying whose signature it disbelieved, so the
+    /// mismatch has to be caught here or not at all.
+    pub fn agent_mismatch(&self) -> Option<String> {
+        let declared = self.agent_address.as_deref()?.trim().to_lowercase();
+        let derived = self.derived_agent()?.to_lowercase();
+        if declared == derived {
+            return None;
+        }
+        Some(format!(
+            "HL_AGENT_ADDRESS says {declared} but HL_AGENT_PRIVATE_KEY signs as {derived}. One \
+             of the two was pasted wrong. A key with a character missing still signs - it just \
+             signs as a wallet your account never approved, and the venue rejects that without \
+             saying whose signature it disbelieved."
+        ))
     }
 
     fn base(&self) -> &str {
@@ -282,6 +320,10 @@ pub fn open(
                  to know whose book to read."
                         .to_string()
                 })?;
+
+            if let Some(problem) = env.agent_mismatch() {
+                return Err(problem);
+            }
 
             let hl = if mode == Mode::Live {
                 let key = env.agent_key.as_deref().ok_or_else(|| {
@@ -407,6 +449,61 @@ mod tests {
         load_dotenv(&f);
         assert_eq!(std::env::var("AI_TRADER_TEST_A").unwrap(), "from_shell");
         assert_eq!(std::env::var("AI_TRADER_TEST_B").unwrap(), "from_file");
+    }
+
+    const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+    const KEY_ADDRESS: &str = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23";
+
+    #[test]
+    fn a_declared_agent_that_matches_the_key_is_silent() {
+        let env = Env {
+            agent_key: Some(KEY.into()),
+            agent_address: Some(KEY_ADDRESS.to_uppercase()),
+            ..Default::default()
+        };
+        // Case must not matter: the UI shows a checksummed address and people
+        // paste it as they see it.
+        assert_eq!(env.agent_mismatch(), None);
+        assert_eq!(env.derived_agent().as_deref(), Some(KEY_ADDRESS));
+    }
+
+    #[test]
+    fn a_key_that_signs_as_someone_else_is_caught_before_anything_is_sent() {
+        // The failure this exists for: a key with a character dropped still
+        // parses and still signs - as a wallet the account never approved.
+        let env = Env {
+            agent_key: Some(KEY.into()),
+            agent_address: Some("0xdeadbeef00000000000000000000000000000000".into()),
+            ..Default::default()
+        };
+        let m = env.agent_mismatch().expect("mismatch must be reported");
+        assert!(
+            m.contains(KEY_ADDRESS),
+            "names what the key actually signs as: {m}"
+        );
+        assert!(m.contains("deadbeef"), "and what was declared: {m}");
+    }
+
+    #[test]
+    fn a_mismatch_stops_a_live_venue_from_opening_at_all() {
+        let env = Env {
+            account: Some("0x1111111111111111111111111111111111111111".into()),
+            agent_key: Some(KEY.into()),
+            agent_address: Some("0xdeadbeef00000000000000000000000000000000".into()),
+            api_url: Some(hyperliquid::TESTNET.into()),
+            ..Default::default()
+        };
+        let e = open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        assert!(e.contains("pasted wrong"), "{e}");
+    }
+
+    #[test]
+    fn declaring_nothing_is_fine_because_the_address_is_optional() {
+        let env = Env {
+            agent_key: Some(KEY.into()),
+            ..Default::default()
+        };
+        assert_eq!(env.agent_mismatch(), None);
     }
 
     fn dummy_prices() -> Arc<dyn PriceSource> {

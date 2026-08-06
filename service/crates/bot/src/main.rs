@@ -531,6 +531,50 @@ async fn cmd_mode_show(cfg: &BotConfig) -> Result<(), String> {
                 Ok(a) => a.address().to_string(),
                 Err(e) => format!("unusable: {e}"),
             });
+    // Ask the venue whether it will actually accept this agent. An unapproved
+    // or expired one signs perfectly well and is rejected without explanation,
+    // so the answer belongs here rather than in a failed order.
+    let approval = match (&configured_agent, &env.account) {
+        (Some(agent), Some(account)) if !agent.starts_with("unusable") => {
+            let info =
+                hyperliquid::Info::new(env.api_url.as_deref().unwrap_or(hyperliquid::MAINNET))
+                    .map_err(|e| e.to_string())?;
+            match info.agents(account).await {
+                Ok(list) => {
+                    let now = time::OffsetDateTime::now_utc();
+                    match list.iter().find(|a| a.address.eq_ignore_ascii_case(agent)) {
+                        Some(a) => serde_json::json!({
+                            "approved": true,
+                            "name": a.name,
+                            "days_left": a.days_left(now),
+                            "expires": a.expires_at().map(|e| e
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_default()),
+                        }),
+                        None => serde_json::json!({
+                            "approved": false,
+                            "detail": format!(
+                                "the account has not approved {agent}. Generating an API wallet \
+                                 is not enough - the approval is a separate signed action in the \
+                                 Hyperliquid UI. Approved right now: {}.",
+                                if list.is_empty() {
+                                    "nothing".to_string()
+                                } else {
+                                    list.iter()
+                                        .map(|a| format!("{} ({})", a.name, a.address))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                            ),
+                        }),
+                    }
+                }
+                Err(e) => serde_json::json!({"approved": null, "detail": e.to_string()}),
+            }
+        }
+        _ => serde_json::Value::Null,
+    };
+
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -539,6 +583,9 @@ async fn cmd_mode_show(cfg: &BotConfig) -> Result<(), String> {
             "venue": venue.describe(),
             "agent_address": venue.agent_address(),
             "configured_agent": configured_agent,
+            "agent_name": env.agent_name,
+            "agent_declared": env.agent_address,
+            "agent_approval": approval,
             "moves_real_money": cfg.mode.moves_real_money(),
         }))
         .unwrap()
