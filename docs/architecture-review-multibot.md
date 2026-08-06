@@ -182,6 +182,22 @@ protobuf wire, actively maintained; also `yatws`). The IB venue adapter
 is therefore planned as a Rust `VenueAdapter` behind `open_live("ib")`,
 removing Python from the money path entirely; ib_async remains only
 until that adapter lands and passes the arming/reconcile checks.
+
+*Exception (1) is ALSO retired for the futures bot* (operator, same day:
+"migrate the futures bot to rust as well" + "you must implement all
+features in rust so there is no parity creep between training and
+runtime" + "a common features crate" + per-instrument-type scoping +
+per-model feature selection). Landed: `features-cme` (CME session
+framing + the feature CATALOG — stable names, models declare their
+subset, training exports and runtime inference resolve through the same
+accessors), `noise-book` (the four-sleeve decision core), `futures-bot`
+(replay/features binary, records-DB publishing). The Rust port
+reproduces the committed parity fixture exactly — fill counts and net
+dollars per sleeve on two independent windows. Python's remaining roles:
+the research lab (reference implementation + fixture regeneration) and,
+at most, training orchestration over Rust-computed features. Still open
+for the futures bot: the rust-ibapi venue adapter, the live bar loop,
+and runtime snapshot/recovery in the Rust binary.
 5. **One control plane.** Single `api` over the records DB; bot registry
    page; per-bot dashboard rendered from the bot's declared metadata (not
    a parameter allowlist); global + per-bot halt. Then, per README's own

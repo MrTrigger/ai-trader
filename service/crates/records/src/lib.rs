@@ -343,6 +343,16 @@ impl Registry {
         Ok(())
     }
 
+    /// A fresh (non-resume) replay owns its history: the strategy that
+    /// produced the old rows may no longer be the strategy running.
+    pub async fn clear_fills(&self, bot_id: &str) -> Result<(), RecordsError> {
+        sqlx::query("DELETE FROM fills WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Most recent first, as JSON text per row.
     pub async fn recent_fills(
         &self,
@@ -617,6 +627,40 @@ pub mod blocking {
             payload_json: &str,
         ) -> Result<(), RecordsError> {
             self.wait(self.inner.put_status(bot_id, heartbeat_at, payload_json))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_fill(
+            &self,
+            bot_id: &str,
+            fill_key: &str,
+            at: &str,
+            instrument: Option<&str>,
+            sleeve: Option<&str>,
+            side: Option<&str>,
+            qty: Option<&str>,
+            price: Option<&str>,
+            pnl: Option<&str>,
+            reason: Option<&str>,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.record_fill(
+                bot_id, fill_key, at, instrument, sleeve, side, qty, price, pnl, reason,
+                payload_json,
+            ))
+        }
+
+        pub fn clear_fills(&self, bot_id: &str) -> Result<(), RecordsError> {
+            self.wait(self.inner.clear_fills(bot_id))
+        }
+
+        pub fn put_snapshot(
+            &self,
+            bot_id: &str,
+            taken_at: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.put_snapshot(bot_id, taken_at, payload_json))
         }
 
         pub fn get_status(&self, bot_id: &str) -> Result<Option<StatusRow>, RecordsError> {

@@ -1,5 +1,18 @@
 # futures-noise — the NQ four-sleeve book as an ai-trader bot
 
+**Rust end to end** (operator mandate 2026-08-06): the decision core is
+`service/crates/noise-book` (scanner machines, trail management, session
+runtime, kill rail) on `service/crates/features-cme` (session framing +
+the bar-feature catalog — the ONE implementation both training and the
+runtime link; models select features by catalog name). The binary is
+`service/crates/futures-bot` (`replay`, `features`, live IB via
+rust-ibapi next). Acceptance gate: `./run.sh parity` must reproduce the
+committed `parity-fixture.json` — fill counts and net dollars per sleeve,
+exactly. The Python implementation in trading-journal remains the lab's
+reference (it regenerates the fixture after an INTENDED strategy change
+via `./run.sh parity-py`); it no longer runs in production.
+
+
 Bot #2 (docs/futures-bot-proposal.md). The DECISION CORE does not live in
 this repo: it is the parity-proven engine in `trading-journal/backtest`
 (scanners, position management, feeds, runtime), consumed as a path

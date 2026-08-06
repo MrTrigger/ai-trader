@@ -1,0 +1,13 @@
+[package]
+name = "futures-bot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+features-cme = { workspace = true }
+noise-book = { workspace = true }
+records = { path = "../records" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
