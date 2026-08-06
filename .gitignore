@@ -8,6 +8,12 @@
 /planner/src/**/*.egg-info/
 /service/target/
 
+# Operational state: controls, run history, the order ledger, the paper venue's
+# books. Live and machine-local by definition - the code that produces it is the
+# asset, and committing a snapshot of a running account would be a mistake in
+# both directions.
+/var/
+
 .env
 *.log
 

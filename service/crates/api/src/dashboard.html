@@ -5,402 +5,482 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ai-trader — operations</title>
 <style>
+  /* A command centre, not a document: dark ground, cards that float a little
+     off it, one bright accent reserved for money going the right way, and every
+     number in a mono face so columns line up and a digit changing is visible in
+     peripheral vision. */
   :root {
-    --bg: #f5f7f6;
-    --surface: #ffffff;
-    --surface-2: #eef1f0;
-    --ink: #131819;
-    --ink-2: #4a595c;
-    --ink-3: #7d8c8f;
-    --line: #dce3e2;
-    --accent: #14705f;
-    --good: #2c7a4b;
-    --warn: #9a6512;
-    --bad: #a83a2b;
+    --bg: #08090b;
+    --panel: #101216;
+    --panel-2: #15181d;
+    --line: #1f232a;
+    --line-2: #2a2f38;
+    --ink: #e6e8ec;
+    --ink-2: #9aa1ac;
+    --ink-3: #646b77;
+    --up: #4ade80;
+    --down: #f87171;
+    --warn: #fbbf24;
+    --info: #818cf8;
+    --accent: #34d399;
+    /* Chart and basket categories, in fixed order. Never cycled: a ninth asset
+       folds into "other" rather than reusing the first hue, or two rows would
+       claim the same colour. */
+    --c1: #818cf8; --c2: #34d399; --c3: #4ade80; --c4: #a78bfa;
+    --c5: #fbbf24; --c6: #60a5fa; --c7: #fb7185; --c8: #2dd4bf;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --radius: 3px;
+    --r: 10px;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0d1113;
-      --surface: #141a1c;
-      --surface-2: #1b2325;
-      --ink: #e4ebe9;
-      --ink-2: #a3b1b3;
-      --ink-3: #74858a;
-      --line: #232d30;
-      --accent: #3fae95;
-      --good: #4fae74;
-      --warn: #d09a3c;
-      --bad: #d9705e;
-    }
-  }
-  :root[data-theme="dark"] {
-    --bg: #0d1113; --surface: #141a1c; --surface-2: #1b2325;
-    --ink: #e4ebe9; --ink-2: #a3b1b3; --ink-3: #74858a; --line: #232d30;
-    --accent: #3fae95; --good: #4fae74; --warn: #d09a3c; --bad: #d9705e;
-  }
-  :root[data-theme="light"] {
-    --bg: #f5f7f6; --surface: #ffffff; --surface-2: #eef1f0;
-    --ink: #131819; --ink-2: #4a595c; --ink-3: #7d8c8f; --line: #dce3e2;
-    --accent: #14705f; --good: #2c7a4b; --warn: #9a6512; --bad: #a83a2b;
-  }
+  /* The reference is a single committed dark world, so this deliberately does
+     not flip. A light "trading floor at 2am" would be a different design, not a
+     recoloured one. */
 
   * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
   body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 14px;
-    line-height: 1.45;
-    -webkit-font-smoothing: antialiased;
+    margin: 0; color: var(--ink); font-family: var(--sans);
+    font-size: 13.5px; line-height: 1.45; -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px 20px 64px; }
+  ::selection { background: rgba(52,211,153,.25); }
 
-  /* --- header --------------------------------------------------------- */
-  header {
-    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 18px;
-    padding-bottom: 14px; border-bottom: 1px solid var(--line); margin-bottom: 20px;
+  /* --- chrome ---------------------------------------------------------- */
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 18px; border-bottom: 1px solid var(--line);
+    background: var(--bg); position: sticky; top: 0; z-index: 5;
   }
-  h1 {
-    font-size: 15px; font-weight: 620; margin: 0; letter-spacing: .01em;
+  .mark {
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    background: var(--panel-2); border: 1px solid var(--line-2);
+    border-radius: 5px; padding: 2px 6px; color: var(--ink-2);
   }
-  h1 span { color: var(--ink-3); font-weight: 400; }
-  .grow { flex: 1 1 auto; }
-  .meta { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+  .topbar .caption { color: var(--ink-2); font-size: 13px; }
+  .topbar .grow { flex: 1 1 auto; }
+  .topbar .meta { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
 
-  .lamp {
-    display: inline-flex; align-items: center; gap: 7px;
-    font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em;
-    text-transform: uppercase; padding: 3px 9px; border-radius: 999px;
-    border: 1px solid var(--line); background: var(--surface);
+  .shell {
+    display: grid; gap: 14px; padding: 14px 18px 56px;
+    grid-template-columns: 1fr;
+    align-items: start;
   }
-  .lamp::before {
-    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3);
+  @media (min-width: 1180px) {
+    .shell { grid-template-columns: 250px minmax(0, 1fr) 320px; }
   }
-  .lamp.running::before { background: var(--good); }
-  .lamp.paused::before  { background: var(--warn); }
-  .lamp.halted::before  { background: var(--bad); }
-  .lamp.running { color: var(--good); }
-  .lamp.paused  { color: var(--warn); }
-  .lamp.halted  { color: var(--bad); }
+  .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
-  /* --- panels --------------------------------------------------------- */
-  .panel {
-    background: var(--surface); border: 1px solid var(--line);
-    border-radius: var(--radius); margin-bottom: 16px;
+  /* --- cards ----------------------------------------------------------- */
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--r); min-width: 0;
   }
-  .panel > h2 {
-    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
-    color: var(--ink-3); font-weight: 600; margin: 0;
-    padding: 11px 14px; border-bottom: 1px solid var(--line);
+  .card > header {
     display: flex; align-items: baseline; gap: 10px;
-    /* The label is two or three words and must never wrap; the hint beside it
-       is a sentence and always may. */
-    white-space: nowrap;
+    padding: 12px 14px 0;
   }
-  .panel > h2 .hint {
-    letter-spacing: 0; text-transform: none; font-weight: 400; font-size: 11.5px;
-    white-space: normal;
+  .card > header .t {
+    font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; white-space: nowrap;
   }
-  /* The health and expectation tables live in a .body rather than a .scroll
-     wrapper; below about 420px they are what pushes the page sideways. Wide
-     content scrolls inside its own panel, never by moving the page. */
-  .panel .body { padding: 14px; overflow-x: auto; }
-  .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
-  @media (min-width: 1000px) { .cols { grid-template-columns: 1.35fr 1fr; } }
-  /* Grid items default to min-width:auto, so one wide child - here the <pre>
-     holding the CLI commands - sizes the whole track to its longest line and
-     pushes the page sideways. This is the fix, and it has to be on the items
-     rather than the container. */
-  .cols > *, .panel { min-width: 0; }
+  .card > header .sub { font-size: 11.5px; color: var(--ink-3); }
+  .card > header .act {
+    margin-left: auto; font-size: 12px; color: var(--info);
+    background: none; border: 0; padding: 0; cursor: pointer;
+  }
+  .card .pad { padding: 12px 14px 14px; overflow-x: auto; }
+  .card .pad.tight { padding: 10px 14px 12px; }
 
-  /* --- tiles ---------------------------------------------------------- */
-  .tiles {
-    display: grid; gap: 1px; background: var(--line);
-    border: 1px solid var(--line); border-radius: var(--radius);
-    grid-template-columns: repeat(2, 1fr); margin-bottom: 16px; overflow: hidden;
+  /* --- status ---------------------------------------------------------- */
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); display: inline-block; }
+  .dot.running { background: var(--up); box-shadow: 0 0 0 3px rgba(74,222,128,.12); }
+  .dot.paused  { background: var(--warn); box-shadow: 0 0 0 3px rgba(251,191,36,.12); }
+  .dot.halted  { background: var(--down); box-shadow: 0 0 0 3px rgba(248,113,113,.12); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em;
+    text-transform: uppercase; padding: 3px 8px; border-radius: 5px;
+    border: 1px solid var(--line-2); color: var(--ink-2); background: var(--panel-2);
   }
-  @media (min-width: 720px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
-  @media (min-width: 1000px) { .tiles { grid-template-columns: repeat(6, 1fr); } }
-  .tile { background: var(--surface); padding: 12px 14px; }
-  .tile .k {
-    font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+  .pill.running { color: var(--up); border-color: rgba(74,222,128,.3); }
+  .pill.paused  { color: var(--warn); border-color: rgba(251,191,36,.3); }
+  .pill.halted  { color: var(--down); border-color: rgba(248,113,113,.3); }
+
+  /* --- hero ------------------------------------------------------------ */
+  .hero { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 18px 26px; padding: 16px 16px 14px; }
+  .hero .label {
+    font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
     color: var(--ink-3); font-weight: 600;
   }
-  .tile .v {
-    font-family: var(--mono); font-size: 19px; font-variant-numeric: tabular-nums;
-    margin-top: 4px; letter-spacing: -.01em;
+  .hero .amount {
+    font-family: var(--mono); font-size: 34px; font-weight: 500;
+    letter-spacing: -.02em; line-height: 1.1; margin-top: 4px;
+    font-variant-numeric: tabular-nums;
   }
-  .tile .s { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
-  .pos { color: var(--good); } .neg { color: var(--bad); }
+  .hero .amount .cents { font-size: 22px; color: var(--ink-3); }
+  .hero .delta { font-family: var(--mono); font-size: 13px; margin-top: 6px; }
+  .hero .stats { margin-left: auto; display: flex; gap: 26px; }
+  .hero .stats div { text-align: right; }
+  .hero .stats .k {
+    font-size: 10.5px; color: var(--ink-3); letter-spacing: .06em;
+    text-transform: none;
+  }
+  .hero .stats .v {
+    font-family: var(--mono); font-size: 17px; font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+  }
+  .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--ink-2); }
+  .warn-t { color: var(--warn); }
 
-  /* --- tables --------------------------------------------------------- */
+  /* --- chart ----------------------------------------------------------- */
+  .chart { position: relative; padding: 4px 6px 0; }
+  .chart svg { display: block; width: 100%; }
+  .gridline { stroke: var(--line); stroke-width: 1; }
+  .navline { fill: none; stroke: var(--up); stroke-width: 1.75; stroke-linejoin: round; }
+  .navend { fill: var(--up); }
+  .axis { fill: var(--ink-3); font-family: var(--mono); font-size: 9.5px; }
+  .crosshair { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
+  .chartfoot {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 14px 12px; font-size: 11.5px; color: var(--ink-3);
+  }
+  .range { display: flex; gap: 4px; }
+  .range button {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em;
+    padding: 3px 9px; border-radius: 5px; border: 1px solid transparent;
+    background: none; color: var(--ink-3); cursor: pointer;
+  }
+  .range button.on { background: var(--panel-2); border-color: var(--line-2); color: var(--ink); }
+  .chartfoot .note { margin-left: auto; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--panel-2);
+    border: 1px solid var(--line-2); border-radius: 6px; padding: 5px 8px;
+    font-family: var(--mono); font-size: 11px; white-space: nowrap;
+  }
+
+  /* --- basket ---------------------------------------------------------- */
+  .stack { display: flex; gap: 2px; height: 9px; margin: 10px 0 12px; }
+  .stack i { border-radius: 2px; min-width: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chipx {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-2);
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 9px;
+  }
+  .chipx i { width: 7px; height: 7px; border-radius: 2px; }
+
+  /* --- tables ---------------------------------------------------------- */
   .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th {
-    text-align: left; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
-    color: var(--ink-3); font-weight: 600; padding: 9px 14px;
-    border-bottom: 1px solid var(--line); white-space: nowrap;
+    text-align: left; font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; padding: 8px 14px; white-space: nowrap;
+    border-bottom: 1px solid var(--line);
   }
-  td {
-    padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top;
-  }
+  td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(255,255,255,.015); }
   .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-  /* A timestamp is a label, not a quantity. Right-aligning it in a wide column
-     strands it in the middle of the table. */
-  .time { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-3); }
-  .sym { font-family: var(--mono); font-weight: 600; }
+  .time { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
+  .sym { font-family: var(--mono); font-weight: 600; letter-spacing: .01em; }
   .dim { color: var(--ink-3); }
-  .wrapcell { min-width: 260px; color: var(--ink-2); font-size: 12.5px; }
+  .wrapcell { min-width: 240px; color: var(--ink-2); font-size: 12px; }
   .ellipsis {
-    font-family: var(--mono); font-size: 12px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-3);
     max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .side-l { color: var(--up); font-family: var(--mono); font-weight: 600; }
+  .side-s { color: var(--down); font-family: var(--mono); font-weight: 600; }
 
-  .chip {
-    display: inline-block; font-family: var(--mono); font-size: 10.5px;
-    letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px;
-    border-radius: 2px; border: 1px solid var(--line); color: var(--ink-2);
+  /* Exposure drawn in the row, from a centre line: long right, short left. The
+     number is beside it, so this is for reading the shape of the book at a
+     glance rather than reading a value off. */
+  .expo { position: relative; height: 7px; width: 170px; background: var(--panel-2); border-radius: 3px; }
+  .expo::before { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; border-left: 1px solid var(--line-2); }
+  .expo i { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+  .expo i.l { left: 50%; background: var(--c1); }
+  .expo i.s { right: 50%; background: var(--c7); }
+
+  tr.out-executed  td:first-child { box-shadow: inset 2px 0 0 var(--up); }
+  tr.out-partial   td:first-child { box-shadow: inset 2px 0 0 var(--warn); }
+  tr.out-halted    td:first-child { box-shadow: inset 2px 0 0 var(--down); }
+  tr.out-refused   td:first-child { box-shadow: inset 2px 0 0 var(--ink-3); }
+  tr.out-flattened td:first-child { box-shadow: inset 2px 0 0 var(--info); }
+  tr.out-adopted   td:first-child { box-shadow: inset 2px 0 0 var(--c4); }
+
+  /* --- meters ---------------------------------------------------------- */
+  .meter { margin-bottom: 13px; }
+  .meter:last-child { margin-bottom: 0; }
+  .meter .row { display: flex; align-items: baseline; gap: 8px; }
+  .meter .name { font-size: 12.5px; color: var(--ink); }
+  .meter .val { margin-left: auto; font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .meter .val .lim { color: var(--ink-3); }
+  .meter .track { height: 5px; background: var(--panel-2); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .meter .track i { display: block; height: 100%; border-radius: 3px; background: var(--up); }
+  .meter.mid .track i { background: var(--warn); }
+  .meter.high .track i { background: var(--down); }
+  .meter .foot { font-size: 11px; color: var(--ink-3); margin-top: 5px; }
+
+  /* --- key/value ------------------------------------------------------- */
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--ink-3); }
+  .kv dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  /* Sentence-length values, so key over value and left aligned. Right-aligning
+     a wrapped sentence gives three ragged lines and no way to scan them. */
+  .stack-kv { display: flex; flex-direction: column; gap: 9px; font-size: 12.5px; }
+  .stack-kv .k { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  .stack-kv .v { color: var(--ink-2); margin-top: 2px; }
+
+  /* --- activity -------------------------------------------------------- */
+  .feed { display: flex; flex-direction: column; gap: 11px; max-height: 460px; overflow-y: auto; }
+  .feed .row { display: flex; gap: 10px; font-size: 12.5px; }
+  .feed .at { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); flex: 0 0 44px; }
+  .feed .what { color: var(--ink-2); }
+  .feed .what b { color: var(--ink); font-weight: 600; }
+  .feed .row.warn .what { color: var(--warn); }
+  .feed .row.bad .what { color: var(--down); }
+
+  /* --- controls -------------------------------------------------------- */
+  label {
+    display: block; font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; margin-bottom: 5px;
   }
-  .chip.long  { color: var(--good); border-color: currentColor; }
-  .chip.short { color: var(--bad);  border-color: currentColor; }
-  /* A fills table is a dozen rows of the same two words. Bordered chips there
-     turn into a wall of boxes that reads as texture rather than as sides, so
-     the side is carried by colour and weight alone. */
-  .side { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600; }
-  .side.buy  { color: var(--good); }
-  .side.sell { color: var(--bad); }
-
-  /* Outcome carries a stripe as well as a word, so a bad run is visible
-     before it is read. */
-  tr.out-executed  td:first-child { box-shadow: inset 3px 0 0 var(--good); }
-  tr.out-partial   td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
-  tr.out-halted    td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
-  tr.out-refused   td:first-child { box-shadow: inset 3px 0 0 var(--ink-3); }
-  tr.out-flattened td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
-
-  /* Weight, drawn from a centre line: long right, short left. The number is
-     already in the column beside it, so this exists to make the shape of the
-     book readable at a glance rather than to be read off. */
-  .weightcell .bar { margin-top: 4px; margin-left: auto; }
-  .weightcell .sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
-  .bar {
-    height: 6px; background: var(--surface-2); border-radius: 1px;
-    position: relative; width: 84px;
-  }
-  .bar::before {
-    content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px;
-    border-left: 1px solid var(--ink-3); opacity: .5;
-  }
-  .bar i { position: absolute; top: 0; bottom: 0; border-radius: 1px; }
-  .bar i.l { background: var(--good); left: 50%; }
-  .bar i.s { background: var(--bad); right: 50%; }
-
-  /* --- notes and warnings --------------------------------------------- */
-  .note {
-    font-size: 12.5px; color: var(--ink-2); padding: 10px 14px;
-    background: var(--surface-2); border-radius: var(--radius);
-  }
-  .warnings { border-color: var(--warn); }
-  .warnings > h2 { color: var(--warn); }
-  .warnings li { margin-bottom: 6px; color: var(--ink-2); font-size: 12.5px; }
-  .warnings ul { margin: 0; padding-left: 18px; }
-
-  /* --- controls ------------------------------------------------------- */
-  label { display: block; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; margin-bottom: 4px; }
   input[type=text] {
     width: 100%; padding: 7px 9px; font-family: var(--sans); font-size: 13px;
-    color: var(--ink); background: var(--bg); border: 1px solid var(--line);
-    border-radius: var(--radius);
+    color: var(--ink); background: var(--bg); border: 1px solid var(--line-2);
+    border-radius: 6px;
   }
+  input[type=text]::placeholder { color: var(--ink-3); }
   input[type=text]:focus-visible, button:focus-visible {
     outline: 2px solid var(--accent); outline-offset: 1px;
   }
-  .field { margin-bottom: 10px; }
-  /* Controls are grouped by what they do to the system, not by how dangerous
-     they look. Stopping, starting, and changing the book are three different
-     decisions and a single row of buttons makes them look like one. */
-  .ctlgroup { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 12px; }
-  .ctllabel {
-    font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
-    color: var(--ink-3); font-weight: 600; margin-bottom: 7px;
-  }
-  .ctlgroup .note { margin: 8px 0 0; }
-  .ctlgroup button[disabled] { opacity: .45; }
-  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
-  button {
+  .field { margin-bottom: 9px; }
+  .btnrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btnrow.one { grid-template-columns: 1fr; }
+  button.ctl {
     font-family: var(--sans); font-size: 13px; font-weight: 550; cursor: pointer;
-    padding: 8px 14px; border-radius: var(--radius); border: 1px solid var(--line);
-    background: var(--surface-2); color: var(--ink);
+    padding: 9px 12px; border-radius: 7px; border: 1px solid var(--line-2);
+    background: var(--panel-2); color: var(--ink);
   }
-  /* The label takes the page ground, not white. In dark mode --bad is a light
-     salmon and white-on-salmon is unreadable; the ground is dark there and
-     light here, so it stays legible against both. */
-  button.danger { background: var(--bad); border-color: var(--bad); color: var(--bg); }
-  button.go { background: var(--accent); border-color: var(--accent); color: var(--bg); }
-  button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
-  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ctl:hover:not([disabled]) { border-color: var(--ink-3); }
+  button.ctl.kill {
+    color: var(--down); border-color: rgba(248,113,113,.35); background: rgba(248,113,113,.08);
+  }
+  button.ctl.kill:hover:not([disabled]) { background: rgba(248,113,113,.14); }
+  button.ctl.go {
+    color: var(--up); border-color: rgba(74,222,128,.35); background: rgba(74,222,128,.08);
+  }
+  button.ctl.go:hover:not([disabled]) { background: rgba(74,222,128,.14); }
+  button.ctl[disabled] { opacity: .4; cursor: not-allowed; }
+  .ctlnote { font-size: 11px; color: var(--ink-3); margin: 8px 0 0; line-height: 1.5; }
+  .ctlsplit { border-top: 1px solid var(--line); margin: 12px 0 0; padding-top: 12px; }
+  .result { margin-top: 10px; font-size: 12px; }
   pre.cmd {
-    font-family: var(--mono); font-size: 12px; background: var(--bg); color: var(--ink-2);
-    border: 1px solid var(--line); border-radius: var(--radius);
-    padding: 8px 10px; margin: 6px 0 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 11px; background: var(--bg); color: var(--ink-2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+    margin: 8px 0 0; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
   }
-  .result { margin-top: 10px; font-size: 12.5px; }
 
-  /* --- chart ----------------------------------------------------------- */
-  .chart { position: relative; }
-  .chart svg { display: block; width: 100%; }
-  .grid { stroke: var(--line); stroke-width: 1; }
-  .navline { fill: none; stroke: var(--accent); stroke-width: 2; }
-  .navfill { fill: var(--accent); opacity: .1; }
-  .navend { fill: var(--accent); }
-  .axis { fill: var(--ink-3); font-family: var(--mono); font-size: 10px; }
-  .crosshair { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
-  .tip {
-    position: absolute; pointer-events: none; background: var(--surface);
-    border: 1px solid var(--line); border-radius: var(--radius);
-    padding: 5px 8px; font-family: var(--mono); font-size: 11.5px;
-    white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.14);
+  .banner {
+    border: 1px solid rgba(251,191,36,.35); background: rgba(251,191,36,.06);
+    border-radius: var(--r); padding: 12px 14px; margin-bottom: 14px;
   }
-  .empty { color: var(--ink-3); font-size: 12.5px; padding: 14px; }
+  .banner .t { font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--warn); font-weight: 600; }
+  .banner ul { margin: 8px 0 0; padding-left: 18px; }
+  .banner li { color: var(--ink-2); font-size: 12.5px; margin-bottom: 5px; }
+  .card.alarm { border-color: rgba(248,113,113,.35); }
+  .card.alarm > header .t { color: var(--down); }
+
+  .empty { color: var(--ink-3); font-size: 12.5px; padding: 12px 14px; }
+  .nowrapx { white-space: nowrap; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>ai-trader <span>/ operations</span></h1>
-    <span id="lamp" class="lamp">loading</span>
-    <span class="grow"></span>
-    <span class="meta" id="stamp"></span>
-  </header>
 
-  <div id="warnings"></div>
-  <div class="tiles" id="tiles"></div>
+<div class="topbar">
+  <span class="mark">AT</span>
+  <span class="caption">Operations — book, controls, risk and run history</span>
+  <span class="grow"></span>
+  <span class="meta" id="stamp"></span>
+</div>
 
-  <div class="cols">
-    <div>
-      <section class="panel">
-        <h2>Net asset value <span class="hint" id="navhint"></span></h2>
-        <div class="chart" id="chart"><div class="empty">no runs yet</div></div>
-      </section>
+<div id="banner"></div>
 
-      <section class="panel">
-        <h2>Positions <span class="hint" id="poshint"></span></h2>
-        <div class="scroll"><table id="positions"></table></div>
-      </section>
+<div class="shell">
+  <!-- left rail: what is running, and against what account -->
+  <div class="col">
+    <section class="card">
+      <div class="pad" style="display:flex;align-items:center;gap:10px">
+        <span class="dot" id="raildot"></span>
+        <strong style="font-size:15px">ai-trader</strong>
+        <span class="pill" id="railstate" style="margin-left:auto">—</span>
+      </div>
+    </section>
 
-      <section class="panel">
-        <h2>Balances <span class="hint" id="balhint"></span></h2>
-        <div class="scroll"><table id="balances"></table></div>
-      </section>
+    <section class="card">
+      <header><span class="t">Strategy</span></header>
+      <div class="pad tight" id="strategy"></div>
+    </section>
 
-      <section class="panel" id="openorders-panel">
-        <h2>Open orders <span class="hint">accepted by the venue, not yet filled</span></h2>
-        <div class="scroll"><table id="openorders"></table></div>
-      </section>
-
-      <section class="panel">
-        <h2>Recent fills</h2>
-        <div class="scroll"><table id="fills"></table></div>
-      </section>
-    </div>
-
-    <div>
-      <section class="panel" id="controls">
-        <h2>Controls <span class="hint" id="controlhint"></span></h2>
-        <div class="body">
-          <div class="field">
-            <label for="who">Your name</label>
-            <input type="text" id="who" placeholder="who is doing this" autocomplete="off">
-          </div>
-          <div class="field">
-            <label for="why">Reason</label>
-            <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off">
-          </div>
-
-          <div class="ctlgroup">
-            <div class="ctllabel">Stop</div>
-            <div class="btnrow">
-              <button class="danger" data-action="halt">Halt</button>
-              <button class="warn" data-action="pause">Pause</button>
-            </div>
-            <p class="note">
-              <strong>Halt</strong> stops execution; planning continues.
-              <strong>Pause</strong> permits only orders that reduce exposure.
-              Neither closes what is already open.
-            </p>
-          </div>
-
-          <div class="ctlgroup">
-            <div class="ctllabel">Start</div>
-            <div class="btnrow">
-              <button class="go" data-action="resume">Resume trading</button>
-            </div>
-            <p class="note">
-              Grants trading authority again. The next scheduled run will trade.
-            </p>
-          </div>
-
-          <div class="ctlgroup">
-            <div class="ctllabel">Position</div>
-            <div class="btnrow">
-              <button class="danger" data-action="flatten">Flatten everything</button>
-              <button data-action="adopt">Adopt venue positions</button>
-            </div>
-            <p class="note">
-              <strong>Flatten</strong> closes every open position at market, now, and works even
-              while halted. <strong>Adopt</strong> takes positions the venue already holds on as
-              our opening state — for a fresh install or a restored backup.
-            </p>
-          </div>
-
-          <div class="result" id="ctlresult"></div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h2>Health</h2>
-        <div class="body" id="health"></div>
-      </section>
-
-      <div id="reconciliation"></div>
-
-      <section class="panel">
-        <h2>Live against the backtest</h2>
-        <div class="body" id="expectation"></div>
-      </section>
-    </div>
+    <section class="card">
+      <header><span class="t">Account</span></header>
+      <div class="pad tight" id="account"></div>
+    </section>
   </div>
 
-  <section class="panel">
-    <h2>Run history</h2>
-    <div class="scroll"><table id="runs"></table></div>
-  </section>
+  <!-- centre: the book -->
+  <div class="col">
+    <section class="card">
+      <div class="hero">
+        <div>
+          <div class="label">Net asset value</div>
+          <div class="amount" id="nav">—</div>
+          <div class="delta" id="navdelta"></div>
+        </div>
+        <div class="stats" id="herostats"></div>
+      </div>
+      <div class="chart" id="chart"></div>
+      <div class="chartfoot">
+        <div class="range" id="range"></div>
+        <span class="note" id="chartnote"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Book</span><span class="sub" id="bookhint"></span></header>
+      <div class="pad tight" id="basket"></div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Positions</span><span class="sub" id="poshint"></span></header>
+      <div class="scroll"><table id="positions"></table></div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Balances</span><span class="sub" id="balhint"></span></header>
+      <div class="scroll"><table id="balances"></table></div>
+    </section>
+
+    <section class="card" id="openorders-card">
+      <header><span class="t">Open orders</span><span class="sub">accepted, not yet filled</span></header>
+      <div class="scroll"><table id="openorders"></table></div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Run history</span><span class="sub" id="runhint"></span></header>
+      <div class="scroll"><table id="runs"></table></div>
+    </section>
+  </div>
+
+  <!-- right rail: the controls and the guardrails -->
+  <div class="col">
+    <section class="card" id="controls">
+      <header><span class="t">Master control</span><span class="sub" id="controlhint"></span></header>
+      <div class="pad">
+        <div style="display:flex;align-items:center;gap:9px;margin-bottom:12px">
+          <span class="dot" id="ctldot"></span>
+          <strong style="font-size:16px" id="ctlstate">—</strong>
+          <span class="dim" style="margin-left:auto;font-family:var(--mono);font-size:11.5px" id="ctlsince"></span>
+        </div>
+
+        <div class="field">
+          <label for="who">Your name</label>
+          <input type="text" id="who" placeholder="who is doing this" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="why">Reason</label>
+          <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off">
+        </div>
+
+        <div class="btnrow">
+          <button class="ctl" data-action="pause">Pause</button>
+          <button class="ctl kill" data-action="halt">Kill switch</button>
+        </div>
+        <p class="ctlnote">
+          Pause permits only orders that reduce exposure. The kill switch stops execution entirely;
+          planning continues. Neither closes what is already open.
+        </p>
+
+        <div class="ctlsplit">
+          <div class="btnrow one">
+            <button class="ctl go" data-action="resume">Resume trading</button>
+          </div>
+          <p class="ctlnote">Grants trading authority again. The next scheduled run will trade.</p>
+        </div>
+
+        <div class="ctlsplit">
+          <div class="btnrow">
+            <button class="ctl kill" data-action="flatten">Flatten all</button>
+            <button class="ctl" data-action="adopt">Adopt book</button>
+          </div>
+          <p class="ctlnote">
+            Flatten cancels every resting order then closes every position at market, and works
+            while halted. Adopt takes positions the venue already holds on as our opening state.
+          </p>
+        </div>
+
+        <div class="result" id="ctlresult"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Risk limits</span><span class="sub" id="riskhint"></span></header>
+      <div class="pad" id="risk"></div>
+    </section>
+
+    <div id="reconciliation"></div>
+
+    <section class="card">
+      <header><span class="t">Health</span></header>
+      <div class="pad" id="health"></div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Live vs backtest</span></header>
+      <div class="pad" id="expectation"></div>
+    </section>
+
+    <section class="card">
+      <header><span class="t">Activity</span></header>
+      <div class="pad"><div class="feed" id="activity"></div></div>
+    </section>
+  </div>
 </div>
 
 <script>
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const fmtNum = (v, dp = 2) => {
-  const n = Number(v);
+const num = (v) => Number(String(v ?? "").replace(/,/g, ""));
+const fmt = (v, dp = 2) => {
+  const n = num(v);
   return Number.isFinite(n)
-    ? n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp })
-    : String(v ?? "—");
+    ? n.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp })
+    : "—";
 };
-const fmtPct = (v, dp = 1) =>
-  Number.isFinite(Number(v)) ? (Number(v) * 100).toFixed(dp) + "%" : "—";
-const signClass = (v) => (Number(v) > 0 ? "pos" : Number(v) < 0 ? "neg" : "");
-const shortTime = (iso) => (iso ? iso.replace("T", " ").replace(/(\.\d+)?Z$/, "Z") : "—");
+const pct = (v, dp = 1) => {
+  const n = num(v);
+  if (!Number.isFinite(n)) return "—";
+  // Without this a drawdown of -0.00004 prints as "-0.0%", which reads as a
+  // loss too small to name rather than as nothing having happened.
+  return (Math.abs(n) * 100 < 0.05 ? 0 : n * 100).toFixed(dp) + "%";
+};
+const signed = (v, dp = 2) => (num(v) > 0 ? "+" : "") + fmt(v, dp);
+const cls = (v) => (num(v) > 0 ? "up" : num(v) < 0 ? "down" : "flat");
+/* Net exposure is a *deviation from neutral*, not a profit. Colouring it with
+   the money palette would make a 32% directional tilt read as a good thing on a
+   page where green means money made. */
+const drift = (v) => (Math.abs(num(v)) > 0.2 ? "warn-t" : Math.abs(num(v)) > 0.05 ? "flat" : "up");
+const clock = (iso) => (iso ? String(iso).slice(11, 16) : "—");
+const stampOf = (iso) => (iso ? String(iso).replace("T", " ").replace(/(\.\d+)?Z$/, "") : "—");
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const CAT = ["--c1", "--c2", "--c3", "--c4", "--c5", "--c6", "--c7", "--c8"];
+const hue = (i) => "var(" + CAT[i % CAT.length] + ")";
 
 let latest = null;
+let range = "ALL";
 
 async function refresh() {
   try {
@@ -409,194 +489,158 @@ async function refresh() {
     latest = await res.json();
     render(latest);
   } catch (e) {
-    // A dashboard that silently keeps showing the last good state is worse
-    // than one that says it lost contact.
+    // Saying nothing and continuing to show the last good state is worse than
+    // admitting the page has lost contact.
     $("stamp").textContent = "cannot reach the api: " + e.message;
-    $("lamp").className = "lamp halted";
-    $("lamp").textContent = "unknown";
+    $("railstate").className = "pill halted";
+    $("railstate").textContent = "unknown";
   }
 }
 
 function render(s) {
-  $("stamp").textContent = "as of " + shortTime(s.generated_at) + " · refreshes every 10s";
-  const lamp = $("lamp");
-  lamp.className = "lamp " + s.control_state;
-  lamp.textContent = s.control_state;
+  $("stamp").textContent = stampOf(s.generated_at) + "Z · refreshes every 10s";
+  $("raildot").className = "dot " + s.control_state;
+  $("railstate").className = "pill " + s.control_state;
+  $("railstate").textContent = s.control_state;
 
-  renderWarnings(s.warnings);
-  renderTiles(s);
+  renderBanner(s.warnings);
+  renderStrategy(s.expectation);
+  renderAccount(s);
+  renderHero(s);
+  renderRange();
   renderChart(s.runs);
-  renderPositions(s);
+  renderBasket(s.book);
+  renderPositions(s.book);
   renderBalances(s.book);
   renderOpenOrders(s.book.open_orders);
-  renderFills(s.fills);
   renderRuns(s.runs);
-  renderHealth(s.health, s.controls);
+  renderMaster(s);
+  renderRisk(s);
   renderReconciliation(s.reconciliation);
+  renderHealth(s.health, s.controls);
   renderExpectation(s.expectation, s.live);
-  renderControlAvailability(s.controls_enabled, s.control_state);
+  renderActivity(s);
 }
 
-/* Shown in full only when the two sides disagree. When they agree there is one
-   line to read, because a panel that looks the same whether or not anything is
-   wrong trains people to stop looking at it. */
-function renderReconciliation(r) {
-  const el = $("reconciliation");
-  if (!r) { el.innerHTML = ""; return; }
-  if (r.agrees) {
-    el.innerHTML =
-      '<section class="panel"><h2>Reconciliation</h2><div class="body">' +
-      '<span class="lamp running">agrees</span>' +
-      '<p class="note" style="margin-top:10px">Our order ledger and the venue agree on ' +
-      r.theirs.length + " position(s), from " + r.ledger_entries + " ledger entries.</p>" +
-      "</div></section>";
+/* --- left rail -------------------------------------------------------- */
+function renderBanner(w) {
+  $("banner").innerHTML = !w || !w.length ? "" :
+    '<div class="shell" style="padding-bottom:0;display:block"><div class="banner">' +
+    '<div class="t">Read this first</div><ul>' +
+    w.map((x) => "<li>" + esc(x) + "</li>").join("") + "</ul></div></div>";
+}
+
+function renderStrategy(e) {
+  const st = e && e.strategy;
+  if (!st) {
+    $("strategy").innerHTML = '<div class="dim" style="font-size:12.5px">No research record loaded.</div>';
     return;
   }
-
-  // Both sides always render, even when one is empty. An absent row reads as
-  // "not checked"; "flat" is the fact.
-  const rows = (title, list) =>
-    "<tr><td class='dim' style='padding-left:0'>" + esc(title) + "</td><td class='num'>" +
-    (list.length ? list.map((p) => esc(p.asset) + " " + esc(p.qty)).join("<br>") : "flat") +
-    "</td></tr>";
-
-  let detail = "";
-  if (r.unknown_fills.length) {
-    detail +=
-      "<p class='note' style='margin-top:10px'><strong>Fills we never authorised:</strong></p>" +
-      "<table><tbody>" +
-      r.unknown_fills
-        .map((f) =>
-          "<tr><td class='sym'>" + esc(f.asset) + "</td><td class='num'>" + esc(f.qty) +
-          "</td><td class='dim ellipsis' title='" + esc(f.client_order_id) + "'>" +
-          esc(f.client_order_id) + "</td></tr>")
-        .join("") +
-      "</tbody></table>";
-  }
-  if (r.disagreements.length) {
-    detail +=
-      "<table style='margin-top:8px'><thead><tr><th></th><th class='num'>Ours</th>" +
-      "<th class='num'>Venue</th></tr></thead><tbody>" +
-      r.disagreements
-        .map((d) =>
-          "<tr><td class='sym'>" + esc(d.asset) + "</td><td class='num'>" + esc(d.ours) +
-          "</td><td class='num neg'>" + esc(d.theirs) + "</td></tr>")
-        .join("") +
-      "</tbody></table>";
-  }
-
-  el.innerHTML =
-    '<section class="panel warnings"><h2>Reconciliation</h2><div class="body">' +
-    '<span class="lamp halted">disagrees</span>' +
-    detail +
-    // The per-asset table above already shows both sides, so the summary is
-    // only worth the space when there is no such table — that is, when the
-    // positions agree and only the fills are unexplained.
-    (r.disagreements.length
-      ? ""
-      : "<table style='margin-top:8px'><tbody>" +
-        rows("Our record", r.ours) +
-        rows("Venue", r.theirs) +
-        "</tbody></table>") +
-    // The remedy, in the operator's hands rather than in a log they have to go
-    // and find. This process cannot run it - it holds no venue credentials.
-    (r.unadopted.length || r.unknown_fills.length
-      ? "<p class='note' style='margin-top:10px'>Check the account first. Then take it on — " +
-        "fill in your name and a reason in Controls, and:</p>" +
-        (controlsEnabled
-          ? "<div class='btnrow' style='margin-top:8px'>" +
-            (r.unknown_fills.length
-              ? "<button class='danger' id='adopt-unknown'>Adopt, accepting these fills</button>"
-              : "<button data-action='adopt' class='go'>Adopt venue positions</button>") +
-            "</div>"
-          : "<pre class='cmd'>bot --config &lt;file&gt; adopt --reason \"...\" --by you --confirm" +
-            (r.unknown_fills.length ? " \\\n    --accept-unknown-fills" : "") +
-            "</pre>")
-      : "<p class='note' style='margin-top:10px'>Drift is never auto-corrected. Investigate before " +
-        "anything else — the next run will refuse to trade until this agrees.</p>") +
-    "</div></section>";
+  // Straight from the committed backtest record, so it cannot end up describing
+  // last month's strategy.
+  const keep = ["rebalance", "position count", "venue", "costs", "target gross"];
+  const rows = (st.params || [])
+    .filter(([k]) => keep.includes(k))
+    .map(([k, v]) => '<div><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div></div>")
+    .join("");
+  $("strategy").innerHTML =
+    '<div style="font-size:13px;margin-bottom:12px">' + esc(st.name || "—") + "</div>" +
+    '<div class="stack-kv">' + rows + "</div>";
 }
 
-function renderWarnings(w) {
-  const el = $("warnings");
-  if (!w || !w.length) { el.innerHTML = ""; return; }
-  el.innerHTML =
-    '<section class="panel warnings"><h2>Read this first</h2><div class="body"><ul>' +
-    w.map((x) => "<li>" + esc(x) + "</li>").join("") +
-    "</ul></div></section>";
-}
-
-function tile(k, v, sub, cls) {
-  return (
-    '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v ' + (cls || "") + '">' +
-    esc(v) + '</div><div class="s">' + esc(sub || "") + "</div></div>"
-  );
-}
-
-function renderTiles(s) {
+function renderAccount(s) {
   const b = s.book;
-  const pnl = Number(b.total_pnl);
-  const start = Number(b.nav) - pnl;
-  const pnlPct = start > 0 ? pnl / start : NaN;
-  $("tiles").innerHTML =
-    tile("NAV", fmtNum(b.nav), b.fills_count + " fills") +
-    tile("Total P&L", fmtNum(b.total_pnl), Number.isFinite(pnlPct) ? fmtPct(pnlPct) : "", signClass(pnl)) +
-    tile("Unrealised", fmtNum(b.unrealised_pnl), "realised " + fmtNum(b.realised_pnl), signClass(b.unrealised_pnl)) +
-    tile("Gross exposure", b.gross_exposure === "n/a" ? "—" : fmtPct(b.gross_exposure), "of NAV") +
-    tile("Net exposure", b.net_exposure === "n/a" ? "—" : fmtPct(b.net_exposure), "0% is neutral") +
-    tile("Fees paid", fmtNum(b.fees_paid), "since inception");
+  $("account").innerHTML =
+    '<dl class="kv">' +
+    "<dt>Cash</dt><dd>" + fmt(b.cash) + "</dd>" +
+    "<dt>Fees paid</dt><dd>" + fmt(b.fees_paid) + "</dd>" +
+    "<dt>Fills</dt><dd>" + b.fills_count + "</dd>" +
+    "<dt>Runs</dt><dd>" + s.live.runs_recorded + "</dd>" +
+    "<dt>Clean</dt><dd>" + s.live.clean_runs + " of " + s.live.runs_recorded + "</dd>" +
+    "</dl>";
 }
 
-/* --- NAV chart ------------------------------------------------------- */
+/* --- hero ------------------------------------------------------------- */
+function renderHero(s) {
+  const b = s.book;
+  const whole = fmt(b.nav).split(".");
+  $("nav").innerHTML = esc(whole[0]) + '<span class="cents">.' + esc(whole[1] || "00") + "</span>";
 
-/* Axis bounds a human would have chosen: round numbers, one of 1/2/2.5/5 times
-   a power of ten. Padding the raw min and max instead produced labels like
-   "108,384" and "21,754", which are precise about nothing and read as noise. */
+  const pnl = num(b.total_pnl);
+  const start = num(b.nav) - pnl;
+  const rel = start > 0 ? pnl / start : NaN;
+  $("navdelta").innerHTML =
+    '<span class="' + cls(pnl) + '">' + signed(pnl) +
+    (Number.isFinite(rel) ? "  " + (rel > 0 ? "+" : "") + pct(rel, 2) : "") +
+    '</span> <span class="dim">since inception</span>';
+
+  const live = s.live;
+  const stat = (k, v, c) =>
+    '<div><div class="k">' + esc(k) + '</div><div class="v ' + (c || "") + '">' + esc(v) + "</div></div>";
+  $("herostats").innerHTML =
+    stat("Gross", b.gross_exposure === "n/a" ? "—" : pct(b.gross_exposure)) +
+    stat("Net", b.net_exposure === "n/a" ? "—" : pct(b.net_exposure), drift(b.net_exposure)) +
+    stat("Unrealised", signed(b.unrealised_pnl), cls(b.unrealised_pnl)) +
+    stat("Max DD", live.max_drawdown == null ? "—" : pct(live.max_drawdown), "down") +
+    stat("Sharpe", live.sharpe == null ? "not yet" : fmt(live.sharpe), "");
+}
+
+/* --- chart ------------------------------------------------------------ */
+const RANGES = [["1D", 1], ["1W", 7], ["1M", 30], ["ALL", null]];
+
+function renderRange() {
+  $("range").innerHTML = RANGES.map(
+    ([k]) => '<button data-range="' + k + '" class="' + (k === range ? "on" : "") + '">' + k + "</button>"
+  ).join("");
+}
+
 function niceScale(lo, hi) {
   if (!(hi > lo)) {
     const v = hi || 1;
-    return [v * 0.9, v * 1.1, [v * 0.9, v, v * 1.1]];
+    return [v * 0.995, v * 1.005, [v * 0.995, v, v * 1.005]];
   }
   const pad = (hi - lo) * 0.1;
-  // Five intervals, not three. Three produced steps so coarse that the floor
-  // rounded down to zero and half the plot was empty space below the data —
-  // and a NAV chart anchored at zero shows a flat line for any move worth
+  // Five intervals. Three produced steps coarse enough to round the floor to
+  // zero, and a NAV chart anchored at zero shows a flat line for any move worth
   // looking at.
-  const rawStep = (hi - lo + 2 * pad) / 5;
-  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
-  const step = [1, 2, 2.5, 5, 10].find((m) => m * mag >= rawStep) * mag;
+  const raw = (hi - lo + 2 * pad) / 5;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].find((m) => m * mag >= raw) * mag;
   const y0 = Math.floor((lo - pad) / step) * step;
   const y1 = Math.ceil((hi + pad) / step) * step;
   const ticks = [];
   for (let t = y0; t <= y1 + step / 2; t += step) ticks.push(t);
   return [y0, y1, ticks];
 }
+
 function renderChart(runs) {
   const el = $("chart");
-  const pts = (runs || [])
+  let pts = (runs || [])
     .slice()
     .reverse()
     .filter((r) => r.nav != null)
-    .map((r) => ({ t: r.recorded_at, v: Number(r.nav), outcome: r.outcome }))
+    .map((r) => ({ t: r.recorded_at, v: num(r.nav) }))
     .filter((p) => Number.isFinite(p.v));
 
-  $("navhint").textContent =
-    pts.length > 1
-      ? "as the plan saw it at each run — the account is only marked when something runs, so this is not a continuous curve"
-      : "";
+  const days = (RANGES.find(([k]) => k === range) || [])[1];
+  if (days) {
+    const cutoff = Date.now() - days * 86400e3;
+    const inRange = pts.filter((p) => Date.parse(p.t) >= cutoff);
+    // A range with nothing in it shows nothing, rather than silently widening.
+    pts = inRange;
+  }
+
+  $("chartnote").textContent =
+    "NAV as the plan saw it at each run — the account is only marked when something runs";
 
   if (pts.length < 2) {
     el.innerHTML = '<div class="empty">' +
-      (pts.length ? "one run recorded; a curve needs at least two" : "no runs yet") + "</div>";
+      (pts.length ? "one run in this range; a curve needs two" : "no runs in this range") + "</div>";
     return;
   }
 
-  // Draw at the element's own pixel size. A fixed viewBox stretched with
-  // preserveAspectRatio="none" scales x and y differently, which makes a 2px
-  // stroke thicker vertically than horizontally and turns the endpoint dot into
-  // an ellipse — small, but it is the kind of wrongness that reads as sloppy.
-  const W = Math.max(el.clientWidth || 900, 320);
-  const H = 170, PADL = 60, PADR = 16, PADT = 12, PADB = 26;
+  const W = Math.max(el.clientWidth || 860, 320);
+  const H = 220, PADL = 58, PADR = 14, PADT = 14, PADB = 26;
   const lo = Math.min(...pts.map((p) => p.v));
   const hi = Math.max(...pts.map((p) => p.v));
   const [y0, y1, ticks] = niceScale(lo, hi);
@@ -605,33 +649,32 @@ function renderChart(runs) {
 
   const line = pts.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
   const area = line + " L" + x(pts.length - 1).toFixed(1) + " " + (H - PADB) + " L" + PADL + " " + (H - PADB) + " Z";
-
   const grid = ticks
     .map((t) =>
-      '<line class="grid" x1="' + PADL + '" x2="' + (W - PADR) + '" y1="' + y(t).toFixed(1) +
+      '<line class="gridline" x1="' + PADL + '" x2="' + (W - PADR) + '" y1="' + y(t).toFixed(1) +
       '" y2="' + y(t).toFixed(1) + '"></line>' +
       '<text class="axis" x="' + (PADL - 8) + '" y="' + (y(t) + 3.5).toFixed(1) + '" text-anchor="end">' +
-      fmtNum(t, 0) + "</text>")
+      fmt(t, 0) + "</text>")
     .join("");
 
-  // Two time labels, at the ends. A dashboard needs to know what window it is
-  // looking at; it does not need a tick per run. Within a single day the dates
-  // would be identical and say nothing, so the label falls back to the clock.
   const first = pts[0].t || "", last = pts[pts.length - 1].t || "";
   const sameDay = first.slice(0, 10) === last.slice(0, 10);
-  const label = (iso) => (sameDay ? iso.slice(11, 16) + "Z" : iso.slice(0, 10));
+  const lbl = (iso) => (sameDay ? clock(iso) + "Z" : iso.slice(0, 10));
   const xAxis =
     '<text class="axis" x="' + PADL + '" y="' + (H - 8) + '">' +
-    (sameDay ? first.slice(0, 10) + " " + label(first) : label(first)) + "</text>" +
-    '<text class="axis" x="' + (W - PADR) + '" y="' + (H - 8) + '" text-anchor="end">' +
-    label(last) + "</text>";
+    (sameDay ? first.slice(0, 10) + " " + lbl(first) : lbl(first)) + "</text>" +
+    '<text class="axis" x="' + (W - PADR) + '" y="' + (H - 8) + '" text-anchor="end">' + lbl(last) + "</text>";
 
   el.innerHTML =
     '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" role="img" ' +
-    'aria-label="net asset value at each recorded run">' + grid + xAxis +
-    '<path class="navfill" d="' + area + '"></path>' +
+    'aria-label="net asset value at each recorded run">' +
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0%" stop-color="var(--up)" stop-opacity=".22"/>' +
+    '<stop offset="100%" stop-color="var(--up)" stop-opacity="0"/></linearGradient></defs>' +
+    grid + xAxis +
+    '<path d="' + area + '" fill="url(#g)"></path>' +
     '<path class="navline" d="' + line + '"></path>' +
-    '<circle class="navend" cx="' + x(pts.length - 1).toFixed(1) + '" cy="' + y(pts[pts.length - 1].v).toFixed(1) + '" r="3.5"></circle>' +
+    '<circle class="navend" cx="' + x(pts.length - 1).toFixed(1) + '" cy="' + y(pts[pts.length - 1].v).toFixed(1) + '" r="3"></circle>' +
     '<line class="crosshair" id="ch" x1="0" x2="0" y1="' + PADT + '" y2="' + (H - PADB) + '" style="display:none"></line>' +
     "</svg>";
 
@@ -641,7 +684,6 @@ function renderChart(runs) {
   tip.className = "tip";
   tip.style.display = "none";
   el.appendChild(tip);
-
   svg.addEventListener("mousemove", (ev) => {
     const box = svg.getBoundingClientRect();
     const px = ((ev.clientX - box.left) / box.width) * W;
@@ -651,10 +693,10 @@ function renderChart(runs) {
     ch.setAttribute("x2", x(i));
     ch.style.display = "";
     tip.style.display = "";
-    tip.textContent = shortTime(pts[i].t) + "  ·  " + fmtNum(pts[i].v);
+    tip.textContent = stampOf(pts[i].t) + "  ·  " + fmt(pts[i].v);
     const left = (x(i) / W) * box.width;
-    tip.style.left = Math.min(Math.max(left - 60, 0), box.width - tip.offsetWidth) + "px";
-    tip.style.top = "6px";
+    tip.style.left = Math.min(Math.max(left - 70, 0), box.width - tip.offsetWidth) + "px";
+    tip.style.top = "8px";
   });
   svg.addEventListener("mouseleave", () => {
     ch.style.display = "none";
@@ -662,203 +704,336 @@ function renderChart(runs) {
   });
 }
 
-/* --- tables ---------------------------------------------------------- */
-function renderPositions(s) {
-  const p = s.book.positions || [];
-  $("poshint").textContent = p.length ? p.length + " open" : "";
+/* --- basket ----------------------------------------------------------- */
+function renderBasket(book) {
+  const p = (book.positions || []).filter((x) => x.notional != null);
+  const gross = p.reduce((a, x) => a + Math.abs(num(x.notional)), 0);
+  $("bookhint").textContent = p.length
+    ? p.length + " names · " + fmt(gross, 0) + " gross"
+    : "";
   if (!p.length) {
-    $("positions").innerHTML = '<tbody><tr><td class="empty">flat — nothing open</td></tr></tbody>';
+    $("basket").innerHTML = '<div class="dim" style="font-size:12.5px">Flat — nothing open.</div>';
     return;
   }
+  const sorted = p.slice().sort((a, b) => Math.abs(num(b.notional)) - Math.abs(num(a.notional)));
+  // Longs cycle the categorical hues; every short takes the same rose. Side is
+  // the first thing to read off a book, and hue-per-asset alone hides it.
+  let longIdx = 0;
+  const paint = (x) => (x.side === "short" ? "var(--c7)" : hue(longIdx++));
+  const colours = sorted.map(paint);
+  const bars = sorted
+    .map((x, i) =>
+      '<i style="flex:' + (Math.abs(num(x.notional)) / gross).toFixed(4) +
+      ';background:' + colours[i] + '"></i>')
+    .join("");
+  const chips = sorted
+    .map((x, i) =>
+      '<span class="chipx"><i style="background:' + colours[i] + '"></i>' + esc(x.asset) + " " +
+      pct(Math.abs(num(x.notional)) / gross, 0) +
+      (x.side === "short" ? ' <span class="down">short</span>' : "") + "</span>")
+    .join("");
+  $("basket").innerHTML = '<div class="stack">' + bars + "</div>" + '<div class="chips">' + chips + "</div>";
+}
+
+/* --- tables ----------------------------------------------------------- */
+function renderPositions(book) {
+  const p = book.positions || [];
+  $("poshint").textContent = p.length ? p.length + " open" : "";
+  if (!p.length) {
+    $("positions").innerHTML = '<tbody><tr><td class="empty">Flat — nothing open</td></tr></tbody>';
+    return;
+  }
+  // Bars are scaled to the largest position, so the widest is always full and
+  // the shape of the book reads at a glance regardless of account size.
+  const peak = Math.max(...p.map((r) => Math.abs(num(r.weight)) || 0), 0.0001);
   const rows = p
     .map((r) => {
-      const w = Number(r.weight);
-      const wpct = Number.isFinite(w) ? w : 0;
-      const width = Math.min(Math.abs(wpct) * 100, 50);
-      // The bar sits under its own number rather than in a column of its own.
-      // As a separate column it pushed Unrealised off the right edge, and the
-      // P&L on a position is not the thing to lose to a decoration.
-      const bar =
-        '<div class="bar"><i class="' + (wpct >= 0 ? "l" : "s") + '" style="width:' + width.toFixed(1) + '%"></i></div>';
+      const w = num(r.weight);
+      const width = Math.min((Math.abs(w) / peak) * 50, 50);
+      const bar = '<div class="expo"><i class="' + (w >= 0 ? "l" : "s") +
+        '" style="width:' + width.toFixed(1) + '%"></i></div>';
       return (
         "<tr>" +
         '<td class="sym">' + esc(r.asset) + "</td>" +
-        '<td><span class="chip ' + r.side + '">' + r.side + "</span></td>" +
-        '<td class="num">' + esc(r.qty) + "</td>" +
-        '<td class="num dim">' + fmtNum(r.avg_price) + "</td>" +
-        '<td class="num">' + (r.mark ? fmtNum(r.mark) : '<span class="dim">no mark</span>') + "</td>" +
-        // Notional and weight are the same fact in two units, so they share a
-        // cell. As separate columns the table outgrew its panel and dropped
-        // Unrealised off the edge, which is not the number to lose.
-        '<td class="num weightcell">' +
-        (r.notional ? fmtNum(r.notional) : "—") +
-        (Number.isFinite(w) ? '<div class="sub">' + fmtPct(w) + " of NAV</div>" + bar : "") +
-        "</td>" +
-        '<td class="num ' + signClass(r.unrealised_pnl) + '">' + (r.unrealised_pnl ? fmtNum(r.unrealised_pnl) : "—") + "</td>" +
+        '<td class="' + (r.side === "long" ? "side-l" : "side-s") + '">' +
+        (r.side === "long" ? "L" : "S") + "</td>" +
+        "<td>" + bar + "</td>" +
+        '<td class="num">' + (r.notional ? fmt(Math.abs(num(r.notional)), 0) : "—") + "</td>" +
+        '<td class="num dim">' + esc(r.qty) + "</td>" +
+        '<td class="num dim">' + fmt(r.avg_price) + "</td>" +
+        '<td class="num">' + (r.mark ? fmt(r.mark) : '<span class="dim">no mark</span>') + "</td>" +
+        '<td class="num ' + cls(r.unrealised_pnl) + '">' +
+        (r.unrealised_pnl ? signed(r.unrealised_pnl) : "—") + "</td>" +
+        '<td class="num dim">' + (Number.isFinite(w) ? pct(w) : "—") + "</td>" +
         "</tr>"
       );
     })
     .join("");
   $("positions").innerHTML =
-    "<thead><tr><th>Asset</th><th>Side</th><th class='num'>Qty</th><th class='num'>Avg</th>" +
-    "<th class='num'>Mark</th><th class='num'>Notional</th>" +
-    "<th class='num'>Unrealised</th></tr></thead><tbody>" + rows + "</tbody>";
+    "<thead><tr><th>Symbol</th><th>Side</th><th>Exposure</th><th class='num'>Notional</th>" +
+    "<th class='num'>Qty</th><th class='num'>Avg</th><th class='num'>Mark</th>" +
+    "<th class='num'>uPnL</th><th class='num'>Weight</th></tr></thead><tbody>" + rows + "</tbody>";
 }
 
 function renderBalances(book) {
   const b = book.balances || [];
   $("balhint").textContent = b.length ? b.length + " held" : "";
   if (!b.length) {
-    $("balances").innerHTML = '<tbody><tr><td class="empty">no balances</td></tr></tbody>';
+    $("balances").innerHTML = '<tbody><tr><td class="empty">No balances</td></tr></tbody>';
     return;
   }
-  const rows = b
-    .map(
-      (r) =>
-        "<tr><td class='sym'>" + esc(r.currency) +
-        (r.is_quote ? " <span class='dim'>cash</span>" : "") + "</td>" +
-        "<td class='num'>" + (r.is_quote ? fmtNum(r.total) : esc(r.total)) + "</td>" +
-        // Available is the number that matters when sizing: two resting buys
-        // must not both look affordable against the same cash.
-        "<td class='num'>" + (r.is_quote ? fmtNum(r.available) : esc(r.available)) + "</td>" +
-        "<td class='num " + (Number(r.reserved) ? "" : "dim") + "'>" +
-        (r.is_quote ? fmtNum(r.reserved) : esc(r.reserved)) + "</td></tr>")
-    .join("");
+  const cell = (r, v) => (r.is_quote ? fmt(v) : esc(v));
   $("balances").innerHTML =
     "<thead><tr><th>Currency</th><th class='num'>Total</th><th class='num'>Available</th>" +
-    "<th class='num'>Reserved</th></tr></thead><tbody>" + rows + "</tbody>";
+    "<th class='num'>Reserved</th></tr></thead><tbody>" +
+    b.map((r) =>
+      "<tr><td class='sym'>" + esc(r.currency) +
+      (r.is_quote ? " <span class='dim' style='font-weight:400'>cash</span>" : "") + "</td>" +
+      "<td class='num'>" + cell(r, r.total) + "</td>" +
+      "<td class='num'>" + cell(r, r.available) + "</td>" +
+      "<td class='num " + (num(r.reserved) ? "" : "dim") + "'>" + cell(r, r.reserved) + "</td></tr>")
+      .join("") + "</tbody>";
 }
 
 function renderOpenOrders(o) {
-  // The panel disappears when there is nothing resting. An empty table every
-  // day is a thing people stop seeing, and this one matters on the day it is
-  // not empty.
-  const panel = $("openorders-panel");
-  if (!o || !o.length) { panel.style.display = "none"; return; }
-  panel.style.display = "";
-  const rows = o
-    .map(
-      (r) =>
-        "<tr><td class='sym'>" + esc(r.asset) + "</td>" +
-        '<td><span class="side ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
-        "<td class='num'>" + esc(r.qty) + "</td>" +
-        "<td class='num'>" + fmtNum(r.limit_price) + "</td>" +
-        "<td class='num dim'>" + fmtNum(r.reserved) + "</td>" +
-        "<td class='dim ellipsis' title='" + esc(r.client_order_id) + "'>" +
-        esc(r.client_order_id) + "</td></tr>")
-    .join("");
+  // The card disappears when nothing is resting. An empty table every day is a
+  // thing people stop seeing, and this one matters on the day it is not empty.
+  const card = $("openorders-card");
+  if (!o || !o.length) { card.style.display = "none"; return; }
+  card.style.display = "";
   $("openorders").innerHTML =
-    "<thead><tr><th>Asset</th><th>Side</th><th class='num'>Qty</th><th class='num'>Limit</th>" +
-    "<th class='num'>Reserved</th><th>Order id</th></tr></thead><tbody>" + rows + "</tbody>";
-}
-
-function renderFills(f) {
-  if (!f || !f.length) {
-    $("fills").innerHTML = '<tbody><tr><td class="empty">nothing has filled</td></tr></tbody>';
-    return;
-  }
-  const rows = f
-    .map(
-      (r) =>
-        "<tr><td class='time'>" + shortTime(r.ts) + "</td>" +
-        "<td class='sym'>" + esc(r.asset) + "</td>" +
-        '<td><span class="side ' + esc(r.side) + '">' + esc(r.side) + "</span></td>" +
-        "<td class='num'>" + esc(r.qty) + "</td>" +
-        "<td class='num'>" + fmtNum(r.price) + "</td>" +
-        "<td class='num dim'>" + fmtNum(r.fee) + "</td>" +
-        // Truncated, with the whole id on hover. It is here to be matched
-        // against a venue record when something has gone wrong, not read - and
-        // at full width it clipped the columns that are read.
-        "<td class='dim ellipsis' title='" + esc(r.client_order_id) + "'>" +
-        esc(r.client_order_id) + "</td></tr>")
-    .join("");
-  $("fills").innerHTML =
-    "<thead><tr><th>Time</th><th>Asset</th><th>Side</th><th class='num'>Qty</th>" +
-    "<th class='num'>Price</th><th class='num'>Fee</th><th>Order id</th></tr></thead><tbody>" +
-    rows + "</tbody>";
+    "<thead><tr><th>Symbol</th><th>Side</th><th class='num'>Qty</th><th class='num'>Limit</th>" +
+    "<th class='num'>Reserved</th><th>Order id</th></tr></thead><tbody>" +
+    o.map((r) =>
+      "<tr><td class='sym'>" + esc(r.asset) + "</td>" +
+      "<td class='" + (r.side === "buy" ? "side-l" : "side-s") + "'>" + esc(r.side) + "</td>" +
+      "<td class='num'>" + esc(r.qty) + "</td>" +
+      "<td class='num'>" + fmt(r.limit_price) + "</td>" +
+      "<td class='num dim'>" + fmt(r.reserved) + "</td>" +
+      "<td class='ellipsis' title='" + esc(r.client_order_id) + "'>" + esc(r.client_order_id) + "</td></tr>")
+      .join("") + "</tbody>";
 }
 
 function renderRuns(runs) {
+  $("runhint").textContent = runs && runs.length ? runs.length + " recorded" : "";
   if (!runs || !runs.length) {
-    $("runs").innerHTML = '<tbody><tr><td class="empty">nothing has run yet</td></tr></tbody>';
+    $("runs").innerHTML = '<tbody><tr><td class="empty">Nothing has run yet</td></tr></tbody>';
     return;
   }
-  const rows = runs
-    .map(
-      (r) =>
-        '<tr class="out-' + esc(r.outcome) + '">' +
-        "<td class='time'>" + shortTime(r.recorded_at) + "</td>" +
-        '<td><span class="chip">' + esc(r.outcome) + "</span></td>" +
-        "<td class='num'>" + r.slices_completed + "/" + r.slices_planned + "</td>" +
-        "<td class='num'>" + r.orders_submitted + "</td>" +
-        "<td class='num " + (r.orders_skipped ? "neg" : "dim") + "'>" + r.orders_skipped + "</td>" +
-        "<td class='num dim'>" + (r.nav ? fmtNum(r.nav) : "—") + "</td>" +
-        // An empty cell reads as missing data. A clean run says so.
-        '<td class="wrapcell">' +
-        (r.detail ? esc(r.detail) : '<span class="dim">clean</span>') +
-        "</td></tr>")
-    .join("");
   $("runs").innerHTML =
-    "<thead><tr><th>Recorded</th><th>Outcome</th><th class='num'>Slices</th>" +
-    "<th class='num'>Sent</th><th class='num'>Skipped</th><th class='num'>NAV</th>" +
-    "<th>What happened</th></tr></thead><tbody>" + rows + "</tbody>";
+    "<thead><tr><th>Recorded</th><th>Outcome</th><th class='num'>Slices</th><th class='num'>Sent</th>" +
+    "<th class='num'>Skipped</th><th class='num'>NAV</th><th>What happened</th></tr></thead><tbody>" +
+    runs.slice(0, 40).map((r) =>
+      '<tr class="out-' + esc(r.outcome) + '">' +
+      "<td class='time'>" + stampOf(r.recorded_at) + "</td>" +
+      '<td><span class="pill">' + esc(r.outcome) + "</span></td>" +
+      "<td class='num'>" + r.slices_completed + "/" + r.slices_planned + "</td>" +
+      "<td class='num'>" + r.orders_submitted + "</td>" +
+      "<td class='num " + (r.orders_skipped ? "down" : "dim") + "'>" + r.orders_skipped + "</td>" +
+      "<td class='num dim'>" + (r.nav ? fmt(r.nav, 0) : "—") + "</td>" +
+      '<td class="wrapcell">' + (r.detail ? esc(r.detail) : '<span class="dim">clean</span>') + "</td></tr>")
+      .join("") + "</tbody>";
+}
+
+/* --- right rail ------------------------------------------------------- */
+function renderMaster(s) {
+  $("ctldot").className = "dot " + s.control_state;
+  $("ctlstate").textContent =
+    s.control_state.charAt(0).toUpperCase() + s.control_state.slice(1);
+  $("ctlstate").className = s.control_state === "running" ? "up" : s.control_state === "paused" ? "flat" : "down";
+  const c = s.controls || {};
+  $("ctlsince").textContent = c.set_at ? "since " + stampOf(c.set_at).slice(5, 16) : "";
+  renderControlAvailability(s.controls_enabled, s.control_state);
+}
+
+function renderRisk(s) {
+  // The planner's own gate, as it measured itself on the last run that had one.
+  // Nothing here is recomputed: a second opinion about a limit is a way to
+  // disagree with the process that enforces it.
+  const run = (s.runs || []).find((r) => r.risk_checks && r.risk_checks.length);
+  const el = $("risk");
+  const bars = [];
+
+  if (run) {
+    $("riskhint").textContent = "as measured " + stampOf(run.recorded_at).slice(5, 16);
+    for (const c of run.risk_checks) {
+      const v = Math.abs(num(c.value)), lim = Math.abs(num(c.limit));
+      const frac = lim > 0 ? Math.min(v / lim, 1) : 0;
+      const level = !c.passed || frac >= 0.95 ? "high" : frac >= 0.75 ? "mid" : "";
+      bars.push(
+        '<div class="meter ' + level + '"><div class="row">' +
+        '<span class="name">' + esc(c.name.replace(/_/g, " ")) + "</span>" +
+        '<span class="val">' + fmt(c.value, 2) + ' <span class="lim">/ ' + fmt(c.limit, 2) + "</span></span>" +
+        '</div><div class="track"><i style="width:' + (frac * 100).toFixed(1) + '%"></i></div>' +
+        (c.detail ? '<div class="foot">' + esc(c.detail) + "</div>" : "") +
+        (c.passed ? "" : '<div class="foot down">breached — the plan was rejected</div>') +
+        "</div>");
+    }
+  } else {
+    $("riskhint").textContent = "";
+  }
+
+  // Live exposure sits alongside, labelled as current rather than as a limit.
+  const b = s.book;
+  if (b.gross_exposure !== "n/a") {
+    const g = Math.abs(num(b.gross_exposure));
+    bars.push(
+      '<div class="meter ' + (g >= 1 ? "high" : g >= 0.9 ? "mid" : "") + '"><div class="row">' +
+      '<span class="name">gross exposure now</span><span class="val">' + pct(g) +
+      ' <span class="lim">of NAV</span></span></div>' +
+      '<div class="track"><i style="width:' + Math.min(g * 100, 100).toFixed(1) + '%"></i></div></div>');
+  }
+
+  el.innerHTML = bars.length
+    ? bars.join("")
+    : '<div class="dim" style="font-size:12.5px">No run has carried a risk report yet.</div>';
+}
+
+function renderReconciliation(r) {
+  const el = $("reconciliation");
+  if (!r) { el.innerHTML = ""; return; }
+  if (r.agrees) {
+    el.innerHTML =
+      '<section class="card"><header><span class="t">Reconciliation</span>' +
+      '<span class="sub up">agrees</span></header><div class="pad tight">' +
+      '<div class="dim" style="font-size:12.5px">Our order ledger and the venue agree on ' +
+      r.theirs.length + " position(s), from " + r.ledger_entries + " ledger entries.</div>" +
+      "</div></section>";
+    return;
+  }
+
+  let detail = "";
+  if (r.unknown_fills.length) {
+    detail +=
+      '<div class="ctlnote" style="color:var(--down)">Fills we never authorised:</div>' +
+      "<table style='margin-top:6px'><tbody>" +
+      r.unknown_fills.map((f) =>
+        "<tr><td class='sym' style='padding-left:0'>" + esc(f.asset) + "</td>" +
+        "<td class='num'>" + esc(f.qty) + "</td>" +
+        "<td class='ellipsis' title='" + esc(f.client_order_id) + "'>" + esc(f.client_order_id) +
+        "</td></tr>").join("") + "</tbody></table>";
+  }
+  if (r.disagreements.length) {
+    detail +=
+      "<table style='margin-top:8px'><thead><tr><th style='padding-left:0'></th>" +
+      "<th class='num'>Ours</th><th class='num'>Venue</th></tr></thead><tbody>" +
+      r.disagreements.map((d) =>
+        "<tr><td class='sym' style='padding-left:0'>" + esc(d.asset) + "</td>" +
+        "<td class='num'>" + esc(d.ours) + "</td>" +
+        "<td class='num down'>" + esc(d.theirs) + "</td></tr>").join("") + "</tbody></table>";
+  }
+
+  el.innerHTML =
+    '<section class="card alarm"><header><span class="t">Reconciliation</span>' +
+    '<span class="sub down">disagrees</span></header><div class="pad tight">' + detail +
+    (r.unadopted.length || r.unknown_fills.length
+      ? '<p class="ctlnote">Check the account, then take it on — name and reason in Master control, and:</p>' +
+        (controlsEnabled
+          ? '<div class="btnrow one" style="margin-top:8px">' +
+            (r.unknown_fills.length
+              ? '<button class="ctl kill" id="adopt-unknown">Adopt, accepting these fills</button>'
+              : '<button class="ctl go" data-action="adopt">Adopt venue positions</button>') +
+            "</div>"
+          : "<pre class='cmd'>bot --config &lt;file&gt; adopt --reason \"...\" --by you --confirm" +
+            (r.unknown_fills.length ? " \\\n    --accept-unknown-fills" : "") + "</pre>")
+      : '<p class="ctlnote">Drift is never auto-corrected. Investigate first — the next run will refuse to trade until this agrees.</p>') +
+    "</div></section>";
 }
 
 function renderHealth(h, c) {
-  const notes = (h.notes || []).map((n) => "<li>" + esc(n) + "</li>").join("");
   $("health").innerHTML =
-    '<div class="lamp ' + (h.ok ? "running" : "halted") + '">' + (h.ok ? "ok" : "needs attention") + "</div>" +
-    '<table style="margin-top:10px"><tbody>' +
-    row("Control state", h.control_state) +
-    row("Set by", (c && c.set_by) || "—") +
-    row("Reason", (c && c.reason) || "—") +
-    row("Last run", shortTime(h.last_run_at) + (h.last_run_outcome ? " · " + h.last_run_outcome : "")) +
-    row("Hours since", h.hours_since_last_run == null ? "—" : h.hours_since_last_run) +
-    "</tbody></table>" +
-    (notes ? '<ul style="margin:10px 0 0;padding-left:18px;font-size:12.5px;color:var(--ink-2)">' + notes + "</ul>" : "");
+    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:11px">' +
+    '<span class="dot ' + (h.ok ? "running" : "halted") + '"></span>' +
+    '<strong class="' + (h.ok ? "up" : "down") + '" style="font-size:13px">' +
+    (h.ok ? "OK" : "Needs attention") + "</strong></div>" +
+    '<dl class="kv">' +
+    "<dt>Set by</dt><dd>" + esc((c && c.set_by) || "—") + "</dd>" +
+    "<dt>Last run</dt><dd>" + esc(stampOf(h.last_run_at).slice(5, 16)) + "</dd>" +
+    "<dt>Outcome</dt><dd>" + esc(h.last_run_outcome || "—") + "</dd>" +
+    "<dt>Hours since</dt><dd>" + (h.hours_since_last_run == null ? "—" : h.hours_since_last_run) + "</dd>" +
+    "</dl>" +
+    ((c && c.reason) ? '<p class="ctlnote">' + esc(c.reason) + "</p>" : "") +
+    ((h.notes || []).length
+      ? '<ul style="margin:9px 0 0;padding-left:16px">' +
+        h.notes.map((n) => '<li style="font-size:11.5px;color:var(--ink-2);margin-bottom:4px">' + esc(n) + "</li>").join("") +
+        "</ul>"
+      : "");
 }
 
-function row(k, v) {
-  return "<tr><td class='dim' style='padding-left:0'>" + esc(k) + "</td><td>" + esc(v) + "</td></tr>";
-}
-
-function renderExpectation(m, live) {
+function renderExpectation(e, live) {
+  const m = e && e.metrics;
   const el = $("expectation");
-  let html = "";
   if (!m) {
-    html +=
-      '<p class="note">No backtest record was loaded, so there is nothing to compare against. ' +
-      "Pass <code>--expectation docs/research/backtest.json</code>.</p>";
-  } else {
-    // The sample size goes in the column header, not only in a footnote. A
-    // number that cannot support the comparison it is placed next to should
-    // say so where the eye lands, which is the header.
-    const days = live.days_live == null ? 0 : live.days_live;
-    const liveHead = live.meaningful
-      ? "Live · " + days + "d"
-      : "<span class='dim'>Live · " + days + "d, too short</span>";
-    html +=
-      "<table><thead><tr><th></th><th class='num'>Backtest · " +
-      fmtNum(m.years, 1) + "y</th><th class='num'>" + liveHead + "</th></tr></thead><tbody>" +
-      cmp("Return", fmtPct(m.total_return), live.return_since_start == null ? "—" : fmtPct(live.return_since_start), live.meaningful) +
-      cmp("Sharpe", fmtNum(m.sharpe), live.sharpe == null ? "not yet" : fmtNum(live.sharpe), live.meaningful) +
-      cmp("Max drawdown", fmtPct(m.max_drawdown), live.max_drawdown == null ? "—" : fmtPct(live.max_drawdown), live.meaningful) +
-      cmp("Clean runs", "—", live.clean_runs + " of " + live.runs_recorded, true) +
-      "</tbody></table>";
+    el.innerHTML = '<div class="dim" style="font-size:12.5px">No backtest record loaded — pass --expectation.</div>';
+    return;
   }
-  html += '<p class="note" style="margin-top:10px">' + esc(live.note) + "</p>";
-  el.innerHTML = html;
-}
-
-function cmp(k, a, b, emphasiseLive) {
-  return (
-    "<tr><td class='dim'>" + esc(k) + "</td>" +
+  const days = live.days_live == null ? 0 : live.days_live;
+  // Sample size in the column header, not a footnote: a number that cannot
+  // support the comparison it is placed next to should say so where the eye
+  // lands.
+  const liveHead = "Live " + days + "d";
+  const row = (k, a, b) =>
+    "<tr><td class='dim' style='padding-left:0'>" + esc(k) + "</td>" +
     "<td class='num dim'>" + esc(a) + "</td>" +
-    "<td class='num" + (emphasiseLive ? "" : " dim") + "'>" + esc(b) + "</td></tr>"
-  );
+    "<td class='num" + (live.meaningful ? "" : " dim") + "'>" + esc(b) + "</td></tr>";
+  el.innerHTML =
+    "<table><thead><tr><th style='padding-left:0'></th>" +
+    "<th class='num'>BT " + fmt(m.years, 1) + "y</th>" +
+    "<th class='num'>" + esc(liveHead) + "</th></tr></thead><tbody>" +
+    row("Return", pct(m.total_return), live.return_since_start == null ? "—" : pct(live.return_since_start)) +
+    row("Sharpe", fmt(m.sharpe), live.sharpe == null ? "not yet" : fmt(live.sharpe)) +
+    row("Max DD", pct(m.max_drawdown), live.max_drawdown == null ? "—" : pct(live.max_drawdown)) +
+    "</tbody></table>" +
+    '<p class="ctlnote">' + esc(live.note) + "</p>";
 }
 
-/* --- controls -------------------------------------------------------- */
+/* --- activity --------------------------------------------------------- */
+function renderActivity(s) {
+  // One stream, newest first, folded from things that actually happened: fills,
+  // runs, and the last control change. Nothing here is a separate log to keep
+  // in sync - if it is on this list, it is in a file somewhere.
+  const ev = [];
+  for (const f of s.fills || []) {
+    ev.push({
+      at: f.ts,
+      html: "Filled <b>" + esc(f.asset) + "</b> " +
+        '<span class="' + (f.side === "buy" ? "up" : "down") + '">' + esc(f.side) + "</span> " +
+        esc(f.qty) + " @ " + fmt(f.price),
+    });
+  }
+  for (const r of s.runs || []) {
+    const bad = r.outcome === "halted" || r.orders_skipped > 0;
+    const odd = r.outcome === "refused" || r.outcome === "partial";
+    ev.push({
+      at: r.recorded_at,
+      kind: bad ? "bad" : odd ? "warn" : "",
+      html:
+        "<b>" + esc(r.outcome) + "</b>" +
+        (r.orders_submitted
+          ? " · " + r.orders_submitted + (r.orders_submitted === 1 ? " order" : " orders")
+          : "") +
+        (r.detail ? " · " + esc(r.detail.slice(0, 120)) + (r.detail.length > 120 ? "…" : "") : ""),
+    });
+  }
+  const c = s.controls || {};
+  if (c.set_at) {
+    ev.push({
+      at: c.set_at,
+      kind: c.kill_switch ? "bad" : c.paused ? "warn" : "",
+      html: "<b>" + esc(s.control_state) + "</b> by " + esc(c.set_by || "someone") +
+        (c.reason ? " · " + esc(c.reason) : ""),
+    });
+  }
+
+  ev.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  $("activity").innerHTML = ev.length
+    ? ev.slice(0, 30).map((e) =>
+        '<div class="row ' + (e.kind || "") + '"><span class="at">' + clock(e.at) +
+        '</span><span class="what">' + e.html + "</span></div>").join("")
+    : '<div class="dim" style="font-size:12.5px">Nothing has happened yet.</div>';
+}
+
+/* --- controls --------------------------------------------------------- */
 
 /* What each button does, in the operator's words, and how hard it is to press.
    `confirm` is the sentence in the dialog; `typed` demands the word back before
@@ -872,7 +1047,7 @@ const ACTIONS = {
   resume:  { path: "/api/resume",  verb: "Resume",
              confirm: "Grant trading authority again. The next scheduled run will trade." },
   flatten: { path: "/api/flatten", verb: "Flatten", typed: "FLATTEN",
-             confirm: "Close EVERY open position at market, right now, at whatever price the book offers." },
+             confirm: "Cancel every resting order and close EVERY open position at market, right now, at whatever price the book offers." },
   adopt:   { path: "/api/adopt",   verb: "Adopt",
              confirm: "Write the venue's current positions into our own record as an opening baseline." },
 };
@@ -881,17 +1056,12 @@ let controlsEnabled = false;
 
 function renderControlAvailability(enabled, state) {
   controlsEnabled = !!enabled;
-  const hint = $("controlhint");
-  document.querySelectorAll("#controls button[data-action]").forEach((b) => {
+  document.querySelectorAll("button[data-action]").forEach((b) => {
     b.disabled = !controlsEnabled;
   });
-  hint.textContent = controlsEnabled
-    ? "every action runs the bot, records a run, and needs a name"
-    : "read-only: this dashboard was started without --bot";
-  // Nudge toward the control that matches the current state rather than
-  // making every button look equally likely.
-  const resume = document.querySelector('#controls button[data-action="resume"]');
-  if (resume) resume.classList.toggle("go", state !== "running");
+  $("controlhint").textContent = controlsEnabled
+    ? "runs the bot"
+    : "read-only";
 }
 
 async function sendControl(name, extra) {
@@ -901,20 +1071,19 @@ async function sendControl(name, extra) {
   const reason = $("why").value.trim();
   const out = $("ctlresult");
   if (!by || !reason) {
-    out.innerHTML = '<span class="neg">A name and a reason are both required.</span>';
+    out.innerHTML = '<span class="down">A name and a reason are both required.</span>';
     $(by ? "why" : "who").focus();
     return;
   }
   if (!window.confirm(spec.verb + "?\n\n" + spec.confirm + "\n\nReason: " + reason)) return;
   if (spec.typed) {
-    const typed = window.prompt("Type " + spec.typed + " to confirm.");
-    if (typed !== spec.typed) {
+    if (window.prompt("Type " + spec.typed + " to confirm.") !== spec.typed) {
       out.innerHTML = '<span class="dim">Cancelled.</span>';
       return;
     }
   }
 
-  out.textContent = "running " + spec.verb.toLowerCase() + "…";
+  out.innerHTML = '<span class="dim">running ' + esc(spec.verb.toLowerCase()) + "…</span>";
   try {
     const res = await fetch(extra || spec.path, {
       method: "POST",
@@ -926,52 +1095,49 @@ async function sendControl(name, extra) {
       // The bot's own refusal, verbatim. Those messages name the remedy, and
       // paraphrasing them here would lose the part that helps.
       out.innerHTML =
-        '<span class="neg">' + esc(data.error || "HTTP " + res.status) + "</span>" +
+        '<span class="down">' + esc(data.error || "HTTP " + res.status) + "</span>" +
         (data.command ? "<pre class='cmd'>" + esc(data.command) + "</pre>" : "");
       return;
     }
     const rec = data.record || {};
     out.innerHTML =
-      '<span class="pos">' + esc(spec.verb) + " done" +
+      '<span class="up">' + esc(spec.verb) + " done" +
       (rec.outcome ? " · " + esc(rec.outcome) : "") + ".</span>" +
-      (rec.detail ? "<p class='note' style='margin-top:8px'>" + esc(rec.detail) + "</p>" : "");
+      (rec.detail ? '<p class="ctlnote">' + esc(rec.detail) + "</p>" : "");
     refresh();
   } catch (e) {
-    out.innerHTML = '<span class="neg">' + esc(e.message) + "</span>";
+    out.innerHTML = '<span class="down">' + esc(e.message) + "</span>";
   }
 }
 
-document.querySelectorAll("#controls button[data-action]").forEach((b) => {
-  b.addEventListener("click", () => sendControl(b.dataset.action));
-});
-
-/* Adoption after a lost ledger needs the stronger form, and it is offered from
-   the reconciliation panel where the problem is visible rather than from the
-   generic control list. */
+// One delegated listener: panels re-render, so buttons bound at load would stop
+// working the moment their card was rewritten.
 document.addEventListener("click", (ev) => {
-  if (!ev.target) return;
-  if (ev.target.id === "adopt-unknown") {
+  const t = ev.target;
+  if (!t) return;
+  if (t.id === "adopt-unknown") {
     sendControl("adopt", "/api/adopt-accepting-unknown-fills");
     return;
   }
-  // Buttons rendered into panels after load are not covered by the sweep over
-  // #controls, so they are handled here.
-  if (ev.target.dataset && ev.target.dataset.action && !ev.target.closest("#controls")) {
-    sendControl(ev.target.dataset.action);
+  if (t.dataset && t.dataset.action) {
+    sendControl(t.dataset.action);
+    return;
+  }
+  if (t.dataset && t.dataset.range) {
+    range = t.dataset.range;
+    renderRange();
+    if (latest) renderChart(latest.runs);
   }
 });
 
-refresh();
-setInterval(refresh, 10000);
-
-// The chart is drawn at its container's pixel width, so it has to be redrawn
-// when that changes. Debounced: a drag across the screen is one resize, not
-// eighty.
 let resizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => latest && renderChart(latest.runs), 150);
 });
+
+refresh();
+setInterval(refresh, 10000);
 </script>
 </body>
 </html>

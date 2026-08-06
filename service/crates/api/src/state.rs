@@ -185,9 +185,19 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
     let expectation = inputs
         .expectation_path
         .and_then(|p| match std::fs::read_to_string(p) {
+            // Metrics and the strategy's own description. The left rail names
+            // what is running; taking that from the committed research record
+            // rather than a constant means it cannot describe last month's
+            // strategy.
             Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
-                .and_then(|v| v.get("metrics").cloned()),
+                .map(|v| {
+                    serde_json::json!({
+                        "metrics": v.get("metrics").cloned(),
+                        "strategy": v.get("strategy").cloned(),
+                        "window": v.get("window").cloned(),
+                    })
+                }),
             Err(_) => {
                 warnings.push(format!(
                 "no backtest record at {} - there is nothing to compare the live account against",

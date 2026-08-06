@@ -417,6 +417,15 @@ pub struct RunRecord {
     pub gross_exposure: Option<String>,
     pub net_exposure: Option<String>,
     pub control_state: String,
+    /// The risk gate's own numbers, as the planner computed them: every limit,
+    /// what it measured, and whether it held.
+    ///
+    /// Carried into the run record rather than left in the plan file, because
+    /// the question "how close to the cap were we when this ran" is asked long
+    /// after the plan has been superseded — and an operations view that has to
+    /// go and find the plan is one that does not get looked at.
+    #[serde(default)]
+    pub risk_checks: Vec<plan::RiskCheck>,
     /// One entry per slice attempted, in order. Kept whole rather than merged:
     /// *which* slice failed is the first diagnostic question, and a merged
     /// summary cannot answer it.
@@ -452,6 +461,7 @@ impl RunRecord {
             gross_exposure: Some(plan.nav.gross_exposure.to_string()),
             net_exposure: Some(plan.nav.net_exposure.to_string()),
             control_state: controls.state().into(),
+            risk_checks: plan.risk_report.checks.clone(),
             slices: Vec::new(),
         }
     }
@@ -705,6 +715,7 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
             gross_exposure: Some(plan.nav.gross_exposure.to_string()),
             net_exposure: Some(plan.nav.net_exposure.to_string()),
             control_state: controls.state().into(),
+            risk_checks: plan.risk_report.checks.clone(),
             slices: Vec::new(),
         };
 
@@ -920,6 +931,7 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
             gross_exposure: None,
             net_exposure: None,
             control_state: controls.state().into(),
+            risk_checks: Vec::new(),
             slices: vec![serde_json::json!({
                 "adopted": written,
                 "acknowledged": acknowledged,
@@ -997,6 +1009,7 @@ impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
             gross_exposure: None,
             net_exposure: None,
             control_state: controls.state().into(),
+            risk_checks: Vec::new(),
             slices: Vec::new(),
         };
 

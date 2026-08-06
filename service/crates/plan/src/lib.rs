@@ -195,7 +195,7 @@ pub struct Order {
     pub est_cost_bps: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskCheck {
     pub name: String,

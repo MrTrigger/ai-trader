@@ -826,9 +826,10 @@ can never be pointed at a funded account at all.
 
 ### 8.2 The dashboard is a lens with hands, and the hands belong to the bot
 
-The `api` process serves an operations dashboard on loopback: control state, NAV and P&L folded from
-the fill log, positions, balances with what resting orders have claimed, open orders, fills, run
-history with what went wrong, reconciliation, health, and live performance against the backtest.
+The `api` process serves an operations dashboard on loopback, laid out as a command centre rather
+than a report: what is running and against which account on the left, the book in the middle — NAV,
+its curve, the basket, positions, balances, open orders, run history — and the controls, the risk
+gate, reconciliation, health and an activity feed down the right.
 
 It carries the full control set — halt, pause, resume, flatten, adopt — and holds **no venue
 credentials**. It performs none of them: it invokes the `bot` binary, which owns the key, the gates
@@ -849,6 +850,12 @@ otherwise alarming:
   undone by pressing something else;
 - started without `--bot`, the dashboard shows everything and changes nothing — and that is the
   default.
+
+The risk card shows the **planner's own gate** — every limit, what it measured, and whether it held
+— carried into the run record rather than recomputed here. A dashboard that derived its own version
+of a limit would be a second opinion about the thing that enforces it. Colour follows the money
+everywhere on the page except net exposure, which is a deviation from dollar-neutral rather than a
+gain, and is coloured as drift.
 
 Live performance is shown with its sample size in the column header, not in a footnote. Below the
 threshold the live column is greyed and the Sharpe reads *not yet*: a ratio from a few weeks is
