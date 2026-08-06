@@ -8,6 +8,7 @@ rust-version.workspace = true
 plan = { workspace = true }
 venue = { workspace = true }
 executor = { path = "../executor" }
+records = { path = "../records" }
 async-trait = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }

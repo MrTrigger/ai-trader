@@ -1,18 +1,18 @@
 //! The fleet view: every registered bot, with live status (multi-bot UI,
 //! migration step: "one control plane").
 //!
-//! Identity comes from the DB registry (DB-first, triggerlab mandate); the
-//! per-bot status is read best-effort from each bot's registered state_dir.
-//! Two state contracts exist until step 4 unifies records in Postgres:
+//! Identity AND operational records come from Postgres (steps 1 and 4):
+//! `bot_status` for the live document, `fills`/`runs` for history,
+//! `control_events` for the control word. Every bot publishes to the same
+//! tables whatever language it is written in, so this module renders one
+//! contract, not per-bot dialects. Reading a bot's `state_dir` files
+//! remains only as a dev fallback for bots that have not yet written a
+//! status row — a pod has no files at all.
 //!
-//! * `botstate/state.json` — the futures bot's heartbeat document.
-//! * `controls.json` + `runs/*.json` — the crypto runner's files.
-//!
-//! Controls here are the narrow kind: HALT/RESUME for bots speaking the
-//! botstate contract is a merge into their polled control.json — the same
-//! file the bot's own rails read, no credentials involved. Runner-contract
-//! bots keep their controls on their own credentialed `bot` binary (this
-//! process only delegates for THE bot it wraps).
+//! Controls: HALT/RESUME appends a `control_events` row (reason + name
+//! required, merged over the current payload so per-sleeve switches
+//! survive). Bots read the newest row at their own gates; absent rows mean
+//! halted. No credentials are involved anywhere in this process.
 
 use std::path::{Path, PathBuf};
 
@@ -99,14 +99,72 @@ fn status_for(repo_root: &Path, state_dir: Option<&str>) -> Value {
     out
 }
 
+/// Which dialect a published status document speaks. The futures contract
+/// carries per-sleeve walks; the runner contract does not.
+fn dialect_of(payload: &Value) -> &'static str {
+    if payload.get("sleeves").is_some() {
+        "botstate"
+    } else {
+        "runner"
+    }
+}
+
+/// Status summary from a bot's DB rows, or `None` if it never published one.
+fn status_from_rows(
+    status: Option<&records::StatusRow>,
+    control: Option<&records::ControlRow>,
+    last_run: Option<&Value>,
+) -> Option<Value> {
+    let s = status?;
+    let doc: Value = serde_json::from_str(&s.payload).unwrap_or(Value::Null);
+    let mut out = json!({
+        "contract": dialect_of(&doc),
+        "source": "db",
+        "heartbeat_age_seconds": s.heartbeat_age_seconds,
+        "mode": doc.get("mode"),
+        "halted": doc.get("halted"),
+    });
+    if let Some(c) = control {
+        let cp: Value = serde_json::from_str(&c.payload).unwrap_or(Value::Null);
+        out["kill_switch"] = cp.get("kill_switch").cloned().unwrap_or(Value::Null);
+        out["paused"] = cp.get("paused").cloned().unwrap_or(Value::Null);
+        out["control_state"] = json!(c.state);
+    }
+    if let Some(r) = last_run {
+        out["last_run"] = json!({
+            "outcome": r.get("outcome"),
+            "recorded_at": r.get("recorded_at"),
+        });
+    }
+    Some(out)
+}
+
 /// GET /api/bots
 pub fn list(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
-    let bots = with_registry(|reg| Box::pin(reg.list_bots()))?;
+    let data = with_registry(|reg| {
+        Box::pin(async move {
+            let bots = reg.list_bots().await?;
+            let mut rows = Vec::new();
+            for b in bots {
+                let status = reg.get_status(&b.bot_id).await?;
+                let control = reg.current_control(&b.bot_id).await?;
+                let last_run = reg
+                    .recent_runs(&b.bot_id, 1)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+                rows.push((b, status, control, last_run));
+            }
+            Ok(rows)
+        })
+    })?;
     let local = local_state_dir.to_string_lossy();
-    let rows: Vec<Value> = bots
+    let rows: Vec<Value> = data
         .into_iter()
-        .map(|b| {
-            let status = status_for(repo_root, b.state_dir.as_deref());
+        .map(|(b, status, control, last_run)| {
+            let status = status_from_rows(status.as_ref(), control.as_ref(), last_run.as_ref())
+                .unwrap_or_else(|| status_for(repo_root, b.state_dir.as_deref()));
             let is_local = b
                 .state_dir
                 .as_deref()
@@ -128,49 +186,115 @@ pub fn list(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
     Ok(json!({ "available": true, "bots": rows }))
 }
 
-/// POST /api/bots/{id}/halt|resume — botstate-contract bots only.
+/// POST /api/bots/{id}/halt|resume — one control path for every bot.
+///
+/// Appends a `control_events` row whose payload merges over the current
+/// one, so per-sleeve switches and other bot-specific keys survive a
+/// halt/resume cycle. Both dialects are written (`halt` for the futures
+/// contract, `kill_switch` for the runner's ControlFile) — each bot reads
+/// its own key from the same row.
 pub fn set_halt(
-    repo_root: &Path,
+    _repo_root: &Path,
     bot_id: &str,
     halt: bool,
     reason: &str,
     by: &str,
 ) -> Result<Value, String> {
-    let bot = with_registry(|reg| Box::pin(reg.bot(bot_id.to_string().leak())))?
-        .ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
-    let Some(dir) = bot.state_dir.as_deref() else {
-        return Err(format!("{bot_id} has no state_dir registered"));
-    };
-    let botstate = repo_root.join(dir).join("botstate");
-    if !botstate.join("state.json").exists() {
-        return Err(format!(
-            "{bot_id} does not speak the botstate contract — use its own \
-             credentialed `bot` binary for controls"
-        ));
-    }
-    std::fs::create_dir_all(&botstate).map_err(|e| e.to_string())?;
-    let path = botstate.join("control.json");
-    let mut current: Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| json!({}));
-    let obj = current
-        .as_object_mut()
-        .ok_or("control.json is not an object")?;
-    obj.insert("halt".into(), json!(halt));
-    obj.insert("reason".into(), json!(reason));
-    obj.insert("set_by".into(), json!(by));
-    std::fs::write(&path, serde_json::to_string_pretty(&current).unwrap())
-        .map_err(|e| e.to_string())?;
-    Ok(current)
+    let reason = reason.to_string();
+    let by = by.to_string();
+    let bot_id = bot_id.to_string();
+    with_registry(move |reg| {
+        Box::pin(async move {
+            if reg.bot(&bot_id).await?.is_none() {
+                // Same failure shape as RecordsError::UnknownBot, but we
+                // want the check before writing a control row for a typo.
+                return Err(records::RecordsError::UnknownBot(bot_id.clone()));
+            }
+            let mut payload = match reg.current_control(&bot_id).await? {
+                Some(row) => serde_json::from_str::<Value>(&row.payload)
+                    .unwrap_or_else(|_| json!({})),
+                None => json!({}),
+            };
+            let now = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let obj = payload.as_object_mut().expect("control payload is an object");
+            obj.insert("halt".into(), json!(halt));
+            obj.insert("kill_switch".into(), json!(halt));
+            obj.insert("paused".into(), json!(false));
+            obj.insert("reason".into(), json!(reason));
+            obj.insert("set_by".into(), json!(by));
+            obj.insert("set_at".into(), json!(now));
+            obj.insert("bot_id".into(), json!(bot_id));
+            let state = if halt { "halted" } else { "running" };
+            reg.set_control(&bot_id, state, &reason, &by, &payload.to_string())
+                .await?;
+            Ok(payload)
+        })
+    })
 }
 
 
 /// GET /api/bots/{id}/state — the per-bot detail document the dashboard's
-/// bot view renders. Shape depends on the bot's state contract.
+/// bot view renders. Served from the records DB; a bot that has never
+/// published a status row falls back to its state_dir files (dev only).
 pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
-    let bot = with_registry(|reg| Box::pin(reg.bot(bot_id.to_string().leak())))?
-        .ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
+    let id = bot_id.to_string();
+    let (bot, status, control, fills, runs) = with_registry(move |reg| {
+        Box::pin(async move {
+            let bot = reg.bot(&id).await?;
+            let status = reg.get_status(&id).await?;
+            let control = reg.current_control(&id).await?;
+            let fills = reg.recent_fills(&id, 500).await?;
+            let runs = reg.recent_runs(&id, 20).await?;
+            Ok((bot, status, control, fills, runs))
+        })
+    })?;
+    let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
+
+    if let Some(srow) = status {
+        let state: Value = serde_json::from_str(&srow.payload).unwrap_or(Value::Null);
+        if dialect_of(&state) == "botstate" {
+            // Chronological, like the journal file the shape came from.
+            let fills: Vec<Value> = fills
+                .into_iter()
+                .rev()
+                .filter_map(|t| serde_json::from_str(&t).ok())
+                .collect();
+            return Ok(json!({
+                "contract": "botstate",
+                "source": "db",
+                "display_name": bot.display_name,
+                "cadence": bot.cadence,
+                "asset_class": bot.asset_class,
+                "decision_core": bot.decision_core,
+                "enabled": bot.enabled,
+                "heartbeat_age_seconds": srow.heartbeat_age_seconds,
+                "state": state,
+                "fills": fills,
+            }));
+        }
+        let controls: Value = control
+            .map(|c| serde_json::from_str(&c.payload).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
+        let runs: Vec<Value> = runs
+            .into_iter()
+            .filter_map(|t| serde_json::from_str(&t).ok())
+            .collect();
+        return Ok(json!({
+            "contract": "runner",
+            "source": "db",
+            "display_name": bot.display_name,
+            "cadence": bot.cadence,
+            "asset_class": bot.asset_class,
+            "enabled": bot.enabled,
+            "heartbeat_age_seconds": srow.heartbeat_age_seconds,
+            "controls": controls,
+            "runs": runs,
+        }));
+    }
+
+    // Dev fallback: no status row yet — read the registered state_dir.
     let Some(dir) = bot.state_dir.as_deref() else {
         return Ok(json!({ "contract": "none" }));
     };

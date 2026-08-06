@@ -1430,6 +1430,7 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -1596,6 +1597,7 @@ dependencies = [
  "async-trait",
  "executor",
  "plan",
+ "records",
  "rust_decimal",
  "serde",
  "serde_json",

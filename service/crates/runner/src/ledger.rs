@@ -137,70 +137,133 @@ pub struct UnknownFill {
     pub at: String,
 }
 
-/// An append-only file of [`Entry`], one JSON object per line.
+/// The append-only ledger of [`Entry`], behind one of two backends.
 ///
-/// JSONL rather than one JSON document: appending is a single write with no
-/// read-modify-write, so two processes cannot lose each other's entries, and a
-/// truncated last line costs one entry rather than the whole file.
-pub struct Ledger {
-    path: PathBuf,
+/// `Db` is the deployment backend: rows in the shared `ledger_entries`
+/// table, which survive the pod and are what the control plane reads.
+/// `File` (one JSON object per line) remains for offline dev and tests —
+/// appending is a single write with no read-modify-write, and a truncated
+/// last line costs one entry rather than the whole file.
+pub enum Ledger {
+    File {
+        path: PathBuf,
+    },
+    Db {
+        rec: std::sync::Arc<records::blocking::Records>,
+        bot_id: String,
+    },
 }
 
 impl Ledger {
     pub fn open(state_dir: &Path) -> Self {
-        Self {
+        Self::File {
             path: state_dir.join("ledger.jsonl"),
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn db(rec: std::sync::Arc<records::blocking::Records>, bot_id: impl Into<String>) -> Self {
+        Self::Db {
+            rec,
+            bot_id: bot_id.into(),
+        }
+    }
+
+    /// The backing file, when this ledger is file-backed (dev/tests only).
+    pub fn file_path(&self) -> Option<&Path> {
+        match self {
+            Self::File { path } => Some(path),
+            Self::Db { .. } => None,
+        }
+    }
+
+    /// Where this ledger lives, for operator messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::File { path } => path.display().to_string(),
+            Self::Db { bot_id, .. } => format!("ledger_entries rows for bot {bot_id}"),
+        }
     }
 
     pub fn append(&self, entry: &Entry) -> Result<(), RunnerError> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| RunnerError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?;
-        }
-        let line = serde_json::to_string(entry).expect("ledger entry serialises");
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| RunnerError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        writeln!(f, "{line}").map_err(|source| RunnerError::Io {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub fn read(&self) -> Result<Vec<Entry>, RunnerError> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => {
-                return Err(RunnerError::Io {
-                    path: self.path.clone(),
+        match self {
+            Self::File { path } => {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|source| RunnerError::Io {
+                        path: dir.to_path_buf(),
+                        source,
+                    })?;
+                }
+                let line = serde_json::to_string(entry).expect("ledger entry serialises");
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|source| RunnerError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                writeln!(f, "{line}").map_err(|source| RunnerError::Io {
+                    path: path.clone(),
                     source,
                 })
             }
-        };
-        text.lines()
-            .enumerate()
-            .filter(|(_, l)| !l.trim().is_empty())
-            .map(|(i, l)| {
-                serde_json::from_str(l).map_err(|e| RunnerError::Malformed {
-                    what: "ledger entry",
-                    path: self.path.clone(),
-                    detail: format!("line {}: {e}", i + 1),
+            Self::Db { rec, bot_id } => {
+                let v = serde_json::to_value(entry).expect("ledger entry serialises");
+                let kind = v["kind"].as_str().unwrap_or("unknown").to_string();
+                // Baseline/Acknowledged carry `at`; Submitted's is the send
+                // stamp. Every variant has one.
+                let at = v["at"].as_str().unwrap_or("1970-01-01T00:00:00Z").to_string();
+                let coid = v["client_order_id"].as_str().map(str::to_string);
+                rec.ledger_append(
+                    bot_id,
+                    &at,
+                    &kind,
+                    coid.as_deref(),
+                    &v.to_string(),
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn read(&self) -> Result<Vec<Entry>, RunnerError> {
+        match self {
+            Self::File { path } => {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(source) => {
+                        return Err(RunnerError::Io {
+                            path: path.clone(),
+                            source,
+                        })
+                    }
+                };
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, l)| !l.trim().is_empty())
+                    .map(|(i, l)| {
+                        serde_json::from_str(l).map_err(|e| RunnerError::Malformed {
+                            what: "ledger entry",
+                            path: path.clone(),
+                            detail: format!("line {}: {e}", i + 1),
+                        })
+                    })
+                    .collect()
+            }
+            Self::Db { rec, bot_id } => rec
+                .ledger_entries(bot_id)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    serde_json::from_str(&l).map_err(|e| RunnerError::Malformed {
+                        what: "ledger entry",
+                        path: PathBuf::from(format!("db:ledger_entries/{bot_id}")),
+                        detail: format!("row {}: {e}", i + 1),
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        }
     }
 
     pub fn is_empty(&self) -> Result<bool, RunnerError> {

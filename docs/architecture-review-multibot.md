@@ -145,6 +145,20 @@ credential *references* (which scope, which secret name), never secrets.
    `state_dir` files remain a dev-mode backend behind the same interface.
    Retire `data/book.json` — positions derive from fills, as §0.7 already
    demands.
+   *LANDED 2026-08-06*: migration `0003_operational.sql` (runs,
+   ledger_entries, fills, control_events, bot_status, snapshots,
+   venue_sim_state — every row keyed by bot_id, the bot's own document
+   verbatim as jsonb next to indexed columns). Runner's
+   Ledger/RunStore/ControlStore and the futures bot's state store are
+   dual-backend: DATABASE_URL → Postgres (no silent fallback — an
+   unreachable DB refuses, fail closed), unset → files, loudly, for dev
+   and the hermetic parity gates. One control contract for every bot:
+   halt/resume appends a control_events row; absence means halted.
+   Verified: replay parity, crash/resume parity through the DB (exact,
+   with journal rehydration), halt→bot-reads-it→resume audit trail.
+   Deployment note (operator): ONE pod, N bot processes + one api, all on
+   the cluster DB; `var/` holds only caches. Still open from this step:
+   retire `data/book.json` on the planner side.
 5. **One control plane.** Single `api` over the records DB; bot registry
    page; per-bot dashboard rendered from the bot's declared metadata (not
    a parameter allowlist); global + per-bot halt. Then, per README's own

@@ -7,3 +7,4 @@ edition = "2021"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "time", "migrate", "macros"] }
 thiserror = "1"
 time = { version = "0.3", features = ["parsing", "formatting"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }

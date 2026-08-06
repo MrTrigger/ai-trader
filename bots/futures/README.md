@@ -23,16 +23,21 @@ validated backtest before any live bar is trusted.
     ./run.sh shadow              # live-data readiness loop (IB gateway)
     ./run.sh parity              # the gate
 
-State publishes to `var/futures/state/botstate/` (state.json heartbeat,
-journal.jsonl fills, control.json, runtime snapshot) — the same contract
-the journal's dashboard used; ai-trader's multi-bot UI reads it via the
-registry's state_dir column. Identity: `bot_id = futures-noise`, registered
-and DB-gated like every bot (fail closed when DATABASE_URL is set).
+State publishes to the shared records DB (step 4): the heartbeat document
+to `bot_status`, fills to `fills` (content-keyed, idempotent — replays and
+crash-recovery reruns never double-insert), the crash-recovery snapshot to
+`snapshots`, and controls are read from the newest `control_events` row —
+the same tables every bot in the fleet reports to, and the only store that
+survives the pod. `run.sh` sources `.env` for DATABASE_URL; without it the
+old `var/futures/state/botstate/` file contract remains as announced dev
+fallback (the parity gate forces it, hermetically). Identity: `bot_id =
+futures-noise`, registered and DB-gated like every bot (fail closed when
+DATABASE_URL is set).
 
 ## Venue
 
 `venue_id = ib`. The IB adapter (ib_async executor with two-flag arming,
 reconciliation rail, ib-check probe) lives with the decision core in
-trading-journal/backtest/src/backtest/bot/venue.py until step 4 moves
-operational records to Postgres; the registry's `ib` venue row already
-exists and `open_live("ib")` refuses with a pointer here until then.
+trading-journal/backtest/src/backtest/bot/venue.py (a §3.5-style
+"credentials live where the work is" judgment); the registry's `ib` venue
+row already exists and `open_live("ib")` refuses with a pointer here.

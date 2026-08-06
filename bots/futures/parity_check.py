@@ -23,10 +23,14 @@ WINDOW = "2026-06-01"
 
 
 def run_replay() -> dict:
+    # File mode on purpose: this is a hermetic gate against a committed
+    # fixture, not a deployment — it must neither write fixture-window rows
+    # into the shared records DB nor depend on one being reachable.
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
     subprocess.run(
         [str(JOURNAL / ".venv/bin/python"), "-m", "backtest.cli", "bot-replay",
          "--rules", "rules-lab", "--start", WINDOW],
-        cwd=JOURNAL, check=True, capture_output=True,
+        cwd=JOURNAL, check=True, capture_output=True, env=env,
     )
     rows = [json.loads(l) for l in (JOURNAL / "botstate/journal.jsonl").read_text().splitlines()]
     out: dict = {}

@@ -69,6 +69,9 @@ pub enum RunnerError {
         detail: String,
     },
 
+    #[error("records db: {0}")]
+    Records(#[from] records::RecordsError),
+
     #[error(
         "plan {plan_id} was already executed at {when}. Running it again would submit the \
          same orders against a book that has since moved, and no id would collide because \
@@ -478,65 +481,100 @@ impl RunRecord {
     }
 }
 
-/// Append-only run history on disk, one file per run.
+/// Append-only run history, behind one of two backends.
 ///
-/// One file rather than one growing log: a half-written line in a shared log
-/// corrupts the whole history, and a run that died mid-write should cost its own
-/// record and no others.
-pub struct RunStore {
-    root: PathBuf,
+/// `Db` is the deployment backend: one row per run in the shared `runs`
+/// table. `File` (one file per run) remains for offline dev and tests —
+/// one file rather than one growing log, because a half-written line in a
+/// shared log corrupts the whole history, and a run that died mid-write
+/// should cost its own record and no others.
+pub enum RunStore {
+    File {
+        root: PathBuf,
+    },
+    Db {
+        rec: std::sync::Arc<records::blocking::Records>,
+        bot_id: String,
+    },
 }
 
 impl RunStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::File { root: root.into() }
     }
 
-    pub fn dir(&self) -> PathBuf {
-        self.root.join("runs")
+    pub fn db(rec: std::sync::Arc<records::blocking::Records>, bot_id: impl Into<String>) -> Self {
+        Self::Db {
+            rec,
+            bot_id: bot_id.into(),
+        }
     }
 
-    pub fn record(&self, run: &RunRecord) -> Result<PathBuf, RunnerError> {
-        let dir = self.dir();
-        fs::create_dir_all(&dir).map_err(io(&dir))?;
-        // Timestamp-prefixed, so a directory listing is chronological without
-        // opening anything.
-        let name = format!(
-            "{}-{}.json",
-            run.recorded_at.replace([':', '.'], ""),
-            run.run_id
-        );
-        let path = dir.join(name);
-        let text = serde_json::to_string_pretty(run).expect("RunRecord serialises");
-        fs::write(&path, text + "\n").map_err(io(&path))?;
-        Ok(path)
+    pub fn record(&self, run: &RunRecord) -> Result<(), RunnerError> {
+        match self {
+            Self::File { root } => {
+                let dir = root.join("runs");
+                fs::create_dir_all(&dir).map_err(io(&dir))?;
+                // Timestamp-prefixed, so a directory listing is chronological
+                // without opening anything.
+                let name = format!(
+                    "{}-{}.json",
+                    run.recorded_at.replace([':', '.'], ""),
+                    run.run_id
+                );
+                let path = dir.join(name);
+                let text = serde_json::to_string_pretty(run).expect("RunRecord serialises");
+                fs::write(&path, text + "\n").map_err(io(&path))?;
+                Ok(())
+            }
+            Self::Db { rec, bot_id } => {
+                let text = serde_json::to_string(run).expect("RunRecord serialises");
+                rec.record_run(bot_id, &run.run_id, &run.recorded_at, &run.outcome, &text)?;
+                Ok(())
+            }
+        }
     }
 
     /// Most recent first.
     pub fn recent(&self, limit: usize) -> Result<Vec<RunRecord>, RunnerError> {
-        let dir = self.dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
-            .map_err(io(&dir))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
-        paths.sort();
-        paths.reverse();
-        paths
-            .into_iter()
-            .take(limit)
-            .map(|p| {
-                let text = fs::read_to_string(&p).map_err(io(&p))?;
-                serde_json::from_str(&text).map_err(|e| RunnerError::Malformed {
-                    what: "run record",
-                    path: p,
-                    detail: e.to_string(),
+        match self {
+            Self::File { root } => {
+                let dir = root.join("runs");
+                if !dir.exists() {
+                    return Ok(Vec::new());
+                }
+                let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+                    .map_err(io(&dir))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                    .collect();
+                paths.sort();
+                paths.reverse();
+                paths
+                    .into_iter()
+                    .take(limit)
+                    .map(|p| {
+                        let text = fs::read_to_string(&p).map_err(io(&p))?;
+                        serde_json::from_str(&text).map_err(|e| RunnerError::Malformed {
+                            what: "run record",
+                            path: p,
+                            detail: e.to_string(),
+                        })
+                    })
+                    .collect()
+            }
+            Self::Db { rec, bot_id } => rec
+                .recent_runs(bot_id, limit as i64)?
+                .into_iter()
+                .map(|text| {
+                    serde_json::from_str(&text).map_err(|e| RunnerError::Malformed {
+                        what: "run record",
+                        path: PathBuf::from(format!("db:runs/{bot_id}")),
+                        detail: e.to_string(),
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        }
     }
 
     /// When this plan was executed, if it was.
@@ -553,10 +591,102 @@ impl RunStore {
     /// re-plan, which is a strictly worse thing to force at the moment
     /// something has just gone wrong.
     pub fn executed_at(&self, plan_id: &str) -> Result<Option<String>, RunnerError> {
+        if let Self::Db { rec, bot_id } = self {
+            return Ok(rec.run_executed_at(bot_id, plan_id)?);
+        }
         Ok(self.recent(500)?.into_iter().find_map(|r| {
             (r.plan_id.as_deref() == Some(plan_id) && r.orders_submitted > 0)
                 .then_some(r.recorded_at)
         }))
+    }
+}
+
+/// Where controls live, behind one of two backends.
+///
+/// `Db` reads the newest `control_events` row and appends a new one on
+/// every write — controls are an audit trail, never updated in place.
+/// Either way the fail-closed default holds: nothing readable means HALTED.
+pub enum ControlStore {
+    File(PathBuf),
+    Db {
+        rec: std::sync::Arc<records::blocking::Records>,
+        bot_id: String,
+    },
+}
+
+impl ControlStore {
+    pub fn db(rec: std::sync::Arc<records::blocking::Records>, bot_id: impl Into<String>) -> Self {
+        Self::Db {
+            rec,
+            bot_id: bot_id.into(),
+        }
+    }
+
+    /// Read fresh, every time, and never fail: anything unreadable resolves
+    /// to halted rather than to an error a caller might retry through.
+    pub fn read(&self) -> ControlFile {
+        match self {
+            Self::File(path) => ControlFile::read(path),
+            Self::Db { rec, bot_id } => match rec.current_control(bot_id) {
+                Ok(Some(row)) => {
+                    serde_json::from_str::<ControlFile>(&row.payload).unwrap_or_else(|e| {
+                        ControlFile {
+                            bot_id: Some(bot_id.clone()),
+                            kill_switch: true,
+                            paused: false,
+                            reason: Some(format!(
+                                "control row for {bot_id} is unreadable ({e}); halted rather \
+                                 than guessing"
+                            )),
+                            set_by: None,
+                            set_at: None,
+                        }
+                    })
+                }
+                Ok(None) => ControlFile {
+                    bot_id: Some(bot_id.clone()),
+                    kill_switch: true,
+                    paused: false,
+                    reason: Some(
+                        "no control row found; defaulting to halted. Resume (with a reason \
+                         and a name) to enable trading."
+                            .into(),
+                    ),
+                    set_by: None,
+                    set_at: None,
+                },
+                Err(e) => ControlFile {
+                    bot_id: Some(bot_id.clone()),
+                    kill_switch: true,
+                    paused: false,
+                    reason: Some(format!(
+                        "control read failed ({e}); halted rather than guessing"
+                    )),
+                    set_by: None,
+                    set_at: None,
+                },
+            },
+        }
+    }
+
+    pub fn write(&self, controls: &ControlFile) -> Result<(), RunnerError> {
+        match self {
+            Self::File(path) => controls.write(path),
+            Self::Db { rec, bot_id } => {
+                let mut stamped = controls.clone();
+                stamped.bot_id = Some(bot_id.clone());
+                let payload =
+                    serde_json::to_string(&stamped).expect("ControlFile serialises");
+                rec.set_control(
+                    bot_id,
+                    stamped.state(),
+                    stamped.reason.as_deref().unwrap_or("no reason recorded"),
+                    stamped.set_by.as_deref().unwrap_or("unattributed"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -666,7 +796,8 @@ pub struct Runner<'a, V: VenueAdapter + ?Sized, C: Timer> {
     /// Our own record of what we authorised. The independent half of
     /// reconciliation — see the [`ledger`] module docs.
     pub ledger: &'a Ledger,
-    pub controls_path: PathBuf,
+    /// Controls, re-read fresh at every gate (file or DB backend).
+    pub controls: ControlStore,
     pub schedule: Schedule,
     /// How old a plan may be when the first slice goes out.
     pub max_plan_age_minutes: i64,
@@ -685,7 +816,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
     /// once at the top would not.
     pub async fn run(&self, plan: &Plan) -> Result<RunRecord, RunnerError> {
         let now = self.clock.now();
-        let controls = ControlFile::read(&self.controls_path);
+        let controls = self.controls.read();
 
         if let Some(when) = self.store.executed_at(&plan.plan_id.to_string())? {
             let e = RunnerError::AlreadyExecuted {
@@ -740,7 +871,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
 
             // Re-read: the window is long enough for a human to intervene inside
             // it, which is half the point of having a window.
-            let controls = ControlFile::read(&self.controls_path);
+            let controls = self.controls.read();
             record.control_state = controls.state().into();
             if controls.kill_switch {
                 record.outcome = "halted".into();
@@ -877,7 +1008,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         accept_unknown_fills: bool,
     ) -> Result<RunRecord, RunnerError> {
         let now = self.clock.now();
-        let controls = ControlFile::read(&self.controls_path);
+        let controls = self.controls.read();
         let report = self.inspect().await?;
 
         if !report.unknown_fills.is_empty() && !accept_unknown_fills {
@@ -984,7 +1115,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
     /// are required for "flat" to mean anything.
     pub async fn flatten(&self, reason: &str, by: &str) -> Result<RunRecord, RunnerError> {
         let now = self.clock.now();
-        let controls = ControlFile::read(&self.controls_path);
+        let controls = self.controls.read();
 
         // Resting orders go first. A flatten that closed every position and
         // left the working orders alive would let one fill an hour later and

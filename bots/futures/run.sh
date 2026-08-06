@@ -9,6 +9,14 @@ PY="$JOURNAL/backtest/.venv/bin/python"
 STATE="$ROOT/var/futures/state"
 mkdir -p "$STATE"
 
+# The deployment identity lives in .env (DATABASE_URL above all): with it,
+# replay/shadow publish to the shared records DB the fleet reads; without
+# it they fall back to file state and say so. The parity gate scrubs
+# DATABASE_URL itself — it is hermetic on purpose.
+if [ -f "$ROOT/.env" ]; then
+  set -a; . "$ROOT/.env"; set +a
+fi
+
 case "${1:-}" in
   replay)
     shift

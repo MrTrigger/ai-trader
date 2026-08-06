@@ -1401,7 +1401,10 @@ async function renderBot(id) {
   const d = DETAILS[id] || (await loadDetail(id));
   if (!b || !d) { $F('botview').innerHTML = card('not found', '', 'unknown bot ' + id); return; }
   const st = d.state || {};
-  const halted = st.halted;
+  const rc = d.controls || {};
+  const halted = d.contract === 'runner'
+    ? (rc.kill_switch === true ? (rc.reason || 'kill switch') : null)
+    : st.halted;
   agg($F('botbar'), [
     ['bot', id], ['class', d.asset_class], ['cadence', d.cadence],
     ['registry', b.enabled ? 'enabled' : 'disabled', b.enabled ? 'pos' : ''],
@@ -1409,17 +1412,33 @@ async function renderBot(id) {
     ['status', halted ? 'HALTED (' + halted + ')' : 'active', halted ? 'neg' : 'pos'],
   ]);
   const v = $F('botview');
+  const wireHalt = () => {
+    const btn = $F('btnHalt');
+    if (btn) btn.onclick = async () => {
+      const reason = prompt((halted ? 'Clear halt on ' : 'Halt ') + id + ' — reason:'); if (!reason) return;
+      const by = prompt('Your name:'); if (!by) return;
+      await fetch('/api/bots/' + id + '/' + (halted ? 'resume' : 'halt'),
+        { method: 'POST', body: JSON.stringify({ reason, by }) });
+      delete DETAILS[id]; await loadFleet();
+    };
+  };
   if (d.contract === 'runner') {
     v.innerHTML =
-      card('This bot has its own deep dashboard', '',
+      card('Controls', 'reason + name required, audit-logged',
+        '<button id="btnHalt" class="pill" style="cursor:pointer;padding:8px 16px">'
+        + (halted ? 'clear halt' : 'HALT — kill switch') + '</button>'
+        + '<div class="k" style="margin-top:8px;color:var(--ink-3);font-size:11px">'
+        + (rc.set_by ? 'Set by ' + rc.set_by + (rc.set_at ? ' at ' + String(rc.set_at).slice(0, 19) : '') + '. ' : '')
+        + 'The bot re-reads controls before every slice; open positions are never touched from this page.</div>')
+      + card('This bot has its own deep dashboard', '',
         'The crypto runner keeps its full book view on the process wrapping its state dir'
-        + (b.local ? ' — it is THIS process: <a href="#/local">open the book view</a>.' : '.')
-        + '<br><br>Controls stay on its credentialed <code>bot</code> binary.', true)
+        + (b.local ? ' — it is THIS process: <a href="#/local">open the book view</a>.' : '.'), false)
       + card('Recent runs', (d.runs || []).length + ' recorded',
         '<table class="flt"><tr><th>recorded</th><th>outcome</th><th class="num">sent</th><th>detail</th></tr>'
         + (d.runs || []).map((r) => '<tr><td>' + String(r.recorded_at || '').slice(0, 19) + '</td><td>'
           + (r.outcome || '') + '</td><td class="num">' + (r.orders_submitted ?? '') + '</td><td>'
           + (r.detail || '') + '</td></tr>').join('') + '</table>', true);
+    wireHalt();
     return;
   }
   // botstate contract — the futures bot's full view
@@ -1469,14 +1488,7 @@ async function renderBot(id) {
         + '</td><td>' + (f.reason || '') + '</td></tr>').join('') + '</table>', true);
   spark($F('botEquity'), equitySeries(fills),
     getComputedStyle(document.documentElement).getPropertyValue('--info'));
-  const btn = $F('btnHalt');
-  if (btn) btn.onclick = async () => {
-    const reason = prompt((halted ? 'Clear halt on ' : 'Halt ') + id + ' — reason:'); if (!reason) return;
-    const by = prompt('Your name:'); if (!by) return;
-    await fetch('/api/bots/' + id + '/' + (halted ? 'resume' : 'halt'),
-      { method: 'POST', body: JSON.stringify({ reason, by }) });
-    delete DETAILS[id]; await loadFleet();
-  };
+  wireHalt();
 }
 
 function route() {

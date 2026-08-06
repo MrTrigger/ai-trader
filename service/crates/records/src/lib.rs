@@ -1,10 +1,12 @@
-//! Identity registries — the DB-first source of truth for WHO is trading
-//! (architecture-review-multibot.md step 1).
+//! The DB-first source of truth: WHO is trading (identity registries,
+//! step 1) and WHAT happened (operational records, step 4).
 //!
-//! Scope is deliberately small: registries and lookups. Operational records
-//! (plans, fills, runs, NAV) migrate here in step 4. Nothing in this crate
-//! touches credentials — accounts carry a `credential_ref` naming the
-//! SOPS/env entry, and resolution stays where it is today.
+//! Operational rows carry the bot's own document verbatim as jsonb text
+//! next to a few indexed columns; this crate moves JSON as *strings* and
+//! never parses it — the document dialects belong to the bots and the
+//! dashboard, not to storage. Nothing in this crate touches credentials —
+//! accounts carry a `credential_ref` naming the SOPS/env entry, and
+//! resolution stays where it is today.
 //!
 //! Fail-closed contract: when `DATABASE_URL` is configured, an unregistered
 //! or disabled bot must NOT run. When it is not configured (dev mode), the
@@ -174,5 +176,480 @@ impl Registry {
             return Err(RecordsError::UnknownBot(bot_id.into()));
         }
         Ok(())
+    }
+}
+
+/// The current control word for a bot, i.e. the newest `control_events` row.
+/// `payload` is the full control document in the bot's own dialect.
+#[derive(Debug, Clone)]
+pub struct ControlRow {
+    pub state: String,
+    pub reason: String,
+    pub set_by: String,
+    pub at: String,
+    pub payload: String,
+}
+
+/// A bot's published state document plus its heartbeat.
+#[derive(Debug, Clone)]
+pub struct StatusRow {
+    pub bot_id: String,
+    pub heartbeat_at: String,
+    /// Computed by Postgres at read time, so no clock-format parsing on the
+    /// reader's side ever decides whether a bot looks alive.
+    pub heartbeat_age_seconds: i64,
+    pub payload: String,
+}
+
+// Operational records (step 4). Timestamps cross this boundary as RFC 3339
+// text and are cast to timestamptz in SQL; JSON documents cross as text and
+// are cast to jsonb — so Rust and Python callers speak the identical dialect.
+impl Registry {
+    /// Idempotent: re-recording the same (bot, run) overwrites — a crash
+    /// between execute and record, then a retry, must not fail on conflict.
+    pub async fn record_run(
+        &self,
+        bot_id: &str,
+        run_id: &str,
+        recorded_at: &str,
+        outcome: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO runs (bot_id, run_id, recorded_at, outcome, payload) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5::jsonb) \
+             ON CONFLICT (bot_id, run_id) DO UPDATE SET \
+             recorded_at = EXCLUDED.recorded_at, outcome = EXCLUDED.outcome, \
+             payload = EXCLUDED.payload",
+        )
+        .bind(bot_id)
+        .bind(run_id)
+        .bind(recorded_at)
+        .bind(outcome)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Most recent first, as JSON text per row.
+    pub async fn recent_runs(
+        &self,
+        bot_id: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT payload::text FROM runs WHERE bot_id = $1 \
+             ORDER BY recorded_at DESC LIMIT $2",
+        )
+        .bind(bot_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    /// When this plan last put orders on the wire, if it ever did. Mirrors
+    /// the file store's guard: only `orders_submitted > 0` counts — a run
+    /// that halted before sending anything must leave the plan runnable.
+    pub async fn run_executed_at(
+        &self,
+        bot_id: &str,
+        plan_id: &str,
+    ) -> Result<Option<String>, RecordsError> {
+        let row = sqlx::query(
+            "SELECT payload->>'recorded_at' FROM runs \
+             WHERE bot_id = $1 AND payload->>'plan_id' = $2 \
+             AND COALESCE((payload->>'orders_submitted')::int, 0) > 0 \
+             ORDER BY recorded_at DESC LIMIT 1",
+        )
+        .bind(bot_id)
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    pub async fn ledger_append(
+        &self,
+        bot_id: &str,
+        at: &str,
+        kind: &str,
+        client_order_id: Option<&str>,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO ledger_entries (bot_id, at, kind, client_order_id, payload) \
+             VALUES ($1, $2::timestamptz, $3, $4, $5::jsonb)",
+        )
+        .bind(bot_id)
+        .bind(at)
+        .bind(kind)
+        .bind(client_order_id)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every entry, in the exact order written.
+    pub async fn ledger_entries(&self, bot_id: &str) -> Result<Vec<String>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT payload::text FROM ledger_entries WHERE bot_id = $1 ORDER BY seq",
+        )
+        .bind(bot_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Idempotent on (bot, fill_key): replays and recovery reruns re-derive
+    /// the same key and the insert becomes a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_fill(
+        &self,
+        bot_id: &str,
+        fill_key: &str,
+        at: &str,
+        instrument: Option<&str>,
+        sleeve: Option<&str>,
+        side: Option<&str>,
+        qty: Option<&str>,
+        price: Option<&str>,
+        pnl: Option<&str>,
+        reason: Option<&str>,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO fills (bot_id, fill_key, at, instrument, sleeve, side, \
+             qty, price, pnl, reason, payload) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5, $6, $7::numeric, \
+             $8::numeric, $9::numeric, $10, $11::jsonb) \
+             ON CONFLICT (bot_id, fill_key) DO NOTHING",
+        )
+        .bind(bot_id)
+        .bind(fill_key)
+        .bind(at)
+        .bind(instrument)
+        .bind(sleeve)
+        .bind(side)
+        .bind(qty)
+        .bind(price)
+        .bind(pnl)
+        .bind(reason)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Most recent first, as JSON text per row.
+    pub async fn recent_fills(
+        &self,
+        bot_id: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT payload::text FROM fills WHERE bot_id = $1 \
+             ORDER BY at DESC, fill_key DESC LIMIT $2",
+        )
+        .bind(bot_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Append a control word. Absence of any row means HALTED (fail closed);
+    /// this never updates in place — controls are an audit trail.
+    pub async fn set_control(
+        &self,
+        bot_id: &str,
+        state: &str,
+        reason: &str,
+        set_by: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO control_events (bot_id, state, reason, set_by, payload) \
+             VALUES ($1, $2, $3, $4, $5::jsonb)",
+        )
+        .bind(bot_id)
+        .bind(state)
+        .bind(reason)
+        .bind(set_by)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn current_control(
+        &self,
+        bot_id: &str,
+    ) -> Result<Option<ControlRow>, RecordsError> {
+        let row = sqlx::query(
+            "SELECT state, reason, set_by, at::text, payload::text \
+             FROM control_events WHERE bot_id = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(bot_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| ControlRow {
+            state: r.get(0),
+            reason: r.get(1),
+            set_by: r.get(2),
+            at: r.get(3),
+            payload: r.get(4),
+        }))
+    }
+
+    pub async fn put_status(
+        &self,
+        bot_id: &str,
+        heartbeat_at: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO bot_status (bot_id, heartbeat_at, payload) \
+             VALUES ($1, $2::timestamptz, $3::jsonb) \
+             ON CONFLICT (bot_id) DO UPDATE SET \
+             heartbeat_at = EXCLUDED.heartbeat_at, payload = EXCLUDED.payload",
+        )
+        .bind(bot_id)
+        .bind(heartbeat_at)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_status(&self, bot_id: &str) -> Result<Option<StatusRow>, RecordsError> {
+        let row = sqlx::query(
+            "SELECT bot_id, heartbeat_at::text, \
+             EXTRACT(EPOCH FROM now() - heartbeat_at)::bigint, payload::text \
+             FROM bot_status WHERE bot_id = $1",
+        )
+        .bind(bot_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| StatusRow {
+            bot_id: r.get(0),
+            heartbeat_at: r.get(1),
+            heartbeat_age_seconds: r.get(2),
+            payload: r.get(3),
+        }))
+    }
+
+    pub async fn all_status(&self) -> Result<Vec<StatusRow>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT bot_id, heartbeat_at::text, \
+             EXTRACT(EPOCH FROM now() - heartbeat_at)::bigint, payload::text \
+             FROM bot_status ORDER BY bot_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| StatusRow {
+                bot_id: r.get(0),
+                heartbeat_at: r.get(1),
+                heartbeat_age_seconds: r.get(2),
+                payload: r.get(3),
+            })
+            .collect())
+    }
+
+    pub async fn put_snapshot(
+        &self,
+        bot_id: &str,
+        taken_at: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO snapshots (bot_id, taken_at, payload) \
+             VALUES ($1, $2::timestamptz, $3::jsonb) \
+             ON CONFLICT (bot_id) DO UPDATE SET \
+             taken_at = EXCLUDED.taken_at, payload = EXCLUDED.payload",
+        )
+        .bind(bot_id)
+        .bind(taken_at)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_snapshot(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
+        let row = sqlx::query("SELECT payload::text FROM snapshots WHERE bot_id = $1")
+            .bind(bot_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    pub async fn put_sim_state(
+        &self,
+        bot_id: &str,
+        updated_at: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO venue_sim_state (bot_id, updated_at, payload) \
+             VALUES ($1, $2::timestamptz, $3::jsonb) \
+             ON CONFLICT (bot_id) DO UPDATE SET \
+             updated_at = EXCLUDED.updated_at, payload = EXCLUDED.payload",
+        )
+        .bind(bot_id)
+        .bind(updated_at)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_sim_state(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
+        let row = sqlx::query("SELECT payload::text FROM venue_sim_state WHERE bot_id = $1")
+            .bind(bot_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+}
+
+/// Synchronous facade for callers that are not async (the runner's money
+/// path). One current-thread runtime, one pool, shared behind an `Arc`.
+pub mod blocking {
+    use std::sync::Arc;
+
+    use super::{ControlRow, RecordsError, Registry, StatusRow};
+
+    pub struct Records {
+        rt: tokio::runtime::Runtime,
+        inner: Registry,
+    }
+
+    impl Records {
+        pub fn connect(database_url: &str) -> Result<Arc<Self>, RecordsError> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio current-thread runtime");
+            let inner = wait_on(&rt, Registry::connect(database_url))?;
+            Ok(Arc::new(Self { rt, inner }))
+        }
+
+        pub fn registry(&self) -> &Registry {
+            &self.inner
+        }
+
+        fn wait<F>(&self, fut: F) -> F::Output
+        where
+            F: std::future::Future + Send,
+            F::Output: Send,
+        {
+            wait_on(&self.rt, fut)
+        }
+
+        pub fn record_run(
+            &self,
+            bot_id: &str,
+            run_id: &str,
+            recorded_at: &str,
+            outcome: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(
+                self.inner
+                    .record_run(bot_id, run_id, recorded_at, outcome, payload_json),
+            )
+        }
+
+        pub fn recent_runs(&self, bot_id: &str, limit: i64) -> Result<Vec<String>, RecordsError> {
+            self.wait(self.inner.recent_runs(bot_id, limit))
+        }
+
+        pub fn run_executed_at(
+            &self,
+            bot_id: &str,
+            plan_id: &str,
+        ) -> Result<Option<String>, RecordsError> {
+            self.wait(self.inner.run_executed_at(bot_id, plan_id))
+        }
+
+        pub fn ledger_append(
+            &self,
+            bot_id: &str,
+            at: &str,
+            kind: &str,
+            client_order_id: Option<&str>,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(
+                self.inner
+                    .ledger_append(bot_id, at, kind, client_order_id, payload_json),
+            )
+        }
+
+        pub fn ledger_entries(&self, bot_id: &str) -> Result<Vec<String>, RecordsError> {
+            self.wait(self.inner.ledger_entries(bot_id))
+        }
+
+        pub fn set_control(
+            &self,
+            bot_id: &str,
+            state: &str,
+            reason: &str,
+            set_by: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.set_control(bot_id, state, reason, set_by, payload_json))
+        }
+
+        pub fn current_control(&self, bot_id: &str) -> Result<Option<ControlRow>, RecordsError> {
+            self.wait(self.inner.current_control(bot_id))
+        }
+
+        pub fn put_status(
+            &self,
+            bot_id: &str,
+            heartbeat_at: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.put_status(bot_id, heartbeat_at, payload_json))
+        }
+
+        pub fn get_status(&self, bot_id: &str) -> Result<Option<StatusRow>, RecordsError> {
+            self.wait(self.inner.get_status(bot_id))
+        }
+
+        pub fn put_sim_state(
+            &self,
+            bot_id: &str,
+            updated_at: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.put_sim_state(bot_id, updated_at, payload_json))
+        }
+
+        pub fn get_sim_state(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
+            self.wait(self.inner.get_sim_state(bot_id))
+        }
+    }
+
+    /// Drive a future to completion from a plain thread, even when the caller
+    /// is already inside some other tokio runtime. `block_on` on the calling
+    /// thread would panic there; a scoped thread has no runtime context, so
+    /// it is always legal — and the caller genuinely wants to block.
+    fn wait_on<F>(rt: &tokio::runtime::Runtime, fut: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        std::thread::scope(|s| {
+            s.spawn(|| rt.block_on(fut))
+                .join()
+                .expect("records db call panicked")
+        })
     }
 }

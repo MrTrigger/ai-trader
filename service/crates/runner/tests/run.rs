@@ -514,7 +514,7 @@ fn runner<'a>(
         clock,
         store,
         ledger,
-        controls_path: controls,
+        controls: runner::ControlStore::File(controls),
         schedule,
         max_plan_age_minutes: 120,
     }
@@ -1451,9 +1451,9 @@ fn a_truncated_ledger_line_is_an_error_rather_than_a_silent_gap() {
             OffsetDateTime::UNIX_EPOCH,
         )
         .unwrap();
-    let mut text = std::fs::read_to_string(ledger.path()).unwrap();
+    let mut text = std::fs::read_to_string(ledger.file_path().unwrap()).unwrap();
     text.push_str("{\"kind\":\"submitted\",\"client_order_i");
-    std::fs::write(ledger.path(), text).unwrap();
+    std::fs::write(ledger.file_path().unwrap(), text).unwrap();
 
     let err = ledger.read().expect_err("a torn line must not be skipped");
     assert!(matches!(err, RunnerError::Malformed { .. }), "{err}");
@@ -1485,7 +1485,7 @@ async fn a_lost_ledger_can_be_recovered_by_a_human_who_says_so() {
     .run(&standard_plan("2026-08-01T00:00:00Z"))
     .await
     .unwrap();
-    std::fs::remove_file(ledger.path()).unwrap();
+    std::fs::remove_file(ledger.file_path().unwrap()).unwrap();
 
     let r = runner(
         &venue,
@@ -1565,7 +1565,7 @@ async fn an_acknowledged_fill_is_not_counted_twice() {
     .run(&standard_plan("2026-08-01T00:00:00Z"))
     .await
     .unwrap();
-    std::fs::remove_file(ledger.path()).unwrap();
+    std::fs::remove_file(ledger.file_path().unwrap()).unwrap();
 
     let r = runner(
         &venue,

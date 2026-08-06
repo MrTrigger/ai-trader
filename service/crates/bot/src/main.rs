@@ -45,7 +45,7 @@ use std::sync::Arc;
 use active_venue::{Active, Env, Mode};
 use config::BotConfig;
 use paper::PaperConfig;
-use runner::{ControlFile, Ledger, RunStore, Runner};
+use runner::{ControlFile, ControlStore, Ledger, RunStore, Runner};
 use venue::{ManualPrices, PriceSource, SystemClock, VenueAdapter};
 
 type Venue = Active;
@@ -230,6 +230,56 @@ impl Flags {
     }
 }
 
+// --- operational stores -----------------------------------------------------
+
+/// Where runs, the ledger, controls and the paper book live.
+///
+/// `DATABASE_URL` set → Postgres, the deployment contract: rows survive the
+/// pod and are what the control plane reads. Not set → files under
+/// `state_dir`, dev mode, announced loudly. There is deliberately no silent
+/// fallback from DB to files: an unreachable DB is a refusal, not a
+/// downgrade — a bot quietly writing files while the fleet reads the DB
+/// would be invisible exactly when something is wrong.
+struct Stores {
+    rec: Option<Arc<records::blocking::Records>>,
+    store: RunStore,
+    ledger: Ledger,
+    controls: ControlStore,
+}
+
+fn open_stores(cfg: &BotConfig) -> Result<Stores, String> {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            let rec = records::blocking::Records::connect(&url).map_err(|e| {
+                format!(
+                    "records db unreachable ({e}) — refusing to fall back to files while \
+                     DATABASE_URL is set (fail closed)"
+                )
+            })?;
+            Ok(Stores {
+                store: RunStore::db(rec.clone(), &cfg.bot_id),
+                ledger: Ledger::db(rec.clone(), &cfg.bot_id),
+                controls: ControlStore::db(rec.clone(), &cfg.bot_id),
+                rec: Some(rec),
+            })
+        }
+        _ => {
+            eprintln!(
+                "bot {}: DATABASE_URL not set — file state under {} (dev mode). \
+                 Deployment always sets it.",
+                cfg.bot_id,
+                cfg.state_dir.display()
+            );
+            Ok(Stores {
+                rec: None,
+                store: RunStore::new(&cfg.state_dir),
+                ledger: Ledger::open(&cfg.state_dir),
+                controls: ControlStore::File(cfg.controls_path()),
+            })
+        }
+    }
+}
+
 // --- the venue --------------------------------------------------------------
 
 /// Load the venue for the configured mode, restoring whatever it knew last time.
@@ -238,7 +288,10 @@ impl Flags {
 /// invocation would start flat and the executor would reconcile a real
 /// intention against a book that had forgotten everything. The live venue keeps
 /// its own books, so there is nothing to restore.
-fn open_venue(cfg: &BotConfig) -> Result<Venue, String> {
+fn open_venue(
+    cfg: &BotConfig,
+    rec: Option<&records::blocking::Records>,
+) -> Result<Venue, String> {
     let env = Env::load(cfg.env_path(&config_path()).as_deref());
 
     // Marks. A live feed is the default because a paper run on frozen prices
@@ -271,11 +324,18 @@ fn open_venue(cfg: &BotConfig) -> Result<Venue, String> {
     // gets rejected for a lot size that changed last month.
     let markets = cfg.markets();
 
-    let path = cfg.venue_state_path();
-    let snapshot = match std::fs::read_to_string(&path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    let snapshot = match rec {
+        Some(rec) => rec
+            .get_sim_state(&cfg.bot_id)
+            .map_err(|e| format!("cannot read the paper book from the records db: {e}"))?,
+        None => {
+            let path = cfg.venue_state_path();
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+            }
+        }
     };
 
     active_venue::open(
@@ -293,13 +353,26 @@ fn open_venue(cfg: &BotConfig) -> Result<Venue, String> {
 ///
 /// Only paper has books of ours to write. The live venue is its own record, and
 /// writing a local copy of it would create a second opinion about the account.
-async fn save_venue(cfg: &BotConfig, venue: &Venue) -> Result<(), String> {
+async fn save_venue(
+    cfg: &BotConfig,
+    rec: Option<&records::blocking::Records>,
+    venue: &Venue,
+) -> Result<(), String> {
     if !venue.is_paper() {
         return Ok(());
     }
     let Some(paper) = venue.as_paper() else {
         return Ok(());
     };
+    let snap = paper.snapshot().await;
+    if let Some(rec) = rec {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        return rec
+            .put_sim_state(&cfg.bot_id, &now, &snap)
+            .map_err(|e| format!("cannot write the paper book to the records db: {e}"));
+    }
     let path = cfg.venue_state_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -307,7 +380,7 @@ async fn save_venue(cfg: &BotConfig, venue: &Venue) -> Result<(), String> {
     }
     // Write-then-rename, so a crash mid-write cannot leave a truncated book.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, paper.snapshot().await)
+    std::fs::write(&tmp, snap)
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
 }
@@ -319,23 +392,48 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("cannot read plan {}: {e}", plan_path.display()))?;
     let plan = plan::Plan::parse(&text).map_err(|e| format!("plan is not valid: {e}"))?;
 
-    let venue = open_venue(cfg)?;
-    let store = RunStore::new(&cfg.state_dir);
+    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
-    let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
         ledger: &ledger,
-        controls_path: cfg.controls_path(),
+        controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
     };
 
     let outcome = runner.run(&plan).await;
-    save_venue(cfg, &venue).await?;
+    save_venue(cfg, rec.as_deref(), &venue).await?;
+
+    // Publish the status heartbeat the fleet dashboard renders. Best-effort:
+    // the run's own record is already in the runs table, and a failed status
+    // write must not turn a clean run into a reported failure.
+    if let Some(rec) = rec.as_deref() {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let doc = match &outcome {
+            Ok(r) => serde_json::json!({
+                "mode": cfg.mode,
+                "last_outcome": r.outcome,
+                "nav": r.nav,
+                "control_state": r.control_state,
+                "recorded_at": r.recorded_at,
+            }),
+            Err(e) => serde_json::json!({
+                "mode": cfg.mode,
+                "last_outcome": "error",
+                "detail": e.to_string(),
+            }),
+        };
+        if let Err(e) = rec.put_status(&cfg.bot_id, &now, &doc.to_string()) {
+            eprintln!("bot {}: status write failed: {e}", cfg.bot_id);
+        }
+    }
 
     match outcome {
         Ok(record) => {
@@ -355,8 +453,9 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
 }
 
 fn cmd_status(cfg: &BotConfig) -> Result<(), String> {
-    let controls = ControlFile::read(&cfg.controls_path());
-    let store = RunStore::new(&cfg.state_dir);
+    let st = open_stores(cfg)?;
+    let controls = st.controls.read();
+    let store = st.store;
     let now = time::OffsetDateTime::now_utc();
     let health = runner::health(&controls, &store, cfg.cadence_hours, now)
         .map_err(|e| format!("cannot assess health: {e}"))?;
@@ -379,7 +478,7 @@ fn cmd_status(cfg: &BotConfig) -> Result<(), String> {
 }
 
 fn cmd_history(cfg: &BotConfig, limit: Option<usize>) -> Result<(), String> {
-    let store = RunStore::new(&cfg.state_dir);
+    let store = open_stores(cfg)?.store;
     let runs = store
         .recent(limit.unwrap_or(20))
         .map_err(|e| format!("cannot read run history: {e}"))?;
@@ -388,7 +487,8 @@ fn cmd_history(cfg: &BotConfig, limit: Option<usize>) -> Result<(), String> {
 }
 
 async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
-    let venue = open_venue(cfg)?;
+    let st = open_stores(cfg)?;
+    let venue = open_venue(cfg, st.rec.as_deref())?;
     let positions = venue
         .get_positions()
         .await
@@ -414,11 +514,8 @@ async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
 /// they do not, so this can be a cron check as well as something a human runs
 /// after an incident.
 async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
-    let (venue, store, ledger) = (
-        open_venue(cfg)?,
-        RunStore::new(&cfg.state_dir),
-        Ledger::open(&cfg.state_dir),
-    );
+    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -426,7 +523,7 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
         clock: &clock,
         store: &store,
         ledger: &ledger,
-        controls_path: cfg.controls_path(),
+        controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
     };
@@ -447,11 +544,8 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
 async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let reason = flags.need("--reason")?;
     let by = flags.need("--by")?;
-    let (venue, store, ledger) = (
-        open_venue(cfg)?,
-        RunStore::new(&cfg.state_dir),
-        Ledger::open(&cfg.state_dir),
-    );
+    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -459,7 +553,7 @@ async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         clock: &clock,
         store: &store,
         ledger: &ledger,
-        controls_path: cfg.controls_path(),
+        controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
     };
@@ -530,7 +624,7 @@ async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), St
 
 /// What venue this is pointed at, and whether it could trade.
 async fn cmd_mode_show(cfg: &BotConfig) -> Result<(), String> {
-    let venue = open_venue(cfg)?;
+    let venue = open_venue(cfg, open_stores(cfg)?.rec.as_deref())?;
     // Derived from the key whatever mode we are in, because "is the agent I
     // configured the one the account approved" is a question you want answered
     // *before* switching to live, not by a rejected order afterwards.
@@ -628,22 +722,23 @@ async fn cmd_mode_set(
     // Prove the new mode works before committing to it.
     let mut probe = cfg.clone();
     probe.mode = mode;
-    let venue =
-        open_venue(&probe).map_err(|e| format!("cannot switch to {}: {e}", mode.as_str()))?;
+    let stores = open_stores(cfg)?;
+    let venue = open_venue(&probe, stores.rec.as_deref())
+        .map_err(|e| format!("cannot switch to {}: {e}", mode.as_str()))?;
     let described = venue.describe();
 
     // Going live starts flat by construction: the ledger describes a paper book
     // that has nothing to do with the real account, and carrying it across
     // would have us reconcile one account's history against another's balance.
     if mode.moves_real_money() || mode == Mode::LiveReadonly {
-        let ledger = Ledger::open(&cfg.state_dir);
+        let ledger = &stores.ledger;
         if !ledger.is_empty().map_err(|e| e.to_string())? {
             return Err(format!(
                 "the order ledger already describes a {} book. Switching venues with it in \
                  place would reconcile one account's history against another's balance. Move \
                  {} aside first, then `bot adopt` against the real account.",
                 cfg.mode.as_str(),
-                ledger.path().display()
+                ledger.describe()
             ));
         }
     }
@@ -659,9 +754,9 @@ async fn cmd_mode_set(
     std::fs::rename(&tmp, config_path)
         .map_err(|e| format!("cannot replace {}: {e}", config_path.display()))?;
 
-    let store = RunStore::new(&cfg.state_dir);
+    let store = stores.store;
     let now = time::OffsetDateTime::now_utc();
-    let controls = ControlFile::read(&cfg.controls_path());
+    let controls = stores.controls.read();
     let stamp = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
@@ -716,8 +811,9 @@ fn cmd_control(
                 .unwrap_or_default(),
         ),
     };
-    control
-        .write(&cfg.controls_path())
+    open_stores(cfg)?
+        .controls
+        .write(&control)
         .map_err(|e| format!("cannot write controls: {e}"))?;
     println!("{}", serde_json::to_string_pretty(&control).unwrap());
     Ok(())
@@ -726,23 +822,22 @@ fn cmd_control(
 async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let reason = flags.need("--reason")?;
     let by = flags.need("--by")?;
-    let venue = open_venue(cfg)?;
-    let store = RunStore::new(&cfg.state_dir);
+    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
-    let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
         ledger: &ledger,
-        controls_path: cfg.controls_path(),
+        controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
     };
 
     let outcome = runner.flatten(&reason, &by).await;
-    save_venue(cfg, &venue).await?;
+    save_venue(cfg, rec.as_deref(), &venue).await?;
 
     let record = outcome.map_err(|e| format!("flatten failed: {e}"))?;
     println!("{}", serde_json::to_string_pretty(&record).unwrap());
