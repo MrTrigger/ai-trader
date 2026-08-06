@@ -217,11 +217,7 @@ impl Info {
         Ok(vec![Balance {
             currency: QUOTE.into(),
             total,
-            available: spot
-                .token_to_available_after_maintenance
-                .is_none()
-                .then(|| dec(&perps.withdrawable))
-                .unwrap_or(total),
+            available: dec(&perps.withdrawable),
         }])
     }
 
@@ -483,6 +479,7 @@ pub struct SpotState {
     pub token_to_available_after_maintenance: Option<Vec<(u32, String)>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SpotBalance {
     pub coin: String,
