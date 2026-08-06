@@ -203,7 +203,12 @@ impl VenueAdapter for FakeVenue {
             tick: dec("0.01"),
             lot: dec("0.0001"),
             min_notional: dec("10"),
+            multiplier: Decimal::ONE,
+            expiry: None,
+            initial_margin: None,
+            asset_class: "crypto".into(),
             capabilities: Capabilities {
+                stop_orders: false,
                 fractional: true,
                 short: true,
                 max_leverage: dec("1"),

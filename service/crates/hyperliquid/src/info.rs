@@ -414,7 +414,12 @@ fn perp_market(u: &Universe) -> Market {
         lot,
         // Hyperliquid enforces a $10 minimum order value.
         min_notional: Decimal::from(10),
+        multiplier: Decimal::ONE,
+        expiry: None,
+        initial_margin: None,
+        asset_class: "crypto".into(),
         capabilities: Capabilities {
+            stop_orders: false,
             fractional: true,
             short: true,
             max_leverage: Decimal::from(u.max_leverage),

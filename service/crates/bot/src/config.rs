@@ -175,7 +175,12 @@ impl BotConfig {
                 tick: m.tick,
                 lot: m.lot,
                 min_notional: m.min_notional,
-                capabilities: Capabilities {
+                multiplier: Decimal::ONE,
+            expiry: None,
+            initial_margin: None,
+            asset_class: "crypto".into(),
+            capabilities: Capabilities {
+                stop_orders: false,
                     fractional: true,
                     short: m.short,
                     max_leverage: Decimal::ONE,

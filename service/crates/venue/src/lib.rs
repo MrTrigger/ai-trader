@@ -26,6 +26,8 @@
 //! websocket client. Making it synchronous now would mean rewriting it, and
 //! §4 exists so these interfaces do not get rewritten.
 
+pub mod calendar;
+
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -62,6 +64,12 @@ pub struct Capabilities {
     pub short: bool,
     /// `1` means spot. Above 1 means the venue will lend against the position.
     pub max_leverage: Decimal,
+    /// Whether the venue accepts stop orders. False everywhere today: the
+    /// paper venue does not model them and no strategy needs them yet; the
+    /// field exists so an order can be REFUSED against it (capabilities are
+    /// read, not decorative — step-3 finding).
+    #[serde(default)]
+    pub stop_orders: bool,
     /// Whether holding accrues or pays funding — a perp, in practice.
     pub funding: bool,
 }
@@ -70,6 +78,7 @@ impl Capabilities {
     /// Plain spot: fractional, long-only, unlevered, no funding.
     pub fn spot() -> Self {
         Self {
+            stop_orders: false,
             fractional: true,
             short: false,
             max_leverage: Decimal::ONE,
@@ -92,10 +101,45 @@ pub struct Market {
     pub lot: Decimal,
     /// Smallest order value the venue accepts, in `quote_currency`.
     pub min_notional: Decimal,
+    /// What one unit of `qty` IS, financially (step 3: futures vocabulary).
+    ///
+    /// Crypto/spot: `multiplier = 1`, `expiry = None` — a qty of 1 BTC is one
+    /// bitcoin. Futures: an NQ contract has `multiplier = 20` (one point of
+    /// price moves $20 of value) and an expiry, after which the market stops
+    /// existing. P&L and notional math must use `multiplier`; anything that
+    /// assumes qty x price is value silently mis-prices a future 20x.
+    #[serde(default = "decimal_one")]
+    pub multiplier: Decimal,
+    /// Contract expiry for dated instruments; `None` for perpetual/spot.
+    #[serde(default)]
+    pub expiry: Option<time::Date>,
+    /// Margin to OPEN one contract/unit, in `quote_currency`. `None` for
+    /// fully-funded spot. Initial vs maintenance is a later refinement; one
+    /// number is enough to refuse an order the account cannot carry.
+    #[serde(default)]
+    pub initial_margin: Option<Decimal>,
+    /// Which asset class this market belongs to: "crypto", "futures",
+    /// "equity". Adapters declare it; the engine may partition risk by it
+    /// but never branches on venue.
+    #[serde(default = "default_asset_class")]
+    pub asset_class: String,
     pub capabilities: Capabilities,
 }
 
+fn default_asset_class() -> String {
+    "crypto".into()
+}
+
+fn decimal_one() -> Decimal {
+    Decimal::ONE
+}
+
 impl Market {
+    /// Notional value of a quantity at a price, multiplier-aware.
+    pub fn notional(&self, qty: Decimal, price: Decimal) -> Decimal {
+        qty.abs() * price * self.multiplier
+    }
+
     /// Whether `qty` sits exactly on the lot grid.
     ///
     /// Exact because [`Decimal`] is base-10: `0.39753288 % 0.00000001` is zero
@@ -169,7 +213,10 @@ pub struct OrderRequest {
 pub enum OrderState {
     /// Accepted and resting at the venue.
     Open,
-    /// Completely filled. Partial fills are not modelled yet; when a venue
+    /// Some quantity filled, remainder still working (step 3: the enum grew
+    /// the variant its own comment promised).
+    PartiallyFilled,
+    /// Completely filled. Partial fills were unmodelled until step 3; the
     /// needs them, this enum grows a variant rather than `Filled` growing a
     /// meaning.
     Filled,
@@ -620,6 +667,10 @@ mod tests {
             tick: dec("0.01"),
             lot: dec("0.00000001"),
             min_notional: dec("10"),
+            multiplier: Decimal::ONE,
+            expiry: None,
+            initial_margin: None,
+            asset_class: "crypto".into(),
             capabilities: Capabilities::spot(),
         };
         assert!(m.qty_on_grid(dec("0.39753288")));

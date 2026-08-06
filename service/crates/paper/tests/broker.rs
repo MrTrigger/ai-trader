@@ -36,6 +36,10 @@ fn markets() -> Vec<Market> {
             tick: dec("0.01"),
             lot: dec("0.00000001"),
             min_notional: dec("10"),
+            multiplier: Decimal::ONE,
+            expiry: None,
+            initial_margin: None,
+            asset_class: "crypto".into(),
             capabilities: Capabilities::spot(),
         },
         Market {
@@ -45,6 +49,10 @@ fn markets() -> Vec<Market> {
             tick: dec("0.01"),
             lot: dec("0.00000001"),
             min_notional: dec("10"),
+            multiplier: Decimal::ONE,
+            expiry: None,
+            initial_margin: None,
+            asset_class: "crypto".into(),
             capabilities: Capabilities {
                 short: true,
                 funding: true,
