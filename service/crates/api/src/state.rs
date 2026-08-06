@@ -320,12 +320,12 @@ fn read_mode(path: Option<&Path>, warnings: &mut Vec<String>) -> Option<ModeView
     let feed = v
         .get("feed")
         .and_then(|m| m.as_str())
-        .unwrap_or("hyperliquid");
+        .unwrap_or("venue");
     if feed == "file" {
         warnings.push(
             "the price feed is a static file, so marks never move. A paper run against frozen \
              prices produces no P&L, no slippage and no drawdown - none of what a forward test \
-             measures. Set \"feed\": \"hyperliquid\" in the bot config for live prices."
+             measures. Set \"feed\": \"venue\" in the bot config for live prices."
                 .into(),
         );
     }

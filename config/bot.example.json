@@ -1,5 +1,6 @@
 {
   "bot_id": "crypto-portfolio",
+  "venue_id": "hyperliquid",
   "notes": {
     "file": "Copy, edit, point `bot --config` at it. Every number here costs money, so none of them defaults: a fee rate that quietly defaults is a fee rate nobody checked.",
     "fees": "Hyperliquid perp taker, measured on two venues rather than assumed - see config/default.toml and docs/phase-1-findings.md.",

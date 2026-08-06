@@ -72,13 +72,19 @@ impl std::str::FromStr for Mode {
 
 /// The venue a run is actually using.
 ///
-/// An enum rather than a boxed trait object so the compiler still sees both
-/// arms: adding a method to `VenueAdapter` fails to build here until both are
-/// handled, which is what stops the live path quietly missing something the
-/// paper path has.
+/// Paper stays a concrete type (its books are OURS to snapshot); the live
+/// side is a type-erased adapter plus the metadata captured when the venue
+/// registry opened it. Identity step 2: nothing outside [`open_live`] may
+/// know a live venue's name.
 pub enum Active {
     Paper(Box<PaperVenue<Arc<dyn PriceSource>, SystemClock>>),
-    Live(Box<Hyperliquid>),
+    Live {
+        adapter: Box<dyn VenueAdapter + Send + Sync>,
+        /// Human description captured at open ("hyperliquid mainnet for 0x…").
+        description: String,
+        /// The signing agent, when the venue has that concept.
+        agent: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Active {
@@ -94,12 +100,7 @@ impl Active {
     pub fn describe(&self) -> String {
         match self {
             Active::Paper(_) => "paper venue".into(),
-            Active::Live(h) => format!(
-                "hyperliquid {} for {}{}",
-                if h.is_mainnet() { "mainnet" } else { "testnet" },
-                h.account(),
-                if h.can_trade() { "" } else { " (read-only)" }
-            ),
+            Active::Live { description, .. } => description.clone(),
         }
     }
 
@@ -110,7 +111,7 @@ impl Active {
     /// and the rejection does not say which agent it disbelieved.
     pub fn agent_address(&self) -> Option<&str> {
         match self {
-            Active::Live(h) => h.agent_address(),
+            Active::Live { agent, .. } => agent.as_deref(),
             _ => None,
         }
     }
@@ -133,43 +134,43 @@ impl VenueAdapter for Active {
     async fn get_markets(&self) -> Result<Vec<Market>, VenueError> {
         match self {
             Active::Paper(v) => v.get_markets().await,
-            Active::Live(v) => v.get_markets().await,
+            Active::Live { adapter, .. } => adapter.get_markets().await,
         }
     }
     async fn get_balances(&self) -> Result<Vec<Balance>, VenueError> {
         match self {
             Active::Paper(v) => v.get_balances().await,
-            Active::Live(v) => v.get_balances().await,
+            Active::Live { adapter, .. } => adapter.get_balances().await,
         }
     }
     async fn get_positions(&self) -> Result<Vec<Position>, VenueError> {
         match self {
             Active::Paper(v) => v.get_positions().await,
-            Active::Live(v) => v.get_positions().await,
+            Active::Live { adapter, .. } => adapter.get_positions().await,
         }
     }
     async fn get_open_orders(&self) -> Result<Vec<OpenOrder>, VenueError> {
         match self {
             Active::Paper(v) => v.get_open_orders().await,
-            Active::Live(v) => v.get_open_orders().await,
+            Active::Live { adapter, .. } => adapter.get_open_orders().await,
         }
     }
     async fn get_fills(&self, since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError> {
         match self {
             Active::Paper(v) => v.get_fills(since).await,
-            Active::Live(v) => v.get_fills(since).await,
+            Active::Live { adapter, .. } => adapter.get_fills(since).await,
         }
     }
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
         match self {
             Active::Paper(v) => v.place_order(order).await,
-            Active::Live(v) => v.place_order(order).await,
+            Active::Live { adapter, .. } => adapter.place_order(order).await,
         }
     }
     async fn cancel_order(&self, id: &str) -> Result<(), VenueError> {
         match self {
             Active::Paper(v) => v.cancel_order(id).await,
-            Active::Live(v) => v.cancel_order(id).await,
+            Active::Live { adapter, .. } => adapter.cancel_order(id).await,
         }
     }
 }
@@ -285,6 +286,7 @@ fn load_dotenv(path: &std::path::Path) {
 /// Every refusal names the specific thing that is missing. "Cannot start in
 /// live mode" is useless at 3am; "HL_AGENT_PRIVATE_KEY is empty" is a fix.
 pub fn open(
+    venue_id: &str,
     mode: Mode,
     env: &Env,
     paper_cfg: PaperConfig,
@@ -306,7 +308,31 @@ pub fn open(
             };
             Ok(Active::Paper(Box::new(v)))
         }
-        Mode::LiveReadonly | Mode::Live => {
+        Mode::LiveReadonly | Mode::Live => open_live(venue_id, mode, env),
+    }
+}
+
+/// THE venue registry: the one sanctioned place a live venue's name may be
+/// matched (spec section 4.1 — nothing else branches on venue identity).
+/// Authority (`mode`) and identity (`venue_id`) arrive as separate inputs;
+/// conflating them was the step-2 finding.
+fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
+    match venue_id {
+        "hyperliquid" => open_hyperliquid(mode, env),
+        "ib" => Err(
+            "venue 'ib' is registered but its adapter arrives with the futures bot \
+             (docs/futures-bot-proposal.md)"
+                .into(),
+        ),
+        other => Err(format!(
+            "unknown venue_id {other:?}. Known live venues: hyperliquid, ib (planned)."
+        )),
+    }
+}
+
+fn open_hyperliquid(mode: Mode, env: &Env) -> Result<Active, String> {
+    {
+        {
             let account = env
                 .account
                 .as_deref()
@@ -337,7 +363,18 @@ pub fn open(
             } else {
                 Hyperliquid::read_only(env.base(), account).map_err(|e| e.to_string())?
             };
-            Ok(Active::Live(Box::new(hl)))
+            let description = format!(
+                "hyperliquid {} for {}{}",
+                if hl.is_mainnet() { "mainnet" } else { "testnet" },
+                hl.account(),
+                if hl.can_trade() { "" } else { " (read-only)" }
+            );
+            let agent = hl.agent_address().map(str::to_string);
+            Ok(Active::Live {
+                adapter: Box::new(hl),
+                description,
+                agent,
+            })
         }
     }
 }
@@ -365,7 +402,7 @@ mod tests {
     #[test]
     fn live_without_an_account_refuses_and_names_the_variable() {
         let env = Env::default();
-        let e = open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
         assert!(e.contains("HL_ACCOUNT_ADDRESS"), "{e}");
     }
 
@@ -378,8 +415,7 @@ mod tests {
             account: Some("0x0000000000000000000000000000000000000000".into()),
             ..Default::default()
         };
-        let e = open(
-            Mode::LiveReadonly,
+        let e = open("hyperliquid", Mode::LiveReadonly,
             &env,
             paper_cfg(),
             vec![],
@@ -396,7 +432,7 @@ mod tests {
             account: Some("0x1111111111111111111111111111111111111111".into()),
             ..Default::default()
         };
-        let e = open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
         assert!(e.contains("HL_AGENT_PRIVATE_KEY"), "{e}");
         assert!(
             e.contains("live-readonly"),
@@ -404,8 +440,7 @@ mod tests {
         );
 
         // Watching a real account needs no credential at all.
-        let v = open(
-            Mode::LiveReadonly,
+        let v = open("hyperliquid", Mode::LiveReadonly,
             &env,
             paper_cfg(),
             vec![],
@@ -426,11 +461,11 @@ mod tests {
             allow_live: false,
             ..Default::default()
         };
-        let e = open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
         assert!(e.contains("HL_ALLOW_LIVE"), "{e}");
 
         env.allow_live = true;
-        assert!(open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).is_ok());
+        assert!(open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).is_ok());
     }
 
     #[test]
@@ -493,7 +528,7 @@ mod tests {
             api_url: Some(hyperliquid::TESTNET.into()),
             ..Default::default()
         };
-        let e = open(Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
         assert!(e.contains("pasted wrong"), "{e}");
     }
 

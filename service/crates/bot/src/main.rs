@@ -244,7 +244,8 @@ fn open_venue(cfg: &BotConfig) -> Result<Venue, String> {
     // Marks. A live feed is the default because a paper run on frozen prices
     // measures nothing; the file feed stays for fixtures and offline work.
     let prices: Arc<dyn PriceSource> = match cfg.feed.as_str() {
-        "hyperliquid" => env.price_source()?,
+        // the configured venue's own feed ("hyperliquid" kept as a legacy alias)
+        "venue" | "hyperliquid" => env.price_source()?,
         _ => {
             let m = config::read_marks(&cfg.marks_path())?;
             let manual = Arc::new(ManualPrices::new());
@@ -278,6 +279,7 @@ fn open_venue(cfg: &BotConfig) -> Result<Venue, String> {
     };
 
     active_venue::open(
+        &cfg.venue_id,
         cfg.mode,
         &env,
         paper_cfg,

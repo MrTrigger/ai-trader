@@ -25,6 +25,11 @@ pub struct BotConfig {
     /// process refuses to run unless this id is registered AND enabled
     /// (fail closed — identity is DB-first per the triggerlab mandate).
     pub bot_id: String,
+    /// Which live venue this bot points at (venues registry key). Authority
+    /// lives in `mode`; identity lives here — conflating them was the
+    /// step-2 finding (docs/architecture-review-multibot.md).
+    #[serde(default = "default_venue_id")]
+    pub venue_id: String,
     /// Where controls, run history and venue state live.
     pub state_dir: PathBuf,
     /// `paper`, `live-readonly`, or `live`.
@@ -85,7 +90,7 @@ fn default_mode() -> crate::active_venue::Mode {
     crate::active_venue::Mode::Paper
 }
 fn default_feed() -> String {
-    "hyperliquid".into()
+    "venue".into()
 }
 fn default_max_age() -> i64 {
     120
@@ -119,7 +124,9 @@ impl BotConfig {
             .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
         let cfg: BotConfig = serde_json::from_str(&text)
             .map_err(|e| format!("cannot parse config {}: {e}", path.display()))?;
-        if !matches!(cfg.feed.as_str(), "hyperliquid" | "file") {
+        // "venue" = the configured live venue's own price feed;
+        // "hyperliquid" is accepted as a legacy alias for it.
+        if !matches!(cfg.feed.as_str(), "venue" | "hyperliquid" | "file") {
             return Err(format!(
                 "feed '{}' is not implemented. Use 'hyperliquid' for live prices, or 'file' to \
                  read a static marks.json.",
@@ -192,4 +199,8 @@ pub fn read_marks(path: &Path) -> Result<BTreeMap<String, Decimal>, String> {
                 .map_err(|e| format!("mark for {k} is not a number: {e}"))
         })
         .collect()
+}
+
+fn default_venue_id() -> String {
+    "hyperliquid".into()
 }
