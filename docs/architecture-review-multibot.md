@@ -109,9 +109,22 @@ Notably the futures bot fits target-state diffing naturally: at each bar
 close its desired state per sleeve (+1/-1/0 x units) IS a target; DIFF and
 idempotent convergence apply unchanged.
 
+## Deployment constraint (operator, 2026-08-06)
+
+ai-trader will later deploy to the **triggerlab cluster** alongside the
+journal. That settles the storage question up front: identity is DB-FIRST,
+not files-then-migrate. The registries — `bots`, `venues`, `accounts`,
+`account_bindings` (bot x account x credential scope) — are Postgres tables
+from step 1, and they are the authoritative source the control plane,
+executor and dashboards read. Per-`state_dir` JSON survives only as a
+dev-mode state backend behind the same interface; identity itself is never
+file-resident. Credentials stay in SOPS/env as today — the DB stores
+credential *references* (which scope, which secret name), never secrets.
+
 ## Sequenced migration (each step cheap now, expensive later)
 
-1. **Identity first, while N=1.** Add `bot_id`/`account_id`/`venue_id` to
+1. **Identity first, in Postgres, while N=1.** Stand up the DB with the
+   four registry tables above; add `bot_id`/`account_id`/`venue_id` to
    Plan (schema bump), RunRecord, ledger entries, controls; prefix
    `client_order_id` with the bot id (kills the collision + unknown-fills
    hazard); scope `flatten` to the bot's own ledger positions, never the
@@ -126,11 +139,12 @@ idempotent convergence apply unchanged.
    fills; implement `Calendar` (§4.3) with always-open, CME and XNYS
    implementations; make capabilities READ (executor refuses what the
    market can't do).
-4. **Records to Postgres** (the operator's prod-cluster direction): build
-   §5.2 with the identity columns; ledger/runs/fills/NAV move from
-   per-dir JSON to shared tables; `state_dir` files remain a dev-mode
-   backend behind the same interface. Retire `data/book.json` — positions
-   derive from fills, as §0.7 already demands.
+4. **Operational records to Postgres** (identity tables exist since step
+   1): build the rest of §5.2 with identity columns on every row;
+   ledger/runs/fills/NAV move from per-dir JSON to shared tables;
+   `state_dir` files remain a dev-mode backend behind the same interface.
+   Retire `data/book.json` — positions derive from fills, as §0.7 already
+   demands.
 5. **One control plane.** Single `api` over the records DB; bot registry
    page; per-bot dashboard rendered from the bot's declared metadata (not
    a parameter allowlist); global + per-bot halt. Then, per README's own
