@@ -247,7 +247,8 @@ fn plan_json(orders: &str) -> String {
     "rejected_reason": null
   }},
   "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "schema_version": "1.1.0",
+  "bot_id": "testbot",
+  "schema_version": "1.2.0",
   "status": "accepted",
   "targets": [
     {{
@@ -374,8 +375,8 @@ async fn execution_reconciles_before_trading_not_after() {
 #[test]
 fn the_client_order_id_is_a_pure_function_of_the_plan_and_order() {
     let p = plan::Plan::parse(&plan_json(&order("BTC", "buy", "1.5", "entry"))).unwrap();
-    let a = client_order_id(&p.plan_id.to_string(), &p.orders[0]);
-    let b = client_order_id(&p.plan_id.to_string(), &p.orders[0]);
+    let a = client_order_id(&p.bot_id, &p.plan_id.to_string(), &p.orders[0]);
+    let b = client_order_id(&p.bot_id, &p.plan_id.to_string(), &p.orders[0]);
     assert_eq!(
         a, b,
         "a replay must produce the same id or a restart doubles up"
@@ -390,8 +391,8 @@ fn different_sides_get_different_ids() {
         order("ETH", "buy", "1", "entry")
     )))
     .unwrap();
-    let a = client_order_id(&p.plan_id.to_string(), &p.orders[0]);
-    let b = client_order_id(&p.plan_id.to_string(), &p.orders[1]);
+    let a = client_order_id(&p.bot_id, &p.plan_id.to_string(), &p.orders[0]);
+    let b = client_order_id(&p.bot_id, &p.plan_id.to_string(), &p.orders[1]);
     assert_ne!(a, b);
 }
 

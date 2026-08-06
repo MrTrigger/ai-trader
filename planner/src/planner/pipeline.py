@@ -347,6 +347,7 @@ def run(
 
     document = build(
         run_id=run_id,
+        bot_id=config.bot_id,
         as_of=as_of,
         mode=mode,  # type: ignore[arg-type]
         quote_currency=config.quote_currency,

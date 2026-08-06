@@ -167,8 +167,8 @@ impl ExecutionRecord {
 /// Quantity is included because two orders for the same asset and side within
 /// one plan would otherwise collide — which the plan contract forbids, but an
 /// id scheme that depends on that invariant holding is a worse scheme.
-pub fn client_order_id(plan_id: &str, order: &Order) -> String {
-    id_for(plan_id, order, None)
+pub fn client_order_id(bot_id: &str, plan_id: &str, order: &Order) -> String {
+    id_for(bot_id, plan_id, order, None)
 }
 
 /// The same id, qualified by which slice of a spread-out execution it belongs
@@ -182,19 +182,21 @@ pub fn client_order_id(plan_id: &str, order: &Order) -> String {
 ///
 /// The slice index is part of the plan's fixed schedule, not a counter, so it
 /// stays deterministic across a restart.
-pub fn client_order_id_for_slice(plan_id: &str, order: &Order, slice: u8) -> String {
-    id_for(plan_id, order, Some(slice))
+pub fn client_order_id_for_slice(bot_id: &str, plan_id: &str, order: &Order, slice: u8) -> String {
+    id_for(bot_id, plan_id, order, Some(slice))
 }
 
-fn id_for(plan_id: &str, order: &Order, slice: Option<u8>) -> String {
+fn id_for(bot_id: &str, plan_id: &str, order: &Order, slice: Option<u8>) -> String {
     let side = match order.side {
         Side::Buy => "B",
         Side::Sell => "S",
     };
-    // Plan ids are uuids; the first segment is ample to disambiguate and keeps
-    // the id inside the length limits venues impose.
+    // The bot id namespaces every order (identity step 1): two bots on one
+    // account can never collide, and every fill is attributable to its bot
+    // by prefix. Venues that cap id length hash it anyway (hyperliquid's
+    // cloid is a keccak of this string).
     let short = plan_id.split('-').next().unwrap_or(plan_id);
-    let base = format!("{short}-{}-{side}-{}", order.asset, order.qty.normalize());
+    let base = format!("{bot_id}-{short}-{}-{side}-{}", order.asset, order.qty.normalize());
     match slice {
         Some(n) => format!("{base}-s{n}"),
         None => base,
@@ -228,9 +230,9 @@ fn check_sequence(orders: &[Order]) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn to_request(plan_id: &str, order: &Order, slice: Option<u8>) -> OrderRequest {
+fn to_request(bot_id: &str, plan_id: &str, order: &Order, slice: Option<u8>) -> OrderRequest {
     OrderRequest {
-        client_order_id: id_for(plan_id, order, slice),
+        client_order_id: id_for(bot_id, plan_id, order, slice),
         asset: AssetId::from(order.asset.clone()),
         side: order.side,
         qty: order.qty,
@@ -376,7 +378,7 @@ pub async fn execute_slice<V: VenueAdapter + ?Sized>(
             record.not_attempted.push(order.asset.clone());
             continue;
         }
-        let req = to_request(&plan_id, order, slice);
+        let req = to_request(&plan.bot_id, &plan_id, order, slice);
         let coid = req.client_order_id.clone();
         match venue.place_order(&req).await {
             Ok(ack) => record.submitted.push(OrderOutcome {

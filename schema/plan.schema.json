@@ -9,6 +9,7 @@
     "schema_version",
     "plan_id",
     "run_id",
+    "bot_id",
     "created_at",
     "as_of",
     "mode",
@@ -29,9 +30,17 @@
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
     },
-    "plan_id": { "$ref": "#/$defs/uuid" },
-    "run_id": { "$ref": "#/$defs/uuid" },
-
+    "plan_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "run_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "bot_id": {
+      "description": "Which bot decided this plan (identity registry key). Identity is addressing, not provenance: the executor namespaces orders, ledgers and controls by it, and the registry (records crate) is its source of truth.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+    },
     "created_at": {
       "description": "Wall-clock time the plan was written. Never used for decisions - see as_of.",
       "type": "string",
@@ -42,41 +51,65 @@
       "type": "string",
       "format": "date-time"
     },
-
     "mode": {
       "description": "dry: never executable, produced by backtest or by `plan --dry-run`. live: eligible for execute_plan.",
-      "enum": ["dry", "live"]
+      "enum": [
+        "dry",
+        "live"
+      ]
     },
     "status": {
-      "enum": ["accepted", "rejected", "superseded", "executing", "executed", "failed"]
+      "enum": [
+        "accepted",
+        "rejected",
+        "superseded",
+        "executing",
+        "executed",
+        "failed"
+      ]
     },
-
     "quote_currency": {
       "description": "The currency NAV, weights and costs are denominated in.",
       "type": "string",
       "minLength": 2,
       "maxLength": 10
     },
-
     "nav": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["total", "cash", "gross_exposure", "net_exposure"],
+      "required": [
+        "total",
+        "cash",
+        "gross_exposure",
+        "net_exposure"
+      ],
       "properties": {
-        "total": { "$ref": "#/$defs/decimal" },
-        "cash": { "$ref": "#/$defs/decimal" },
+        "total": {
+          "$ref": "#/$defs/decimal"
+        },
+        "cash": {
+          "$ref": "#/$defs/decimal"
+        },
         "gross_exposure": {
           "description": "Sum of |weight| across positions, as a fraction of NAV.",
           "$ref": "#/$defs/decimal"
         },
-        "net_exposure": { "$ref": "#/$defs/decimal" },
+        "net_exposure": {
+          "$ref": "#/$defs/decimal"
+        },
         "benchmark_beta": {
           "description": "Portfolio beta against the configured benchmark (BTC for crypto, SPY for equities). Null until a beta estimate exists.",
-          "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
-
     "provenance": {
       "description": "Everything needed to re-derive this plan. If a plan cannot be reproduced from its inputs plus these versions, that is a bug, not a limitation (design spec section 5.1).",
       "type": "object",
@@ -93,11 +126,21 @@
         "universe_size"
       ],
       "properties": {
-        "planner_version": { "type": "string" },
-        "feature_set_version": { "type": "string" },
-        "scoring_version": { "type": "string" },
-        "risk_model_version": { "type": "string" },
-        "ruleset_version": { "type": "string" },
+        "planner_version": {
+          "type": "string"
+        },
+        "feature_set_version": {
+          "type": "string"
+        },
+        "scoring_version": {
+          "type": "string"
+        },
+        "risk_model_version": {
+          "type": "string"
+        },
+        "ruleset_version": {
+          "type": "string"
+        },
         "constructor": {
           "description": "The constructor that actually produced these weights.",
           "type": "string"
@@ -108,7 +151,14 @@
         },
         "model_id": {
           "description": "Set only when an LLM-derived feature contributed. Null otherwise.",
-          "oneOf": [{ "type": "string" }, { "type": "null" }]
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "inputs_hash": {
           "description": "Content hash of the bars and features this plan was computed from.",
@@ -122,143 +172,284 @@
         }
       }
     },
-
     "targets": {
       "description": "The desired portfolio. Complete: an asset absent from this list has a target weight of zero.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["asset", "weight", "direction"],
+        "required": [
+          "asset",
+          "weight",
+          "direction"
+        ],
         "properties": {
-          "asset": { "$ref": "#/$defs/asset" },
+          "asset": {
+            "$ref": "#/$defs/asset"
+          },
           "weight": {
             "description": "Signed fraction of NAV. Negative means short.",
             "$ref": "#/$defs/decimal"
           },
-          "direction": { "enum": ["long", "short"] },
+          "direction": {
+            "enum": [
+              "long",
+              "short"
+            ]
+          },
           "conviction": {
             "description": "The signal score that drove this weight, carried for attribution.",
-            "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+            "oneOf": [
+              {
+                "$ref": "#/$defs/decimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       }
     },
-
     "current": {
       "description": "Positions as observed at the venue at as_of - the baseline the diff was taken against. Recorded so a stale plan can be detected before execution.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["asset", "qty", "weight"],
+        "required": [
+          "asset",
+          "qty",
+          "weight"
+        ],
         "properties": {
-          "asset": { "$ref": "#/$defs/asset" },
-          "qty": { "$ref": "#/$defs/decimal" },
-          "weight": { "$ref": "#/$defs/decimal" }
+          "asset": {
+            "$ref": "#/$defs/asset"
+          },
+          "qty": {
+            "$ref": "#/$defs/decimal"
+          },
+          "weight": {
+            "$ref": "#/$defs/decimal"
+          }
         }
       }
     },
-
     "orders": {
       "description": "The minimal set of orders that moves current to targets. Empty whenever status is rejected.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["asset", "side", "qty", "order_type", "reason"],
+        "required": [
+          "asset",
+          "side",
+          "qty",
+          "order_type",
+          "reason"
+        ],
         "properties": {
-          "asset": { "$ref": "#/$defs/asset" },
-          "side": { "enum": ["buy", "sell"] },
+          "asset": {
+            "$ref": "#/$defs/asset"
+          },
+          "side": {
+            "enum": [
+              "buy",
+              "sell"
+            ]
+          },
           "qty": {
             "description": "Absolute base-asset quantity, always positive. Direction is carried by `side`.",
             "$ref": "#/$defs/positive_decimal"
           },
-          "order_type": { "enum": ["market", "limit"] },
+          "order_type": {
+            "enum": [
+              "market",
+              "limit"
+            ]
+          },
           "limit_price": {
-            "oneOf": [{ "$ref": "#/$defs/positive_decimal" }, { "type": "null" }]
+            "oneOf": [
+              {
+                "$ref": "#/$defs/positive_decimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "reason": {
             "description": "Why this order exists. `exit` and `reduce` are the only reasons permitted to run while trading is paused.",
-            "enum": ["entry", "exit", "increase", "reduce", "rebalance"]
+            "enum": [
+              "entry",
+              "exit",
+              "increase",
+              "reduce",
+              "rebalance"
+            ]
           },
           "est_cost_bps": {
-            "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }]
+            "oneOf": [
+              {
+                "$ref": "#/$defs/decimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "allOf": [
           {
-            "if": { "properties": { "order_type": { "const": "limit" } } },
+            "if": {
+              "properties": {
+                "order_type": {
+                  "const": "limit"
+                }
+              }
+            },
             "then": {
-              "required": ["limit_price"],
-              "properties": { "limit_price": { "$ref": "#/$defs/positive_decimal" } }
+              "required": [
+                "limit_price"
+              ],
+              "properties": {
+                "limit_price": {
+                  "$ref": "#/$defs/positive_decimal"
+                }
+              }
             }
           }
         ]
       }
     },
-
     "risk_report": {
       "description": "The section 6 evaluation. A plan is accepted only if every hard limit passed - the risk layer rejects a plan whole, never partially.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["passed", "checks"],
+      "required": [
+        "passed",
+        "checks"
+      ],
       "properties": {
-        "passed": { "type": "boolean" },
+        "passed": {
+          "type": "boolean"
+        },
         "checks": {
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["name", "limit", "value", "passed"],
+            "required": [
+              "name",
+              "limit",
+              "value",
+              "passed"
+            ],
             "properties": {
-              "name": { "type": "string" },
-              "limit": { "$ref": "#/$defs/decimal" },
-              "value": { "$ref": "#/$defs/decimal" },
-              "passed": { "type": "boolean" },
-              "detail": { "oneOf": [{ "type": "string" }, { "type": "null" }] }
+              "name": {
+                "type": "string"
+              },
+              "limit": {
+                "$ref": "#/$defs/decimal"
+              },
+              "value": {
+                "$ref": "#/$defs/decimal"
+              },
+              "passed": {
+                "type": "boolean"
+              },
+              "detail": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
             }
           }
         },
         "rejected_reason": {
-          "oneOf": [{ "type": "string" }, { "type": "null" }]
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
-
     "cost_estimate": {
       "description": "Estimated cost of executing this plan. Fed into the constructor's objective (design spec section 6.1), not merely reported. Compared against realised cost after execution.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["total_bps", "total_quote"],
+      "required": [
+        "total_bps",
+        "total_quote"
+      ],
       "properties": {
-        "total_bps": { "$ref": "#/$defs/decimal" },
-        "total_quote": { "$ref": "#/$defs/decimal" },
+        "total_bps": {
+          "$ref": "#/$defs/decimal"
+        },
+        "total_quote": {
+          "$ref": "#/$defs/decimal"
+        },
         "per_asset": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["asset", "bps"],
+            "required": [
+              "asset",
+              "bps"
+            ],
             "properties": {
-              "asset": { "$ref": "#/$defs/asset" },
-              "bps": { "$ref": "#/$defs/decimal" },
-              "spread_bps": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
-              "impact_bps": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] }
+              "asset": {
+                "$ref": "#/$defs/asset"
+              },
+              "bps": {
+                "$ref": "#/$defs/decimal"
+              },
+              "spread_bps": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "impact_bps": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
             }
           }
         }
       }
     },
-
     "warnings": {
       "description": "Non-fatal disclosures that must be surfaced above any number derived from this plan: degenerate factors, unenforced rules, inadequate sample. Reported first, before results (design spec section 11).",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "message"],
+        "required": [
+          "kind",
+          "message"
+        ],
         "properties": {
           "kind": {
             "enum": [
@@ -271,34 +462,66 @@
               "other"
             ]
           },
-          "message": { "type": "string" }
+          "message": {
+            "type": "string"
+          }
         }
       }
     }
   },
-
   "allOf": [
     {
       "description": "A rejected plan carries no orders. Nothing downstream should have to remember this.",
-      "if": { "properties": { "status": { "const": "rejected" } }, "required": ["status"] },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "then": {
         "properties": {
-          "orders": { "maxItems": 0 },
-          "risk_report": { "properties": { "passed": { "const": false } } }
+          "orders": {
+            "maxItems": 0
+          },
+          "risk_report": {
+            "properties": {
+              "passed": {
+                "const": false
+              }
+            }
+          }
         }
       }
     },
     {
       "description": "An accepted plan passed every hard limit.",
-      "if": { "properties": { "status": { "const": "accepted" } }, "required": ["status"] },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "accepted"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "then": {
         "properties": {
-          "risk_report": { "properties": { "passed": { "const": true } } }
+          "risk_report": {
+            "properties": {
+              "passed": {
+                "const": true
+              }
+            }
+          }
         }
       }
     }
   ],
-
   "$defs": {
     "uuid": {
       "type": "string",

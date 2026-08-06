@@ -111,7 +111,9 @@ impl FakeVenue {
     fn resting_order(self, id: &str, asset: &str, qty: &str) -> Self {
         self.resting.lock().unwrap().push(OpenOrder {
             venue_order_id: id.into(),
-            client_order_id: format!("c-{id}"),
+            // The runner under test is bot "testbot"; flatten only touches
+            // orders carrying its prefix (identity step 1 scoping).
+            client_order_id: format!("testbot-{id}"),
             asset: asset.into(),
             side: Side::Buy,
             qty: dec(qty),
@@ -502,6 +504,7 @@ fn runner<'a>(
     schedule: Schedule,
 ) -> Runner<'a, FakeVenue, TestClock> {
     Runner {
+        bot_id: "testbot".into(),
         venue,
         clock,
         store,
@@ -593,6 +596,7 @@ async fn a_kill_switch_thrown_mid_window_stops_the_remaining_slices() {
     let clock = TestClock::at("2026-08-01T00:30:00Z").with_hook(move |until| {
         if until >= target {
             ControlFile {
+                bot_id: None,
                 kill_switch: true,
                 paused: false,
                 reason: Some("operator stopped it".into()),
@@ -865,6 +869,7 @@ async fn flatten_works_while_the_kill_switch_is_engaged() {
     .unwrap();
 
     ControlFile {
+        bot_id: None,
         kill_switch: true,
         paused: false,
         reason: Some("stopped".into()),
@@ -1056,6 +1061,7 @@ fn a_kill_switch_makes_health_report_not_ok_with_the_reason() {
     let store = RunStore::new(&dir);
 
     let c = ControlFile {
+        bot_id: None,
         kill_switch: true,
         paused: false,
         reason: Some("drawdown breach".into()),
@@ -1631,6 +1637,40 @@ async fn a_run_that_did_submit_is_never_replayed() {
     r.run(&plan).await.unwrap();
     let err = r.run(&plan).await.expect_err("orders already went out");
     assert!(matches!(err, RunnerError::AlreadyExecuted { .. }));
+}
+
+#[tokio::test]
+async fn flatten_leaves_a_sibling_bots_orders_alone() {
+    // Identity step 1: on a shared account another bot's resting orders are
+    // not ours to cancel — the old venue-wide flatten liquidated the
+    // sibling's book, which is the hazard this scoping removes.
+    let dir = tmpdir("flatten-scoped");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new().resting_order("V-SIBLING", "BTC", "0.3");
+    // overwrite the auto prefix: this order belongs to some OTHER bot
+    venue.resting.lock().unwrap()[0].client_order_id = "otherbot-V-SIBLING".into();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .flatten("get me out", "magnus")
+    .await
+    .unwrap();
+
+    assert_eq!(rec.outcome, "flattened");
+    assert_eq!(
+        venue.get_open_orders().await.unwrap().len(),
+        1,
+        "the sibling bot's order must survive our flatten"
+    );
 }
 
 #[tokio::test]

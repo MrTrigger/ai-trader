@@ -1,0 +1,16 @@
+# Local dev database for the identity registries (and, in step 4, the
+# operational records). Prod is the triggerlab cluster's Postgres; this
+# compose exists so `cargo test`/local runs have the same schema.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aitrader
+      POSTGRES_PASSWORD: aitrader
+      POSTGRES_DB: ai_trader
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:

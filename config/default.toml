@@ -1,5 +1,7 @@
 [meta]
 ruleset_version = "phase0"
+# Identity registry key — must match a registered row in the bots table.
+bot_id = "crypto-portfolio"
 
 [portfolio]
 quote_currency = "USD"

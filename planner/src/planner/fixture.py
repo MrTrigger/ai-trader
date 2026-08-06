@@ -45,6 +45,7 @@ _CREATED_AT = datetime(2026, 8, 1, 6, 30, tzinfo=timezone.utc)
 def build() -> dict:
     return P.build(
         run_id=_RUN_ID,
+        bot_id="crypto-portfolio",
         as_of=_AS_OF,
         created_at=_CREATED_AT,
         mode="live",

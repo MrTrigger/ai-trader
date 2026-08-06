@@ -1,5 +1,6 @@
 {
   "as_of": "2026-08-01T00:00:00+00:00",
+  "bot_id": "crypto-portfolio",
   "cost_estimate": {
     "per_asset": [
       {
@@ -54,7 +55,7 @@
       "side": "sell"
     }
   ],
-  "plan_id": "5227e5a9-d91b-50b0-9275-ce7ca4c3ddf8",
+  "plan_id": "f98038ab-1746-58d7-9736-43c2bea65ba3",
   "provenance": {
     "constructor": "conviction_tilt",
     "constructor_requested": "mvo",
@@ -89,7 +90,7 @@
     "rejected_reason": null
   },
   "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "status": "accepted",
   "targets": [
     {

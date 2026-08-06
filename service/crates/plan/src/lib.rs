@@ -253,6 +253,10 @@ pub struct Plan {
     pub schema_version: String,
     pub plan_id: Uuid,
     pub run_id: Uuid,
+    /// Which bot decided this plan (identity registry key). The executor
+    /// namespaces orders, ledgers and controls by it — identity is
+    /// addressing, not provenance.
+    pub bot_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// The newest bar close this plan was allowed to see.
@@ -302,6 +306,17 @@ impl Plan {
     /// process is the one that can move money, and a guarantee that only holds
     /// if an upstream validator ran is not a guarantee.
     fn check_invariants(&self) -> Result<(), PlanError> {
+        if self.bot_id.is_empty()
+            || !self
+                .bot_id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(PlanError::Invariant(format!(
+                "bot_id {:?} is not a registry slug (lowercase alnum + dashes)",
+                self.bot_id
+            )));
+        }
         if self.status == Status::Rejected && !self.orders.is_empty() {
             return Err(PlanError::Invariant(format!(
                 "rejected plan carries {} orders; rejection is whole, never partial",

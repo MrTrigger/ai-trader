@@ -171,6 +171,10 @@ fn stamp(t: OffsetDateTime) -> String {
 /// invites the worst available response, which is to clear it and see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlFile {
+    /// Which bot these controls govern. Optional for old files; stamped on
+    /// every write so shared-DB migration (step 4) can attribute rows.
+    #[serde(default)]
+    pub bot_id: Option<String>,
     /// Plan, but never execute. The strongest stop.
     #[serde(default)]
     pub kill_switch: bool,
@@ -189,6 +193,7 @@ impl Default for ControlFile {
     /// Absent controls mean **halted**, not "trade freely".
     fn default() -> Self {
         Self {
+            bot_id: None,
             kill_switch: true,
             paused: false,
             reason: Some(
@@ -208,6 +213,7 @@ impl ControlFile {
         at: OffsetDateTime,
     ) -> Self {
         Self {
+            bot_id: None,
             kill_switch: false,
             paused: false,
             reason: Some(reason.into()),
@@ -240,6 +246,7 @@ impl ControlFile {
             return Self::default();
         };
         serde_json::from_str::<ControlFile>(&text).unwrap_or_else(|e| Self {
+            bot_id: None,
             kill_switch: true,
             paused: false,
             reason: Some(format!(
@@ -399,6 +406,9 @@ impl Timer for venue::SystemClock {
 /// What one decision-and-execution cycle did. The unit an operator asks about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
+    /// Identity registry key of the bot this run belongs to.
+    #[serde(default)]
+    pub bot_id: Option<String>,
     pub run_id: String,
     pub plan_id: Option<String>,
     pub as_of: String,
@@ -446,6 +456,7 @@ impl RunRecord {
         now: OffsetDateTime,
     ) -> Self {
         Self {
+            bot_id: Some(plan.bot_id.clone()),
             run_id: plan.run_id.to_string(),
             plan_id: Some(plan.plan_id.to_string()),
             as_of: stamp(plan.as_of),
@@ -645,6 +656,10 @@ pub fn health(
 
 /// Everything a run needs that is not the plan.
 pub struct Runner<'a, V: VenueAdapter + ?Sized, C: Timer> {
+    /// Identity registry key. Namespaces every order id this runner emits,
+    /// scopes flatten to this bot's own book, and is stamped on every
+    /// record (identity step 1 — see docs/architecture-review-multibot.md).
+    pub bot_id: String,
     pub venue: &'a V,
     pub clock: &'a C,
     pub store: &'a RunStore,
@@ -700,6 +715,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
 
         let slices = slice_plan(plan, self.schedule);
         let mut record = RunRecord {
+            bot_id: Some(self.bot_id.clone()),
             run_id: plan.run_id.to_string(),
             plan_id: Some(plan.plan_id.to_string()),
             as_of: stamp(plan.as_of),
@@ -757,7 +773,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             // which reads as an intrusion.
             let plan_id = slice.plan.plan_id.to_string();
             for o in &slice.plan.orders {
-                let coid = executor::client_order_id_for_slice(&plan_id, o, slice.index);
+                let coid =
+                    executor::client_order_id_for_slice(&slice.plan.bot_id, &plan_id, o, slice.index);
                 self.ledger
                     .authorise(&coid, o, &plan_id, slice.index, self.clock.now())?;
             }
@@ -905,6 +922,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         let written = self.ledger.adopt(&adopting, by, reason, now)?;
 
         let record = RunRecord {
+            bot_id: Some(self.bot_id.clone()),
             run_id: format!("adopt-{}", stamp(now)),
             plan_id: None,
             as_of: stamp(now),
@@ -968,7 +986,18 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         // left the working orders alive would let one fill an hour later and
         // re-open a book somebody had just decided to be out of — and every
         // record would say the flatten worked.
-        let resting = read_with_retry(|| self.venue.get_open_orders()).await?;
+        // SCOPE (identity step 1): only THIS bot's resting orders are ours to
+        // cancel. On a shared account, the sibling bot's orders are not our
+        // book — cancelling them was the "flatten liquidates bot B" hazard.
+        let own_prefix = format!("{}-", self.bot_id);
+        let resting: Vec<_> = read_with_retry(|| self.venue.get_open_orders())
+            .await?
+            .into_iter()
+            .filter(|o| {
+                o.client_order_id.starts_with(&own_prefix)
+                    || o.client_order_id.starts_with(&format!("{}-FLAT-", self.bot_id))
+            })
+            .collect();
         let mut cancelled = Vec::new();
         let mut cancel_failures = 0usize;
         for o in &resting {
@@ -987,13 +1016,17 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             }
         }
 
-        // Positions are read *after* cancelling: a cancel releases inventory a
-        // resting sell had claimed, and sizing the exit off the earlier view
-        // would leave part of the book behind.
-        let positions = read_with_retry(|| self.venue.get_positions()).await?;
-        let open: Vec<_> = positions.iter().filter(|p| !p.qty.is_zero()).collect();
+        // Positions come from OUR LEDGER, not the venue book (identity step
+        // 1): the venue's positions on a shared account include the sibling
+        // bot's, and closing those liquidated a book somebody else owned.
+        // Fills are read after cancelling for the same inventory reason as
+        // before.
+        let known = read_with_retry(|| self.venue.get_fills(None)).await?;
+        let owned = self.ledger.our_positions(&known)?;
+        let open: Vec<_> = owned.iter().filter(|p| !p.qty.is_zero()).collect();
 
         let mut record = RunRecord {
+            bot_id: Some(self.bot_id.clone()),
             run_id: format!("flatten-{}", stamp(now)),
             plan_id: None,
             as_of: stamp(now),
@@ -1026,7 +1059,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             let req = venue::OrderRequest {
                 // Deterministic in asset and size, so a retry after a crash
                 // resubmits the same id rather than doubling the exit.
-                client_order_id: format!("FLAT-{}-{}", p.asset.as_str(), qty.normalize()),
+                client_order_id: format!("{}-FLAT-{}-{}", self.bot_id, p.asset.as_str(), qty.normalize()),
                 asset: p.asset.clone(),
                 side,
                 qty,

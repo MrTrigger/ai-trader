@@ -39,7 +39,7 @@ import jsonschema
 # whole-plan veto to a diff budget. Additive to an enum, so a 1.0.0 consumer
 # would reject a plan carrying the new value - which is the correct behaviour
 # for a system that fails closed, and the reason the minor version moved.
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "plan.schema.json"
 
@@ -293,6 +293,7 @@ def digest(doc: dict[str, Any]) -> str:
 def build(
     *,
     run_id: uuid.UUID,
+    bot_id: str,
     as_of: datetime,
     mode: Literal["dry", "live"],
     quote_currency: str,
@@ -326,6 +327,7 @@ def build(
         "schema_version": SCHEMA_VERSION,
         "plan_id": str(uuid.UUID(int=0)),  # placeholder, replaced below
         "run_id": str(run_id),
+        "bot_id": bot_id,
         "created_at": (created_at or datetime.now(timezone.utc)).isoformat(),
         "as_of": as_of.isoformat(),
         "mode": mode,

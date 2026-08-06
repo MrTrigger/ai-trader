@@ -79,7 +79,9 @@ commands:
   pause  --reason R --by WHO         risk-reducing orders only
   resume --reason R --by WHO         permit trading again
   flatten --reason R --by WHO --confirm
-                                     close every open position at market
+                                     close THIS BOT's open positions at market
+  identity [show|migrate|register|enable|disable]
+                                     the DB identity registry (needs DATABASE_URL)
 ";
 
 fn run(args: Vec<String>) -> Result<(), String> {
@@ -117,7 +119,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match command.as_str() {
         "run" => {
             let plan_path = flags.need("--plan")?;
-            block_on(cmd_run(&cfg, PathBuf::from(plan_path)))
+            block_on(async {
+                require_registered(&cfg).await?;
+                cmd_run(&cfg, PathBuf::from(plan_path)).await
+            })
         }
         "status" => cmd_status(&cfg),
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
@@ -161,6 +166,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "halt" => cmd_control(&cfg, true, false, &flags),
         "pause" => cmd_control(&cfg, false, true, &flags),
         "resume" => cmd_control(&cfg, false, false, &flags),
+        "identity" => block_on(cmd_identity(&cfg, &rest[rest.len().min(1)..])),
         "flatten" => {
             if !flags.has("--confirm") {
                 return Err("flatten closes every open position at market. Re-run with \
@@ -316,6 +322,7 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
     let clock = SystemClock;
     let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
@@ -412,6 +419,7 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
     );
     let clock = SystemClock;
     let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
@@ -444,6 +452,7 @@ async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     );
     let clock = SystemClock;
     let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
@@ -655,6 +664,7 @@ async fn cmd_mode_set(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
     let record = runner::RunRecord {
+        bot_id: Some(cfg.bot_id.clone()),
         run_id: format!("mode-{stamp}"),
         plan_id: None,
         as_of: stamp.clone(),
@@ -693,6 +703,7 @@ fn cmd_control(
     let reason = flags.need("--reason")?;
     let by = flags.need("--by")?;
     let control = ControlFile {
+        bot_id: Some(cfg.bot_id.clone()),
         kill_switch,
         paused,
         reason: Some(reason),
@@ -718,6 +729,7 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let clock = SystemClock;
     let ledger = Ledger::open(&cfg.state_dir);
     let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
         venue: &venue,
         clock: &clock,
         store: &store,
@@ -736,6 +748,77 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         return Err(record
             .detail
             .unwrap_or_else(|| "some positions are still open".into()));
+    }
+    Ok(())
+}
+
+
+/// Identity is DB-first (triggerlab mandate): when DATABASE_URL is set, an
+/// unregistered or disabled bot_id refuses to run — fail closed. Without a
+/// DATABASE_URL this is dev mode, allowed but announced.
+async fn require_registered(cfg: &BotConfig) -> Result<(), String> {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!(
+            "bot {}: DATABASE_URL not set — running WITHOUT the identity \
+             registry (dev mode). Prod always sets it.",
+            cfg.bot_id
+        );
+        return Ok(());
+    };
+    let reg = records::Registry::connect(&url)
+        .await
+        .map_err(|e| format!("identity registry unreachable ({e}) — fail closed"))?;
+    reg.require_enabled(&cfg.bot_id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+async fn cmd_identity(cfg: &BotConfig, rest: &[String]) -> Result<(), String> {
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| "identity commands need DATABASE_URL".to_string())?;
+    let reg = records::Registry::connect(&url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let sub = rest.first().map(String::as_str).unwrap_or("show");
+    match sub {
+        "migrate" => {
+            reg.migrate().await.map_err(|e| e.to_string())?;
+            println!("identity schema migrated");
+        }
+        "register" => {
+            reg.register_bot(
+                &cfg.bot_id,
+                &cfg.bot_id,
+                "cron",
+                "crypto",
+                "planner (pipeline.run)",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            println!("registered {} (disabled — enable deliberately)", cfg.bot_id);
+        }
+        "enable" => {
+            reg.set_enabled(&cfg.bot_id, true)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("{} enabled", cfg.bot_id);
+        }
+        "disable" => {
+            reg.set_enabled(&cfg.bot_id, false)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("{} disabled", cfg.bot_id);
+        }
+        "show" | _ => {
+            for b in reg.list_bots().await.map_err(|e| e.to_string())? {
+                let marker = if b.bot_id == cfg.bot_id { "*" } else { " " };
+                println!(
+                    "{marker} {:<24} {:<10} {:<8} enabled={} ({})",
+                    b.bot_id, b.cadence, b.asset_class, b.enabled, b.decision_core
+                );
+            }
+        }
     }
     Ok(())
 }

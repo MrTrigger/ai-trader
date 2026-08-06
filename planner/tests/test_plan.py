@@ -59,6 +59,7 @@ def _passing_risk() -> P.RiskReport:
 def _build(**over):
     base = dict(
         run_id=RUN_ID,
+        bot_id="testbot",
         as_of=AS_OF,
         mode="dry",
         quote_currency="USD",

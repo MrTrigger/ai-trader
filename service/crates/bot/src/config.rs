@@ -20,6 +20,11 @@ pub struct BotConfig {
     /// silent default instead of an error.
     #[serde(default)]
     pub notes: serde_json::Value,
+    /// Identity registry key (bots table). Required: every artifact this
+    /// process writes is namespaced by it, and when DATABASE_URL is set the
+    /// process refuses to run unless this id is registered AND enabled
+    /// (fail closed — identity is DB-first per the triggerlab mandate).
+    pub bot_id: String,
     /// Where controls, run history and venue state live.
     pub state_dir: PathBuf,
     /// `paper`, `live-readonly`, or `live`.

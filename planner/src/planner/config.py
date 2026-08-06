@@ -122,6 +122,10 @@ class Config:
     limits: RiskLimits
     costs: CostModel
     ruleset_version: str = "phase0"
+    #: Identity registry key (bots table). Identity is DB-first (triggerlab);
+    #: this config value must match a registered bot_id — the Rust side
+    #: fail-closes on unregistered ids when DATABASE_URL is set.
+    bot_id: str = "crypto-portfolio"
     signal: str = "placeholder_equal_long"
     #: How many names a ranking signal holds. Distinct from
     #: `limits.max_position_count`, which is a hard risk limit that rejects a
@@ -180,6 +184,7 @@ class Config:
             benchmark=(p.get("benchmark") or None),
             clusters=clusters_from_dict(raw.get("clusters", {})),
             ruleset_version=raw.get("meta", {}).get("ruleset_version", "phase0"),
+            bot_id=raw.get("meta", {}).get("bot_id", "crypto-portfolio"),
             limits=RiskLimits.from_dict(raw["limits"]),
             costs=CostModel.from_dict(raw["costs"]),
             meta=raw.get("meta", {}),

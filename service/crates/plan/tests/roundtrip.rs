@@ -27,7 +27,7 @@ fn dec(s: &str) -> Decimal {
 #[test]
 fn parses_the_python_fixture() {
     let p = fixture();
-    assert_eq!(p.schema_version, "1.1.0");
+    assert_eq!(p.schema_version, "1.2.0");
     assert_eq!(p.mode, Mode::Live);
     assert_eq!(p.status, Status::Accepted);
     assert_eq!(p.quote_currency, "USD");
@@ -131,7 +131,7 @@ fn unknown_field_is_refused() {
 #[test]
 fn unknown_major_version_is_refused() {
     let doc = FIXTURE.replace(
-        r#""schema_version": "1.1.0""#,
+        r#""schema_version": "1.2.0""#,
         r#""schema_version": "2.0.0""#,
     );
     assert!(matches!(
