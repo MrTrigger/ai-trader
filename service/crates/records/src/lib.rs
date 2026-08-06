@@ -33,6 +33,9 @@ pub struct BotRow {
     pub asset_class: String,
     pub decision_core: String,
     pub enabled: bool,
+    /// Where the bot publishes state (repo-relative), until step 4 moves
+    /// operational records into Postgres proper.
+    pub state_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +78,7 @@ impl Registry {
 
     pub async fn bot(&self, bot_id: &str) -> Result<Option<BotRow>, RecordsError> {
         let row = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir \
              FROM bots WHERE bot_id = $1",
         )
         .bind(bot_id)
@@ -88,12 +91,13 @@ impl Registry {
             asset_class: r.get(3),
             decision_core: r.get(4),
             enabled: r.get(5),
+            state_dir: r.get(6),
         }))
     }
 
     pub async fn list_bots(&self) -> Result<Vec<BotRow>, RecordsError> {
         let rows = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir \
              FROM bots ORDER BY bot_id",
         )
         .fetch_all(&self.pool)
@@ -107,6 +111,7 @@ impl Registry {
                 asset_class: r.get(3),
                 decision_core: r.get(4),
                 enabled: r.get(5),
+                state_dir: r.get(6),
             })
             .collect())
     }

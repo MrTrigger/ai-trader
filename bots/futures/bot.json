@@ -1,0 +1,12 @@
+{
+  "bot_id": "futures-noise",
+  "venue_id": "ib",
+  "display_name": "NQ noise-area four-sleeve book",
+  "cadence": "bar_close(CME, 5m)",
+  "asset_class": "futures",
+  "instrument": "MNQ",
+  "state_dir": "var/futures/state",
+  "journal_repo": "../trading-journal",
+  "sizing": { "mode": "fixed", "fixed_units": 1 },
+  "notes": "Decision core: trading-journal/backtest (engine + bot runtime). Evidence ledger: backtest/lab/sleeve_screens.py. Capital dial when live: $150k/unit."
+}
