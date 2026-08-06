@@ -564,8 +564,18 @@ let range = "ALL";
 async function refresh() {
   try {
     const res = await fetch("/api/state", { headers: { accept: "application/json" } });
+    // Always drain the body: an unread fetch body counts as an in-flight
+    // request in Chromium and starves anything waiting for network idle.
+    const text = await res.text();
     if (!res.ok) throw new Error("HTTP " + res.status);
-    latest = await res.json();
+    const doc = JSON.parse(text);
+    if (doc.fleet_only) {
+      // Fleet control plane: this api hosts no local book, so stop asking.
+      clearInterval(refreshTimer);
+      $("stamp").textContent = "fleet control plane · records db";
+      return;
+    }
+    latest = doc;
     render(latest);
   } catch (e) {
     // Saying nothing and continuing to show the last good state is worse than
@@ -1265,8 +1275,8 @@ window.addEventListener("resize", () => {
   resizeTimer = setTimeout(() => latest && renderChart(latest.runs), 150);
 });
 
+const refreshTimer = setInterval(refresh, 10000);
 refresh();
-setInterval(refresh, 10000);
 </script>
 
 <script>
@@ -1400,10 +1410,17 @@ async function renderBot(id) {
   const b = (FLEET.bots || []).find((x) => x.bot_id === id);
   const d = DETAILS[id] || (await loadDetail(id));
   if (!b || !d) { $F('botview').innerHTML = card('not found', '', 'unknown bot ' + id); return; }
-  const st = d.state || {};
+  // Canonical envelope (schema 1): flatten mode/state + detail for the view.
+  const env = d.state || {};
+  const st = env.schema
+    ? Object.assign({ mode: env.mode,
+        halted: env.state === 'halted' ? (env.state_reason || true) : null },
+        env.detail || {})
+    : env;
   const rc = d.controls || {};
+  const rcHalted = rc.schema ? rc.state !== 'running' : rc.kill_switch === true;
   const halted = d.contract === 'runner'
-    ? (rc.kill_switch === true ? (rc.reason || 'kill switch') : null)
+    ? (rcHalted ? (rc.reason || 'kill switch') : null)
     : st.halted;
   agg($F('botbar'), [
     ['bot', id], ['class', d.asset_class], ['cadence', d.cadence],

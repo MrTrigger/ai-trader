@@ -62,12 +62,13 @@ fn status_for(repo_root: &Path, state_dir: Option<&str>) -> Value {
                 .get("heartbeat_utc")
                 .and_then(|h| h.as_str())
                 .and_then(heartbeat_age_seconds);
+            let headline = v.get("headline").cloned().unwrap_or(Value::Null);
             return json!({
-                "contract": "botstate",
+                "contract": dialect_of(&v),
                 "mode": v.get("mode"),
-                "halted": v.get("halted"),
-                "net_total": v.get("net_total"),
-                "trades_total": v.get("trades_total"),
+                "halted": halted_of(&v),
+                "net_total": headline.get("net").or_else(|| v.get("net_total")),
+                "trades_total": headline.get("fills").or_else(|| v.get("trades_total")),
                 "heartbeat_age_seconds": age,
             });
         }
@@ -99,14 +100,31 @@ fn status_for(repo_root: &Path, state_dir: Option<&str>) -> Value {
     out
 }
 
-/// Which dialect a published status document speaks. The futures contract
-/// carries per-sleeve walks; the runner contract does not.
+/// Which detail view a published status document gets. Canonical envelopes
+/// (schema 1) say so via `kind`; legacy documents are sniffed by shape.
 fn dialect_of(payload: &Value) -> &'static str {
+    if payload.get("schema").is_some() {
+        return match payload.get("kind").and_then(|k| k.as_str()) {
+            Some("futures-book") => "botstate",
+            _ => "runner",
+        };
+    }
     if payload.get("sleeves").is_some() {
         "botstate"
     } else {
         "runner"
     }
+}
+
+/// Whether a status document reports itself halted, and why.
+fn halted_of(doc: &Value) -> Value {
+    if doc.get("schema").is_some() {
+        if doc.get("state").and_then(|s| s.as_str()) == Some("halted") {
+            return doc.get("state_reason").cloned().unwrap_or(json!(true));
+        }
+        return Value::Null;
+    }
+    doc.get("halted").cloned().unwrap_or(Value::Null)
 }
 
 /// Status summary from a bot's DB rows, or `None` if it never published one.
@@ -122,12 +140,21 @@ fn status_from_rows(
         "source": "db",
         "heartbeat_age_seconds": s.heartbeat_age_seconds,
         "mode": doc.get("mode"),
-        "halted": doc.get("halted"),
+        "halted": halted_of(&doc),
     });
+    if let Some(h) = doc.get("headline") {
+        out["net_total"] = h.get("net").cloned().unwrap_or(Value::Null);
+        out["trades_total"] = h.get("fills").cloned().unwrap_or(Value::Null);
+        out["headline"] = h.clone();
+    }
     if let Some(c) = control {
-        let cp: Value = serde_json::from_str(&c.payload).unwrap_or(Value::Null);
-        out["kill_switch"] = cp.get("kill_switch").cloned().unwrap_or(Value::Null);
-        out["paused"] = cp.get("paused").cloned().unwrap_or(Value::Null);
+        let cf: Value = serde_json::from_str(&c.payload).unwrap_or(Value::Null);
+        let halted = if cf.get("schema").is_some() {
+            json!(cf.get("state").and_then(|s| s.as_str()) != Some("running"))
+        } else {
+            cf.get("kill_switch").cloned().unwrap_or(Value::Null)
+        };
+        out["kill_switch"] = halted;
         out["control_state"] = json!(c.state);
     }
     if let Some(r) = last_run {
@@ -210,23 +237,42 @@ pub fn set_halt(
                 // want the check before writing a control row for a typo.
                 return Err(records::RecordsError::UnknownBot(bot_id.clone()));
             }
-            let mut payload = match reg.current_control(&bot_id).await? {
+            // Overrides survive the halt/resume cycle. A legacy payload's
+            // bot-specific keys are lifted into `overrides` once, here.
+            let current = match reg.current_control(&bot_id).await? {
                 Some(row) => serde_json::from_str::<Value>(&row.payload)
                     .unwrap_or_else(|_| json!({})),
                 None => json!({}),
             };
+            let overrides = if current.get("schema").is_some() {
+                current.get("overrides").cloned().unwrap_or(Value::Null)
+            } else {
+                let lifted: serde_json::Map<String, Value> =
+                    ["sleeves", "instrument", "sizing", "account"]
+                        .iter()
+                        .filter_map(|k| current.get(*k).map(|v| (k.to_string(), v.clone())))
+                        .collect();
+                if lifted.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Object(lifted)
+                }
+            };
             let now = time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default();
-            let obj = payload.as_object_mut().expect("control payload is an object");
-            obj.insert("halt".into(), json!(halt));
-            obj.insert("kill_switch".into(), json!(halt));
-            obj.insert("paused".into(), json!(false));
-            obj.insert("reason".into(), json!(reason));
-            obj.insert("set_by".into(), json!(by));
-            obj.insert("set_at".into(), json!(now));
-            obj.insert("bot_id".into(), json!(bot_id));
             let state = if halt { "halted" } else { "running" };
+            let mut payload = json!({
+                "schema": 1,
+                "state": state,
+                "reason": reason,
+                "set_by": by,
+                "set_at": now,
+                "bot_id": bot_id,
+            });
+            if !overrides.is_null() {
+                payload["overrides"] = overrides;
+            }
             reg.set_control(&bot_id, state, &reason, &by, &payload.to_string())
                 .await?;
             Ok(payload)

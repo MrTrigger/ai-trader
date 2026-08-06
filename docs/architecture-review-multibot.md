@@ -159,6 +159,29 @@ credential *references* (which scope, which secret name), never secrets.
    Deployment note (operator): ONE pod, N bot processes + one api, all on
    the cluster DB; `var/` holds only caches. Still open from this step:
    retire `data/book.json` on the planner side.
+   *ADDENDUM (same day)*: the reporting contract is CANONICAL, not
+   per-family. Status envelope (schema 1): `{schema, kind, mode, state,
+   state_reason, headline, detail}` — the fleet renders the envelope
+   uniformly, `detail` belongs to the bot's own page. Control document
+   (schema 1): `{schema, state: halted|paused|running, reason, set_by,
+   set_at, overrides}` — unknown states read as halted; bot-specific
+   overrides survive halt/resume cycles. Both are owned by the records
+   crate; Python conforms as a client. The api now runs with no arguments
+   as the standalone fleet control plane (wraps no bot).
+
+## Language policy (operator, 2026-08-06)
+
+Rust owns the platform: identity, the records schema and every contract,
+executor/runner, venues, control plane. Python needs a VERY GOOD reason
+and is only a client of Rust-owned contracts. The two standing
+exceptions: (1) parity-gated decision cores whose validated research
+artifact is Python (the futures book, the crypto planner per §3.5);
+(2) — RETIRED: the "Rust IB clients are immature" claim was re-checked
+2026-08-06 and no longer holds (`ibapi` crate v3, async+blocking,
+protobuf wire, actively maintained; also `yatws`). The IB venue adapter
+is therefore planned as a Rust `VenueAdapter` behind `open_live("ib")`,
+removing Python from the money path entirely; ib_async remains only
+until that adapter lands and passes the arming/reconcile checks.
 5. **One control plane.** Single `api` over the records DB; bot registry
    page; per-bot dashboard rendered from the bot's declared metadata (not
    a parameter allowlist); global + per-bot halt. Then, per README's own

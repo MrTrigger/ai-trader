@@ -629,18 +629,16 @@ impl ControlStore {
             Self::File(path) => ControlFile::read(path),
             Self::Db { rec, bot_id } => match rec.current_control(bot_id) {
                 Ok(Some(row)) => {
-                    serde_json::from_str::<ControlFile>(&row.payload).unwrap_or_else(|e| {
-                        ControlFile {
-                            bot_id: Some(bot_id.clone()),
-                            kill_switch: true,
-                            paused: false,
-                            reason: Some(format!(
-                                "control row for {bot_id} is unreadable ({e}); halted rather \
-                                 than guessing"
-                            )),
-                            set_by: None,
-                            set_at: None,
-                        }
+                    Self::parse_payload(&row.payload, bot_id).unwrap_or_else(|e| ControlFile {
+                        bot_id: Some(bot_id.clone()),
+                        kill_switch: true,
+                        paused: false,
+                        reason: Some(format!(
+                            "control row for {bot_id} is unreadable ({e}); halted rather \
+                             than guessing"
+                        )),
+                        set_by: None,
+                        set_at: None,
                     })
                 }
                 Ok(None) => ControlFile {
@@ -669,20 +667,60 @@ impl ControlStore {
         }
     }
 
+    /// Parse either dialect into a ControlFile. The canonical document
+    /// (schema 1, owned by the records crate) is
+    /// `{schema, state, reason, set_by, set_at, overrides}`; anything older
+    /// parses as a legacy ControlFile. An unknown canonical state reads as
+    /// halted — fail closed.
+    fn parse_payload(payload: &str, bot_id: &str) -> Result<ControlFile, serde_json::Error> {
+        let v: serde_json::Value = serde_json::from_str(payload)?;
+        if v.get("schema").is_some() {
+            let state = v["state"].as_str().unwrap_or("halted");
+            return Ok(ControlFile {
+                bot_id: Some(bot_id.to_string()),
+                kill_switch: state != "running" && state != "paused",
+                paused: state == "paused",
+                reason: v["reason"].as_str().map(str::to_string),
+                set_by: v["set_by"].as_str().map(str::to_string),
+                set_at: v["set_at"].as_str().map(str::to_string),
+            });
+        }
+        serde_json::from_value(v)
+    }
+
     pub fn write(&self, controls: &ControlFile) -> Result<(), RunnerError> {
         match self {
             Self::File(path) => controls.write(path),
             Self::Db { rec, bot_id } => {
-                let mut stamped = controls.clone();
-                stamped.bot_id = Some(bot_id.clone());
-                let payload =
-                    serde_json::to_string(&stamped).expect("ControlFile serialises");
+                // Canonical document out; bot-specific overrides (sleeve
+                // switches, sizing, ...) are carried forward from the
+                // current row so a halt/resume cycle never erases them.
+                let overrides = rec
+                    .current_control(bot_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.payload).ok())
+                    .and_then(|v| v.get("overrides").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                let reason = controls.reason.as_deref().unwrap_or("no reason recorded");
+                let set_by = controls.set_by.as_deref().unwrap_or("unattributed");
+                let mut payload = serde_json::json!({
+                    "schema": 1,
+                    "state": controls.state(),
+                    "reason": reason,
+                    "set_by": set_by,
+                    "set_at": controls.set_at,
+                    "bot_id": bot_id,
+                });
+                if !overrides.is_null() {
+                    payload["overrides"] = overrides;
+                }
                 rec.set_control(
                     bot_id,
-                    stamped.state(),
-                    stamped.reason.as_deref().unwrap_or("no reason recorded"),
-                    stamped.set_by.as_deref().unwrap_or("unattributed"),
-                    &payload,
+                    controls.state(),
+                    reason,
+                    set_by,
+                    &payload.to_string(),
                 )?;
                 Ok(())
             }

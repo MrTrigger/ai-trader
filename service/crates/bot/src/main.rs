@@ -416,18 +416,30 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
         let now = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
+        // The canonical status envelope (schema 1) every bot publishes:
+        // schema/kind/mode/state/headline uniformly, bot-specifics in detail.
         let doc = match &outcome {
             Ok(r) => serde_json::json!({
+                "schema": 1,
+                "kind": "runner",
                 "mode": cfg.mode,
-                "last_outcome": r.outcome,
-                "nav": r.nav,
-                "control_state": r.control_state,
-                "recorded_at": r.recorded_at,
+                "state": if r.control_state == "halted" { "halted" } else { "running" },
+                "state_reason": if r.control_state == "halted" { Some(r.outcome.clone()) } else { None },
+                "headline": { "nav": r.nav, "unit": cfg.quote_currency },
+                "detail": {
+                    "last_outcome": r.outcome,
+                    "control_state": r.control_state,
+                    "recorded_at": r.recorded_at,
+                },
             }),
             Err(e) => serde_json::json!({
+                "schema": 1,
+                "kind": "runner",
                 "mode": cfg.mode,
-                "last_outcome": "error",
-                "detail": e.to_string(),
+                "state": "halted",
+                "state_reason": "run error",
+                "headline": {},
+                "detail": { "last_outcome": "error", "detail": e.to_string() },
             }),
         };
         if let Err(e) = rec.put_status(&cfg.bot_id, &now, &doc.to_string()) {

@@ -65,19 +65,23 @@ const MAX_BODY: u64 = 64 * 1024;
 const REQUEST_TIMEOUT_S: u64 = 10;
 
 const USAGE: &str = "\
-usage: api --state-dir <dir> --initial-cash <amount>
+usage: api [--state-dir <dir> --initial-cash <amount>]
            [--bot <path> --bot-config <file>]
            [--port N] [--expectation <file>] [--quote-currency USD]
 
 Serves the operations dashboard on http://127.0.0.1:7434 until you stop it.
 Loopback only - nothing outside this machine can reach it.
 
-Without --bot and --bot-config the page is read-only: it shows everything and
-can change nothing. With them, its controls run that bot binary.
+With no arguments at all this is the FLEET CONTROL PLANE: it serves every
+registered bot from the records DB (DATABASE_URL) and wraps no bot of its
+own — the deployment shape. --state-dir/--initial-cash additionally mount
+the local book view for one runner bot's state dir (dev). Without --bot
+and --bot-config that local view is read-only.
 ";
 
 struct Config {
-    state_dir: PathBuf,
+    /// `None` = pure fleet control plane: no local book view, DB only.
+    state_dir: Option<PathBuf>,
     /// How to invoke the bot. `None` makes this a read-only dashboard.
     bot: Option<BotCommand>,
     initial_cash: Decimal,
@@ -139,7 +143,10 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("dashboard for {}", cfg.state_dir.display());
+    match &cfg.state_dir {
+        Some(d) => println!("dashboard for {}", d.display()),
+        None => println!("fleet control plane (no wrapped bot: records DB only)"),
+    }
     println!("  http://127.0.0.1:{}", cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
     match std::env::var("DATABASE_URL") {
@@ -189,14 +196,21 @@ fn parse(args: &[String]) -> Result<Config, String> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let state_dir = PathBuf::from(get("--state-dir").ok_or("--state-dir is required")?);
-    let initial_cash: Decimal = get("--initial-cash")
-        .ok_or(
-            "--initial-cash is required: P&L is NAV less what was put in, and guessing that \
-             number would put a wrong figure on a dashboard people trust",
-        )?
-        .parse()
-        .map_err(|e| format!("--initial-cash is not a number: {e}"))?;
+    let state_dir = get("--state-dir").map(PathBuf::from);
+    let initial_cash: Decimal = match get("--initial-cash") {
+        Some(c) => c
+            .parse()
+            .map_err(|e| format!("--initial-cash is not a number: {e}"))?,
+        None if state_dir.is_none() => Decimal::ZERO,
+        None => {
+            return Err(
+                "--initial-cash is required with --state-dir: P&L is NAV less what was put \
+                 in, and guessing that number would put a wrong figure on a dashboard people \
+                 trust"
+                    .into(),
+            )
+        }
+    };
     let port = match get("--port") {
         Some(p) => p.parse().map_err(|_| format!("not a port number: {p}"))?,
         None => DEFAULT_PORT,
@@ -215,8 +229,13 @@ fn parse(args: &[String]) -> Result<Config, String> {
 }
 
 fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
+    let Some(state_dir) = cfg.state_dir.as_deref() else {
+        return Err(
+            "this api wraps no bot (fleet control plane) — there is no local book view".into(),
+        );
+    };
     state::build(&state::Inputs {
-        state_dir: &cfg.state_dir,
+        state_dir,
         initial_cash: cfg.initial_cash,
         quote_currency: &cfg.quote_currency,
         cadence_hours: cfg.cadence_hours,
@@ -269,7 +288,10 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                 Err(e) => json_error(&mut stream, 404, &e),
             }
         }
-        ("GET", "/api/bots") => match fleet::list(&std::env::current_dir().unwrap_or_default(), &cfg.state_dir) {
+        ("GET", "/api/bots") => match fleet::list(
+            &std::env::current_dir().unwrap_or_default(),
+            cfg.state_dir.as_deref().unwrap_or(std::path::Path::new("")),
+        ) {
             Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
             Err(e) => json(
                 &mut stream,
@@ -305,6 +327,12 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                     Err(e) => json_error(&mut stream, 400, &e),
                 }
             }
+        }
+        ("GET", "/api/state") if cfg.state_dir.is_none() => {
+            // Fleet control plane: no wrapped bot, so no local book — a 200
+            // sentinel rather than an error, because this is the expected
+            // deployment shape, and browsers console-log every 5xx.
+            json(&mut stream, 200, br#"{"fleet_only":true}"#)
         }
         ("GET", "/api/state") => match snapshot(cfg) {
             Ok(s) => json(&mut stream, 200, &serde_json::to_vec(&s).unwrap()),
