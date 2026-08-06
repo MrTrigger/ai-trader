@@ -317,10 +317,7 @@ fn read_mode(path: Option<&Path>, warnings: &mut Vec<String>) -> Option<ModeView
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("paper");
-    let feed = v
-        .get("feed")
-        .and_then(|m| m.as_str())
-        .unwrap_or("venue");
+    let feed = v.get("feed").and_then(|m| m.as_str()).unwrap_or("venue");
     if feed == "file" {
         warnings.push(
             "the price feed is a static file, so marks never move. A paper run against frozen \

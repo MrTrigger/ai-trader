@@ -196,7 +196,11 @@ fn id_for(bot_id: &str, plan_id: &str, order: &Order, slice: Option<u8>) -> Stri
     // by prefix. Venues that cap id length hash it anyway (hyperliquid's
     // cloid is a keccak of this string).
     let short = plan_id.split('-').next().unwrap_or(plan_id);
-    let base = format!("{bot_id}-{short}-{}-{side}-{}", order.asset, order.qty.normalize());
+    let base = format!(
+        "{bot_id}-{short}-{}-{side}-{}",
+        order.asset,
+        order.qty.normalize()
+    );
     match slice {
         Some(n) => format!("{base}-s{n}"),
         None => base,

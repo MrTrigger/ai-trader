@@ -365,7 +365,11 @@ fn open_hyperliquid(mode: Mode, env: &Env) -> Result<Active, String> {
             };
             let description = format!(
                 "hyperliquid {} for {}{}",
-                if hl.is_mainnet() { "mainnet" } else { "testnet" },
+                if hl.is_mainnet() {
+                    "mainnet"
+                } else {
+                    "testnet"
+                },
                 hl.account(),
                 if hl.can_trade() { "" } else { " (read-only)" }
             );
@@ -402,7 +406,16 @@ mod tests {
     #[test]
     fn live_without_an_account_refuses_and_names_the_variable() {
         let env = Env::default();
-        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open(
+            "hyperliquid",
+            Mode::Live,
+            &env,
+            paper_cfg(),
+            vec![],
+            dummy_prices(),
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("HL_ACCOUNT_ADDRESS"), "{e}");
     }
 
@@ -415,7 +428,9 @@ mod tests {
             account: Some("0x0000000000000000000000000000000000000000".into()),
             ..Default::default()
         };
-        let e = open("hyperliquid", Mode::LiveReadonly,
+        let e = open(
+            "hyperliquid",
+            Mode::LiveReadonly,
             &env,
             paper_cfg(),
             vec![],
@@ -432,7 +447,16 @@ mod tests {
             account: Some("0x1111111111111111111111111111111111111111".into()),
             ..Default::default()
         };
-        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open(
+            "hyperliquid",
+            Mode::Live,
+            &env,
+            paper_cfg(),
+            vec![],
+            dummy_prices(),
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("HL_AGENT_PRIVATE_KEY"), "{e}");
         assert!(
             e.contains("live-readonly"),
@@ -440,7 +464,9 @@ mod tests {
         );
 
         // Watching a real account needs no credential at all.
-        let v = open("hyperliquid", Mode::LiveReadonly,
+        let v = open(
+            "hyperliquid",
+            Mode::LiveReadonly,
             &env,
             paper_cfg(),
             vec![],
@@ -461,11 +487,29 @@ mod tests {
             allow_live: false,
             ..Default::default()
         };
-        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open(
+            "hyperliquid",
+            Mode::Live,
+            &env,
+            paper_cfg(),
+            vec![],
+            dummy_prices(),
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("HL_ALLOW_LIVE"), "{e}");
 
         env.allow_live = true;
-        assert!(open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).is_ok());
+        assert!(open(
+            "hyperliquid",
+            Mode::Live,
+            &env,
+            paper_cfg(),
+            vec![],
+            dummy_prices(),
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -528,7 +572,16 @@ mod tests {
             api_url: Some(hyperliquid::TESTNET.into()),
             ..Default::default()
         };
-        let e = open("hyperliquid", Mode::Live, &env, paper_cfg(), vec![], dummy_prices(), None).unwrap_err();
+        let e = open(
+            "hyperliquid",
+            Mode::Live,
+            &env,
+            paper_cfg(),
+            vec![],
+            dummy_prices(),
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("pasted wrong"), "{e}");
     }
 

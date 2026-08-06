@@ -773,8 +773,12 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             // which reads as an intrusion.
             let plan_id = slice.plan.plan_id.to_string();
             for o in &slice.plan.orders {
-                let coid =
-                    executor::client_order_id_for_slice(&slice.plan.bot_id, &plan_id, o, slice.index);
+                let coid = executor::client_order_id_for_slice(
+                    &slice.plan.bot_id,
+                    &plan_id,
+                    o,
+                    slice.index,
+                );
                 self.ledger
                     .authorise(&coid, o, &plan_id, slice.index, self.clock.now())?;
             }
@@ -995,7 +999,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             .into_iter()
             .filter(|o| {
                 o.client_order_id.starts_with(&own_prefix)
-                    || o.client_order_id.starts_with(&format!("{}-FLAT-", self.bot_id))
+                    || o.client_order_id
+                        .starts_with(&format!("{}-FLAT-", self.bot_id))
             })
             .collect();
         let mut cancelled = Vec::new();
@@ -1059,7 +1064,12 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             let req = venue::OrderRequest {
                 // Deterministic in asset and size, so a retry after a crash
                 // resubmits the same id rather than doubling the exit.
-                client_order_id: format!("{}-FLAT-{}-{}", self.bot_id, p.asset.as_str(), qty.normalize()),
+                client_order_id: format!(
+                    "{}-FLAT-{}-{}",
+                    self.bot_id,
+                    p.asset.as_str(),
+                    qty.normalize()
+                ),
                 asset: p.asset.clone(),
                 side,
                 qty,

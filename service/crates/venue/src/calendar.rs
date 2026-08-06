@@ -46,10 +46,14 @@ pub struct CmeGlobex {
 
 impl CmeGlobex {
     pub fn standard() -> Self {
-        Self { utc_offset_hours: -6 }
+        Self {
+            utc_offset_hours: -6,
+        }
     }
     pub fn daylight() -> Self {
-        Self { utc_offset_hours: -5 }
+        Self {
+            utc_offset_hours: -5,
+        }
     }
 }
 
@@ -82,7 +86,7 @@ mod tests {
     #[test]
     fn cme_weekend_and_maintenance() {
         let cal = CmeGlobex::standard(); // CT = UTC-6
-        // Saturday: closed all day.
+                                         // Saturday: closed all day.
         assert!(!cal.is_open(datetime!(2026-01-10 15:00 UTC)));
         // Sunday 17:30 CT = 23:30 UTC: open.
         assert!(cal.is_open(datetime!(2026-01-11 23:30 UTC)));

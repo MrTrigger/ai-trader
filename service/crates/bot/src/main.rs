@@ -754,7 +754,6 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     Ok(())
 }
 
-
 /// Identity is DB-first (triggerlab mandate): when DATABASE_URL is set, an
 /// unregistered or disabled bot_id refuses to run — fail closed. Without a
 /// DATABASE_URL this is dev mode, allowed but announced.
@@ -812,7 +811,8 @@ async fn cmd_identity(cfg: &BotConfig, rest: &[String]) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             println!("{} disabled", cfg.bot_id);
         }
-        "show" | _ => {
+        // "show", and anything unrecognised, lists rather than acting.
+        _ => {
             for b in reg.list_bots().await.map_err(|e| e.to_string())? {
                 let marker = if b.bot_id == cfg.bot_id { "*" } else { " " };
                 println!(

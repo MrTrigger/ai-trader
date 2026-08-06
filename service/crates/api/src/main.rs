@@ -87,7 +87,37 @@ struct Config {
     port: u16,
 }
 
+/// Read `KEY=value` lines into the environment without overwriting anything
+/// already exported.
+///
+/// The api needs exactly one thing from `.env` — `DATABASE_URL`, for the
+/// identity registry — and reads no credentials: it holds none and must keep
+/// holding none. A real export wins over the file, so one value can be
+/// overridden for one run without editing anything.
+fn load_dotenv(path: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim().trim_matches('"').trim_matches('\''));
+        // Only what this process is entitled to. Naming the variable rather
+        // than loading the file wholesale means a key added to .env tomorrow
+        // does not silently become readable by the web server.
+        if k == "DATABASE_URL" && std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    load_dotenv(std::path::Path::new(".env"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
@@ -112,6 +142,10 @@ fn main() -> ExitCode {
     println!("dashboard for {}", cfg.state_dir.display());
     println!("  http://127.0.0.1:{}", cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
+    match std::env::var("DATABASE_URL") {
+        Ok(_) => println!("  fleet: identity registry configured"),
+        Err(_) => println!("  fleet: no DATABASE_URL, so the fleet view is unavailable"),
+    }
     match &cfg.bot {
         Some(b) => println!(
             "  controls run {} --config {}",
@@ -228,14 +262,27 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             page::HTML.as_bytes(),
             method == "HEAD",
         ),
-        ("GET", "/api/bots") => match fleet::list(&std::env::current_dir().unwrap_or_default()) {
+        ("GET", r) if r.starts_with("/api/bots/") && r.ends_with("/state") => {
+            let id = r.trim_start_matches("/api/bots/").trim_end_matches("/state");
+            match fleet::detail(&std::env::current_dir().unwrap_or_default(), id) {
+                Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+                Err(e) => json_error(&mut stream, 404, &e),
+            }
+        }
+        ("GET", "/api/bots") => match fleet::list(&std::env::current_dir().unwrap_or_default(), &cfg.state_dir) {
             Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
-            Err(e) => json(&mut stream, 200,
-                &serde_json::to_vec(&serde_json::json!({"available": false, "reason": e})).unwrap()),
+            Err(e) => json(
+                &mut stream,
+                200,
+                &serde_json::to_vec(&serde_json::json!({"available": false, "reason": e})).unwrap(),
+            ),
         },
-        ("POST", r) if r.starts_with("/api/bots/") && (r.ends_with("/halt") || r.ends_with("/resume")) => {
+        ("POST", r)
+            if r.starts_with("/api/bots/") && (r.ends_with("/halt") || r.ends_with("/resume")) =>
+        {
             let halt = r.ends_with("/halt");
-            let id = r.trim_start_matches("/api/bots/")
+            let id = r
+                .trim_start_matches("/api/bots/")
                 .trim_end_matches("/halt")
                 .trim_end_matches("/resume")
                 .to_string();
@@ -247,7 +294,13 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             if reason.is_empty() || by.is_empty() {
                 json_error(&mut stream, 400, "body must carry non-empty reason and by")
             } else {
-                match fleet::set_halt(&std::env::current_dir().unwrap_or_default(), &id, halt, reason, by) {
+                match fleet::set_halt(
+                    &std::env::current_dir().unwrap_or_default(),
+                    &id,
+                    halt,
+                    reason,
+                    by,
+                ) {
                     Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
                     Err(e) => json_error(&mut stream, 400, &e),
                 }

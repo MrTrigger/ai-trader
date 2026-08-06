@@ -961,7 +961,8 @@ function renderMode(s) {
 
   // The feed matters as much as the mode: paper on frozen prices measures
   // nothing, and that is not obvious from the word "paper".
-  const feed = m.feed === "hyperliquid" ? "live prices from Hyperliquid" : "STATIC prices from marks.json";
+  // Anything that is not the file feed is a venue reading its own prices.
+  const feed = m.feed === "file" ? "prices from marks.json" : "live prices from the venue";
   $("modenote").innerHTML = m.real_money
     ? '<span class="down"><b>Real money.</b> Scheduled runs place real orders.</span> Fills at ' + esc(feed) + "."
     : (m.mode === "live-readonly"

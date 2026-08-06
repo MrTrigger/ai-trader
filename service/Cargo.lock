@@ -24,11 +24,13 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "paper",
+ "records",
  "runner",
  "rust_decimal",
  "serde",
  "serde_json",
  "time",
+ "tokio",
  "venue",
 ]
 
