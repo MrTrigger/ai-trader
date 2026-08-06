@@ -15,6 +15,7 @@ plan.workspace = true
 venue.workspace = true
 paper.workspace = true
 hyperliquid.workspace = true
+ib = { path = "../ib" }
 async-trait.workspace = true
 executor.workspace = true
 runner.workspace = true

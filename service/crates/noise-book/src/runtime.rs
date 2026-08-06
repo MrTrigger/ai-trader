@@ -335,6 +335,97 @@ impl Book {
         })
     }
 
+    /// Everything a dead process needs to continue exactly where it
+    /// stopped: machine state per sleeve plus the kill-rail history. Fills
+    /// live in the records DB (rehydrated on restore), features re-warm
+    /// deterministically from the bar history — neither belongs here.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let sleeves: serde_json::Map<String, serde_json::Value> = self
+            .sleeves
+            .iter()
+            .map(|st| {
+                (
+                    st.cfg.key.to_string(),
+                    serde_json::json!({
+                        "scanner": st.scanner,
+                        "position": st.position,
+                        "resting": st.resting,
+                        "bar_index": st.bar_index,
+                        "session": st.session,
+                        "last_bar": st.last_bar,
+                        "last_ts": st.last_bar.as_ref().map(|b| b.ts_utc),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "schema": 1,
+            "halted": self.halted,
+            "instrument": self.instrument,
+            "units": self.units,
+            "daily_net": self.daily_net.iter()
+                .map(|(d, v)| (d.to_string(), *v))
+                .collect::<BTreeMap<String, f64>>(),
+            "sleeves": sleeves,
+        })
+    }
+
+    /// Restore machine state from [`Book::snapshot`]'s document. The caller
+    /// then feeds only bars strictly AFTER each sleeve's `last_ts` mark —
+    /// see [`Book::resume_marks`] — and rehydrates fills from the records
+    /// DB so published totals cover the whole book.
+    pub fn restore(&mut self, snap: &serde_json::Value) -> Result<(), String> {
+        self.halted = snap["halted"].as_str().map(str::to_string);
+        if let Some(i) = snap["instrument"].as_str() {
+            self.instrument = i.to_string();
+        }
+        if let Some(u) = snap["units"].as_u64() {
+            self.units = u as u32;
+        }
+        if let Some(dn) = snap["daily_net"].as_object() {
+            self.daily_net = dn
+                .iter()
+                .map(|(d, v)| {
+                    NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                        .map(|date| (date, v.as_f64().unwrap_or(0.0)))
+                        .map_err(|e| format!("bad daily_net date {d:?}: {e}"))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        for st in &mut self.sleeves {
+            let s = &snap["sleeves"][st.cfg.key];
+            if s.is_null() {
+                continue;
+            }
+            st.scanner = serde_json::from_value(s["scanner"].clone())
+                .map_err(|e| format!("{}: scanner: {e}", st.cfg.key))?;
+            st.position = serde_json::from_value(s["position"].clone())
+                .map_err(|e| format!("{}: position: {e}", st.cfg.key))?;
+            st.resting = serde_json::from_value(s["resting"].clone())
+                .map_err(|e| format!("{}: resting: {e}", st.cfg.key))?;
+            st.bar_index = s["bar_index"].as_i64().unwrap_or(-1);
+            st.session = serde_json::from_value(s["session"].clone())
+                .map_err(|e| format!("{}: session: {e}", st.cfg.key))?;
+            st.last_bar = serde_json::from_value(s["last_bar"].clone())
+                .map_err(|e| format!("{}: last_bar: {e}", st.cfg.key))?;
+        }
+        Ok(())
+    }
+
+    /// Per-sleeve last processed ts_utc — the resume feed boundary.
+    pub fn resume_marks(&self) -> BTreeMap<&'static str, Option<chrono::DateTime<chrono::Utc>>> {
+        self.sleeves
+            .iter()
+            .map(|st| (st.cfg.key, st.last_bar.as_ref().map(|b| b.ts_utc)))
+            .collect()
+    }
+
+    /// Rehydrate the trade list (journal rows from the records DB) so
+    /// everything a resumed process publishes covers the whole book.
+    pub fn rehydrate_fills(&mut self, fills: Vec<Fill>) {
+        self.fills = fills;
+    }
+
     /// Per-sleeve (fills, net) — what the parity fixture asserts on.
     pub fn sleeve_totals(&self) -> BTreeMap<&'static str, (usize, f64)> {
         let mut out: BTreeMap<&'static str, (usize, f64)> = BTreeMap::new();

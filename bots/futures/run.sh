@@ -53,12 +53,20 @@ case "${1:-}" in
     exec "$BOT" features --bars "$BARS" "$@"
     ;;
   shadow)
-    echo "shadow awaits the rust-ibapi venue adapter (registered as the next" >&2
-    echo "step); the decision core and records path are already Rust." >&2
-    exit 2
+    ensure_bot; ensure_bars
+    exec "$BOT" run --bars "$BARS"
+    ;;
+  live)
+    ensure_bot; ensure_bars
+    exec "$BOT" run --bars "$BARS" --live
+    ;;
+  ib-check)
+    shift
+    ensure_bot
+    exec "$BOT" ib-check "$@"
     ;;
   *)
-    echo "usage: run.sh {replay [START]|parity|parity-py|features ...|shadow}" >&2
+    echo "usage: run.sh {replay [START]|parity|parity-py|features ...|shadow|live|ib-check}" >&2
     echo "  REFRESH_BARS=1 re-exports bars; BARS_FROM=YYYY-MM-DD sets the export start" >&2
     exit 2
     ;;

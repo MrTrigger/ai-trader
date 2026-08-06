@@ -114,7 +114,7 @@ pub struct RawBar {
 }
 
 /// A bar enriched with everything the decision core reads.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnrichedBar {
     pub ts_utc: DateTime<Utc>,
     /// Exchange-time clock of the bar open (HH:MM:SS as seconds-of-day),

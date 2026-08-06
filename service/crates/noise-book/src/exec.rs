@@ -84,7 +84,7 @@ impl Position {
 }
 
 /// A completed round trip, the unit the journal and the fills table record.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Fill {
     pub sleeve: String,
     pub session_date: chrono::NaiveDate,
@@ -96,7 +96,7 @@ pub struct Fill {
     pub exit_ts: DateTime<Utc>,
     pub points: f64,
     pub dollars: f64,
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 /// Market entry: fills at the bar's open plus adverse slippage. Filling at
@@ -141,7 +141,7 @@ pub fn exit_all(
     pos: &Position,
     bar: &EnrichedBar,
     price: f64,
-    reason: &'static str,
+    reason: &str,
     costs: &Costs,
 ) -> Fill {
     let pts = (price - pos.entry_price) * pos.sign();
@@ -158,7 +158,7 @@ pub fn exit_all(
         exit_ts: bar.ts_utc,
         points: round2(pts),
         dollars: round2(dollars),
-        reason,
+        reason: reason.to_string(),
     }
 }
 

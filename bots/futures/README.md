@@ -33,8 +33,15 @@ validated backtest before any live bar is trusted.
 ## Running
 
     ./run.sh replay              # stored bars through the whole stack
-    ./run.sh shadow              # live-data readiness loop (IB gateway)
-    ./run.sh parity              # the gate
+    ./run.sh parity              # the gate (Rust vs committed fixture)
+    ./run.sh ib-check            # Gateway readiness probe (run when the
+                                 #  market-data subscription activates)
+    ./run.sh shadow              # LIVE bars, no orders ever: the Book
+                                 #  simulates fills and publishes to the
+                                 #  records DB (fill-model calibration)
+    ./run.sh live                # arms per .env flags; mirrors the book
+                                 #  with market orders; reconciles at
+                                 #  session boundaries, halts on mismatch
 
 State publishes to the shared records DB (step 4): the heartbeat document
 to `bot_status`, fills to `fills` (content-keyed, idempotent — replays and

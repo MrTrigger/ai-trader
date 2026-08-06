@@ -663,6 +663,14 @@ pub mod blocking {
             self.wait(self.inner.put_snapshot(bot_id, taken_at, payload_json))
         }
 
+        pub fn get_snapshot(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
+            self.wait(self.inner.get_snapshot(bot_id))
+        }
+
+        pub fn recent_fills(&self, bot_id: &str, limit: i64) -> Result<Vec<String>, RecordsError> {
+            self.wait(self.inner.recent_fills(bot_id, limit))
+        }
+
         pub fn get_status(&self, bot_id: &str) -> Result<Option<StatusRow>, RecordsError> {
             self.wait(self.inner.get_status(bot_id))
         }

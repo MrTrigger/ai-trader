@@ -319,15 +319,34 @@ pub fn open(
 fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
     match venue_id {
         "hyperliquid" => open_hyperliquid(mode, env),
-        "ib" => Err(
-            "venue 'ib' is registered but its adapter arrives with the futures bot \
-             (docs/futures-bot-proposal.md)"
-                .into(),
-        ),
+        "ib" => open_ib(mode),
         other => Err(format!(
             "unknown venue_id {other:?}. Known live venues: hyperliquid, ib (planned)."
         )),
     }
+}
+
+fn open_ib(mode: Mode) -> Result<Active, String> {
+    // The account block follows the arming intent: the LIVE block only when
+    // the mode is live AND the operator set IB_ALLOW_LIVE; anything else
+    // uses the paper block. Read-only mode forces orders off regardless of
+    // the flags — authority comes from `mode`, never from env alone.
+    let allow_live = matches!(
+        std::env::var("IB_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
+        "yes" | "true" | "1"
+    );
+    let live_block = mode == Mode::Live && allow_live;
+    let mut cfg = ib::IbConfig::from_env(live_block)?;
+    if mode == Mode::LiveReadonly {
+        cfg.allow_orders = false;
+    }
+    let adapter = ib::IbLazy::new(cfg);
+    let description = adapter.describe();
+    Ok(Active::Live {
+        adapter: Box::new(adapter),
+        description,
+        agent: None,
+    })
 }
 
 fn open_hyperliquid(mode: Mode, env: &Env) -> Result<Active, String> {

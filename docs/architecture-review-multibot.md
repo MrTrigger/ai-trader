@@ -195,9 +195,23 @@ accessors), `noise-book` (the four-sleeve decision core), `futures-bot`
 reproduces the committed parity fixture exactly — fill counts and net
 dollars per sleeve on two independent windows. Python's remaining roles:
 the research lab (reference implementation + fixture regeneration) and,
-at most, training orchestration over Rust-computed features. Still open
-for the futures bot: the rust-ibapi venue adapter, the live bar loop,
-and runtime snapshot/recovery in the Rust binary.
+at most, training orchestration over Rust-computed features. *ALL LANDED same day* ("complete everything"): the `ib` crate implements
+`VenueAdapter` over rust-ibapi (two-flag arming, always-permitted
+flatten_all, front month resolved via contract_details never assumed,
+lazily-connecting `IbLazy` behind `open_live("ib")`); `futures-bot run`
+is the live loop (5s→5min aggregation, controls re-read every bar,
+feed-stall watchdog → flatten+halt, broker-vs-model reconciliation at
+session boundaries → mismatch flattens and halts, snapshot every bar
+batch) with shadow (never armed) and live (mirrors Book transitions)
+modes; `ib-check` is the Gateway readiness probe. Crash-recovery parity
+re-proven for the Rust stack: freeze mid-session + resume from the DB
+snapshot converges to the identical book. Backtest equivalence proven on
+a third independent window (2026-04-15→, 274 fills: Python == Rust on
+every sleeve, to the cent). Remaining before live money: run `ib-check`
+against the operator's Gateway (needs the market-data subscription),
+then the shadow month per the bot-spec ladder. Gap on restart mid-
+session: live bars between crash and resume are not yet backfilled from
+IB historical data — noted in the run loop, acceptable for shadow.
 5. **One control plane.** Single `api` over the records DB; bot registry
    page; per-bot dashboard rendered from the bot's declared metadata (not
    a parameter allowlist); global + per-bot halt. Then, per README's own
