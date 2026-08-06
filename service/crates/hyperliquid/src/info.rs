@@ -26,6 +26,10 @@ pub const TESTNET: &str = "https://api.hyperliquid-testnet.xyz";
 
 /// Quote currency for every perp on this venue.
 pub const QUOTE: &str = "USDC";
+/// Its token index, which is how the unified-account view keys balances.
+/// `meta.collateralToken` reports 0, and this is checked against the venue in
+/// `live_read::the_collateral_token_is_still_the_one_we_assume`.
+pub const QUOTE_TOKEN: u32 = 0;
 
 /// A read-only client. Holds no key and cannot place an order.
 #[derive(Debug, Clone)]
@@ -149,21 +153,103 @@ impl Info {
         Ok((markets, marks))
     }
 
-    /// Cash and margin for an account.
+    /// Spendable collateral, whichever kind of account this is.
+    ///
+    /// # Two kinds of account, and reading only one of them was a bug
+    ///
+    /// A **classic** account keeps perps and spot in separate pots: perps
+    /// collateral is `clearinghouseState.accountValue`, spot is its own balance,
+    /// and moving between them is an explicit transfer. A **unified** account
+    /// trades from one balance — the UI greys the transfer out and says so —
+    /// and the collateral lives on the *spot* side while the perps view reports
+    /// zero until a position exists.
+    ///
+    /// Reading only the perps side therefore reports an empty account for every
+    /// unified user, which is how a funded account came back as 0.00.
+    ///
+    /// The two are told apart by `tokenToAvailableAfterMaintenance`, which the
+    /// venue returns only for unified accounts. Verified against three accounts:
+    /// a unified one with spot-only collateral, and two classic ones with
+    /// separately funded perps.
+    ///
+    /// What is **not** verified is a unified account holding an open perp
+    /// position — nothing reachable had one. If the perps view starts reporting
+    /// the same collateral the spot side already does, this would double count,
+    /// so it deliberately does not add the two together, and
+    /// `live_read::a_unified_account_is_not_double_counted` fails loudly if that
+    /// assumption ever stops holding.
     pub async fn balances(&self, user: &str) -> Result<Vec<Balance>, VenueError> {
-        let s: ClearinghouseState = self
+        let perps: ClearinghouseState = self
             .post(serde_json::json!({"type": "clearinghouseState", "user": user}))
             .await?;
-        let total: Decimal = s.margin_summary.account_value.parse().unwrap_or_default();
-        // `withdrawable` is the venue's own answer to "how much is not backing a
-        // position", which is exactly what `available` means here. Deriving it
-        // from account value less margin used would be a second opinion.
-        let available: Decimal = s.withdrawable.parse().unwrap_or(total);
+        let spot: SpotState = self
+            .post(serde_json::json!({"type": "spotClearinghouseState", "user": user}))
+            .await?;
+
+        let dec = |s: &str| s.parse::<Decimal>().unwrap_or_default();
+
+        if let Some(avail) = &spot.token_to_available_after_maintenance {
+            // Unified: one pot, held on the spot side. `available after
+            // maintenance` is the venue's own answer to "how much of this can
+            // still back a trade", which is exactly what `available` means.
+            let total = spot
+                .balances
+                .iter()
+                .find(|b| b.coin == QUOTE)
+                .map(|b| dec(&b.total))
+                .unwrap_or_default();
+            let available = avail
+                .iter()
+                .find(|(token, _)| *token == QUOTE_TOKEN)
+                .map(|(_, v)| dec(v))
+                .unwrap_or(total);
+            return Ok(vec![Balance {
+                currency: QUOTE.into(),
+                total,
+                available,
+            }]);
+        }
+
+        // Classic: perps collateral only. Spot is a separate pot that cannot
+        // back a perp without a transfer, so including it would overstate what
+        // this strategy can actually deploy.
+        let total = dec(&perps.margin_summary.account_value);
         Ok(vec![Balance {
             currency: QUOTE.into(),
             total,
-            available,
+            available: spot
+                .token_to_available_after_maintenance
+                .is_none()
+                .then(|| dec(&perps.withdrawable))
+                .unwrap_or(total),
         }])
+    }
+
+    /// The perps-side account value on its own, for the double-count check.
+    pub async fn raw_perps_account_value(&self, user: &str) -> Result<Decimal, VenueError> {
+        let s: ClearinghouseState = self
+            .post(serde_json::json!({"type": "clearinghouseState", "user": user}))
+            .await?;
+        Ok(s.margin_summary.account_value.parse().unwrap_or_default())
+    }
+
+    /// Which token perps settle in, as the venue reports it.
+    pub async fn collateral_token(&self) -> Result<u32, VenueError> {
+        #[derive(Deserialize)]
+        struct M {
+            #[serde(rename = "collateralToken")]
+            collateral_token: u32,
+        }
+        let m: M = self.post(serde_json::json!({"type": "meta"})).await?;
+        Ok(m.collateral_token)
+    }
+
+    /// Whether this account trades from a single unified balance.
+    pub async fn is_unified(&self, user: &str) -> Result<bool, VenueError> {
+        let spot: SpotState = self
+            .post(serde_json::json!({"type": "spotClearinghouseState", "user": user}))
+            .await?;
+        Ok(spot.token_to_available_after_maintenance.is_some())
     }
 
     /// Open positions, signed.
@@ -384,6 +470,26 @@ pub struct ClearinghouseState {
     pub withdrawable: String,
     #[serde(default, rename = "assetPositions")]
     pub asset_positions: Vec<AssetPosition>,
+}
+
+/// The spot side. Carries the unified-account marker.
+#[derive(Debug, Deserialize)]
+pub struct SpotState {
+    #[serde(default)]
+    pub balances: Vec<SpotBalance>,
+    /// Present only for unified accounts: per-token collateral still free after
+    /// maintenance margin.
+    #[serde(default, rename = "tokenToAvailableAfterMaintenance")]
+    pub token_to_available_after_maintenance: Option<Vec<(u32, String)>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpotBalance {
+    pub coin: String,
+    pub token: u32,
+    pub total: String,
+    #[serde(default)]
+    pub hold: String,
 }
 
 #[allow(dead_code)]

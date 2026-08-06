@@ -93,6 +93,90 @@ async fn an_account_with_no_activity_reads_as_flat_rather_than_failing() {
     assert_eq!(balances[0].currency, "USDC");
 }
 
+/// A funded unified account, if `HL_ACCOUNT_ADDRESS` names one.
+fn configured_account() -> Option<String> {
+    for line in std::fs::read_to_string("../../../.env").ok()?.lines() {
+        if let Some(v) = line.trim().strip_prefix("HL_ACCOUNT_ADDRESS=") {
+            let v = v.trim().trim_matches('"').to_string();
+            if !v.is_empty() && v != "0x0000000000000000000000000000000000000000" {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+#[ignore = "talks to the live venue"]
+async fn a_funded_account_never_reports_as_empty() {
+    // The bug this pins: a unified account holds its collateral on the spot
+    // side and reports zero on the perps side, so reading only perps made a
+    // funded account look flat. A strategy told it has no money either refuses
+    // to size anything or divides by zero.
+    let Some(account) = configured_account() else {
+        println!("no account configured; skipped");
+        return;
+    };
+    let i = info();
+    let unified = i.is_unified(&account).await.expect("unified check");
+    let balances = i.balances(&account).await.expect("balances");
+    assert_eq!(balances.len(), 1);
+    let b = &balances[0];
+    println!(
+        "{account}: unified={unified} total={} available={}",
+        b.total, b.available
+    );
+    assert!(
+        b.available <= b.total,
+        "available {} exceeds total {}",
+        b.available,
+        b.total
+    );
+}
+
+#[tokio::test]
+#[ignore = "talks to the live venue"]
+async fn a_unified_account_is_not_double_counted() {
+    // The assumption that could not be checked when this was written: no
+    // reachable unified account had an open perp position. If the perps view
+    // ever starts reporting the same collateral the spot side already does,
+    // adding them would overstate the account - so this asserts the balance we
+    // report never exceeds the two sides added together, and shouts if the
+    // perps side becomes non-zero on a unified account so the question gets
+    // looked at again.
+    let Some(account) = configured_account() else {
+        println!("no account configured; skipped");
+        return;
+    };
+    let i = info();
+    if !i.is_unified(&account).await.expect("unified check") {
+        println!("{account} is a classic account; nothing to check");
+        return;
+    }
+    let reported = i.balances(&account).await.expect("balances")[0].total;
+    let perps_side = i.raw_perps_account_value(&account).await.expect("perps");
+    println!("unified: reported={reported} perps-side={perps_side}");
+    assert!(
+        perps_side.is_zero(),
+        "a unified account is now reporting {perps_side} on the perps side as well as its spot \
+         collateral. Check whether balances() should be adding them before trusting this number."
+    );
+}
+
+#[tokio::test]
+#[ignore = "talks to the live venue"]
+async fn the_collateral_token_is_still_the_one_we_assume() {
+    // Perps settle in one token, named by the venue. If that ever changes, the
+    // unified-account lookup would key on the wrong index and read zero.
+    let token = info().collateral_token().await.expect("meta");
+    assert_eq!(
+        token,
+        hyperliquid::QUOTE_TOKEN,
+        "perps now collateralise in token {token}, not {}",
+        hyperliquid::QUOTE_TOKEN
+    );
+}
+
 #[tokio::test]
 #[ignore = "talks to the live venue"]
 async fn fills_come_back_oldest_first_with_positive_fees() {

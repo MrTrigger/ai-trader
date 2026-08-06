@@ -41,6 +41,13 @@ an agent key in `.env`, and `HL_ALLOW_LIVE=yes`. They live in different places o
 config copied between machines carries the mode, a `.env` copied carries the key, and needing both
 plus an explicit switch means no single careless copy starts trading.
 
+**Unified accounts.** Hyperliquid can run an account either way. A *classic* account keeps perps
+and spot in separate pots and you transfer between them; a *unified* one trades from a single
+balance, greys the transfer button out, and holds the collateral on the **spot** side while the
+perps view reports zero. The adapter tells them apart by a field the venue returns only for unified
+accounts, because reading the perps side alone reports a funded unified account as empty — which is
+exactly the sort of wrong number a strategy would either refuse to size against or divide by.
+
 **Use an agent wallet, never your main key.** Hyperliquid's API wallets can place and cancel and
 cannot withdraw, which is exactly the boundary spec §3.3 asks for. Generate one in the Hyperliquid
 UI under More → API. They expire; if live orders start being rejected as unauthorised, make a new
