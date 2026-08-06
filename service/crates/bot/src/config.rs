@@ -22,10 +22,21 @@ pub struct BotConfig {
     pub notes: serde_json::Value,
     /// Where controls, run history and venue state live.
     pub state_dir: PathBuf,
-    /// `paper` is the only one built. A missing adapter must be an error at
-    /// startup, not a surprise at the first order.
-    #[serde(default = "default_venue")]
-    pub venue: String,
+    /// `paper`, `live-readonly`, or `live`.
+    ///
+    /// The mode is here rather than only on the command line so that a
+    /// scheduled run cannot pick a different one from an interactive one, and
+    /// so the dashboard has a single place to change it.
+    #[serde(default = "default_mode")]
+    pub mode: crate::active_venue::Mode,
+    /// Where marks come from: `hyperliquid` for the live feed, `file` for
+    /// `marks.json`.
+    ///
+    /// A file feed means frozen prices, which is fine for a fixture and useless
+    /// for a paper run — nothing moves, so there is no P&L, no slippage and no
+    /// drawdown to measure.
+    #[serde(default = "default_feed")]
+    pub feed: String,
     pub quote_currency: String,
     #[serde(with = "rust_decimal::serde::str")]
     pub initial_cash: Decimal,
@@ -48,6 +59,16 @@ pub struct BotConfig {
     /// How often a run is expected. Health goes bad at a cadence and a half.
     #[serde(default = "default_cadence")]
     pub cadence_hours: i64,
+    /// Where credentials live. Relative paths resolve against the config file's
+    /// own directory, so a config and its secrets travel together.
+    ///
+    /// Left unset, the bot looks for `.env` beside the config and then in the
+    /// working directory. Being explicit matters because the dashboard runs the
+    /// bot with a cleared environment — a subprocess that can see the web
+    /// server's environment is one the web server can steer — so the file is
+    /// the only way credentials reach a run started from the page.
+    #[serde(default)]
+    pub env_file: Option<PathBuf>,
     /// Per-asset market rules. Assets absent here cannot be traded at all,
     /// which is the safe direction: an unknown lot size is a rejected order,
     /// not a guessed one.
@@ -55,8 +76,11 @@ pub struct BotConfig {
     pub markets: Vec<MarketConfig>,
 }
 
-fn default_venue() -> String {
-    "paper".into()
+fn default_mode() -> crate::active_venue::Mode {
+    crate::active_venue::Mode::Paper
+}
+fn default_feed() -> String {
+    "hyperliquid".into()
 }
 fn default_max_age() -> i64 {
     120
@@ -90,14 +114,26 @@ impl BotConfig {
             .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
         let cfg: BotConfig = serde_json::from_str(&text)
             .map_err(|e| format!("cannot parse config {}: {e}", path.display()))?;
-        if cfg.venue != "paper" {
+        if !matches!(cfg.feed.as_str(), "hyperliquid" | "file") {
             return Err(format!(
-                "venue '{}' is not implemented. Only 'paper' exists so far; a live adapter is \
-                 not something to discover missing at the first order.",
-                cfg.venue
+                "feed '{}' is not implemented. Use 'hyperliquid' for live prices, or 'file' to \
+                 read a static marks.json.",
+                cfg.feed
             ));
         }
         Ok(cfg)
+    }
+
+    /// The first `.env` that exists, of: the configured path, one beside the
+    /// config, one in the working directory.
+    pub fn env_path(&self, config_path: &Path) -> Option<PathBuf> {
+        let dir = config_path.parent().unwrap_or(Path::new("."));
+        let candidates = match &self.env_file {
+            Some(p) if p.is_absolute() => vec![p.clone()],
+            Some(p) => vec![dir.join(p)],
+            None => vec![dir.join(".env"), PathBuf::from(".env")],
+        };
+        candidates.into_iter().find(|p| p.is_file())
     }
 
     pub fn controls_path(&self) -> PathBuf {

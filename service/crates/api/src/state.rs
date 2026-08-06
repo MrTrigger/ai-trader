@@ -121,6 +121,9 @@ pub struct Snapshot {
     /// Whether this dashboard was given a bot to run. False means it can show
     /// everything and change nothing.
     pub controls_enabled: bool,
+    /// Which venue the bot is pointed at, read from its config rather than
+    /// guessed. `None` when this dashboard was not given one to read.
+    pub mode: Option<ModeView>,
     /// Anything that made a number here less trustworthy than it looks.
     pub warnings: Vec<String>,
 }
@@ -149,6 +152,17 @@ pub struct LiveStats {
 /// "conclusive". The backtest ran nearly four years.
 const MEANINGFUL_DAYS: i64 = 60;
 
+/// What venue the bot will use on its next run.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModeView {
+    /// `paper`, `live-readonly` or `live`.
+    pub mode: String,
+    /// `hyperliquid` or `file`.
+    pub feed: String,
+    /// The one that matters: whether a run could lose real money.
+    pub real_money: bool,
+}
+
 pub struct Inputs<'a> {
     pub state_dir: &'a Path,
     pub initial_cash: Decimal,
@@ -156,6 +170,9 @@ pub struct Inputs<'a> {
     pub cadence_hours: i64,
     pub expectation_path: Option<&'a Path>,
     pub controls_enabled: bool,
+    /// The bot's own config, so the dashboard can read which venue is in use
+    /// rather than keeping a second copy of that answer.
+    pub bot_config: Option<&'a Path>,
     pub run_limit: usize,
     pub fill_limit: usize,
 }
@@ -264,6 +281,7 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         live,
         reconciliation,
         controls_enabled: inputs.controls_enabled,
+        mode: read_mode(inputs.bot_config, &mut warnings),
         warnings,
     })
 }
@@ -289,6 +307,33 @@ fn reconcile_view(
             None
         }
     }
+}
+
+/// The bot's own config is the authority on which venue is in use. This reads
+/// it rather than keeping a copy, because two places to change the mode is one
+/// place too many.
+fn read_mode(path: Option<&Path>, warnings: &mut Vec<String>) -> Option<ModeView> {
+    let path = path?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("paper");
+    let feed = v
+        .get("feed")
+        .and_then(|m| m.as_str())
+        .unwrap_or("hyperliquid");
+    if feed == "file" {
+        warnings.push(
+            "the price feed is a static file, so marks never move. A paper run against frozen \
+             prices produces no P&L, no slippage and no drawdown - none of what a forward test \
+             measures. Set \"feed\": \"hyperliquid\" in the bot config for live prices."
+                .into(),
+        );
+    }
+    Some(ModeView {
+        mode: mode.to_string(),
+        feed: feed.to_string(),
+        real_money: mode == "live",
+    })
 }
 
 fn stamp(t: time::OffsetDateTime) -> String {

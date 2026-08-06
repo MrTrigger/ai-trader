@@ -283,7 +283,7 @@ pub fn reconcile(ours: &[Position], theirs: &[Position]) -> Result<(), ExecError
 /// matches no plan at all, and the next run's diff converges from wherever it
 /// actually is. Stopping early with the remainder named is recoverable; a
 /// partially-applied plan is not.
-pub async fn execute<V: VenueAdapter>(
+pub async fn execute<V: VenueAdapter + ?Sized>(
     venue: &V,
     plan: &Plan,
     ours: &[Position],
@@ -305,7 +305,7 @@ pub async fn execute<V: VenueAdapter>(
 /// compared the venue against itself and could never disagree — the check has
 /// teeth only if the caller owns an independent record. It must also account for
 /// earlier slices, or slice two reports drift the moment slice one fills.
-pub async fn execute_slice<V: VenueAdapter>(
+pub async fn execute_slice<V: VenueAdapter + ?Sized>(
     venue: &V,
     plan: &Plan,
     slice: Option<u8>,

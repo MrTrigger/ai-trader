@@ -17,18 +17,81 @@ Three processes, none of which knows about the others at runtime. They meet thro
 The arrow that matters is the last one. The dashboard writes controls and reads everything else;
 it cannot place an order because it holds nothing that could. See design spec §3.3 and §8.2.
 
+## Venues, and what each one can do
+
+| mode | reads | trades | needs |
+|---|---|---|---|
+| **paper** | live prices | a fake broker | nothing |
+| **live-readonly** | your real account | nothing — every order refused | `HL_ACCOUNT_ADDRESS` |
+| **live** | your real account | real orders, real money | the above, plus an agent key and `HL_ALLOW_LIVE=yes` |
+
+The middle one is the point. Going from *reading a real account* to *trading it* should be one
+deliberate step, not the same step as connecting at all.
+
+Switch from the dashboard, or:
+
+```bash
+bot --config var/live/bot.json mode                       # where am I pointed?
+bot --config var/live/bot.json mode set live-readonly \
+    --reason "watching the real account" --by magnus --confirm
+```
+
+Three separate things must line up before real money is reachable: `mode = "live"` in the config,
+an agent key in `.env`, and `HL_ALLOW_LIVE=yes`. They live in different places on purpose — a
+config copied between machines carries the mode, a `.env` copied carries the key, and needing both
+plus an explicit switch means no single careless copy starts trading.
+
+**Use an agent wallet, never your main key.** Hyperliquid's API wallets can place and cancel and
+cannot withdraw, which is exactly the boundary spec §3.3 asks for. Generate one in the Hyperliquid
+UI under More → API. They expire; if live orders start being rejected as unauthorised, make a new
+one.
+
+## Prices
+
+Nothing about a paper run means anything without them. The feed is one always-on process that
+writes `marks.json`, and everything else reads that file:
+
+```bash
+bot --config var/live/bot.json feed --interval 20     # keep it fresh
+bot --config var/live/bot.json feed --once            # one snapshot
+```
+
+Hyperliquid's info API is public, so this needs no credentials. Write-then-rename on every tick, so
+a reader never catches a half-written file; and a failed poll leaves the last good prices in place
+rather than deleting them — a stale price is visibly stale and can be reasoned about, a missing one
+makes the whole book unvaluable.
+
+Set `"feed": "file"` in the bot config to work offline from a static `marks.json`. The dashboard
+says so loudly when you do, because frozen prices produce no P&L, no slippage and no drawdown —
+none of what a forward test measures.
+
 ## The daily loop
 
 ```bash
-# 1. Data and marks. Whatever holds the price feed writes state_dir/marks.json.
-ai-trader --config config/default.toml data pull
-
-# 2. Decide. Emits a plan; no side effects, no venue key that can trade.
-ai-trader --config config/default.toml plan --out var/bot/plan.json
-
-# 3. Execute. Runs the slice window, then exits.
-bot --config config/bot.json run --plan var/bot/plan.json
+bin/cycle.sh var/live/bot.json
 ```
+
+which is exactly these three, in order, failing the whole cycle if any of them does:
+
+```bash
+ai-trader --config config/default.toml data pull                    # 1. bars
+ai-trader --config config/default.toml plan --out <state>/plan.json # 2. decide
+bot --config var/live/bot.json run --plan <state>/plan.json         # 3. execute
+```
+
+Cron it, and leave the feed running alongside:
+
+```cron
+5 0 * * *  cd /path/to/ai-trader && bin/cycle.sh >> var/live/cycle.log 2>&1
+@reboot    cd /path/to/ai-trader && bot --config var/live/bot.json feed --interval 20
+```
+
+The cycle takes a lock: the execution window is hours long, and two overlapping runs would each
+diff against a book the other is moving. A second cycle finding the lock held exits quietly rather
+than queueing.
+
+There is deliberately no scheduler daemon. Spec §8.1 — the scheduler invokes the same commands a
+human does, and a bespoke one would be a second way to run things, which is the way nobody tests.
 
 Step 3 is the only one that can move capital, and it is one process per run: cron starts it, it
 does one thing, it exits. Everything it cares about is on disk before it goes.
@@ -186,7 +249,7 @@ or grant authority — "who flattened the book at 02:14" is a question that gets
 | File | Written by | What it is |
 |---|---|---|
 | `controls.json` | operator, CLI or dashboard | the kill switch and pause, with who and why |
-| `marks.json` | the price feed | `{"BTC": "64000.50"}`; the bot only reads it |
+| `marks.json` | `bot feed` | `{"BTC": "64000.50"}`, rewritten every tick from the venue |
 | `venue-state.json` | `bot` | the paper venue's books — fill log, resting orders, idempotency map |
 | `runs/*.json` | `bot` | one file per run; timestamp-prefixed, so a listing is chronological |
 | `ledger.jsonl` | `bot` | our own append-only record: order ids we authorised, positions we adopted, fills we acknowledged |
@@ -196,10 +259,14 @@ whole history, and a run that died mid-write should cost its own record and no o
 
 ## What is not built yet
 
-- **A live venue adapter.** `paper` is the only one implemented, and `bot` refuses to start with
-  any other `venue` value rather than discovering it missing at the first order.
-- **A price feed.** `marks.json` is written by hand today. The bot reads marks and never fetches
-  them: a bot with its own feed is a bot with its own opinion about value.
+- **A verified live *write* path.** The Hyperliquid read path is checked against the real API on
+  every run of `cargo test -p hyperliquid --test live_read -- --ignored`. Order placement and
+  cancellation are implemented and unit-tested, but no order has ever been sent — that needs an
+  account. Testnet first: point `HL_API_URL` at `api.hyperliquid-testnet.xyz`, where live mode
+  needs no `HL_ALLOW_LIVE`.
+- **Bars from the venue being traded.** The planner ranks on Binance history while the strategy
+  trades Hyperliquid perps. That was a documented proxy for the backtest; live it is a basis
+  difference, and worth deciding about deliberately rather than by default.
 - **Adaptive execution.** Slices are a fixed hourly schedule. Real execution reads the order book —
   accelerating into depth, waiting out thin patches, posting rather than crossing. A fixed time
   slice is the honest floor (design spec §6.3).

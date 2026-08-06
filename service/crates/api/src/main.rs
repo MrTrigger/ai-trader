@@ -187,6 +187,7 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
         cadence_hours: cfg.cadence_hours,
         expectation_path: cfg.expectation.as_deref(),
         controls_enabled: cfg.bot.is_some(),
+        bot_config: cfg.bot.as_ref().map(|b| b.config.as_path()),
         run_limit: 200,
         // Enough to see the last run or two land, not enough to bury everything
         // below it. The full log is `bot positions` and the fill store; this is
@@ -298,7 +299,9 @@ fn control(
     eprintln!(
         "  control: {}{} by {by}: {reason}",
         control::as_typed(Some(bot), action),
-        if action.is_consequential() {
+        if action.goes_live() {
+            "  [*** POINTS THE BOT AT REAL MONEY ***]"
+        } else if action.is_consequential() {
             "  [moves capital or grants authority]"
         } else {
             ""

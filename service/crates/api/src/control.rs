@@ -33,6 +33,11 @@ pub enum Action {
     Flatten,
     Adopt,
     AdoptAcceptingUnknownFills,
+    /// Point the bot at a different venue. Not a control over the book, but the
+    /// control that decides whose book everything else touches.
+    ModePaper,
+    ModeLiveReadonly,
+    ModeLive,
 }
 
 impl Action {
@@ -44,6 +49,9 @@ impl Action {
             "/api/flatten" => Some(Self::Flatten),
             "/api/adopt" => Some(Self::Adopt),
             "/api/adopt-accepting-unknown-fills" => Some(Self::AdoptAcceptingUnknownFills),
+            "/api/mode/paper" => Some(Self::ModePaper),
+            "/api/mode/live-readonly" => Some(Self::ModeLiveReadonly),
+            "/api/mode/live" => Some(Self::ModeLive),
             _ => None,
         }
     }
@@ -55,6 +63,19 @@ impl Action {
             Self::Resume => "resume",
             Self::Flatten => "flatten",
             Self::Adopt | Self::AdoptAcceptingUnknownFills => "adopt",
+            Self::ModePaper | Self::ModeLiveReadonly | Self::ModeLive => "mode",
+        }
+    }
+
+    /// Positional arguments, before the named ones. Only `mode set` has any,
+    /// and the target comes from the matched action rather than the request, so
+    /// the page cannot ask for a mode that is not on this list.
+    fn positional(self) -> &'static [&'static str] {
+        match self {
+            Self::ModePaper => &["set", "paper"],
+            Self::ModeLiveReadonly => &["set", "live-readonly"],
+            Self::ModeLive => &["set", "live"],
+            _ => &[],
         }
     }
 
@@ -64,6 +85,7 @@ impl Action {
         match self {
             Self::Flatten | Self::Adopt => &["--confirm"],
             Self::AdoptAcceptingUnknownFills => &["--confirm", "--accept-unknown-fills"],
+            Self::ModePaper | Self::ModeLiveReadonly | Self::ModeLive => &["--confirm"],
             _ => &[],
         }
     }
@@ -73,7 +95,12 @@ impl Action {
     /// Not used to forbid anything — the operator asked for these controls — but
     /// the page marks them differently and the log says which kind it was.
     pub fn is_consequential(self) -> bool {
-        !matches!(self, Self::Halt | Self::Pause)
+        !matches!(self, Self::Halt | Self::Pause | Self::ModePaper)
+    }
+
+    /// Whether choosing this puts real capital within reach.
+    pub fn goes_live(self) -> bool {
+        matches!(self, Self::ModeLive)
     }
 }
 
@@ -128,11 +155,11 @@ pub fn run(bot: &BotCommand, action: Action, reason: &str, by: &str) -> Result<O
     let mut cmd = Command::new(&bot.binary);
     cmd.arg("--config")
         .arg(&bot.config)
-        .arg(action.subcommand())
-        .arg("--reason")
-        .arg(reason)
-        .arg("--by")
-        .arg(by);
+        .arg(action.subcommand());
+    for a in action.positional() {
+        cmd.arg(a);
+    }
+    cmd.arg("--reason").arg(reason).arg("--by").arg(by);
     for a in action.extra() {
         cmd.arg(a);
     }
@@ -166,10 +193,12 @@ pub fn as_typed(bot: Option<&BotCommand>, action: Action) -> String {
                 .unwrap_or_else(|| b.binary.display().to_string())
         })
         .unwrap_or_else(|| "bot".into());
-    let mut s = format!(
-        "{binary} --config {config} {} --reason \"...\" --by you",
-        action.subcommand()
-    );
+    let mut s = format!("{binary} --config {config} {}", action.subcommand());
+    for a in action.positional() {
+        s.push(' ');
+        s.push_str(a);
+    }
+    s.push_str(" --reason \"...\" --by you");
     for a in action.extra() {
         s.push(' ');
         s.push_str(a);

@@ -273,6 +273,28 @@
   button.ctl.go:hover:not([disabled]) { background: rgba(74,222,128,.14); }
   button.ctl[disabled] { opacity: .4; cursor: not-allowed; }
   .ctlnote { font-size: 11px; color: var(--ink-3); margin: 8px 0 0; line-height: 1.5; }
+  .ctllabel {
+    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; margin-bottom: 6px;
+  }
+  /* One control, three exclusive states, laid out so the current one reads as
+     a fact rather than as a pressed button. Live gets the warning colour even
+     while unselected: the label should look like what it does. */
+  .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px;
+         background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px; padding: 3px; }
+  .seg button {
+    font-family: var(--sans); font-size: 11.5px; font-weight: 550; cursor: pointer;
+    padding: 6px 4px; border-radius: 5px; border: 1px solid transparent;
+    background: none; color: var(--ink-3); white-space: nowrap;
+  }
+  .seg button:hover:not([disabled]):not(.on) { color: var(--ink-2); }
+  .seg button.on { background: var(--panel-2); border-color: var(--line-2); color: var(--ink); }
+  .seg button.live { color: var(--down); }
+  .seg button.live.on { background: rgba(248,113,113,.12); border-color: rgba(248,113,113,.4); color: var(--down); }
+  .seg button[disabled] { opacity: .45; cursor: not-allowed; }
+  /* When real money is reachable the whole card says so, not a footnote. */
+  .card.livemode { border-color: rgba(248,113,113,.45); }
+  .card.livemode > header .t { color: var(--down); }
   .ctlsplit { border-top: 1px solid var(--line); margin: 12px 0 0; padding-top: 12px; }
   .result { margin-top: 10px; font-size: 12px; }
   pre.cmd {
@@ -314,6 +336,10 @@
         <span class="dot" id="raildot"></span>
         <strong style="font-size:15px">ai-trader</strong>
         <span class="pill" id="railstate" style="margin-left:auto">—</span>
+      </div>
+      <div class="pad tight" style="border-top:1px solid var(--line);display:flex;align-items:center;gap:8px">
+        <span class="dim" style="font-size:11.5px">venue</span>
+        <span class="pill" id="modepill" style="margin-left:auto">—</span>
       </div>
     </section>
 
@@ -382,6 +408,10 @@
           <strong style="font-size:16px" id="ctlstate">—</strong>
           <span class="dim" style="margin-left:auto;font-family:var(--mono);font-size:11.5px" id="ctlsince"></span>
         </div>
+
+        <div class="ctllabel">Venue</div>
+        <div class="seg" id="modeseg"></div>
+        <p class="ctlnote" id="modenote" style="margin-bottom:14px"></p>
 
         <div class="field">
           <label for="who">Your name</label>
@@ -499,6 +529,10 @@ async function refresh() {
 
 function render(s) {
   $("stamp").textContent = stampOf(s.generated_at) + "Z · refreshes every 10s";
+  const live = s.mode && s.mode.real_money;
+  document.title = (live ? "LIVE · " : "") + "ai-trader — operations";
+  $("modepill").className = "pill " + (live ? "halted" : "");
+  $("modepill").textContent = s.mode ? s.mode.mode : "—";
   $("raildot").className = "dot " + s.control_state;
   $("railstate").className = "pill " + s.control_state;
   $("railstate").textContent = s.control_state;
@@ -836,6 +870,38 @@ function renderRuns(runs) {
 }
 
 /* --- right rail ------------------------------------------------------- */
+const MODES = [
+  ["paper", "Paper", ""],
+  ["live-readonly", "Live read-only", ""],
+  ["live", "Live", "live"],
+];
+
+function renderMode(s) {
+  const m = s.mode;
+  const card = $("controls");
+  const seg = $("modeseg");
+  if (!m) {
+    seg.innerHTML = '<button disabled>unknown</button>';
+    $("modenote").textContent = "No bot config to read the venue from.";
+    return;
+  }
+  card.classList.toggle("livemode", !!m.real_money);
+  seg.innerHTML = MODES.map(([id, label, extra]) =>
+    '<button data-action="mode-' + id + '" class="' + extra + (m.mode === id ? " on" : "") + '"' +
+    (m.mode === id ? " disabled" : "") + ">" + label + "</button>").join("");
+  if (!controlsEnabled) seg.querySelectorAll("button").forEach((b) => (b.disabled = true));
+
+  // The feed matters as much as the mode: paper on frozen prices measures
+  // nothing, and that is not obvious from the word "paper".
+  const feed = m.feed === "hyperliquid" ? "live prices from Hyperliquid" : "STATIC prices from marks.json";
+  $("modenote").innerHTML = m.real_money
+    ? '<span class="down"><b>Real money.</b> Scheduled runs place real orders.</span> Fills at ' + esc(feed) + "."
+    : (m.mode === "live-readonly"
+        ? "Reading the real account; every order is refused. Fills would be at " + esc(feed) + "."
+        : "Simulated fills at " + esc(feed) + ".") +
+      (m.feed === "file" ? ' <span class="warn-t">Frozen prices produce no P&amp;L to measure.</span>' : "");
+}
+
 function renderMaster(s) {
   $("ctldot").className = "dot " + s.control_state;
   $("ctlstate").textContent =
@@ -844,6 +910,7 @@ function renderMaster(s) {
   const c = s.controls || {};
   $("ctlsince").textContent = c.set_at ? "since " + stampOf(c.set_at).slice(5, 16) : "";
   renderControlAvailability(s.controls_enabled, s.control_state);
+  renderMode(s);
 }
 
 function renderRisk(s) {
@@ -1040,6 +1107,18 @@ function renderActivity(s) {
    anything is sent. Flatten earns that: it is the one control whose effect
    cannot be undone by pressing something else. */
 const ACTIONS = {
+  "mode-paper": {
+    path: "/api/mode/paper", verb: "Switch to paper",
+    confirm: "Point the bot at the paper venue. Real positions are left exactly as they are — nothing is closed."
+  },
+  "mode-live-readonly": {
+    path: "/api/mode/live-readonly", verb: "Switch to live read-only",
+    confirm: "Point the bot at the real account. It will show real balances, positions and fills, and every order will be refused."
+  },
+  "mode-live": {
+    path: "/api/mode/live", verb: "Go LIVE", typed: "LIVE",
+    confirm: "Point the bot at the real account WITH TRADING ENABLED. From this point a scheduled run can place real orders with real money."
+  },
   halt:    { path: "/api/halt",    verb: "Halt",
              confirm: "Stop executing. Planning continues, and nothing already open is closed." },
   pause:   { path: "/api/pause",   verb: "Pause",

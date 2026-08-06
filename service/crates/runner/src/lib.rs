@@ -644,7 +644,7 @@ pub fn health(
 // --- the run itself ---------------------------------------------------------
 
 /// Everything a run needs that is not the plan.
-pub struct Runner<'a, V: VenueAdapter, C: Timer> {
+pub struct Runner<'a, V: VenueAdapter + ?Sized, C: Timer> {
     pub venue: &'a V,
     pub clock: &'a C,
     pub store: &'a RunStore,
@@ -657,7 +657,7 @@ pub struct Runner<'a, V: VenueAdapter, C: Timer> {
     pub max_plan_age_minutes: i64,
 }
 
-impl<V: VenueAdapter, C: Timer> Runner<'_, V, C> {
+impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
     /// Execute one plan across its slices, recording the outcome either way.
     ///
     /// The gates run before anything is submitted, and each writes a recorded

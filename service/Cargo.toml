@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plan", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/bot", "crates/api", "crates/viewer"]
+members = ["crates/plan", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ venue = { path = "crates/venue" }
 paper = { path = "crates/paper" }
 executor = { path = "crates/executor" }
 runner = { path = "crates/runner" }
+hyperliquid = { path = "crates/hyperliquid" }
 async-trait = "0.1"
 tokio = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
