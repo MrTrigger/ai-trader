@@ -45,6 +45,41 @@
   ::selection { background: rgba(52,211,153,.25); }
 
   /* --- chrome ---------------------------------------------------------- */
+  /* ── fleet nav + views ─────────────────────────────────────────── */
+  .fleetnav { display:flex; gap:6px; align-items:center; padding:10px 14px 0; flex-wrap:wrap; }
+  .fleetnav .tab {
+    font-family: var(--mono); font-size:12px; padding:7px 14px; border-radius:8px;
+    border:1px solid var(--line); background:var(--panel); color:var(--ink);
+    cursor:pointer; display:flex; gap:8px; align-items:center; text-decoration:none;
+  }
+  .fleetnav .tab.active { border-color: var(--info); box-shadow: 0 0 0 1px var(--info) inset; }
+  .fleetnav .tab .sd { width:8px; height:8px; border-radius:50%; background:var(--ink-3); }
+  .fleetnav .tab .sd.ok { background:var(--up); }
+  .fleetnav .tab .sd.bad { background:var(--down); }
+  .fleetnav .tab .sd.warn { background:var(--warn); }
+  .fleetgrid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); padding:0 14px; }
+  .botcard { border:1px solid var(--line); background:var(--panel); border-radius:var(--r); padding:14px 16px; cursor:pointer; }
+  .botcard:hover { border-color: var(--info); }
+  .botcard h3 { margin:0; font-size:15px; display:flex; gap:8px; align-items:center; }
+  .botcard .meta { color:var(--ink-3); font-size:11.5px; margin-top:2px; }
+  .botcard .stat { font-family:var(--mono); font-size:12.5px; margin-top:8px; display:flex; gap:14px; flex-wrap:wrap; }
+  .botcard canvas { width:100%; height:44px; margin-top:8px; }
+  .aggbar { display:flex; gap:22px; padding:12px 16px; margin:10px 14px; border:1px solid var(--line);
+            border-radius:var(--r); background:var(--panel); font-family:var(--mono); font-size:12.5px; flex-wrap:wrap; }
+  .aggbar b { font-size:16px; display:block; font-family:var(--mono); }
+  .aggbar .lbl { color:var(--ink-3); font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; }
+  .gaugewrap { height:8px; border-radius:5px; background:var(--line); overflow:hidden; margin-top:6px; }
+  .gaugewrap > div { height:100%; border-radius:5px; background:var(--info); }
+  .kv { display:flex; gap:8px; align-items:baseline; }
+  .kv .k { color:var(--ink-3); font-size:11px; }
+  .botview-grid { display:grid; gap:12px; padding:0 14px 20px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
+  .botview-wide { grid-column: 1 / -1; }
+  table.flt { width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.flt th { text-align:left; color:var(--ink-3); font-size:10.5px; text-transform:uppercase;
+                 letter-spacing:.07em; padding:4px 8px; border-bottom:1px solid var(--line); }
+  table.flt td { padding:5px 8px; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:12px; }
+  .num { text-align:right; }
+  .pos { color:var(--up); } .neg { color:var(--down); }
   .topbar {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 18px; border-bottom: 1px solid var(--line);
@@ -321,81 +356,25 @@
 
 <div class="topbar">
   <span class="mark">AT</span>
-  <span class="caption">Operations — book, controls, risk and run history</span>
+  <span class="caption">Operations — fleet, controls, risk and run history</span>
   <span class="grow"></span>
   <span class="meta" id="stamp"></span>
 </div>
 
+<nav class="fleetnav" id="fleetnav"></nav>
+
+<div id="view-fleet" hidden>
+  <div class="aggbar" id="aggbar"></div>
+  <div class="fleetgrid" id="fleetgrid"></div>
+</div>
+
+<div id="view-bot" hidden>
+  <div class="aggbar" id="botbar"></div>
+  <div class="botview-grid" id="botview"></div>
+</div>
+
+<div id="view-local">
 <div id="banner"></div>
-
-<!-- The fleet: every registered bot (identity registry), live status,
-     narrow controls. This process's own book views below remain the deep
-     dashboard for the bot it wraps; the fleet is the one place ALL bots
-     appear (multi-bot migration). -->
-<section class="card" style="margin:10px 14px 0">
-  <header style="display:flex;align-items:center;gap:8px;padding:8px 12px">
-    <span class="t" style="font-weight:600">Fleet</span>
-    <span class="sub" id="fleethint" style="margin-left:auto"></span>
-  </header>
-  <div class="pad" id="fleet" style="display:flex;flex-wrap:wrap;gap:10px"></div>
-</section>
-
-<script>
-async function refreshFleet() {
-  try {
-    const r = await fetch('/api/bots');
-    const d = await r.json();
-    const el = document.getElementById('fleet');
-    const hint = document.getElementById('fleethint');
-    if (!d.available) { hint.textContent = d.reason || 'registry unavailable'; return; }
-    hint.textContent = d.bots.length + ' registered';
-    el.innerHTML = '';
-    for (const b of d.bots) {
-      const s = b.status || {};
-      const halted = s.halted || (s.kill_switch === true ? 'kill switch' : null);
-      const hb = s.heartbeat_age_seconds;
-      const stale = hb != null && hb > 300;
-      const card = document.createElement('div');
-      card.style.cssText = 'border:1px solid var(--line);border-radius:8px;padding:10px 12px;min-width:240px;flex:1';
-      card.innerHTML =
-        '<div style="display:flex;gap:8px;align-items:center">'
-        + '<strong>' + b.bot_id + '</strong>'
-        + '<span class="pill" style="margin-left:auto">' + b.asset_class + '</span>'
-        + '<span class="pill">' + (b.enabled ? 'enabled' : 'disabled') + '</span></div>'
-        + '<div class="dim" style="font-size:11.5px;margin-top:2px">' + b.display_name + ' · ' + b.cadence + '</div>'
-        + '<div style="margin-top:6px;font-size:12.5px">'
-        + (halted ? '<span style="color:var(--bad,#e66)">HALTED (' + halted + ')</span>'
-                  : '<span>' + (s.mode || s.last_run?.outcome || 'idle') + '</span>')
-        + (s.net_total != null ? ' · net $' + Number(s.net_total).toLocaleString() : '')
-        + (hb != null ? ' · hb ' + hb + 's' + (stale ? ' ⚠' : '') : '')
-        + (s.last_run ? ' · last run ' + (s.last_run.recorded_at || '') : '')
-        + '</div>';
-      if (s.contract === 'botstate') {
-        const btn = document.createElement('button');
-        btn.textContent = halted ? 'resume' : 'halt';
-        btn.style.cssText = 'margin-top:8px';
-        btn.onclick = async () => {
-          const reason = prompt((halted ? 'Resume' : 'Halt') + ' ' + b.bot_id + ' — reason:');
-          if (!reason) return;
-          const by = prompt('Your name:');
-          if (!by) return;
-          await fetch('/api/bots/' + b.bot_id + '/' + (halted ? 'resume' : 'halt'), {
-            method: 'POST', body: JSON.stringify({ reason, by }),
-          });
-          refreshFleet();
-        };
-        card.appendChild(btn);
-      }
-      el.appendChild(card);
-    }
-  } catch (e) {
-    document.getElementById('fleethint').textContent = 'fleet fetch failed: ' + e;
-  }
-}
-refreshFleet();
-setInterval(refreshFleet, 15000);
-</script>
-
 <div class="shell">
   <!-- left rail: what is running, and against what account -->
   <div class="col">
@@ -545,6 +524,8 @@ setInterval(refreshFleet, 15000);
   </div>
 </div>
 
+</div><!-- /view-local -->
+
 <script>
 "use strict";
 
@@ -596,7 +577,7 @@ async function refresh() {
 }
 
 function render(s) {
-  $("stamp").textContent = stampOf(s.generated_at) + "Z · refreshes every 10s";
+  $("stamp").textContent = stampOf(s.generated_at) + "Z · live";
   const live = s.mode && s.mode.real_money;
   document.title = (live ? "LIVE · " : "") + "ai-trader — operations";
   $("modepill").className = "pill " + (live ? "halted" : "");
@@ -1286,6 +1267,233 @@ window.addEventListener("resize", () => {
 
 refresh();
 setInterval(refresh, 10000);
+</script>
+
+<script>
+/* ── Fleet application ─────────────────────────────────────────────────
+   Hash-routed: #/           the fleet overview
+                #/bot/<id>   a bot's own dashboard (local bot -> the
+                             classic view below; botstate bots -> a
+                             rendered detail view)                       */
+const $F = (id) => document.getElementById(id);
+const fmt$ = (v) => (v == null ? '—' : (v < 0 ? '−$' : '$') + Math.abs(Math.round(v)).toLocaleString());
+const cls$ = (v) => (v < 0 ? 'neg' : 'pos');
+
+let FLEET = { bots: [] };
+const DETAILS = {};
+
+function sd(status, enabled) {
+  const halted = status.halted || status.kill_switch === true;
+  const hb = status.heartbeat_age_seconds;
+  if (halted) return 'bad';
+  if (!enabled) return '';
+  if (hb != null && hb > 300) return 'warn';
+  return 'ok';
+}
+
+function spark(canvas, series, color) {
+  const ctx = canvas.getContext('2d');
+  const w = (canvas.width = canvas.clientWidth * 2), h = (canvas.height = canvas.clientHeight * 2);
+  ctx.clearRect(0, 0, w, h);
+  if (series.length < 2) return;
+  const min = Math.min(...series), max = Math.max(...series), span = max - min || 1;
+  ctx.beginPath();
+  series.forEach((v, i) => {
+    const x = (i / (series.length - 1)) * (w - 4) + 2;
+    const y = h - 3 - ((v - min) / span) * (h - 6);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+  const zy = h - 3 - ((0 - min) / span) * (h - 6);
+  if (zy > 0 && zy < h) {
+    ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1;
+    ctx.setLineDash([4, 5]); ctx.beginPath(); ctx.moveTo(0, zy); ctx.lineTo(w, zy); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+
+function equitySeries(fills) {
+  let cum = 0; return fills.map((f) => (cum += f.dollars || 0));
+}
+
+async function loadFleet() {
+  try { FLEET = await (await fetch('/api/bots')).json(); } catch (e) { FLEET = { available: false, reason: String(e) }; }
+  renderNav(); route();
+}
+
+async function loadDetail(id) {
+  try { DETAILS[id] = await (await fetch('/api/bots/' + id + '/state')).json(); } catch (e) {}
+  return DETAILS[id];
+}
+
+function renderNav() {
+  const nav = $F('fleetnav');
+  const here = location.hash || '#/';
+  const bots = FLEET.bots || [];
+  nav.innerHTML = '';
+  const mk = (href, label, dot, active) => {
+    const a = document.createElement('a');
+    a.className = 'tab' + (active ? ' active' : ''); a.href = href;
+    if (dot != null) { const s = document.createElement('span'); s.className = 'sd ' + dot; a.appendChild(s); }
+    a.appendChild(document.createTextNode(label));
+    nav.appendChild(a);
+  };
+  mk('#/', 'FLEET', null, here === '#/' || here === '');
+  for (const b of bots) mk('#/bot/' + b.bot_id, b.bot_id, sd(b.status || {}, b.enabled), here === '#/bot/' + b.bot_id);
+}
+
+function agg(el, items) {
+  el.innerHTML = items.map(([lbl, val, cls]) =>
+    '<span><span class="lbl">' + lbl + '</span><b class="' + (cls || '') + '">' + val + '</b></span>').join('');
+}
+
+async function renderFleet() {
+  const bots = FLEET.bots || [];
+  if (!FLEET.available) {
+    $F('aggbar').innerHTML = '<span class="dim">' + (FLEET.reason || 'identity registry unavailable') + '</span>';
+    $F('fleetgrid').innerHTML = ''; return;
+  }
+  let net = 0, netKnown = false;
+  for (const b of bots) if (b.status && b.status.net_total != null) { net += b.status.net_total; netKnown = true; }
+  agg($F('aggbar'), [
+    ['bots', bots.length], ['enabled', bots.filter((b) => b.enabled).length],
+    ['halted', bots.filter((b) => (b.status || {}).halted).length, 'neg'],
+    ['net (known)', netKnown ? fmt$(net) : '—', netKnown ? cls$(net) : ''],
+    ['registry', 'postgres · db-first'],
+  ]);
+  const grid = $F('fleetgrid'); grid.innerHTML = '';
+  for (const b of bots) {
+    const s = b.status || {};
+    const card = document.createElement('div'); card.className = 'botcard';
+    card.onclick = () => (location.hash = '#/bot/' + b.bot_id);
+    const halted = s.halted || s.kill_switch === true;
+    card.innerHTML =
+      '<h3><span class="sd ' + sd(s, b.enabled) + '" style="width:9px;height:9px;border-radius:50%;display:inline-block"></span>'
+      + b.bot_id
+      + '<span class="grow" style="flex:1"></span>'
+      + '<span class="pill">' + b.asset_class + '</span>'
+      + '<span class="pill">' + (b.enabled ? 'enabled' : 'disabled') + '</span></h3>'
+      + '<div class="meta">' + b.display_name + ' · ' + b.cadence + '</div>'
+      + '<div class="stat">'
+      + (halted ? '<span class="neg">HALTED</span>' : '<span>' + (s.mode || (s.last_run && s.last_run.outcome) || 'idle') + '</span>')
+      + (s.net_total != null ? '<span class="' + cls$(s.net_total) + '">' + fmt$(s.net_total) + '</span>' : '')
+      + (s.trades_total != null ? '<span>' + s.trades_total + ' fills</span>' : '')
+      + (s.heartbeat_age_seconds != null ? '<span>hb ' + s.heartbeat_age_seconds + 's</span>' : '')
+      + (s.last_run ? '<span>last ' + String(s.last_run.recorded_at || '').slice(0, 16) + '</span>' : '')
+      + '</div>'
+      + ((s.contract === 'botstate') ? '<canvas></canvas>' : '');
+    grid.appendChild(card);
+    if (s.contract === 'botstate') {
+      loadDetail(b.bot_id).then((d) => {
+        if (d && d.fills) spark(card.querySelector('canvas'), equitySeries(d.fills),
+          getComputedStyle(document.documentElement).getPropertyValue('--info'));
+      });
+    }
+  }
+}
+
+function card(title, sub, body, wide) {
+  return '<section class="card' + (wide ? ' botview-wide' : '') + '"><header><span class="t">' + title
+    + '</span>' + (sub ? '<span class="sub">' + sub + '</span>' : '') + '</header><div class="pad">' + body + '</div></section>';
+}
+
+async function renderBot(id) {
+  const b = (FLEET.bots || []).find((x) => x.bot_id === id);
+  const d = DETAILS[id] || (await loadDetail(id));
+  if (!b || !d) { $F('botview').innerHTML = card('not found', '', 'unknown bot ' + id); return; }
+  const st = d.state || {};
+  const halted = st.halted;
+  agg($F('botbar'), [
+    ['bot', id], ['class', d.asset_class], ['cadence', d.cadence],
+    ['registry', b.enabled ? 'enabled' : 'disabled', b.enabled ? 'pos' : ''],
+    ['mode', st.mode || (d.contract === 'runner' ? 'runner' : '—')],
+    ['status', halted ? 'HALTED (' + halted + ')' : 'active', halted ? 'neg' : 'pos'],
+  ]);
+  const v = $F('botview');
+  if (d.contract === 'runner') {
+    v.innerHTML =
+      card('This bot has its own deep dashboard', '',
+        'The crypto runner keeps its full book view on the process wrapping its state dir'
+        + (b.local ? ' — it is THIS process: <a href="#/local">open the book view</a>.' : '.')
+        + '<br><br>Controls stay on its credentialed <code>bot</code> binary.', true)
+      + card('Recent runs', (d.runs || []).length + ' recorded',
+        '<table class="flt"><tr><th>recorded</th><th>outcome</th><th class="num">sent</th><th>detail</th></tr>'
+        + (d.runs || []).map((r) => '<tr><td>' + String(r.recorded_at || '').slice(0, 19) + '</td><td>'
+          + (r.outcome || '') + '</td><td class="num">' + (r.orders_submitted ?? '') + '</td><td>'
+          + (r.detail || '') + '</td></tr>').join('') + '</table>', true);
+    return;
+  }
+  // botstate contract — the futures bot's full view
+  const kill = st.kill || {};
+  const pct = kill.limit ? Math.min(100, Math.round((100 * kill.rolling_net) / kill.limit)) : 0;
+  const sleeves = st.sleeves || {};
+  const fills = (d.fills || []).slice();
+  const openPos = Object.entries(sleeves).filter(([, s]) => s.position);
+  v.innerHTML =
+    card('Equity — shadow fills, cumulative', fills.length + ' fills',
+      '<canvas id="botEquity" style="width:100%;height:170px"></canvas>', true)
+    + card('Kill criterion', 'rolling ' + (kill.rolling_sessions ?? '—') + ' sessions',
+      '<div class="kv"><b class="' + cls$(kill.rolling_net) + '" style="font-size:18px">' + fmt$(kill.rolling_net)
+      + '</b><span class="k">halts at ' + fmt$(kill.limit) + '</span></div>'
+      + '<div class="gaugewrap"><div style="width:' + Math.max(2, pct) + '%;'
+      + (pct > 60 ? 'background:var(--down)' : '') + '"></div></div>')
+    + card('Run config', '',
+      '<div class="kv"><span class="k">instrument</span><b>' + (st.instrument || '—') + '</b></div>'
+      + '<div class="kv"><span class="k">sizing</span><b>' + ((st.sizing || {}).mode || '—') + ' · '
+      + ((st.sizing || {}).units ?? '—') + ' unit(s)</b></div>'
+      + '<div class="kv"><span class="k">net</span><b class="' + cls$(st.net_total) + '">' + fmt$(st.net_total) + '</b></div>'
+      + '<div class="kv"><span class="k">decision core</span><b style="font-size:11px">' + (d.decision_core || '') + '</b></div>')
+    + card('Controls', 'reason + name required',
+      '<button id="btnHalt" class="pill" style="cursor:pointer;padding:8px 16px">'
+      + (halted ? 'clear halt' : 'HALT — no new entries') + '</button>'
+      + '<div class="k" style="margin-top:8px;color:var(--ink-3);font-size:11px">Applied at the next session boundary; '
+      + 'open positions are never touched from this page.</div>')
+    + (openPos.length ? card('Open positions', '',
+      '<table class="flt"><tr><th>sleeve</th><th>dir</th><th class="num">entry</th><th class="num">last</th>'
+      + '<th class="num">trail</th><th class="num">unreal</th><th class="num">held</th></tr>'
+      + openPos.map(([k, s]) => { const p = s.position; return '<tr><td>' + k + '</td><td>' + p.direction
+        + '</td><td class="num">' + p.entry.toLocaleString() + '</td><td class="num">' + p.last_price.toLocaleString()
+        + '</td><td class="num">' + p.trail.toFixed(2) + '</td><td class="num ' + cls$(p.unrealized_dollars) + '">'
+        + fmt$(p.unrealized_dollars) + '</td><td class="num">' + p.bars_held + ' bars</td></tr>'; }).join('')
+      + '</table>', true) : '')
+    + card('Sleeves', Object.keys(sleeves).length + ' independent walks',
+      '<table class="flt"><tr><th>sleeve</th><th>state</th><th class="num">fills</th><th class="num">net</th></tr>'
+      + Object.entries(sleeves).map(([k, s]) => '<tr><td>' + k + '</td><td>'
+        + (s.in_position ? s.direction + ' position' : 'flat') + (s.enabled ? '' : ' · <span class="neg">off</span>')
+        + '</td><td class="num">' + (s.trades_total ?? '') + '</td><td class="num ' + cls$(s.net_total) + '">'
+        + fmt$(s.net_total) + '</td></tr>').join('') + '</table>', true)
+    + card('Recent fills', '', '<table class="flt"><tr><th>session</th><th>sleeve</th><th>dir</th>'
+      + '<th class="num">entry</th><th class="num">exit</th><th class="num">$</th><th>reason</th></tr>'
+      + fills.slice(-30).reverse().map((f) => '<tr><td>' + f.session_date + '</td><td>' + f.sleeve + '</td><td>'
+        + f.direction + '</td><td class="num">' + (f.entry || 0).toLocaleString() + '</td><td class="num">'
+        + (f.exit || 0).toLocaleString() + '</td><td class="num ' + cls$(f.dollars) + '">' + fmt$(f.dollars)
+        + '</td><td>' + (f.reason || '') + '</td></tr>').join('') + '</table>', true);
+  spark($F('botEquity'), equitySeries(fills),
+    getComputedStyle(document.documentElement).getPropertyValue('--info'));
+  const btn = $F('btnHalt');
+  if (btn) btn.onclick = async () => {
+    const reason = prompt((halted ? 'Clear halt on ' : 'Halt ') + id + ' — reason:'); if (!reason) return;
+    const by = prompt('Your name:'); if (!by) return;
+    await fetch('/api/bots/' + id + '/' + (halted ? 'resume' : 'halt'),
+      { method: 'POST', body: JSON.stringify({ reason, by }) });
+    delete DETAILS[id]; await loadFleet();
+  };
+}
+
+function route() {
+  const h = location.hash || '#/';
+  const showLocal = h === '#/local' || (h.startsWith('#/bot/') &&
+    (FLEET.bots || []).some((b) => b.local && '#/bot/' + b.bot_id === h && (b.status || {}).contract === 'runner'));
+  $F('view-fleet').hidden = !(h === '#/' || h === '');
+  $F('view-local').hidden = !showLocal;
+  $F('view-bot').hidden = !(h.startsWith('#/bot/') && !showLocal);
+  renderNav();
+  if (!$F('view-fleet').hidden) renderFleet();
+  if (!$F('view-bot').hidden) renderBot(h.slice('#/bot/'.length));
+}
+
+window.addEventListener('hashchange', route);
+loadFleet();
+setInterval(loadFleet, 15000);
 </script>
 </body>
 </html>
