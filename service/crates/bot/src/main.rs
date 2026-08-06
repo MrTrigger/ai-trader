@@ -520,12 +520,25 @@ async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), St
 /// What venue this is pointed at, and whether it could trade.
 async fn cmd_mode_show(cfg: &BotConfig) -> Result<(), String> {
     let venue = open_venue(cfg)?;
+    // Derived from the key whatever mode we are in, because "is the agent I
+    // configured the one the account approved" is a question you want answered
+    // *before* switching to live, not by a rejected order afterwards.
+    let env = Env::load(cfg.env_path(&config_path()).as_deref());
+    let configured_agent =
+        env.agent_key
+            .as_deref()
+            .map(|k| match hyperliquid::Agent::from_hex(k) {
+                Ok(a) => a.address().to_string(),
+                Err(e) => format!("unusable: {e}"),
+            });
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "mode": cfg.mode,
             "feed": cfg.feed,
             "venue": venue.describe(),
+            "agent_address": venue.agent_address(),
+            "configured_agent": configured_agent,
             "moves_real_money": cfg.mode.moves_real_money(),
         }))
         .unwrap()

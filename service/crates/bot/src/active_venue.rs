@@ -103,6 +103,18 @@ impl Active {
         }
     }
 
+    /// The address the venue will attribute our orders to, when there is a key.
+    ///
+    /// Worth surfacing: an agent that was never approved on the account, or has
+    /// since expired, is the most common reason a first live order is rejected,
+    /// and the rejection does not say which agent it disbelieved.
+    pub fn agent_address(&self) -> Option<&str> {
+        match self {
+            Active::Live(h) => h.agent_address(),
+            _ => None,
+        }
+    }
+
     /// Paper keeps its books in a file; the live venue keeps them itself.
     pub fn is_paper(&self) -> bool {
         matches!(self, Active::Paper(_))
