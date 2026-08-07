@@ -80,7 +80,7 @@ commands:
   resume --reason R --by WHO         permit trading again
   flatten --reason R --by WHO --confirm
                                      close THIS BOT's open positions at market
-  identity [show|migrate|register|enable|disable]
+  identity [show|migrate|register|enable|disable|remove <bot_id>]
                                      the DB identity registry (needs DATABASE_URL)
 ";
 
@@ -113,6 +113,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     let cfg =
         BotConfig::load(&config_path.ok_or_else(|| format!("--config is required\n{USAGE}"))?)?;
+
+    // Before any gate reads the environment, not when the venue is opened.
+    //
+    // This was a fail-open: `require_registered` runs ahead of `open_venue`, so
+    // with DATABASE_URL living only in `.env` it saw no registry, took the
+    // dev-mode path, and let a DISABLED bot trade — the exact thing the
+    // fail-closed gate exists to prevent. Credentials must be resolved before
+    // the first decision that depends on them, not before the first order.
+    let cfg_path = config_path_for_write
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    active_venue::Env::load(cfg.env_path(&cfg_path).as_deref());
     let command = rest.first().cloned().unwrap_or_default();
     let flags = Flags::parse(&rest[rest.len().min(1)..]);
 
@@ -288,11 +300,8 @@ fn open_stores(cfg: &BotConfig) -> Result<Stores, String> {
 /// invocation would start flat and the executor would reconcile a real
 /// intention against a book that had forgotten everything. The live venue keeps
 /// its own books, so there is nothing to restore.
-fn open_venue(
-    cfg: &BotConfig,
-    rec: Option<&records::blocking::Records>,
-) -> Result<Venue, String> {
-    let env = Env::load(cfg.env_path(&config_path()).as_deref());
+fn open_venue(cfg: &BotConfig, rec: Option<&records::blocking::Records>) -> Result<Venue, String> {
+    let env = Env::from_process();
 
     // Marks. A live feed is the default because a paper run on frozen prices
     // measures nothing; the file feed stays for fixtures and offline work.
@@ -380,8 +389,7 @@ async fn save_venue(
     }
     // Write-then-rename, so a crash mid-write cannot leave a truncated book.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, snap)
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, snap).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
 }
 
@@ -392,7 +400,12 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("cannot read plan {}: {e}", plan_path.display()))?;
     let plan = plan::Plan::parse(&text).map_err(|e| format!("plan is not valid: {e}"))?;
 
-    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let Stores {
+        rec,
+        store,
+        ledger,
+        controls,
+    } = open_stores(cfg)?;
     let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
@@ -526,7 +539,12 @@ async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
 /// they do not, so this can be a cron check as well as something a human runs
 /// after an incident.
 async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
-    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let Stores {
+        rec,
+        store,
+        ledger,
+        controls,
+    } = open_stores(cfg)?;
     let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
@@ -556,7 +574,12 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
 async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let reason = flags.need("--reason")?;
     let by = flags.need("--by")?;
-    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let Stores {
+        rec,
+        store,
+        ledger,
+        controls,
+    } = open_stores(cfg)?;
     let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
@@ -834,7 +857,12 @@ fn cmd_control(
 async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
     let reason = flags.need("--reason")?;
     let by = flags.need("--by")?;
-    let Stores { rec, store, ledger, controls } = open_stores(cfg)?;
+    let Stores {
+        rec,
+        store,
+        ledger,
+        controls,
+    } = open_stores(cfg)?;
     let venue = open_venue(cfg, rec.as_deref())?;
     let clock = SystemClock;
     let runner = Runner {
@@ -917,6 +945,25 @@ async fn cmd_identity(cfg: &BotConfig, rest: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
             println!("{} disabled", cfg.bot_id);
+        }
+        // Deregistering is by explicit id, never by "whatever this config says".
+        // Every other subcommand acts on cfg.bot_id, and the one that destroys
+        // an identity should not be reachable by pointing at the wrong config.
+        "remove" => {
+            let target = rest.get(1).ok_or_else(|| {
+                "identity remove needs the bot id spelled out: \
+                 `bot --config <file> identity remove <bot_id>`"
+                    .to_string()
+            })?;
+            let held = reg.record_counts(target).await.map_err(|e| e.to_string())?;
+            if !held.is_empty() {
+                println!("{target} owns:");
+                for (t, n) in &held {
+                    println!("  {n:>6} in {t}");
+                }
+            }
+            reg.remove_bot(target).await.map_err(|e| e.to_string())?;
+            println!("{target} deregistered");
         }
         // "show", and anything unrecognised, lists rather than acting.
         _ => {

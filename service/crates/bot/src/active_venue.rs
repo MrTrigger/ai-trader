@@ -197,11 +197,20 @@ pub struct Env {
 }
 
 impl Env {
-    /// Read from the process environment, having loaded `.env` if present.
+    /// Load `.env` into the process environment, then read it.
+    ///
+    /// Called once at startup so that every gate — the identity registry
+    /// included — sees the same environment. Loading it lazily, when the venue
+    /// was opened, meant checks that run earlier silently saw an empty one.
     pub fn load(dotenv: Option<&std::path::Path>) -> Self {
         if let Some(p) = dotenv {
             load_dotenv(p);
         }
+        Self::from_process()
+    }
+
+    /// Read what is already in the environment, loading nothing.
+    pub fn from_process() -> Self {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Env {
             api_url: get("HL_API_URL"),
@@ -333,7 +342,10 @@ fn open_ib(mode: Mode) -> Result<Active, String> {
     // uses the paper block. Read-only mode forces orders off regardless of
     // the flags — authority comes from `mode`, never from env alone.
     let allow_live = matches!(
-        std::env::var("IB_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
+        std::env::var("IB_ALLOW_LIVE")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
         "yes" | "true" | "1"
     );
     let live_block = mode == Mode::Live && allow_live;
@@ -352,7 +364,10 @@ fn open_ib(mode: Mode) -> Result<Active, String> {
 
 fn open_rithmic(mode: Mode) -> Result<Active, String> {
     let allow_live = matches!(
-        std::env::var("RITHMIC_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
+        std::env::var("RITHMIC_ALLOW_LIVE")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
         "yes" | "true" | "1"
     );
     let live_env = mode == Mode::Live && allow_live;

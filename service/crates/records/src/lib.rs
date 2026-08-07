@@ -46,6 +46,17 @@ pub struct BotRow {
     pub state_dir: Option<String>,
 }
 
+/// A venue account the fleet knows about. Credentials are NOT here — only
+/// the reference naming the SOPS/env entry that holds them.
+#[derive(Debug, Clone)]
+pub struct AccountRow {
+    pub account_id: String,
+    pub venue_id: String,
+    /// `paper` or `live`.
+    pub kind: String,
+    pub credential_ref: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub bot_id: String,
@@ -146,6 +157,56 @@ impl Registry {
             .collect())
     }
 
+    pub async fn list_accounts(&self) -> Result<Vec<AccountRow>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT account_id, venue_id, kind, credential_ref FROM accounts \
+             ORDER BY venue_id, kind, account_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AccountRow {
+                account_id: r.get(0),
+                venue_id: r.get(1),
+                kind: r.get(2),
+                credential_ref: r.get(3),
+            })
+            .collect())
+    }
+
+    /// Point a bot's TRADE scope at `account_id`. One trade account per bot,
+    /// always: two would mean two books and one ledger.
+    ///
+    /// Transactional, because the intermediate state — a bot with no trade
+    /// binding at all — is one a starting bot would read as "default venue"
+    /// and act on.
+    pub async fn set_trade_binding(
+        &self,
+        bot_id: &str,
+        account_id: &str,
+    ) -> Result<(), RecordsError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM account_bindings WHERE bot_id = $1 AND scope = 'trade' \
+             AND account_id <> $2",
+        )
+        .bind(bot_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_bindings (bot_id, account_id, scope) VALUES ($1, $2, 'trade') \
+             ON CONFLICT (bot_id, account_id) DO UPDATE SET scope = 'trade'",
+        )
+        .bind(bot_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Operator convenience: register (or update) a bot row. Registration
     /// never enables — enabling is a separate, deliberate act.
     pub async fn register_bot(
@@ -177,11 +238,20 @@ impl Registry {
     /// Asked before deregistering: a bot with fills is a bot whose history
     /// someone will want to audit, and the identity row is what makes those
     /// rows attributable.
-    pub async fn record_counts(&self, bot_id: &str) -> Result<Vec<(&'static str, i64)>, RecordsError> {
+    pub async fn record_counts(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<(&'static str, i64)>, RecordsError> {
         let mut out = Vec::new();
         for table in [
-            "bot_status", "control_events", "fills", "runs",
-            "ledger_entries", "snapshots", "venue_sim_state", "account_bindings",
+            "bot_status",
+            "control_events",
+            "fills",
+            "runs",
+            "ledger_entries",
+            "snapshots",
+            "venue_sim_state",
+            "account_bindings",
         ] {
             // Table names come from this fixed list, never from a caller.
             let sql = format!("SELECT count(*) FROM {table} WHERE bot_id = $1");
@@ -288,11 +358,7 @@ impl Registry {
     }
 
     /// Most recent first, as JSON text per row.
-    pub async fn recent_runs(
-        &self,
-        bot_id: &str,
-        limit: i64,
-    ) -> Result<Vec<String>, RecordsError> {
+    pub async fn recent_runs(&self, bot_id: &str, limit: i64) -> Result<Vec<String>, RecordsError> {
         let rows = sqlx::query(
             "SELECT payload::text FROM runs WHERE bot_id = $1 \
              ORDER BY recorded_at DESC LIMIT $2",
@@ -349,12 +415,11 @@ impl Registry {
 
     /// Every entry, in the exact order written.
     pub async fn ledger_entries(&self, bot_id: &str) -> Result<Vec<String>, RecordsError> {
-        let rows = sqlx::query(
-            "SELECT payload::text FROM ledger_entries WHERE bot_id = $1 ORDER BY seq",
-        )
-        .bind(bot_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT payload::text FROM ledger_entries WHERE bot_id = $1 ORDER BY seq")
+                .bind(bot_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
@@ -449,10 +514,7 @@ impl Registry {
         Ok(())
     }
 
-    pub async fn current_control(
-        &self,
-        bot_id: &str,
-    ) -> Result<Option<ControlRow>, RecordsError> {
+    pub async fn current_control(&self, bot_id: &str) -> Result<Option<ControlRow>, RecordsError> {
         let row = sqlx::query(
             "SELECT state, reason, set_by, at::text, payload::text \
              FROM control_events WHERE bot_id = $1 ORDER BY seq DESC LIMIT 1",
@@ -612,7 +674,10 @@ pub mod blocking {
                 .build()
                 .expect("tokio current-thread runtime");
             let inner = wait_on(&rt, Registry::connect(database_url))?;
-            Ok(Arc::new(Self { rt: Some(rt), inner }))
+            Ok(Arc::new(Self {
+                rt: Some(rt),
+                inner,
+            }))
         }
 
         pub fn registry(&self) -> &Registry {
@@ -679,7 +744,10 @@ pub mod blocking {
             set_by: &str,
             payload_json: &str,
         ) -> Result<(), RecordsError> {
-            self.wait(self.inner.set_control(bot_id, state, reason, set_by, payload_json))
+            self.wait(
+                self.inner
+                    .set_control(bot_id, state, reason, set_by, payload_json),
+            )
         }
 
         pub fn current_control(&self, bot_id: &str) -> Result<Option<ControlRow>, RecordsError> {
@@ -711,7 +779,16 @@ pub mod blocking {
             payload_json: &str,
         ) -> Result<(), RecordsError> {
             self.wait(self.inner.record_fill(
-                bot_id, fill_key, at, instrument, sleeve, side, qty, price, pnl, reason,
+                bot_id,
+                fill_key,
+                at,
+                instrument,
+                sleeve,
+                side,
+                qty,
+                price,
+                pnl,
+                reason,
                 payload_json,
             ))
         }

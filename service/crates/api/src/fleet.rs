@@ -240,8 +240,9 @@ pub fn set_halt(
             // Overrides survive the halt/resume cycle. A legacy payload's
             // bot-specific keys are lifted into `overrides` once, here.
             let current = match reg.current_control(&bot_id).await? {
-                Some(row) => serde_json::from_str::<Value>(&row.payload)
-                    .unwrap_or_else(|_| json!({})),
+                Some(row) => {
+                    serde_json::from_str::<Value>(&row.payload).unwrap_or_else(|_| json!({}))
+                }
                 None => json!({}),
             };
             let overrides = if current.get("schema").is_some() {
@@ -280,22 +281,42 @@ pub fn set_halt(
     })
 }
 
-
 /// GET /api/bots/{id}/state — the per-bot detail document the dashboard's
 /// bot view renders. Served from the records DB; a bot that has never
 /// published a status row falls back to its state_dir files (dev only).
 pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     let id = bot_id.to_string();
-    let (bot, status, control, fills, runs) = with_registry(move |reg| {
+    let (bot, status, control, fills, runs, bindings, accounts) = with_registry(move |reg| {
         Box::pin(async move {
             let bot = reg.bot(&id).await?;
             let status = reg.get_status(&id).await?;
             let control = reg.current_control(&id).await?;
             let fills = reg.recent_fills(&id, 500).await?;
             let runs = reg.recent_runs(&id, 20).await?;
-            Ok((bot, status, control, fills, runs))
+            let bindings = reg.bindings(&id).await?;
+            let accounts = reg.list_accounts().await?;
+            Ok((bot, status, control, fills, runs, bindings, accounts))
         })
     })?;
+    // Which broker this bot trades through, and what else it could. The
+    // selection lives in the registry, so it survives restarts and the UI
+    // is only ever a view of it.
+    let trade = bindings.iter().find(|b| b.scope == "trade");
+    let broker = json!({
+        "account_id": trade.map(|b| b.account_id.clone()),
+        "venue_id": trade.map(|b| b.venue_id.clone()),
+        "kind": trade.map(|b| b.account_kind.clone()),
+        "credential_ref": trade.map(|b| b.credential_ref.clone()),
+        "options": accounts
+            .iter()
+            .map(|a| json!({
+                "account_id": a.account_id,
+                "venue_id": a.venue_id,
+                "kind": a.kind,
+                "credential_ref": a.credential_ref,
+            }))
+            .collect::<Vec<_>>(),
+    });
     let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
 
     if let Some(srow) = status {
@@ -316,6 +337,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
                 "decision_core": bot.decision_core,
                 "enabled": bot.enabled,
                 "heartbeat_age_seconds": srow.heartbeat_age_seconds,
+                "broker": broker,
                 "state": state,
                 "fills": fills,
             }));
@@ -335,6 +357,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             "asset_class": bot.asset_class,
             "enabled": bot.enabled,
             "heartbeat_age_seconds": srow.heartbeat_age_seconds,
+            "broker": broker,
             "controls": controls,
             "runs": runs,
         }));
@@ -448,10 +471,7 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
         let status_doc: Option<Value> = status
             .as_ref()
             .and_then(|s| serde_json::from_str(&s.payload).ok());
-        let dialect = status_doc
-            .as_ref()
-            .map(dialect_of)
-            .unwrap_or("runner");
+        let dialect = status_doc.as_ref().map(dialect_of).unwrap_or("runner");
 
         // The series, and what its numbers mean.
         let (series, series_kind) = if dialect == "botstate" {
@@ -587,16 +607,94 @@ fn botstate_series(doc: Option<&Value>, fills: &[Value]) -> Vec<Value> {
     let mut cum = 0.0;
     let mut out = Vec::new();
     for f in fills.iter().rev() {
-        let net = f
-            .get("net")
-            .and_then(|n| n.as_f64())
-            .or_else(|| f.get("net").and_then(|n| n.as_str()).and_then(|s| s.parse().ok()));
+        let net = f.get("net").and_then(|n| n.as_f64()).or_else(|| {
+            f.get("net")
+                .and_then(|n| n.as_str())
+                .and_then(|s| s.parse().ok())
+        });
         let Some(net) = net else { continue };
         cum += net;
         out.push(json!([
-            f.get("at").or_else(|| f.get("ts")).cloned().unwrap_or(Value::Null),
+            f.get("at")
+                .or_else(|| f.get("ts"))
+                .cloned()
+                .unwrap_or(Value::Null),
             cum
         ]));
     }
     out
+}
+
+/// POST /api/bots/{id}/venue — point the bot's trade scope at another
+/// broker account.
+///
+/// The selection is registry state, so it persists across restarts and is
+/// what the bot reads when it next starts. It deliberately does NOT reach
+/// into a running process: a bot that switched venue mid-session would
+/// hold a position on one broker and reconcile against another. The switch
+/// is recorded as a run row — same place `mode set` records itself — so
+/// "when did this start trading through AMP" has an answer.
+pub fn set_venue(bot_id: &str, account_id: &str, reason: &str, by: &str) -> Result<Value, String> {
+    let (bot_id, account_id) = (bot_id.to_string(), account_id.to_string());
+    let (reason, by) = (reason.to_string(), by.to_string());
+    with_registry(move |reg| {
+        Box::pin(async move {
+            if reg.bot(&bot_id).await?.is_none() {
+                return Err(records::RecordsError::UnknownBot(bot_id.clone()));
+            }
+            let accounts = reg.list_accounts().await?;
+            let Some(account) = accounts.iter().find(|a| a.account_id == account_id) else {
+                // Not a registry error variant, but the same fail-closed
+                // spirit: an unknown account must never become a binding.
+                return Err(records::RecordsError::UnknownBot(format!(
+                    "account {account_id:?} is not registered"
+                )));
+            };
+            let previous = reg
+                .bindings(&bot_id)
+                .await?
+                .into_iter()
+                .find(|b| b.scope == "trade")
+                .map(|b| format!("{} ({})", b.account_id, b.venue_id));
+            reg.set_trade_binding(&bot_id, &account_id).await?;
+
+            let now = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let record = json!({
+                "bot_id": bot_id,
+                "run_id": format!("venue-{now}"),
+                "recorded_at": now,
+                "as_of": now,
+                "outcome": "venue-changed",
+                "detail": format!(
+                    "{by} pointed the trade binding at {} ({}, {}) from {}. Reason: {reason}.                      Takes effect when the bot next starts.",
+                    account.account_id,
+                    account.venue_id,
+                    account.kind,
+                    previous.as_deref().unwrap_or("nothing"),
+                ),
+                "orders_planned": 0, "orders_submitted": 0, "orders_skipped": 0,
+                "slices_completed": 0, "slices_planned": 0,
+                "control_state": "unchanged",
+                "risk_checks": [], "slices": [],
+            });
+            reg.record_run(
+                &bot_id,
+                record["run_id"].as_str().expect("set above"),
+                &now,
+                "venue-changed",
+                &record.to_string(),
+            )
+            .await?;
+            Ok(json!({
+                "bot_id": bot_id,
+                "account_id": account.account_id,
+                "venue_id": account.venue_id,
+                "kind": account.kind,
+                "previous": previous,
+                "note": "takes effect when the bot next starts",
+            }))
+        })
+    })
 }

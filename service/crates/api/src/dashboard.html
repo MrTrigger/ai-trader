@@ -284,6 +284,12 @@
   }
   input[type=text]::placeholder { color: var(--ink3); }
   .field { margin-bottom: 10px; }
+  select.pick {
+    width: 100%; font-family: var(--sans); font-size: 13px; color: var(--ink);
+    padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line2);
+    background: var(--srf2); cursor: pointer;
+  }
+  select.pick:hover { border-color: var(--ink3); }
   .btnrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .btnrow.one { grid-template-columns: 1fr; }
   button.ctl {
@@ -318,6 +324,14 @@
   .seg button.live.on { background: color-mix(in srgb, var(--down) 12%, var(--srf));
                         border-color: color-mix(in srgb, var(--down) 42%, transparent); color: var(--down); }
   .seg button[disabled] { opacity: .45; cursor: not-allowed; }
+  /* The current mode is *selected*, not unavailable. Dimming it the same way
+     as a control you cannot use reads as "paper is switched off", which is the
+     opposite of what it means. */
+  .seg button.on[disabled] { opacity: 1; cursor: default; }
+  .seg button.on::after {
+    content: ""; width: 5px; height: 5px; border-radius: 50%;
+    background: currentColor; display: inline-block; margin-left: 7px; vertical-align: middle;
+  }
   .card.livemode { border-color: color-mix(in srgb, var(--down) 45%, transparent); }
   .card.livemode > header .eyebrow { color: var(--down); }
   .card.alarm { border-color: color-mix(in srgb, var(--down) 40%, transparent); }
@@ -858,6 +872,8 @@ function renderFutures(id, d) {
           </div>
         </section>
 
+        ${brokerCard(d, id)}
+
         <section class="card">
           <header><span class="eyebrow">Identity</span></header>
           <div class="pad tight"><dl class="kv">
@@ -871,6 +887,35 @@ function renderFutures(id, d) {
         </section>
       </div>
     </div>`;
+}
+
+/* ── broker: which venue account this bot trades through ───────────────── */
+function brokerCard(d, id) {
+  const b = d.broker || {};
+  const opts = b.options || [];
+  if (!opts.length) {
+    return `<section class="card"><header><span class="eyebrow">Broker</span></header>
+      <div class="pad"><div class="empty">No venue accounts registered.</div></div></section>`;
+  }
+  const current = b.account_id || "";
+  return `<section class="card">
+    <header><span class="eyebrow">Broker</span><span class="sub">trade binding</span></header>
+    <div class="pad">
+      <div class="field"><label for="venuepick">Route orders through</label>
+        <select class="pick" id="venuepick">${opts.map((o) => {
+          const label = `${o.venue_id} · ${o.account_id} (${o.kind})`;
+          return `<option value="${esc(o.account_id)}"${o.account_id === current ? " selected" : ""}>${esc(label)}</option>`;
+        }).join("")}</select></div>
+      <div class="btnrow one">
+        <button class="ctl" data-fleet-venue="${esc(id)}">Apply broker</button>
+      </div>
+      <p class="ctlnote">Stored in the registry, so it survives restarts and is what the bot reads
+        when it next starts — a running bot keeps the venue it connected to, because switching
+        mid-session would leave a position on one broker and reconcile against another.
+        Uses the same name and reason as the controls above.</p>
+      <div class="result" id="venueresult"></div>
+    </div>
+  </section>`;
 }
 
 function futuresFills(fills) {
@@ -933,6 +978,8 @@ function renderRunnerRemote(id, bot, d) {
             <div class="result" id="ctlresult"></div>
           </div>
         </section>
+
+        ${brokerCard(d, id)}
         <section class="card">
           <header><span class="eyebrow">Control word</span></header>
           <div class="pad tight"><dl class="kv">
@@ -1310,7 +1357,8 @@ function renderMode(s) {
   if (!m) { seg.innerHTML = "<button disabled>unknown</button>"; $("modenote").textContent = ""; return; }
   document.querySelector("#controls").classList.toggle("livemode", !!m.real_money);
   seg.innerHTML = MODES.map(([id, label, extra]) =>
-    `<button data-action="mode-${id}" class="${extra}${m.mode === id ? " on" : ""}" ${m.mode === id ? "disabled" : ""}>${label}</button>`).join("");
+    `<button data-action="mode-${id}" class="${extra}${m.mode === id ? " on" : ""}"` +
+    (m.mode === id ? ' disabled aria-current="true"' : "") + `>${label}</button>`).join("");
   const feed = m.feed === "file" ? "static prices from marks.json" : "live prices from the venue";
   $("modenote").innerHTML = m.real_money
     ? `<span class="u-down"><b>Real money.</b> Scheduled runs place real orders.</span> Fills at ${esc(feed)}.`
@@ -1376,6 +1424,30 @@ async function fleetControl(id, halt) {
   } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
 }
 
+async function fleetVenue(id) {
+  const by = $("who")?.value.trim(), reason = $("why")?.value.trim();
+  const account = $("venuepick")?.value;
+  const out = $("venueresult");
+  if (!by || !reason) {
+    out.innerHTML = '<span class="u-down">A name and a reason are both required.</span>';
+    $(by ? "why" : "who").focus(); return;
+  }
+  if (!window.confirm("Route " + id + " through " + account +
+      "?\n\nTakes effect when the bot next starts.\nReason: " + reason)) return;
+  out.innerHTML = '<span class="u-dim">updating the trade binding…</span>';
+  try {
+    const res = await fetch("/api/bots/" + encodeURIComponent(id) + "/venue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ account_id: account, by, reason }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    out.innerHTML = '<span class="u-up">Now bound to ' + esc(data.venue_id) + " · " +
+      esc(data.account_id) + ". " + esc(data.note || "") + "</span>";
+    navigate();
+  } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
+}
+
 /* ── one delegated listener: panels re-render ──────────────────────────── */
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("button, .chip");
@@ -1384,6 +1456,7 @@ document.addEventListener("click", (ev) => {
   if (t.dataset.action) { sendControl(t.dataset.action); return; }
   if (t.dataset.fleetHalt) { fleetControl(t.dataset.fleetHalt, true); return; }
   if (t.dataset.fleetResume) { fleetControl(t.dataset.fleetResume, false); return; }
+  if (t.dataset.fleetVenue) { fleetVenue(t.dataset.fleetVenue); return; }
   if (t.dataset.range) { model.range = t.dataset.range; renderFleet(); return; }
   if (t.dataset.toggle) {
     const id = t.dataset.toggle;

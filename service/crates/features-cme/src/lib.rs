@@ -321,8 +321,17 @@ impl FrameStream {
 /// another. Names are append-only: renaming one orphans every model that
 /// declared it.
 pub const CATALOG: &[&str] = &[
-    "open", "high", "low", "close", "volume", "vwap", "atr14", "noise_sigma",
-    "noise_ub", "noise_lb", "slot",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "vwap",
+    "atr14",
+    "noise_sigma",
+    "noise_ub",
+    "noise_lb",
+    "slot",
 ];
 
 /// Resolve one catalog feature on an enriched bar. `None` either means the
@@ -383,17 +392,28 @@ mod tests {
     #[test]
     fn sunday_evening_belongs_to_monday() {
         // 2026-07-05 is a Sunday; 18:00 ET = 22:00 UTC (EDT).
-        let ts = Utc.datetime_from_str("2026-07-05 22:00", "%Y-%m-%d %H:%M").unwrap();
+        let ts = Utc
+            .datetime_from_str("2026-07-05 22:00", "%Y-%m-%d %H:%M")
+            .unwrap();
         let et = to_exchange_time(ts);
-        assert_eq!(session_date(et), NaiveDate::from_ymd_opt(2026, 7, 6).unwrap());
+        assert_eq!(
+            session_date(et),
+            NaiveDate::from_ymd_opt(2026, 7, 6).unwrap()
+        );
         assert_eq!(segment(et), Segment::Overnight);
     }
 
     #[test]
     fn rth_boundaries_are_half_open() {
         // 09:30 ET is rth, 16:15 ET is not (EDT: 13:30 / 20:15 UTC).
-        let open = to_exchange_time(Utc.datetime_from_str("2026-07-06 13:30", "%Y-%m-%d %H:%M").unwrap());
-        let close = to_exchange_time(Utc.datetime_from_str("2026-07-06 20:15", "%Y-%m-%d %H:%M").unwrap());
+        let open = to_exchange_time(
+            Utc.datetime_from_str("2026-07-06 13:30", "%Y-%m-%d %H:%M")
+                .unwrap(),
+        );
+        let close = to_exchange_time(
+            Utc.datetime_from_str("2026-07-06 20:15", "%Y-%m-%d %H:%M")
+                .unwrap(),
+        );
         assert_eq!(segment(open), Segment::Rth);
         assert_eq!(segment(close), Segment::Post);
     }
@@ -418,6 +438,9 @@ mod tests {
         let mut fs = FrameStream::new(Frame::Globex);
         fs.on_bar(&bar("2026-06-01 14:00", 100.0, 100.0, 100.0, 100.0));
         let e = fs.on_bar(&bar("2026-06-02 14:00", 200.0, 200.0, 200.0, 200.0));
-        assert_eq!(e.vwap, 200.0, "new session must not blend yesterday's prints");
+        assert_eq!(
+            e.vwap, 200.0,
+            "new session must not blend yesterday's prints"
+        );
     }
 }

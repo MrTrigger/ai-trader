@@ -212,15 +212,12 @@ impl Ledger {
                 let kind = v["kind"].as_str().unwrap_or("unknown").to_string();
                 // Baseline/Acknowledged carry `at`; Submitted's is the send
                 // stamp. Every variant has one.
-                let at = v["at"].as_str().unwrap_or("1970-01-01T00:00:00Z").to_string();
+                let at = v["at"]
+                    .as_str()
+                    .unwrap_or("1970-01-01T00:00:00Z")
+                    .to_string();
                 let coid = v["client_order_id"].as_str().map(str::to_string);
-                rec.ledger_append(
-                    bot_id,
-                    &at,
-                    &kind,
-                    coid.as_deref(),
-                    &v.to_string(),
-                )?;
+                rec.ledger_append(bot_id, &at, &kind, coid.as_deref(), &v.to_string())?;
                 Ok(())
             }
         }

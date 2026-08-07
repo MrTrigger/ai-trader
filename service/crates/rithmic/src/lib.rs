@@ -36,6 +36,9 @@ use venue::{
     OrderType, Position, Side, VenueAdapter, VenueError,
 };
 
+/// How long a startup connect may take before it is called unreachable.
+const CONNECT_TIMEOUT_S: u64 = 20;
+
 #[derive(Debug, Clone)]
 pub struct RithmicCfg {
     pub env: RithmicEnv,
@@ -59,7 +62,11 @@ impl RithmicCfg {
             )
         };
         Ok(Self {
-            env: if live { RithmicEnv::Live } else { RithmicEnv::Demo },
+            env: if live {
+                RithmicEnv::Live
+            } else {
+                RithmicEnv::Demo
+            },
             symbol_root: std::env::var("RITHMIC_SYMBOL").unwrap_or_else(|_| "MNQ".into()),
             exchange: std::env::var("RITHMIC_EXCHANGE").unwrap_or_else(|_| "CME".into()),
             multiplier: std::env::var("RITHMIC_MULTIPLIER")
@@ -128,23 +135,60 @@ impl RithmicVenue {
     pub async fn connect(cfg: RithmicCfg) -> Result<Self, VenueError> {
         let rcfg = RithmicConfig::from_env(cfg.env).map_err(|e| {
             VenueError::Unreachable(format!(
-                "Rithmic credentials incomplete ({e}) — see .env.example section 8"
+                "Rithmic credentials incomplete ({e}) — see .env section 8"
             ))
         })?;
+        // Present-but-blank is the common half-configured state (the .env
+        // placeholders ship empty), and rithmic-rs's Retry strategy would
+        // sit on it forever rather than fail. Refuse first, loudly: a bot
+        // that hangs at startup looks identical to a bot that is working.
+        for (name, value) in [
+            ("URL", &rcfg.url),
+            ("USER", &rcfg.user),
+            ("PW", &rcfg.password),
+        ] {
+            if value.trim().is_empty() {
+                return Err(VenueError::Unreachable(format!(
+                    "Rithmic {:?} {name} is empty — fill .env section 8 with the credentials \
+                     AMP sends. Refusing to retry a login that cannot succeed.",
+                    cfg.env
+                )));
+            }
+        }
         let account = RithmicAccount::from_env(cfg.env).map_err(|e| {
             VenueError::Unreachable(format!(
                 "Rithmic account not configured ({e}) — refusing to trade an inferred account"
             ))
         })?;
-        let order = RithmicOrderPlant::connect(&rcfg, ConnectStrategy::Retry)
-            .await
-            .map_err(|e| unreachable_err(format!("order plant: {e}")))?;
-        let pnl = RithmicPnlPlant::connect(&rcfg, ConnectStrategy::Retry)
-            .await
-            .map_err(|e| unreachable_err(format!("pnl plant: {e}")))?;
-        let history = RithmicHistoryPlant::connect(&rcfg, ConnectStrategy::Retry)
-            .await
-            .map_err(|e| unreachable_err(format!("history plant: {e}")))?;
+        // Bounded: Retry is right for a blip mid-session, but at startup an
+        // unreachable venue must surface as an error the operator can read.
+        let deadline = std::time::Duration::from_secs(CONNECT_TIMEOUT_S);
+        macro_rules! bounded {
+            ($what:literal, $fut:expr) => {
+                match tokio::time::timeout(deadline, $fut).await {
+                    Err(_) => {
+                        return Err(VenueError::Unreachable(format!(
+                            "{} did not connect within {CONNECT_TIMEOUT_S}s — check the URL, \
+                             the credentials, and whether Rithmic is up",
+                            $what
+                        )))
+                    }
+                    Ok(r) => r.map_err(|e| unreachable_err(format!("{}: {e}", $what)))?,
+                }
+            };
+        }
+        let order = bounded!(
+            "order plant",
+            RithmicOrderPlant::connect(&rcfg, ConnectStrategy::Retry)
+        );
+        let pnl = bounded!(
+            "pnl plant",
+            RithmicPnlPlant::connect(&rcfg, ConnectStrategy::Retry)
+        );
+        let history = bounded!(
+            "history plant",
+            RithmicHistoryPlant::connect(&rcfg, ConnectStrategy::Retry)
+        );
         order
             .get_handle(&account)
             .login()
@@ -433,7 +477,10 @@ impl VenueAdapter for RithmicVenue {
         ))
     }
 
-    async fn get_fills(&self, _since: Option<time::OffsetDateTime>) -> Result<Vec<Fill>, VenueError> {
+    async fn get_fills(
+        &self,
+        _since: Option<time::OffsetDateTime>,
+    ) -> Result<Vec<Fill>, VenueError> {
         Err(VenueError::Unreachable(
             "fill enumeration awaits rithmic-check against demo credentials".into(),
         ))

@@ -21,8 +21,8 @@ use std::process::ExitCode;
 
 use chrono::NaiveDate;
 use features_cme::{in_frame, segment, to_exchange_time, EnrichedBar, Frame, FrameStream, RawBar};
-use noise_book::runtime::Book;
 use noise_book::book_sleeves;
+use noise_book::runtime::Book;
 
 const USAGE: &str = "\
 usage: futures-bot <command>
@@ -186,8 +186,7 @@ fn replay(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         // Enrich once per frame; feature streams consume ALL bars so the
         // replay window never truncates the lookbacks.
         let g_bar: EnrichedBar = globex.on_bar(raw);
-        let r_bar: Option<EnrichedBar> =
-            in_frame(seg, Frame::Rth).then(|| rth.on_bar(raw));
+        let r_bar: Option<EnrichedBar> = in_frame(seg, Frame::Rth).then(|| rth.on_bar(raw));
         if let Some(fz) = freeze_at {
             let et_naive = to_exchange_time(raw.ts_utc).naive_local();
             if et_naive > fz {
@@ -235,9 +234,9 @@ fn replay(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 
     match rec.as_ref() {
         Some(rec) => publish(rec, &book, &bot_id, "replay")?,
-        None => eprintln!(
-            "futures-bot {bot_id}: DATABASE_URL not set — results not recorded (dev)"
-        ),
+        None => {
+            eprintln!("futures-bot {bot_id}: DATABASE_URL not set — results not recorded (dev)")
+        }
     }
 
     if let Some(fx) = get("--fixture") {
@@ -302,10 +301,7 @@ fn publish(
     Ok(())
 }
 
-fn check_fixture(
-    path: &str,
-    totals: &BTreeMap<&'static str, (usize, f64)>,
-) -> Result<(), String> {
+fn check_fixture(path: &str, totals: &BTreeMap<&'static str, (usize, f64)>) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let want: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
@@ -345,8 +341,8 @@ fn features_cmd(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         Some("globex") => Frame::Globex,
         other => return Err(format!("--frame must be rth|globex, got {other:?}")),
     };
-    let select: Option<Vec<String>> = get("--select")
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    let select: Option<Vec<String>> =
+        get("--select").map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
     if let Some(names) = &select {
         features_cme::validate_selection(names)?;
     }
@@ -368,7 +364,10 @@ fn features_cmd(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 m.insert("ts_utc".into(), serde_json::json!(e.ts_utc));
                 m.insert("session_date".into(), serde_json::json!(e.session_date));
                 for n in names {
-                    m.insert(n.clone(), serde_json::json!(features_cme::feature_value(&e, n)));
+                    m.insert(
+                        n.clone(),
+                        serde_json::json!(features_cme::feature_value(&e, n)),
+                    );
                 }
                 serde_json::Value::Object(m)
             }
@@ -423,7 +422,10 @@ async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     match venue::VenueAdapter::get_balances(&venue).await {
         Ok(b) => {
             for bal in b {
-                println!("balance:   {} {} (available {})", bal.total, bal.currency, bal.available);
+                println!(
+                    "balance:   {} {} (available {})",
+                    bal.total, bal.currency, bal.available
+                );
             }
         }
         Err(e) => println!("balance:   UNAVAILABLE ({e})"),
@@ -462,7 +464,6 @@ async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     }
 }
 
-
 async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let live = get("--live").is_some() || std::env::args().any(|a| a == "--live");
     let mode = if live { "live" } else { "shadow" };
@@ -476,7 +477,9 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let reg = records::Registry::connect(&url)
         .await
         .map_err(|e| format!("records db unreachable ({e}) — fail closed"))?;
-    reg.require_enabled(&bot_id).await.map_err(|e| e.to_string())?;
+    reg.require_enabled(&bot_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let rec = records::blocking::Records::connect(&url).map_err(|e| e.to_string())?;
 
     // Which venue trades this bot is DATA: the registry's trade binding
@@ -566,7 +569,9 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             let mut feed_cfg = ib::IbConfig::from_env(live && yes("IB_ALLOW_LIVE"))?;
             feed_cfg.allow_orders = false; // the feed connection can never trade
             feed_cfg.client_id += 1;
-            let feed = ib::IbVenue::connect(feed_cfg).await.map_err(|e| e.to_string())?;
+            let feed = ib::IbVenue::connect(feed_cfg)
+                .await
+                .map_err(|e| e.to_string())?;
             tokio::spawn(feed_task(feed, bar_tx));
         }
         Trading::Rithmic(v) => {
@@ -604,7 +609,9 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                     }
                     book.halted = Some("feed-stall".into());
                     live::publish_live(&rec, &book, &bot_id, mode, Some("feed stall — halted"))?;
-                    return Err(format!("no completed bar for {silent}m in market hours — halted"));
+                    return Err(format!(
+                        "no completed bar for {silent}m in market hours — halted"
+                    ));
                 }
                 // Heartbeat so the dashboard sees a live process either way.
                 live::publish_live(&rec, &book, &bot_id, mode, None)?;
@@ -689,7 +696,9 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             if outcome.session_rolled {
                 // Broker-vs-model reconciliation at the boundary. Mismatch is
                 // never auto-corrected: flatten and halt for a human.
-                let venue_net: i64 = trading.adapter().get_positions()
+                let venue_net: i64 = trading
+                    .adapter()
+                    .get_positions()
                     .await
                     .map_err(|e| e.to_string())?
                     .iter()
@@ -723,7 +732,10 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let path = get("--bars").ok_or("--bars is required")?;
     let days: i32 = get("--days").map(|d| d.parse().unwrap_or(5)).unwrap_or(5);
     let existing = read_bars(&path)?;
-    let last = existing.last().map(|b| b.ts_utc).ok_or("bars file is empty")?;
+    let last = existing
+        .last()
+        .map(|b| b.ts_utc)
+        .ok_or("bars file is empty")?;
 
     let cfg = ib::IbConfig::from_env(false)?;
     let venue = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
@@ -788,7 +800,12 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 /// poll IB historical 5-minute bars. Sends COMPLETED 5-minute buckets.
 async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
     // Attempt realtime first: subscribe and wait up to 45s for a first bar.
-    match feed.client().realtime_bars(feed.contract()).subscribe().await {
+    match feed
+        .client()
+        .realtime_bars(feed.contract())
+        .subscribe()
+        .await
+    {
         Ok(sub) => {
             let mut stream = sub.filter_data();
             match tokio::time::timeout(std::time::Duration::from_secs(45), stream.next()).await {
@@ -846,7 +863,9 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
             Ok(data) => {
                 let now = chrono::Utc::now();
                 for b in &data.bars {
-                    let BarTimestamp::DateTime(dt) = &b.date else { continue };
+                    let BarTimestamp::DateTime(dt) = &b.date else {
+                        continue;
+                    };
                     let Some(ts) =
                         chrono::DateTime::<chrono::Utc>::from_timestamp(dt.unix_timestamp(), 0)
                     else {
@@ -914,10 +933,16 @@ impl Trading {
 
     async fn flatten_all(&self, prefix: &str) -> Result<(), String> {
         match self {
-            Trading::Ib(v) => v.flatten_all(prefix).await.map(|_| ()).map_err(|e| e.to_string()),
-            Trading::Rithmic(v) => {
-                v.flatten_all(prefix).await.map(|_| ()).map_err(|e| e.to_string())
-            }
+            Trading::Ib(v) => v
+                .flatten_all(prefix)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Trading::Rithmic(v) => v
+                .flatten_all(prefix)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
         }
     }
 }

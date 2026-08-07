@@ -54,10 +54,7 @@ pub fn control_from_payload(payload: &serde_json::Value) -> Control {
             payload.get("overrides").cloned().unwrap_or_default(),
         )
     } else {
-        (
-            payload["halt"].as_bool().unwrap_or(false),
-            payload.clone(),
-        )
+        (payload["halt"].as_bool().unwrap_or(false), payload.clone())
     };
     let disabled = overrides["sleeves"]
         .as_object()
@@ -246,7 +243,11 @@ pub async fn mirror_transition(
             qty,
             order_type: venue::OrderType::Market,
             limit_price: None,
-            reason: if opening { venue::OrderReason::Entry } else { venue::OrderReason::Exit },
+            reason: if opening {
+                venue::OrderReason::Entry
+            } else {
+                venue::OrderReason::Exit
+            },
         })
         .await?;
     Ok(ack.venue_order_id)

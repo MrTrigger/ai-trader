@@ -13,8 +13,8 @@ use chrono::NaiveDate;
 use features_cme::EnrichedBar;
 
 use crate::exec::{
-    exit_all, force_flat_price, manage_noise, market_fill, noise_exit_price, Costs, Fill,
-    Position, Signal,
+    exit_all, force_flat_price, manage_noise, market_fill, noise_exit_price, Costs, Fill, Position,
+    Signal,
 };
 use crate::scanner::Scanner;
 use crate::Sleeve;
@@ -161,7 +161,10 @@ impl Book {
             // early-close days mirror the engine's session-end force_flat
             // against the session's LAST bar.
             if let Some(pos) = st.position.take() {
-                let last = st.last_bar.as_ref().expect("a position implies a prior bar");
+                let last = st
+                    .last_bar
+                    .as_ref()
+                    .expect("a position implies a prior bar");
                 let price = force_flat_price(&pos, last, &costs);
                 booked.push(exit_all(
                     key,
@@ -192,12 +195,30 @@ impl Book {
         if let Some(pos) = st.position.as_mut() {
             let fill = if pos.noise_exit_pending {
                 let price = noise_exit_price(pos, bar, &costs);
-                Some(exit_all(key, &instrument, session, pos, bar, price, "noise_trail", &costs))
+                Some(exit_all(
+                    key,
+                    &instrument,
+                    session,
+                    pos,
+                    bar,
+                    price,
+                    "noise_trail",
+                    &costs,
+                ))
             } else {
                 manage_noise(pos, bar);
                 if clock >= flat_by {
                     let price = force_flat_price(pos, bar, &costs);
-                    Some(exit_all(key, &instrument, session, pos, bar, price, "flat_by", &costs))
+                    Some(exit_all(
+                        key,
+                        &instrument,
+                        session,
+                        pos,
+                        bar,
+                        price,
+                        "flat_by",
+                        &costs,
+                    ))
                 } else {
                     None
                 }
