@@ -6,13 +6,17 @@ import { Controls } from "../components/Controls";
 import { KillRail } from "../components/KillRail";
 import { RouteChain } from "../components/RouteChain";
 import { SettingsModal } from "../components/SettingsModal";
+import { FeedStatus, type Feed } from "../components/FeedStatus";
+import { LogModal } from "../components/LogModal";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefresh: () => void }) {
   const [settings, setSettings] = useState(false);
+  const [logs, setLogs] = useState(false);
   const st = d.state ?? {};
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
+  const feed = (det as { feed?: Feed }).feed;
   const halted = st.state === "halted" || (d.controls as { kill_switch?: boolean } | null)?.kill_switch === true;
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
@@ -30,6 +34,13 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         )}
         <Heart age={d.heartbeat_age_seconds} />
         <span className="text-[12px] text-faint">{d.display_name} · {d.cadence}</span>
+        <button
+          onClick={() => setLogs(true)}
+          className="ml-auto rounded-lg border border-line2 px-3 py-1.5 font-display text-[12px] text-dim
+                     transition hover:border-brand/60 hover:text-brand"
+        >
+          Log
+        </button>
       </div>
 
       <RouteChain
@@ -163,6 +174,10 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
             />
           </Card>
 
+          <Card title="Feed" aside={feed?.source === "realtime" ? "realtime" : "polled"}>
+            <FeedStatus feed={feed} />
+          </Card>
+
           {/* The rail lives with the book, where the number it measures is;
               this card carries only what a rail cannot show — the exact
               distance left. */}
@@ -184,6 +199,8 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
           )}
         </div>
       </div>
+
+      {logs && <LogModal botId={id} onClose={() => setLogs(false)} />}
 
       {settings && (
         <SettingsModal

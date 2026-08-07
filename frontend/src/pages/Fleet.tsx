@@ -3,6 +3,7 @@ import type { Overview } from "../api/types";
 import { Card, Heart, Pill } from "../components/Card";
 import { Spark } from "../components/Spark";
 import { execution } from "../components/RouteChain";
+import { FeedStatus, type Feed } from "../components/FeedStatus";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 /**
@@ -81,6 +82,10 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                   <span className="text-faint"> → </span>
                   <span className={ex.live ? "text-alarm" : ""}>{ex.label}</span>
                 </p>
+
+                <div className="mt-2">
+                  <FeedStatus feed={(st as { feed?: Feed }).feed} compact />
+                </div>
 
                 <div className="mt-3"><Spark points={series} /></div>
 

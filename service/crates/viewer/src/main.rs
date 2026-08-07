@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     if !path.is_file() {
         eprintln!("no such file: {}", path.display());
         eprintln!(
-            "generate it first:  ai-trader report --record <record.json> --out {}",
+            "provide a generated self-contained research HTML file at {}",
             path.display()
         );
         return ExitCode::from(2);

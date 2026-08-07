@@ -594,6 +594,12 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // IB historical 5-minute bars, which this account DOES have. The bot
     // decides on completed bars either way; polling adds seconds of
     // latency to a decision that executes at the next bar open.
+    // The feed's health is shared, not inferred: the producer knows why it
+    // is quiet, and the loop publishes what it knows.
+    let feed_health = std::sync::Arc::new(std::sync::Mutex::new(live::FeedHealth {
+        source: "starting".into(),
+        ..Default::default()
+    }));
     let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<RawBar>(64);
     match &trading {
         Trading::Ib(_) => {
@@ -603,12 +609,12 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             let feed = ib::IbVenue::connect(feed_cfg)
                 .await
                 .map_err(|e| e.to_string())?;
-            tokio::spawn(feed_task(feed, bar_tx));
+            tokio::spawn(feed_task(feed, bar_tx, feed_health.clone(), rec.clone(), bot_id.clone()));
         }
         Trading::Rithmic(v) => {
             // The history plant rides its own websocket inside the same
             // venue handle; polling it never contends with the order path.
-            tokio::spawn(rithmic_feed_task(v.clone(), bar_tx));
+            tokio::spawn(rithmic_feed_task(v.clone(), bar_tx, feed_health.clone()));
         }
     }
     eprintln!("run loop started ({mode}); ctrl-c to stop");
@@ -655,7 +661,8 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 if control.flatten && !was_halted && live {
                     let _ = trading.flatten_all(&bot_id).await;
                 }
-                live::publish_live(&rec, &book, &bot_id, mode, None)?;
+                let fh = feed_health.lock().expect("feed health").clone();
+                live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
                 continue;
             }
             Ok(None) => {
@@ -746,7 +753,10 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             }
         }
 
-        live::publish_live(&rec, &book, &bot_id, mode, None)?;
+        {
+            let fh = feed_health.lock().expect("feed health").clone();
+            live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
+        }
         if book.halted.is_some() {
             eprintln!("halted: {:?} — loop stays up publishing state", book.halted);
         }
@@ -826,7 +836,19 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 
 /// The bar producer: realtime 5s bars when the subscription allows, else
 /// poll IB historical 5-minute bars. Sends COMPLETED 5-minute buckets.
-async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
+async fn feed_task(
+    feed: ib::IbVenue,
+    tx: tokio::sync::mpsc::Sender<RawBar>,
+    health: std::sync::Arc<std::sync::Mutex<live::FeedHealth>>,
+    rec: std::sync::Arc<records::blocking::Records>,
+    bot_id: String,
+) {
+    // Narrate state CHANGES only. A log that repeats itself every 20s is
+    // one nobody reads, and it buries the line that mattered.
+    let say = |level: &str, line: String| {
+        eprintln!("feed: {line}");
+        let _ = rec.log_line(&bot_id, level, &line);
+    };
     // Attempt realtime first: subscribe and wait up to 45s for a first bar.
     match feed
         .client()
@@ -838,7 +860,8 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
             let mut stream = sub.filter_data();
             match tokio::time::timeout(std::time::Duration::from_secs(45), stream.next()).await {
                 Ok(Some(Ok(first))) => {
-                    eprintln!("feed: realtime 5s bars streaming");
+                    health.lock().expect("feed health").source = "realtime".into();
+                    say("info", "realtime 5s bars streaming".into());
                     let mut agg = live::Aggregate5s::default();
                     let mut push = |b: &ibapi::market_data::realtime::Bar,
                                     agg: &mut live::Aggregate5s|
@@ -862,13 +885,16 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
                     }
                     return; // stream ended; receiver's timeout handles it
                 }
-                _ => eprintln!(
-                    "feed: no realtime bars in 45s (no live subscription) — \
-                     falling back to historical polling"
-                ),
+                _ => {
+                    health.lock().expect("feed health").source = "poll".into();
+                    say("info", "no realtime subscription — polling historical bars".into());
+                }
             }
         }
-        Err(e) => eprintln!("feed: realtime refused ({e}) — falling back to historical polling"),
+        Err(e) => {
+            health.lock().expect("feed health").source = "poll".into();
+            say("warn", format!("realtime refused ({e}) — polling historical bars"));
+        }
     }
 
     // Poll mode: every 20s fetch the last day of 5-minute bars and emit the
@@ -889,6 +915,16 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
             .await;
         match fetched {
             Ok(data) => {
+                let recovered = {
+                    let mut h = health.lock().expect("feed health");
+                    let n = h.failures;
+                    h.failures = 0;
+                    h.last_error = None;
+                    n
+                };
+                if recovered > 0 {
+                    say("info", format!("feed recovered after {recovered} failed poll(s)"));
+                }
                 let now = chrono::Utc::now();
                 for b in &data.bars {
                     let BarTimestamp::DateTime(dt) = &b.date else {
@@ -911,13 +947,24 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
                             close: b.close,
                             volume: b.volume.max(0.0),
                         };
+                        health.lock().expect("feed health").last_bar_utc = Some(ts);
                         if tx.send(bar).await.is_err() {
                             return;
                         }
                     }
                 }
             }
-            Err(e) => eprintln!("feed: historical poll failed ({e}); retrying"),
+            Err(e) => {
+                let first = {
+                    let mut h = health.lock().expect("feed health");
+                    h.failures += 1;
+                    h.last_error = Some(e.to_string());
+                    h.failures == 1
+                };
+                if first {
+                    say("error", format!("historical poll failed: {e}"));
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
@@ -1002,7 +1049,9 @@ impl Trading {
 async fn rithmic_feed_task(
     venue: std::sync::Arc<rithmic::RithmicVenue>,
     tx: tokio::sync::mpsc::Sender<RawBar>,
+    health: std::sync::Arc<std::sync::Mutex<live::FeedHealth>>,
 ) {
+    health.lock().expect("feed health").source = "poll".into();
     let mut last_sent: Option<i64> = None;
     loop {
         let now = chrono::Utc::now().timestamp();
@@ -1032,7 +1081,12 @@ async fn rithmic_feed_task(
                     }
                 }
             }
-            Err(e) => eprintln!("feed: rithmic history poll failed ({e}); retrying"),
+            Err(e) => {
+                let mut h = health.lock().expect("feed health");
+                h.failures += 1;
+                h.last_error = Some(e.to_string());
+                eprintln!("feed: rithmic history poll failed ({e}); retrying");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }

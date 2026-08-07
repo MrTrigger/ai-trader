@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-cme", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot"]
+members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-cme", "crates/features-crypto", "crates/crypto-portfolio", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,8 @@ executor = { path = "crates/executor" }
 runner = { path = "crates/runner" }
 hyperliquid = { path = "crates/hyperliquid" }
 features-cme = { path = "crates/features-cme" }
+features-crypto = { path = "crates/features-crypto" }
+crypto-portfolio = { path = "crates/crypto-portfolio" }
 noise-book = { path = "crates/noise-book" }
 async-trait = "0.1"
 tokio = { version = "1", default-features = false }
@@ -23,4 +25,4 @@ serde_json = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "2"
 time = { version = "0.3", features = ["serde-well-known", "parsing"] }
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v5"] }

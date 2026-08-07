@@ -1,11 +1,10 @@
 # Market data and plans are derived artifacts, reproducible from the source
 # plus a manifest. The store is not the asset; the code that fills it is.
 /data/
-/planner/.venv/
-/planner/**/__pycache__/
-/planner/.pytest_cache/
-/planner/*.egg-info/
-/planner/src/**/*.egg-info/
+/training/.venv/
+/training/**/__pycache__/
+/training/.pytest_cache/
+/training/*.egg-info/
 /service/target/
 
 # Operational state: controls, run history, the order ledger, the paper venue's

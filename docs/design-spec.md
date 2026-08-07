@@ -1,5 +1,12 @@
 # AI Trader — Design Spec
 
+> **Implementation update (2026-08-07):** sections below that assign the
+> crypto planner, feature computation, backtest, or validation to Python are a
+> historical design record. Those components now live in Rust
+> (`features-crypto` and `crypto-portfolio`). Python is retained only to fit a
+> model from the final Rust-emitted matrix and does not compute or preprocess
+> model inputs. See the repository README for the current map.
+
 > **Brief for a coding agent.** Read §0 first — the principles constrain every decision below.
 > This spec is **phased and gated on purpose**. Each phase has an exit gate stated in evidence,
 > not in features. Do not build a later phase until the prior gate is passed. Do not put capital
@@ -114,9 +121,9 @@ Principles, and they are worth as much as they ever were:
 
 - the **causality guarantee** — build features over full history, rebuild over every prefix,
   require row *i* identical both times. A feature is causal exactly when deleting the future
-  doesn't change it. Reimplemented here in `planner/tests/test_features.py`, ~40 lines.
-- **lookahead should raise, not be discouraged.** The equivalent here is `store.read(until=...)`
-  and `pipeline.usable_horizon`: a bar newer than the horizon is never loaded, so it cannot be read.
+  doesn't change it. Enforced in `features-crypto` prefix-invariance tests.
+- **lookahead should raise, not be discouraged.** `crypto-portfolio` selects a closed-bar horizon
+  before calling the shared Rust decision function; training uses the same T-1d/T-1h snapshots.
 - **report the plateau's centre, never the peak**, and sweep one axis at a time.
 - **cost sensitivity as an error bar, not a parameter** — re-run at 2× slippage and see what
   survives. §9's Phase 1 gate is stated in exactly these terms.
@@ -125,7 +132,7 @@ Principles, and they are worth as much as they ever were:
 
 ### 2.3 What the backtest here actually is
 
-`pipeline.run(as_of=T)` replayed over history with a simulated fill model, accumulating a NAV
+`crypto_portfolio::decide(as_of=T)` replayed over history with a simulated fill model, accumulating a NAV
 series. That is not a convenience — it is the only construction that satisfies §0.1, because the
 backtest and the live run are then *literally the same function*. A harness with its own engine
 cannot provide that no matter how good the engine is, which is the deeper reason the dependency
@@ -219,52 +226,37 @@ conventions inherited from the harness; adapters convert at the boundary and nev
 **Preference:** Rust in the backend, React + TypeScript in the frontend — matching
 `trading-journal` (axum + sqlx, Vite + Tailwind), which is the stack actually being maintained.
 
-**That preference is honoured everywhere it doesn't break §0.1.** It cannot be honoured
-*everywhere*, and the reason is worth stating rather than quietly compromising:
+**That preference is now honoured throughout the decision and research path.** Python has one
+narrow, offline role: fit a model from a final matrix emitted by Rust.
 
 | Layer | Language | Why not the other one |
 |---|---|---|
 | `api`, frontend | **Rust + React/TS** | Directly the journal's pattern. No reason to differ. |
 | `executor`, venue adapters | **Rust** | A long-running process holding trade credentials. Explicit error types, no GIL, no silent `None`/float surprises, real retry and idempotency discipline. Rust is *better* here, not merely acceptable. |
-| `planner` (steps 1–8), backtest, validation | **Python** | The research loop lives here — sweeps, holdouts, notebooks, candidate factors thrown away by the dozen — and Phase 1 is almost entirely research loop. Plus cvxpy for MVO, statsmodels for cross-sectional regression, and the Anthropic SDK. |
+| planner, features, backtest, validation, reports | **Rust** | One feature implementation and one decision function structurally prevent train/live and replay/live drift. |
+| model fitting only | **Python** | LightGBM fitting consumes final `x_*` values and targets. It may not calculate, align, rank, impute, or select production features. |
 
-**§0.1 constrains the shape, not the language.** The research path and the live path must be *one*
-implementation of steps 1–8 or the Phase 1 gate measures nothing — which is why the backtest is
-`pipeline.run()` replayed over history (§2.3) rather than a second engine. That requirement is
-satisfied by construction and would be satisfied in either language.
+**§0.1 constrains both shape and ownership in the current implementation.** The research path and
+live path call the same Rust `decide()` function, while `features-crypto` owns the exact feature and
+rank-normalisation code used by training and inference. Sweeps, holdouts, walk-forward validation,
+IC, evidence records, and reports are also Rust. A notebook may inspect exported evidence, but it
+cannot become an alternative feature or strategy engine.
 
-So the language choice rests on where the work actually is. Phase 1 is "the whole project" (§9) and
-Phase 1 is research: score a factor, sweep an axis, look at a plateau, discard it. Python is best
-at that and Rust is worst at it, and no amount of `polars` closes that particular gap.
-
-**Two arguments deliberately *not* made here**, because both have been checked and neither holds:
-
-- *"The library gap forces it."* It is narrower than it looks. `polars` is Rust-native and beats
-  pandas for a feature frame; `clarabel`, the solver cvxpy would dispatch `mvo` to, is itself a
-  Rust crate; Ledoit–Wolf shrinkage is thirty lines. On libraries alone this would be close.
-- *"The harness is Python, so the planner must be."* This was the original argument and it was
-  wrong — see §2.1. Steps 1–8 were never going to run through that harness, so a Rust planner
-  would not have meant rewriting it.
-
-The cost of the split is real and accepted: a JSON Schema, a fixture, a cross-language CI job, two
-images, and one CRLF bug already paid for. It buys a security property worth having on its own
-(§3.3) — the process that decides holds no key that can trade.
+The process split still buys the security property in §3.3: the process that decides holds no key
+that can trade. It no longer creates a language split.
 
 **The Plan is the process boundary**, and it already had the right shape for this: immutable,
 schema'd, risk-cleared, persisted, and addressed by id (§5.3, §8.3). Rust never needs to know how
 a plan was computed — only that it exists, validates, and hasn't been superseded.
 
 ```
-  cron -> planner (Python)  --writes Plan row-->  Postgres  --reads plan_id-->  executor (Rust)
+  cron -> crypto-portfolio (Rust)  --writes Plan JSON-->  bot/executor (Rust)
 ```
 
-**Contract discipline, since this is a cross-language seam:**
+**Contract discipline at the process seam:**
 
-- The Plan schema is the contract. Define it **once** (JSON Schema), generate `serde` types and
-  Python models from it. Hand-maintained parallel structs will drift, and the drift will be
-  discovered in production.
-- A round-trip test in CI: Python writes a Plan, Rust parses it, values compare equal. This test
-  failing is a release blocker, not a warning.
+- The Plan schema and shared Rust `plan` crate are the contract. The producer round-trips every
+  emitted document through the executor parser in tests.
 - Version the schema. `executor` refuses a Plan whose schema version it does not know — fail
   closed (§0.3), never best-effort parse.
 
@@ -272,16 +264,14 @@ a plan was computed — only that it exists, validates, and hasn't been supersed
 
 | | Where | What it is |
 |---|---|---|
-| `sim` fill model | Python, inside the backtest | simulates fills against historical bars: ±1 tick, commissions, pessimistic stop fills, stop-before-target |
+| `sim` fill model | Rust, inside `crypto-portfolio::backtest` | crosses the spread, charges commission, and fills only at the next excluded bar's open |
 | `paper` venue | Rust, a `VenueAdapter` impl | a fake broker on live real-time data — exercises the **real** execution, reconciliation and error-handling path |
 
-Phase 2's gate is about the operational path, not the strategy. Running it through the Python
-simulator instead of the Rust executor would test nothing that Phase 1 hasn't already tested.
+Phase 2's gate is about the operational path, not the strategy. Running only the Rust historical
+fill model instead of the Rust executor would test nothing that Phase 1 has not already tested.
 
-**Packaging:** two images (`planner`, `service`) rather than the journal's single container, both
-deployed by Flux into the same namespace. This is a real cost of the split — two toolchains, two
-CI jobs — and it is accepted knowingly in exchange for not maintaining two strategy
-implementations.
+**Packaging:** the planner and executor are separate Rust binaries with different authority. The
+offline Python fitting environment is not deployed in the trading runtime.
 
 ---
 
@@ -789,18 +779,15 @@ Everything is a command. The scheduler invokes the same commands cron does; noth
 path into the engine.
 
 ```
-  ai-trader data pull|inspect|verify
-  ai-trader features build [--as-of]
-  ai-trader plan [--as-of] [--dry-run]        # steps 1-7, prints the plan + risk report
-  ai-trader execute <plan-id>                 # step 8-9, requires an existing plan
-  ai-trader reconcile
-  ai-trader backtest [...]                    # via the harness
-  ai-trader validate [...]                    # holdout, sweeps, walk-forward
-  ai-trader pause | resume | flatten
+  crypto-portfolio data-pull|data-inspect|data-verify
+  crypto-portfolio features|scores|training-matrix
+  crypto-portfolio plan|plan-verify
+  crypto-portfolio backtest|sweep|gate|ic|research|report
+  bot run|reconcile|halt|pause|resume|flatten
 ```
 
-Two binaries implement this today. `ai-trader` (Python) is the planner — it decides and emits a
-Plan. `bot` (Rust) is the executor — it takes a plan file and does steps 9–10, and owns
+Two Rust binaries implement this today. `crypto-portfolio` decides and emits a Plan. `bot` takes a
+plan file and does steps 9–10, and owns
 `halt | pause | resume | flatten | adopt`. The split is §3.3's security boundary, not a packaging
 preference: the process that decides never holds a key that can trade.
 
@@ -935,7 +922,7 @@ systems tend to have:
 
 - **Parameter surface without a holdout.** Two dozen sub-factors, a composite weight vector, and
   regime-conditional weight switching is an enormous researcher-degrees-of-freedom budget. Every
-  one of those constants goes through §9's gates and `validate/sweep.py`'s plateau rule, or it
+  one of those constants goes through §9's gates and `crypto_portfolio::validate`'s plateau rule, or it
   does not ship. This is the entire reason Phase 6 repeats the Phase 1–3 gates independently.
 - **A scheduled run that computes differently from a full run.** Skipping expensive inputs on the
   daily cron (filings, institutional flow) means live scores are not backtest scores. If an input

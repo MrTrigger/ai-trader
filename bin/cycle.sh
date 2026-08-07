@@ -26,9 +26,15 @@ BOT=./service/target/debug/bot
 [ -x "$BOT" ] || BOT=./service/target/release/bot
 [ -x "$BOT" ] || { echo "cycle: no bot binary — cargo build first" >&2; exit 2; }
 
-STATE_DIR="$(python3 -c "import json,sys;print(json.load(open('$CONFIG'))['state_dir'])")"
+PLANNER=./service/target/debug/crypto-portfolio
+[ -x "$PLANNER" ] || PLANNER=./service/target/release/crypto-portfolio
+[ -x "$PLANNER" ] || { echo "cycle: no crypto-portfolio binary — cargo build first" >&2; exit 2; }
+
+command -v jq >/dev/null || { echo "cycle: jq is required to read bot config" >&2; exit 2; }
+STATE_DIR="$(jq -er '.state_dir | strings' "$CONFIG")"
 PLAN="$STATE_DIR/plan.json"
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DAY="$(date -u +%Y-%m-%d)"
 
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -44,7 +50,7 @@ say "cycle $STAMP  config=$CONFIG"
 
 # 1. Data. Without fresh bars the planner is deciding on yesterday.
 say "pull"
-ai-trader --config config/default.toml data pull
+"$PLANNER" data-pull --config config/default.toml --data-root data --days 7
 
 # 2. Decide. Read-only: produces a plan and touches nothing.
 #
@@ -61,11 +67,12 @@ ai-trader --config config/default.toml data pull
 # Without the flag the planner emits a "dry" plan and step 3 refuses it every
 # single time, which is how this script sat broken.
 say "plan"
-ai-trader --config config/default.toml universe rank \
-    --start "$(date -u +%Y-%m-%d)" --step-days 1 --overwrite \
+"$PLANNER" universe-rank --config config/default.toml --data-root data \
+    --as-of "$DAY" --top 30 --overwrite \
     --tradeable <("$BOT" --config "$CONFIG" markets)
 
-ai-trader --config config/default.toml plan --for-execution \
+"$PLANNER" plan --config config/default.toml --data-root data \
+    --as-of "$DAY" --for-execution \
     --book <("$BOT" --config "$CONFIG" book) --out "$PLAN"
 
 # 3. Execute. The only step that can move capital, and the only one that

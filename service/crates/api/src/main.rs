@@ -327,6 +327,13 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
         {
             serve_index(&mut stream, cfg, method == "HEAD")
         }
+        ("GET", r) if r.starts_with("/api/bots/") && r.ends_with("/logs") => {
+            let id = r.trim_start_matches("/api/bots/").trim_end_matches("/logs");
+            match fleet::logs(id, 300) {
+                Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+                Err(e) => json_error(&mut stream, 400, &e),
+            }
+        }
         ("GET", r) if r.starts_with("/api/bots/") && r.ends_with("/state") => {
             let id = r
                 .trim_start_matches("/api/bots/")

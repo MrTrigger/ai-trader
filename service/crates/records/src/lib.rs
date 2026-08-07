@@ -606,6 +606,40 @@ impl Registry {
             .collect())
     }
 
+    /// Narrate. Bounded by usage, not by schema: bots write what an
+    /// operator would want at 3am, not a debug stream.
+    pub async fn log_line(
+        &self,
+        bot_id: &str,
+        level: &str,
+        line: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query("INSERT INTO bot_log (bot_id, level, line) VALUES ($1, $2, $3)")
+            .bind(bot_id)
+            .bind(level)
+            .bind(line)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Newest first, as (at, level, line).
+    pub async fn recent_log(
+        &self,
+        bot_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String)>, RecordsError> {
+        let rows = sqlx::query(
+            "SELECT at::text, level, line FROM bot_log WHERE bot_id = $1 \
+             ORDER BY seq DESC LIMIT $2",
+        )
+        .bind(bot_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
+    }
+
     pub async fn put_snapshot(
         &self,
         bot_id: &str,
@@ -823,6 +857,10 @@ pub mod blocking {
             payload_json: &str,
         ) -> Result<(), RecordsError> {
             self.wait(self.inner.put_snapshot(bot_id, taken_at, payload_json))
+        }
+
+        pub fn log_line(&self, bot_id: &str, level: &str, line: &str) -> Result<(), RecordsError> {
+            self.wait(self.inner.log_line(bot_id, level, line))
         }
 
         pub fn get_snapshot(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {

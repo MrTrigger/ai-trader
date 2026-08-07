@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 export function Card({
   title,
@@ -24,17 +24,32 @@ export function Card({
   );
 }
 
-/** A pulse whose life is the heartbeat's: it fades as the beat goes stale,
- *  so a dead process looks dead rather than merely unlabelled. */
+/**
+ * A heartbeat that keeps counting between polls.
+ *
+ * A number that only moves when the page refreshes cannot tell you the
+ * process died — it just looks like a slightly old number. This one ticks
+ * every second from the age the server reported, so a stopped bot visibly
+ * climbs instead of sitting still, and the pulse stops when it goes stale.
+ */
 export function Heart({ age }: { age?: number | null }) {
-  const stale = (age ?? 0) > 900;
+  const [extra, setExtra] = useState(0);
+  useEffect(() => {
+    setExtra(0);
+    const t = setInterval(() => setExtra((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [age]);
+
+  if (age == null) return <span className="num text-[11px] text-faint">no heartbeat</span>;
+  const live = age + extra;
+  const stale = live > 900;
   return (
-    <span className="inline-flex items-center gap-1.5">
+    <span className="inline-flex items-center gap-1.5" title="time since the bot last published state">
       <span
-        className={`h-[7px] w-[7px] rounded-full ${stale ? "bg-faint" : "bg-go animate-heart"}`}
+        className={`h-[7px] w-[7px] rounded-full ${stale ? "bg-alarm" : "bg-go animate-heart"}`}
         aria-hidden
       />
-      <span className={`num text-[11px] ${stale ? "text-consequence" : "text-dim"}`}>{fmtAge(age)}</span>
+      <span className={`num text-[11px] ${stale ? "text-alarm" : "text-dim"}`}>{fmtAge(live)}</span>
     </span>
   );
 }

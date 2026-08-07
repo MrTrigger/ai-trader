@@ -28,6 +28,44 @@ use venue::VenueAdapter;
 
 pub const STALL_SECONDS: u64 = 90;
 
+/// What the feed is doing, published so the dashboard can say it.
+///
+/// A bot with a dead feed looks exactly like a quiet market from the
+/// outside: no fills, no errors, state "running". That ambiguity is the
+/// whole problem — the operator cannot tell "nothing to trade" from
+/// "nothing arriving" — so the feed reports itself and the UI shows it.
+#[derive(Debug, Clone, Default)]
+pub struct FeedHealth {
+    /// "realtime" once a live subscription is streaming, else "poll".
+    pub source: String,
+    pub last_bar_utc: Option<DateTime<Utc>>,
+    /// Consecutive failed fetches. One is a blip; a run of them is an
+    /// outage, and the difference belongs on screen.
+    pub failures: u32,
+    pub last_error: Option<String>,
+}
+
+impl FeedHealth {
+    pub fn to_json(&self, now: DateTime<Utc>) -> serde_json::Value {
+        let age = self
+            .last_bar_utc
+            .map(|t| now.signed_duration_since(t).num_seconds().max(0));
+        // Healthy is a judgement the bot is best placed to make: it knows
+        // whether the market should be printing right now.
+        let expected = market_should_be_open(now);
+        let healthy = self.failures == 0 && (!expected || age.map(|a| a < 900).unwrap_or(false));
+        serde_json::json!({
+            "source": self.source,
+            "last_bar_utc": self.last_bar_utc.map(|t| t.to_rfc3339()),
+            "last_bar_age_seconds": age,
+            "failures": self.failures,
+            "last_error": self.last_error,
+            "market_open": expected,
+            "healthy": healthy,
+        })
+    }
+}
+
 /// Whether CME equity-index futures SHOULD be printing bars right now:
 /// Sun 18:00 ET through Fri 17:00 ET, minus the daily 17:00-18:00 break.
 /// Holidays are deliberately unmodelled — a holiday reads as a stall,
@@ -278,6 +316,17 @@ pub fn publish_live(
     mode: &str,
     note: Option<&str>,
 ) -> Result<(), String> {
+    publish_with_feed(rec, book, bot_id, mode, note, None)
+}
+
+pub fn publish_with_feed(
+    rec: &records::blocking::Records,
+    book: &Book,
+    bot_id: &str,
+    mode: &str,
+    note: Option<&str>,
+    feed: Option<&FeedHealth>,
+) -> Result<(), String> {
     for f in &book.fills {
         let key = format!(
             "{}|{}|{}|{}|{}|{}",
@@ -307,6 +356,9 @@ pub fn publish_live(
     let mut detail = book.detail_doc();
     if let Some(n) = note {
         detail["note"] = serde_json::json!(n);
+    }
+    if let Some(f) = feed {
+        detail["feed"] = f.to_json(chrono::Utc::now());
     }
     let doc = serde_json::json!({
         "schema": 1,

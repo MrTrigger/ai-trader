@@ -142,6 +142,9 @@ fn status_from_rows(
         "mode": doc.get("mode"),
         "halted": halted_of(&doc),
     });
+    if let Some(f) = doc.pointer("/detail/feed") {
+        out["feed"] = f.clone();
+    }
     if let Some(h) = doc.get("headline") {
         out["net_total"] = h.get("net").cloned().unwrap_or(Value::Null);
         out["trades_total"] = h.get("fills").cloned().unwrap_or(Value::Null);
@@ -658,6 +661,18 @@ fn botstate_series(doc: Option<&Value>, fills: &[Value]) -> Vec<Value> {
         ]));
     }
     out
+}
+
+/// GET /api/bots/{id}/logs — what the bot said, newest first.
+pub fn logs(bot_id: &str, limit: i64) -> Result<Value, String> {
+    let id = bot_id.to_string();
+    let rows = with_registry(move |reg| Box::pin(async move { reg.recent_log(&id, limit).await }))?;
+    Ok(json!({
+        "lines": rows
+            .into_iter()
+            .map(|(at, level, line)| json!({ "at": at, "level": level, "line": line }))
+            .collect::<Vec<_>>(),
+    }))
 }
 
 /// POST /api/bots/{id}/venue — point the bot's trade scope at another

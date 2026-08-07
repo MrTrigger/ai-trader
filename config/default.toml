@@ -11,13 +11,23 @@ target_gross_exposure = "0.80"
 # and inverse_vol are the candidates. Compared, not argued about (4.5).
 constructor = "conviction_tilt"
 
-# Back to the Phase 0 placeholder, which claims no edge and says so on every
-# plan it emits. TWO candidates have now failed the Phase 1 gate and neither may
-# be named here: `xs_momentum` and `gc_breakout`. See docs/phase-1-findings.md.
+# The learned cross-sectional ranker. TWO candidates failed the Phase 1 gate and
+# neither may be named here: `xs_momentum` and `gc_breakout`. See
+# docs/phase-1-findings.md. This field naming a signal that failed its gate
+# would be the softest possible version of shipping it.
 #
-# This field naming a signal that failed its gate would be the softest possible
-# version of shipping it.
-signal = "placeholder_equal_long"
+# `ml_ranker` is the one that passed: out-of-sample IC positive in all six
+# expanding folds, both nulls systematically negative. Until now the config
+# still named the placeholder, so the paper book was forward-testing an
+# equal-weight long-only basket that claims no edge - not the strategy the
+# backtest measured.
+signal = "ml_ranker"
+
+# No fallback model is permitted: `ml_ranker` refuses to run without this, and
+# refuses an artifact whose feature catalogue or ordered feature names disagree
+# with the Rust runtime's own. The artifact carries `trained_through`, and
+# scoring on or before that date is refused rather than silently allowed.
+model_path = "data/models/ranker.rust.json"
 
 # How many names the signal holds. Distinct from limits.max_position_count,
 # which is a hard risk limit: this is what the strategy intends, that is what it
@@ -32,7 +42,7 @@ min_cross_section = 15
 # hours-to-weeks, and every rebalance costs spread. Swept, not assumed (10.3).
 rebalance_every = 7
 
-# Superseded by `ai-trader universe rank`, which ranks by trailing liquidity
+# Superseded by `crypto-portfolio universe-rank`, which ranks by trailing liquidity
 # from the bar store and records a point-in-time snapshot per decision date.
 # Kept only for `universe record`, the Phase 0 configured-list path.
 universe = ["BTC", "ETH", "SOL"]

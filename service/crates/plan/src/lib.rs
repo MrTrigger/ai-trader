@@ -1,15 +1,14 @@
 //! The Plan contract, as the executor sees it.
 //!
-//! This crate parses plans. It deliberately cannot construct one: the planner
-//! decides and the executor executes, and a type that can build a plan in this
-//! process would be a way for the executing half to invent work for itself.
+//! This crate owns the Plan wire contract shared by planners and executors.
+//! Construction lives in a separate planner crate/process; the executor still
+//! has no decision logic and accepts only a serialized, immutable Plan.
 //!
-//! Three properties mirror the Python side, and each exists because of a
-//! specific way the seam could rot:
+//! Three wire properties remain mandatory, and each exists because of a
+//! specific way the planner/executor seam could rot:
 //!
-//! **Decimals arrive as strings.** A JSON number is an `f64` on both sides and
-//! the two languages need not round one identically. `rust_decimal` parses the
-//! exact digits Python emitted.
+//! **Decimals arrive as strings.** JSON numbers pass through floating-point
+//! tooling too easily; `rust_decimal` parses the exact digits emitted.
 //!
 //! **Unknown fields are rejected.** `deny_unknown_fields` everywhere. A field
 //! this build does not understand means the planner knows something this
@@ -48,14 +47,14 @@ pub enum PlanError {
     Invariant(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Mode {
     Dry,
     Live,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Status {
     Accepted,
@@ -66,7 +65,7 @@ pub enum Status {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Direction {
     Long,
@@ -107,7 +106,7 @@ impl OrderReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WarningKind {
     DegenerateFeature,
@@ -119,7 +118,7 @@ pub enum WarningKind {
     Other,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Nav {
     #[serde(with = "rust_decimal::serde::str")]
@@ -134,7 +133,7 @@ pub struct Nav {
     pub benchmark_beta: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub planner_version: String,
@@ -158,7 +157,7 @@ impl Provenance {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub asset: String,
@@ -169,7 +168,7 @@ pub struct Target {
     pub conviction: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentPosition {
     pub asset: String,
@@ -179,7 +178,7 @@ pub struct CurrentPosition {
     pub weight: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Order {
     pub asset: String,
@@ -208,7 +207,7 @@ pub struct RiskCheck {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskReport {
     pub passed: bool,
@@ -217,7 +216,7 @@ pub struct RiskReport {
     pub rejected_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetCost {
     pub asset: String,
@@ -229,7 +228,7 @@ pub struct AssetCost {
     pub impact_bps: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostEstimate {
     #[serde(with = "rust_decimal::serde::str")]
@@ -240,14 +239,14 @@ pub struct CostEstimate {
     pub per_asset: Vec<AssetCost>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Warning {
     pub kind: WarningKind,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     pub schema_version: String,

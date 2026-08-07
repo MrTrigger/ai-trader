@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mrtrigger/ai-trader/schema/plan.schema.json",
   "title": "Plan",
-  "description": "The complete description of what the system intends to do, and the sole contract between the Python planner (steps 1-8) and the Rust executor (steps 9-10). See docs/design-spec.md sections 3.5 and 5.3. Immutable once written: a superseded plan gets status='superseded', it is never edited.",
+  "description": "The complete description of what the system intends to do, and the sole contract between the Rust planner (steps 1-8) and Rust executor (steps 9-10). See docs/design-spec.md sections 3.5 and 5.3. Immutable once written: a superseded plan gets status='superseded', it is never edited.",
   "type": "object",
   "additionalProperties": false,
   "required": [

@@ -3,7 +3,7 @@
 Three processes, none of which knows about the others at runtime. They meet through files.
 
 ```
-  planner (Python)          bot (Rust)                  api (Rust)
+  crypto-portfolio (Rust)   bot (Rust)                  api (Rust)
   read-only venue key       trade-scoped key            no key
   decides                   executes                    shows
         │                        │                          │
@@ -81,9 +81,42 @@ bin/cycle.sh var/live/bot.json
 which is exactly these three, in order, failing the whole cycle if any of them does:
 
 ```bash
-ai-trader --config config/default.toml data pull                    # 1. bars
-ai-trader --config config/default.toml plan --out <state>/plan.json # 2. decide
-bot --config var/live/bot.json run --plan <state>/plan.json         # 3. execute
+crypto-portfolio data-pull --config config/default.toml --data-root data --days 7
+crypto-portfolio universe-rank --config config/default.toml --data-root data \
+  --as-of YYYY-MM-DD --top 30 --tradeable <markets.json> --overwrite
+crypto-portfolio plan --config config/default.toml --data-root data \
+  --as-of YYYY-MM-DD --book <book.json> --out <state>/plan.json --for-execution
+bot --config var/live/bot.json run --plan <state>/plan.json
+```
+
+Read-only preflight and research commands use the same Rust implementation:
+
+```bash
+crypto-portfolio data-inspect --data-root data
+crypto-portfolio data-verify --data-root data --interval daily \
+  --asset BTC --cross-interval
+crypto-portfolio plan-verify --config config/default.toml --data-root data \
+  --as-of YYYY-MM-DD --book <book.json> --runs 3
+crypto-portfolio research --config config/default.toml --data-root data \
+  --start YYYY-MM-DD --end YYYY-MM-DD --initial-cash 100000 --out <record.json>
+crypto-portfolio report --record <record.json> --out <report.html>
+```
+
+`data-verify` always checks that timestamps lie on the expected UTC interval
+grid. Consecutive close-to-open gaps are a liquidity diagnostic and are
+warnings unless `--strict-continuity` is set: a thin market can legitimately
+gap between its last and next trade. `--cross-interval` additionally requires
+daily OHLC to agree with the aggregation of 24 hourly candles (within a
+configurable 5-bps default tolerance). It never repairs or deletes data.
+`report` is a pure lens over a saved record and computes no statistic.
+
+For a historical rebuild, use the public monthly archive rather than today's
+venue list; `--all-listed` includes delisted USDT symbols and excludes Binance
+leveraged tokens:
+
+```bash
+crypto-portfolio data-archive --config config/default.toml --data-root data \
+  --start 2019-10-01 --end 2026-08-01 --all-listed --interval daily
 ```
 
 Cron it, and leave the feed running alongside:
