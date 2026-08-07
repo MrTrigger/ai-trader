@@ -92,8 +92,16 @@ impl Book {
     }
 
     pub fn apply_control(&mut self, c: &Control) {
-        if c.halt && self.halted.is_none() {
-            self.halted = Some("operator".into());
+        if c.halt {
+            if self.halted.is_none() {
+                self.halted = Some("operator".into());
+            }
+        } else if self.halted.as_deref() == Some("operator") {
+            // An operator halt is operator-resumable. Rail halts (kill
+            // criterion, reconcile mismatch, feed stall, refused orders)
+            // stay latched: they mean something is WRONG, and clearing them
+            // is a restart after a human has looked, not a button.
+            self.halted = None;
         }
         self.disabled_sleeves(c);
         if let Some(i) = &c.instrument {
