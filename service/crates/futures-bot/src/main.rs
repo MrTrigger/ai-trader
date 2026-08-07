@@ -644,7 +644,17 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                         "no completed bar for {silent}m in market hours — halted"
                     ));
                 }
-                // Heartbeat so the dashboard sees a live process either way.
+                // Controls are obeyed here as well, not only on a bar.
+                // Reading them only when the feed ticks meant a Stop pressed
+                // during the daily break, a weekend, or a quiet poll gap sat
+                // unapplied — the book stayed open precisely when somebody
+                // had just asked for it to be closed.
+                let control = read_control(&rec, &bot_id)?;
+                let was_halted = book.halted.is_some();
+                book.apply_control(&control);
+                if control.flatten && !was_halted && live {
+                    let _ = trading.flatten_all(&bot_id).await;
+                }
                 live::publish_live(&rec, &book, &bot_id, mode, None)?;
                 continue;
             }
@@ -663,24 +673,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 
         // Controls, fresh every completed bar. Halt stops entries now and,
         // in live mode, flattens.
-        // The canonical contract: NO control row means HALTED, fail closed.
-        // Running is a deliberate act — a resume row with a reason and a
-        // name. (An unparseable row also reads as halted.)
-        let control = rec
-            .current_control(&bot_id)
-            .map_err(|e| e.to_string())?
-            .map(|row| {
-                serde_json::from_str(&row.payload)
-                    .map(|v: serde_json::Value| live::control_from_payload(&v))
-                    .unwrap_or(noise_book::runtime::Control {
-                        halt: true,
-                        ..Default::default()
-                    })
-            })
-            .unwrap_or(noise_book::runtime::Control {
-                halt: true,
-                ..Default::default()
-            });
+        let control = read_control(&rec, &bot_id)?;
         // Halt closes nothing; STOP closes. The previous cut flattened on
         // any halt, which quietly made the two identical and made the
         // dashboard's promise ("halting does not close what is open") a
@@ -928,6 +921,27 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
         }
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
+}
+
+/// Read the control word. The canonical contract: no row, an unreadable
+/// row, or an unknown state all mean HALTED — running is a deliberate act.
+fn read_control(
+    rec: &records::blocking::Records,
+    bot_id: &str,
+) -> Result<noise_book::runtime::Control, String> {
+    let halted = || noise_book::runtime::Control {
+        halt: true,
+        ..Default::default()
+    };
+    Ok(rec
+        .current_control(bot_id)
+        .map_err(|e| e.to_string())?
+        .map(|row| {
+            serde_json::from_str(&row.payload)
+                .map(|v: serde_json::Value| live::control_from_payload(&v))
+                .unwrap_or_else(|_| halted())
+        })
+        .unwrap_or_else(halted))
 }
 
 /// The trading connection, venue-selected by the registry binding.
