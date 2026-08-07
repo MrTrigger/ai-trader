@@ -603,8 +603,16 @@ fn live_stats(runs: &[RunRecord], book: &Book, initial_cash: Decimal) -> LiveSta
     let ret = (start > 0.0).then(|| current / start - 1.0);
 
     let meaningful = days.unwrap_or(0) >= MEANINGFUL_DAYS && navs.len() >= 30;
-    let note = if navs.len() < 2 {
+    // Two branches, because one run is not none: the card sat under a populated
+    // run history telling the operator nothing had run.
+    let note = if navs.is_empty() {
         "Nothing has run yet, so there is no live record to compare against anything.".into()
+    } else if navs.len() < 2 {
+        format!(
+            "{} run so far. A return needs two marks to measure between, so there is nothing \
+             here to compare against the backtest yet.",
+            navs.len()
+        )
     } else if !meaningful {
         format!(
             "{} runs over {} days, against a backtest of several years. Far too short to judge \
