@@ -320,6 +320,7 @@ fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
     match venue_id {
         "hyperliquid" => open_hyperliquid(mode, env),
         "ib" => open_ib(mode),
+        "rithmic" => open_rithmic(mode),
         other => Err(format!(
             "unknown venue_id {other:?}. Known live venues: hyperliquid, ib (planned)."
         )),
@@ -341,6 +342,25 @@ fn open_ib(mode: Mode) -> Result<Active, String> {
         cfg.allow_orders = false;
     }
     let adapter = ib::IbLazy::new(cfg);
+    let description = adapter.describe();
+    Ok(Active::Live {
+        adapter: Box::new(adapter),
+        description,
+        agent: None,
+    })
+}
+
+fn open_rithmic(mode: Mode) -> Result<Active, String> {
+    let allow_live = matches!(
+        std::env::var("RITHMIC_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
+        "yes" | "true" | "1"
+    );
+    let live_env = mode == Mode::Live && allow_live;
+    let mut cfg = rithmic::RithmicCfg::from_env(live_env)?;
+    if mode == Mode::LiveReadonly {
+        cfg.allow_orders = false;
+    }
+    let adapter = rithmic::RithmicLazy::new(cfg);
     let description = adapter.describe();
     Ok(Active::Live {
         adapter: Box::new(adapter),

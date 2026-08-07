@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 JOURNAL = (HERE / "../../../trading-journal/backtest").resolve()
 FIXTURE = HERE / "parity-fixture.json"
 WINDOW = "2026-06-01"
+WINDOW_END = "2026-08-03"
 
 
 def run_replay() -> dict:
@@ -29,7 +30,7 @@ def run_replay() -> dict:
     env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
     subprocess.run(
         [str(JOURNAL / ".venv/bin/python"), "-m", "backtest.cli", "bot-replay",
-         "--rules", "rules-lab", "--start", WINDOW],
+         "--rules", "rules-lab", "--start", WINDOW, "--end", WINDOW_END],
         cwd=JOURNAL, check=True, capture_output=True, env=env,
     )
     rows = [json.loads(l) for l in (JOURNAL / "botstate/journal.jsonl").read_text().splitlines()]

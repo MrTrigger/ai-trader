@@ -39,6 +39,7 @@ case "${1:-}" in
     ensure_bot; ensure_bars
     env -u DATABASE_URL "$BOT" replay --bars "$BARS" \
       --start "$(python3 -c "import json;print(json.load(open('$HERE/parity-fixture.json'))['window_start'])")" \
+      --end "$(python3 -c "import json;print(json.load(open('$HERE/parity-fixture.json'))['window_end'])")" \
       --fixture "$HERE/parity-fixture.json"
     ;;
   parity-py)
@@ -65,8 +66,13 @@ case "${1:-}" in
     ensure_bot
     exec "$BOT" ib-check "$@"
     ;;
+  rithmic-check)
+    shift
+    ensure_bot
+    exec "$BOT" rithmic-check "$@"
+    ;;
   *)
-    echo "usage: run.sh {replay [START]|parity|parity-py|features ...|shadow|live|ib-check}" >&2
+    echo "usage: run.sh {replay [START]|parity|parity-py|features ...|shadow|live|ib-check|rithmic-check}" >&2
     echo "  REFRESH_BARS=1 re-exports bars; BARS_FROM=YYYY-MM-DD sets the export start" >&2
     exit 2
     ;;

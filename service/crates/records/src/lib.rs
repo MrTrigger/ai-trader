@@ -25,6 +25,12 @@ pub enum RecordsError {
     UnknownBot(String),
     #[error("bot {0:?} is registered but disabled — enable it before running (fail closed)")]
     DisabledBot(String),
+    #[error(
+        "bot {bot_id:?} still owns operational records ({held}). Deregistering would orphan \
+         history somebody may need to audit. Disable it instead, or clear those rows first if \
+         they were never real."
+    )]
+    BotHasRecords { bot_id: String, held: String },
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +169,55 @@ impl Registry {
         .bind(decision_core)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// How much operational history a bot owns, across every records table.
+    ///
+    /// Asked before deregistering: a bot with fills is a bot whose history
+    /// someone will want to audit, and the identity row is what makes those
+    /// rows attributable.
+    pub async fn record_counts(&self, bot_id: &str) -> Result<Vec<(&'static str, i64)>, RecordsError> {
+        let mut out = Vec::new();
+        for table in [
+            "bot_status", "control_events", "fills", "runs",
+            "ledger_entries", "snapshots", "venue_sim_state", "account_bindings",
+        ] {
+            // Table names come from this fixed list, never from a caller.
+            let sql = format!("SELECT count(*) FROM {table} WHERE bot_id = $1");
+            let n: i64 = sqlx::query_scalar(&sql)
+                .bind(bot_id)
+                .fetch_one(&self.pool)
+                .await?;
+            if n > 0 {
+                out.push((table, n));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deregister a bot. Refuses while it still owns operational records —
+    /// the foreign keys would refuse anyway, and an error naming the tables is
+    /// more use than one naming a constraint.
+    pub async fn remove_bot(&self, bot_id: &str) -> Result<(), RecordsError> {
+        let held = self.record_counts(bot_id).await?;
+        if !held.is_empty() {
+            return Err(RecordsError::BotHasRecords {
+                bot_id: bot_id.into(),
+                held: held
+                    .iter()
+                    .map(|(t, n)| format!("{n} in {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        let res = sqlx::query("DELETE FROM bots WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(RecordsError::UnknownBot(bot_id.into()));
+        }
         Ok(())
     }
 

@@ -9,6 +9,7 @@ features-cme = { workspace = true }
 noise-book = { workspace = true }
 records = { path = "../records" }
 ib = { path = "../ib" }
+rithmic = { path = "../rithmic" }
 ibapi = { version = "3", default-features = false, features = ["async"] }
 venue = { workspace = true }
 rust_decimal = { workspace = true }

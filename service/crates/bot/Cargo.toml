@@ -16,6 +16,7 @@ venue.workspace = true
 paper.workspace = true
 hyperliquid.workspace = true
 ib = { path = "../ib" }
+rithmic = { path = "../rithmic" }
 async-trait.workspace = true
 executor.workspace = true
 runner.workspace = true

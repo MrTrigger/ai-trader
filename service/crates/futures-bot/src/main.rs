@@ -50,7 +50,11 @@ usage: futures-bot <command>
       lab's stored history and now, so today's noise bands are computed
       from actual recent sessions.
 
-  run --bars <warmup jsonl> [--live] [--bot-id ID]
+  rithmic-check [--live]
+      Rithmic readiness probe: connect + login all plants, positions read,
+      history bars. Needs the RITHMIC_* credentials (.env section 8).
+
+  run --bars <warmup jsonl> [--live] [--bot-id ID] [--venue ib|rithmic]
       The live loop: IB 5s bars -> 5min -> the SAME stack replay parity
       proved. Default is SHADOW (never armed, simulated fills, published
       to the records DB). --live arms per the .env flags and mirrors the
@@ -75,6 +79,7 @@ fn main() -> ExitCode {
         Some("replay") => replay(&get),
         Some("features") => features_cmd(&get),
         Some("ib-check") => block_on_async(ib_check(&get)),
+        Some("rithmic-check") => block_on_async(rithmic_check(&get)),
         Some("backfill") => block_on_async(backfill(&get)),
         Some("run") => block_on_async(run_live(&get)),
         _ => {
@@ -474,25 +479,63 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     reg.require_enabled(&bot_id).await.map_err(|e| e.to_string())?;
     let rec = records::blocking::Records::connect(&url).map_err(|e| e.to_string())?;
 
-    // The account block follows the arming intent, exactly like the venue
-    // registry: the LIVE block only when --live AND the operator set
-    // IB_ALLOW_LIVE; otherwise the paper block — which is what "--live on a
-    // paper account" means.
-    let allow_live = matches!(
-        std::env::var("IB_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
-        "yes" | "true" | "1"
-    );
-    let mut cfg = ib::IbConfig::from_env(live && allow_live)?;
-    if !live {
-        // Shadow NEVER arms, whatever the env says.
-        cfg.allow_orders = false;
-    }
-    let symbol = cfg.symbol.clone();
-    let venue_conn = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
-    eprintln!("{}", venue_conn.describe());
-    if live && !venue_conn.is_armed() {
+    // Which venue trades this bot is DATA: the registry's trade binding
+    // decides (--venue overrides for dev). The operator switches brokers by
+    // updating the binding, not by editing code.
+    let venue_id = match get("--venue") {
+        Some(v) => v,
+        None => reg
+            .bindings(&bot_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|b| b.scope == "trade")
+            .map(|b| b.venue_id)
+            .unwrap_or_else(|| "ib".into()),
+    };
+    let yes = |k: &str| {
+        matches!(
+            std::env::var(k).unwrap_or_default().to_lowercase().as_str(),
+            "yes" | "true" | "1"
+        )
+    };
+    // The account/env block follows the arming intent, exactly like the
+    // venue registry: the LIVE block only when --live AND the operator set
+    // the venue's ALLOW_LIVE; otherwise paper/demo — which is what "--live
+    // on a paper account" means.
+    let trading = match venue_id.as_str() {
+        "ib" => {
+            let mut cfg = ib::IbConfig::from_env(live && yes("IB_ALLOW_LIVE"))?;
+            if !live {
+                cfg.allow_orders = false; // shadow NEVER arms
+            }
+            Trading::Ib(std::sync::Arc::new(
+                ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?,
+            ))
+        }
+        "rithmic" => {
+            let mut cfg = rithmic::RithmicCfg::from_env(live && yes("RITHMIC_ALLOW_LIVE"))?;
+            if !live {
+                cfg.allow_orders = false;
+            }
+            Trading::Rithmic(std::sync::Arc::new(
+                rithmic::RithmicVenue::connect(cfg)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            ))
+        }
+        other => {
+            return Err(format!(
+                "the futures bot trades on ib or rithmic; the {other:?} binding is not one"
+            ))
+        }
+    };
+    let symbol = trading.symbol_root();
+    eprintln!("{}", trading.describe());
+    if live && !trading.is_armed() {
         return Err(
-            "--live but the adapter is not armed (IB_ALLOW_ORDERS / IB_ALLOW_LIVE) —              refusing a live loop that could only fail at the first order"
+            "--live but the adapter is not armed (the venue's ALLOW_ORDERS / ALLOW_LIVE \
+             flags) — refusing a live loop that could only fail at the first order"
                 .into(),
         );
     }
@@ -518,12 +561,19 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // decides on completed bars either way; polling adds seconds of
     // latency to a decision that executes at the next bar open.
     let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<RawBar>(64);
-    {
-        let mut feed_cfg = ib::IbConfig::from_env(live && allow_live)?;
-        feed_cfg.allow_orders = false; // the feed connection can never trade
-        feed_cfg.client_id += 1;
-        let feed = ib::IbVenue::connect(feed_cfg).await.map_err(|e| e.to_string())?;
-        tokio::spawn(feed_task(feed, bar_tx));
+    match &trading {
+        Trading::Ib(_) => {
+            let mut feed_cfg = ib::IbConfig::from_env(live && yes("IB_ALLOW_LIVE"))?;
+            feed_cfg.allow_orders = false; // the feed connection can never trade
+            feed_cfg.client_id += 1;
+            let feed = ib::IbVenue::connect(feed_cfg).await.map_err(|e| e.to_string())?;
+            tokio::spawn(feed_task(feed, bar_tx));
+        }
+        Trading::Rithmic(v) => {
+            // The history plant rides its own websocket inside the same
+            // venue handle; polling it never contends with the order path.
+            tokio::spawn(rithmic_feed_task(v.clone(), bar_tx));
+        }
     }
     eprintln!("run loop started ({mode}); ctrl-c to stop");
 
@@ -550,7 +600,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 let silent = now.signed_duration_since(last_bar_seen).num_minutes();
                 if live::market_should_be_open(now) && silent > 70 {
                     if live {
-                        let _ = venue_conn.flatten_all(&bot_id).await;
+                        let _ = trading.flatten_all(&bot_id).await;
                     }
                     book.halted = Some("feed-stall".into());
                     live::publish_live(&rec, &book, &bot_id, mode, Some("feed stall — halted"))?;
@@ -596,7 +646,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         let was_halted = book.halted.is_some();
         book.apply_control(&control);
         if book.halted.is_some() && !was_halted && live {
-            let _ = venue_conn.flatten_all(&bot_id).await;
+            let _ = trading.flatten_all(&bot_id).await;
         }
 
         // Catch-up gate: the poll feed replays the last day's bars at
@@ -620,7 +670,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         if live {
             for (sleeve, direction, delta) in &outcome.transitions {
                 if let Err(e) = live::mirror_transition(
-                    &venue_conn,
+                    trading.adapter(),
                     &bot_id,
                     &symbol,
                     sleeve,
@@ -631,7 +681,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 .await
                 {
                     // An order the venue refused is a halt, not a retry loop.
-                    let _ = venue_conn.flatten_all(&bot_id).await;
+                    let _ = trading.flatten_all(&bot_id).await;
                     book.halted = Some(format!("order-refused: {e}"));
                     break;
                 }
@@ -639,7 +689,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             if outcome.session_rolled {
                 // Broker-vs-model reconciliation at the boundary. Mismatch is
                 // never auto-corrected: flatten and halt for a human.
-                let venue_net: i64 = venue::VenueAdapter::get_positions(&venue_conn)
+                let venue_net: i64 = trading.adapter().get_positions()
                     .await
                     .map_err(|e| e.to_string())?
                     .iter()
@@ -651,7 +701,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                     .sum();
                 let model_net = live::model_net_contracts(&book);
                 if venue_net != model_net {
-                    let _ = venue_conn.flatten_all(&bot_id).await;
+                    let _ = trading.flatten_all(&bot_id).await;
                     book.halted = Some(format!(
                         "reconcile-mismatch: broker {venue_net} vs model {model_net}"
                     ));
@@ -824,4 +874,129 @@ async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
         }
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
+}
+
+/// The trading connection, venue-selected by the registry binding.
+enum Trading {
+    Ib(std::sync::Arc<ib::IbVenue>),
+    Rithmic(std::sync::Arc<rithmic::RithmicVenue>),
+}
+
+impl Trading {
+    fn describe(&self) -> String {
+        match self {
+            Trading::Ib(v) => v.describe(),
+            Trading::Rithmic(v) => v.describe(),
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        match self {
+            Trading::Ib(v) => v.is_armed(),
+            Trading::Rithmic(v) => v.is_armed(),
+        }
+    }
+
+    fn symbol_root(&self) -> String {
+        std::env::var(match self {
+            Trading::Ib(_) => "IB_SYMBOL",
+            Trading::Rithmic(_) => "RITHMIC_SYMBOL",
+        })
+        .unwrap_or_else(|_| "MNQ".into())
+    }
+
+    fn adapter(&self) -> &dyn venue::VenueAdapter {
+        match self {
+            Trading::Ib(v) => v.as_ref(),
+            Trading::Rithmic(v) => v.as_ref(),
+        }
+    }
+
+    async fn flatten_all(&self, prefix: &str) -> Result<(), String> {
+        match self {
+            Trading::Ib(v) => v.flatten_all(prefix).await.map(|_| ()).map_err(|e| e.to_string()),
+            Trading::Rithmic(v) => {
+                v.flatten_all(prefix).await.map(|_| ()).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+/// Bar feed for the Rithmic venue: poll the history plant's 5-minute time
+/// bars and emit newly completed buckets — the same bar-close discipline
+/// as every other feed.
+async fn rithmic_feed_task(
+    venue: std::sync::Arc<rithmic::RithmicVenue>,
+    tx: tokio::sync::mpsc::Sender<RawBar>,
+) {
+    let mut last_sent: Option<i64> = None;
+    loop {
+        let now = chrono::Utc::now().timestamp();
+        let start = (now - 86_400) as i32;
+        match venue.time_bars_5m(start, now as i32).await {
+            Ok(bars) => {
+                for (ts, o, h, l, c, v) in bars {
+                    let complete = ts + 302 <= now;
+                    let fresh = last_sent.map(|l| ts > l).unwrap_or(true);
+                    if complete && fresh {
+                        last_sent = Some(ts);
+                        let Some(ts_utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                        else {
+                            continue;
+                        };
+                        let bar = RawBar {
+                            ts_utc,
+                            open: o,
+                            high: h,
+                            low: l,
+                            close: c,
+                            volume: v.max(0.0),
+                        };
+                        if tx.send(bar).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("feed: rithmic history poll failed ({e}); retrying"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    }
+}
+
+async fn rithmic_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    let live = get("--live").is_some() || std::env::args().any(|a| a == "--live");
+    let cfg = rithmic::RithmicCfg::from_env(live)?;
+    println!("connecting to Rithmic ({:?}) ...", cfg.env);
+    let venue = rithmic::RithmicVenue::connect(cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("connected: {}", venue.describe());
+    match venue::VenueAdapter::get_positions(&venue).await {
+        Ok(p) if p.is_empty() => println!("positions: flat"),
+        Ok(p) => {
+            for pos in p {
+                println!("position:  {} {} @ {}", pos.qty, pos.asset, pos.avg_price);
+            }
+        }
+        Err(e) => println!("positions: UNAVAILABLE ({e})"),
+    }
+    let now = chrono::Utc::now().timestamp();
+    match venue.time_bars_5m((now - 7_200) as i32, now as i32).await {
+        Ok(bars) if bars.is_empty() => {
+            println!("history:   reachable but no bars in the last 2h (market closed?)")
+        }
+        Ok(bars) => println!(
+            "history:   {} bars in the last 2h (latest ts {})",
+            bars.len(),
+            bars.last().map(|b| b.0).unwrap_or(0)
+        ),
+        Err(e) => println!("history:   UNAVAILABLE ({e})"),
+    }
+    println!(
+        "NOTE: order semantics (bracket with zero-tick children as plain entry) are \
+         deliberately NOT probed here — verify with one manual 1-lot on the demo \
+         account before arming a live loop."
+    );
+    Ok(())
 }
