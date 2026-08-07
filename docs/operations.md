@@ -119,6 +119,14 @@ api --state-dir var/bot --initial-cash 30000 \
 
 Then <http://127.0.0.1:7434>. Loopback only, with no flag to change that.
 
+The page is **fleet-first**: the landing view is the whole operation — combined net P&L across
+every registered bot (each rebased to its own start, so a NAV and a futures ledger can share one
+axis), the combined drawdown as an underwater band beneath it, a summary card per bot, and one
+merged activity feed. Each bot then has its own console at `#/bot/<id>`, and the consoles are
+**not** the same page: a runner bot gets book/positions/balances/venue controls, a futures book
+gets sleeves, its kill line and its fills. Equity is drawn as steps, not slopes — it only changes
+when a run lands, and a slope between two runs would invent motion nothing recorded.
+
 Without `--bot` and `--bot-config` the page shows everything and changes nothing. That is the
 default: a dashboard that could act the moment it was pointed at a state directory would be one
 nobody chose to give authority to.

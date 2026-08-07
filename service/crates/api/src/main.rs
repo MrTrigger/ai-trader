@@ -64,6 +64,10 @@ const MAX_BODY: u64 = 64 * 1024;
 /// How long a connection may sit without saying anything.
 const REQUEST_TIMEOUT_S: u64 = 10;
 
+/// The TriggerTrader mark: a reticle on a dark tile. Inline so the api stays
+/// a single self-contained binary with no asset directory to deploy.
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0B0F14"/><g stroke="#53C6E8" stroke-width="2.2" fill="none" stroke-linecap="round"><circle cx="16" cy="16" r="7.5"/><path d="M16 3.5v5M16 23.5v5M3.5 16h5M23.5 16h5"/></g><circle cx="16" cy="16" r="2.4" fill="#53C6E8"/></svg>"##;
+
 const USAGE: &str = "\
 usage: api [--state-dir <dir> --initial-cash <amount>]
            [--bot <path> --bot-config <file>]
@@ -288,6 +292,17 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                 Err(e) => json_error(&mut stream, 404, &e),
             }
         }
+        ("GET", "/api/fleet/overview") => match fleet::overview(
+            &std::env::current_dir().unwrap_or_default(),
+            cfg.state_dir.as_deref().unwrap_or(std::path::Path::new("")),
+        ) {
+            Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+            Err(e) => json(
+                &mut stream,
+                200,
+                &serde_json::to_vec(&serde_json::json!({"available": false, "reason": e})).unwrap(),
+            ),
+        },
         ("GET", "/api/bots") => match fleet::list(
             &std::env::current_dir().unwrap_or_default(),
             cfg.state_dir.as_deref().unwrap_or(std::path::Path::new("")),
@@ -342,9 +357,13 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             let action = Action::parse(r).expect("just matched");
             control(&mut stream, cfg, &mut reader, content_length, action)
         }
-        ("GET" | "HEAD", "/favicon.ico") => {
-            respond(&mut stream, 404, "text/plain; charset=utf-8", b"", true)
-        }
+        ("GET" | "HEAD", "/favicon.ico" | "/favicon.svg") => respond(
+            &mut stream,
+            200,
+            "image/svg+xml",
+            FAVICON_SVG.as_bytes(),
+            method == "HEAD",
+        ),
         ("GET" | "HEAD" | "POST", _) => json_error(&mut stream, 404, "no such route"),
         _ => json_error(&mut stream, 405, "method not allowed"),
     }
@@ -471,7 +490,7 @@ fn respond(
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
-         script-src 'unsafe-inline'; connect-src 'self'\r\n\
+         script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );

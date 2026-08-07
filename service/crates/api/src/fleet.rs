@@ -396,3 +396,207 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         "runs": runs,
     }))
 }
+
+/// GET /api/fleet/overview — everything the fleet landing page draws, in one
+/// round trip: per-bot equity/P&L series, a merged action feed, and the same
+/// identity rows `list` returns.
+///
+/// Series come from wherever a bot actually records history today — DB runs
+/// when they exist, `runs/*.json` files for runner bots that predate step 4,
+/// the status document's daily nets for the futures book. Each series says
+/// which *kind* of number it is (`nav` or `pnl`) so the page can baseline NAVs
+/// to zero before combining; adding a NAV to a P&L would manufacture money.
+pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
+    let data = with_registry(|reg| {
+        Box::pin(async move {
+            let bots = reg.list_bots().await?;
+            let mut rows = Vec::new();
+            for b in bots {
+                let status = reg.get_status(&b.bot_id).await?;
+                let control = reg.current_control(&b.bot_id).await?;
+                let runs: Vec<Value> = reg
+                    .recent_runs(&b.bot_id, 500)
+                    .await?
+                    .into_iter()
+                    .filter_map(|t| serde_json::from_str(&t).ok())
+                    .collect();
+                let fills: Vec<Value> = reg
+                    .recent_fills(&b.bot_id, 500)
+                    .await?
+                    .into_iter()
+                    .filter_map(|t| serde_json::from_str(&t).ok())
+                    .collect();
+                rows.push((b, status, control, runs, fills));
+            }
+            Ok(rows)
+        })
+    })?;
+
+    let local = local_state_dir.to_string_lossy();
+    let mut bots_out = Vec::new();
+    let mut feed: Vec<Value> = Vec::new();
+
+    for (b, status, control, db_runs, db_fills) in data {
+        // Runs: DB first, files as the pre-step-4 fallback.
+        let mut runs = db_runs;
+        if runs.is_empty() {
+            if let Some(dir) = b.state_dir.as_deref() {
+                runs = read_run_files(&repo_root.join(dir));
+            }
+        }
+
+        let status_doc: Option<Value> = status
+            .as_ref()
+            .and_then(|s| serde_json::from_str(&s.payload).ok());
+        let dialect = status_doc
+            .as_ref()
+            .map(dialect_of)
+            .unwrap_or("runner");
+
+        // The series, and what its numbers mean.
+        let (series, series_kind) = if dialect == "botstate" {
+            (botstate_series(status_doc.as_ref(), &db_fills), "pnl")
+        } else {
+            let pts: Vec<Value> = runs
+                .iter()
+                .rev() // files/DB arrive newest-first; a curve reads oldest-first
+                .filter_map(|r| {
+                    let nav = r.get("nav")?.as_str()?.parse::<f64>().ok()?;
+                    let at = r.get("recorded_at")?.as_str()?;
+                    Some(json!([at, nav]))
+                })
+                .collect();
+            (pts, "nav")
+        };
+
+        // Feed: run outcomes, futures fills, and the newest control word.
+        for r in runs.iter().take(12) {
+            feed.push(json!({
+                "at": r.get("recorded_at"),
+                "bot_id": b.bot_id,
+                "kind": r.get("outcome"),
+                "text": r.get("detail").and_then(|d| d.as_str())
+                    .map(|d| d.chars().take(160).collect::<String>())
+                    .unwrap_or_else(|| format!(
+                        "{} · {} order(s)",
+                        r.get("outcome").and_then(|o| o.as_str()).unwrap_or("run"),
+                        r.get("orders_submitted").and_then(|o| o.as_u64()).unwrap_or(0)
+                    )),
+            }));
+        }
+        for f in db_fills.iter().take(12) {
+            feed.push(json!({
+                "at": f.get("at").or_else(|| f.get("ts")).or_else(|| f.get("time")),
+                "bot_id": b.bot_id,
+                "kind": "fill",
+                "text": format!(
+                    "filled {} {} @ {}",
+                    f.get("side").and_then(|s| s.as_str()).unwrap_or(""),
+                    f.get("qty").map(|q| q.to_string()).unwrap_or_default(),
+                    f.get("price").map(|p| p.to_string()).unwrap_or_default()
+                ),
+            }));
+        }
+        if let Some(c) = &control {
+            feed.push(json!({
+                "at": c.at,
+                "bot_id": b.bot_id,
+                "kind": c.state,
+                "text": format!("{} by {} · {}", c.state, c.set_by, c.reason),
+            }));
+        }
+
+        let st = status_from_rows(status.as_ref(), control.as_ref(), runs.first())
+            .unwrap_or_else(|| status_for(repo_root, b.state_dir.as_deref()));
+        let is_local = b
+            .state_dir
+            .as_deref()
+            .map(|d| local.ends_with(d) || local.contains(d))
+            .unwrap_or(false);
+        bots_out.push(json!({
+            "local": is_local,
+            "bot_id": b.bot_id,
+            "display_name": b.display_name,
+            "cadence": b.cadence,
+            "asset_class": b.asset_class,
+            "decision_core": b.decision_core,
+            "enabled": b.enabled,
+            "status": st,
+            "series": series,
+            "series_kind": series_kind,
+        }));
+    }
+
+    // Newest first, capped: this is a glance, not an archive.
+    feed.sort_by(|a, b| {
+        b.get("at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .cmp(a.get("at").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+    feed.truncate(40);
+
+    Ok(json!({ "available": true, "bots": bots_out, "feed": feed }))
+}
+
+/// Run records from a runner bot's `runs/` directory, newest first.
+fn read_run_files(dir: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir.join("runs")) {
+        let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        names.sort();
+        for path in names.iter().rev() {
+            if let Some(v) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+            {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// Cumulative P&L for a futures-book bot: its daily nets if the status
+/// document carries them, else a cumsum over recorded fills' nets.
+fn botstate_series(doc: Option<&Value>, fills: &[Value]) -> Vec<Value> {
+    if let Some(daily) = doc
+        .and_then(|d| d.get("detail"))
+        .and_then(|d| d.get("recent_daily_net"))
+        .and_then(|d| d.as_array())
+    {
+        let mut cum = 0.0;
+        let mut out = Vec::new();
+        for item in daily {
+            // Either [session, net] pairs or bare numbers, depending on age.
+            let (label, net) = match item {
+                Value::Array(pair) if pair.len() == 2 => (
+                    pair[0].as_str().unwrap_or("").to_string(),
+                    pair[1].as_f64().unwrap_or(0.0),
+                ),
+                Value::Number(n) => (String::new(), n.as_f64().unwrap_or(0.0)),
+                _ => continue,
+            };
+            cum += net;
+            out.push(json!([label, cum]));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    let mut cum = 0.0;
+    let mut out = Vec::new();
+    for f in fills.iter().rev() {
+        let net = f
+            .get("net")
+            .and_then(|n| n.as_f64())
+            .or_else(|| f.get("net").and_then(|n| n.as_str()).and_then(|s| s.parse().ok()));
+        let Some(net) = net else { continue };
+        cum += net;
+        out.push(json!([
+            f.get("at").or_else(|| f.get("ts")).cloned().unwrap_or(Value::Null),
+            cum
+        ]));
+    }
+    out
+}
