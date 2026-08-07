@@ -70,7 +70,9 @@ fn to_request(plan: &Plan, index: usize) -> OrderRequest {
     }
 }
 
-fn venue_for(eth: Capabilities) -> PaperVenue<ManualPrices, SystemClock> {
+fn venue_for(
+    eth: Capabilities,
+) -> PaperVenue<venue::MarketsWithPrices<Vec<Market>, ManualPrices>, SystemClock> {
     let prices = ManualPrices::new();
     prices.set("BTC", dec("64000.00"));
     prices.set("ETH", dec("3000.00"));
@@ -85,8 +87,10 @@ fn venue_for(eth: Capabilities) -> PaperVenue<ManualPrices, SystemClock> {
             initial_cash: dec("100000.00"),
             ..Default::default()
         },
-        vec![market("BTC", Capabilities::spot()), market("ETH", eth)],
-        prices,
+        venue::MarketsWithPrices {
+            markets: vec![market("BTC", Capabilities::spot()), market("ETH", eth)],
+            prices,
+        },
         SystemClock,
     )
 }

@@ -77,7 +77,7 @@ impl std::str::FromStr for Mode {
 /// registry opened it. Identity step 2: nothing outside [`open_live`] may
 /// know a live venue's name.
 pub enum Active {
-    Paper(Box<PaperVenue<Arc<dyn PriceSource>, SystemClock>>),
+    Paper(Box<PaperVenue<PaperUpstream, SystemClock>>),
     Live {
         adapter: Box<dyn VenueAdapter + Send + Sync>,
         /// Human description captured at open ("hyperliquid mainnet for 0x…").
@@ -121,7 +121,7 @@ impl Active {
         matches!(self, Active::Paper(_))
     }
 
-    pub fn as_paper(&self) -> Option<&PaperVenue<Arc<dyn PriceSource>, SystemClock>> {
+    pub fn as_paper(&self) -> Option<&PaperVenue<PaperUpstream, SystemClock>> {
         match self {
             Active::Paper(p) => Some(p),
             _ => None,
@@ -334,25 +334,64 @@ pub fn open(
     mode: Mode,
     env: &Env,
     paper_cfg: PaperConfig,
-    markets: Vec<Market>,
-    prices: Arc<dyn PriceSource>,
+    prices: Option<Arc<dyn PriceSource>>,
     snapshot: Option<&str>,
 ) -> Result<Active, String> {
     match mode {
         Mode::Paper => {
+            // Paper wraps the live adapter rather than standing beside it. The
+            // exchange is the data provider in paper exactly as in live, so the
+            // instrument universe, the tick and lot grids and the marks are all
+            // read from it; only order submission is simulated. There is no
+            // second list anywhere, which is the point - a hand-kept copy is
+            // how paper stops predicting live.
+            let upstream = match open_live(venue_id, Mode::LiveReadonly, env)? {
+                Active::Live { adapter, .. } => adapter,
+                other => return Ok(other),
+            };
+            let upstream: Arc<dyn VenueAdapter + Send + Sync> = Arc::from(upstream);
+            // Marks: the exchange's own feed unless a file feed was configured
+            // for offline work. Either way the instruments come from `upstream`.
+            let prices = match prices {
+                Some(p) => p,
+                None => env.price_source()?,
+            };
+            let source = PaperUpstream {
+                venue: upstream,
+                prices,
+            };
             let v = match snapshot {
-                Some(s) => PaperVenue::restore(paper_cfg, markets, prices, SystemClock, s)
-                    .map_err(|e| {
-                        format!(
-                            "venue state is unreadable ({e}). Refusing to start with an empty \
-                             book: that would look like a flat account and trade as one."
-                        )
-                    })?,
-                None => PaperVenue::new(paper_cfg, markets, prices, SystemClock),
+                Some(s) => PaperVenue::restore(paper_cfg, source, SystemClock, s).map_err(|e| {
+                    format!(
+                        "venue state is unreadable ({e}). Refusing to start with an empty \
+                         book: that would look like a flat account and trade as one."
+                    )
+                })?,
+                None => PaperVenue::new(paper_cfg, source, SystemClock),
             };
             Ok(Active::Paper(Box::new(v)))
         }
         Mode::LiveReadonly | Mode::Live => open_live(venue_id, mode, env),
+    }
+}
+
+/// The exchange, with the marks optionally overridden by a file feed.
+pub struct PaperUpstream {
+    /// The exchange, for everything it knows about its own instruments.
+    venue: Arc<dyn VenueAdapter + Send + Sync>,
+    /// The exchange's price feed, or a file feed for offline work. Marks are a
+    /// separate handle only because `mark_price` lives on `PriceSource`; in
+    /// normal operation both of these are the same Hyperliquid connection.
+    prices: Arc<dyn PriceSource>,
+}
+
+#[async_trait::async_trait]
+impl venue::MarketData for PaperUpstream {
+    async fn markets(&self) -> Result<Vec<Market>, venue::VenueError> {
+        self.venue.get_markets().await
+    }
+    async fn mark(&self, asset: &str) -> Result<rust_decimal::Decimal, venue::VenueError> {
+        self.prices.mark_price(asset).await
     }
 }
 
@@ -504,8 +543,7 @@ mod tests {
             Mode::Live,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap_err();
@@ -526,8 +564,7 @@ mod tests {
             Mode::LiveReadonly,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap_err();
@@ -545,8 +582,7 @@ mod tests {
             Mode::Live,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap_err();
@@ -562,8 +598,7 @@ mod tests {
             Mode::LiveReadonly,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap();
@@ -585,8 +620,7 @@ mod tests {
             Mode::Live,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap_err();
@@ -598,8 +632,7 @@ mod tests {
             Mode::Live,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None
         )
         .is_ok());
@@ -670,8 +703,7 @@ mod tests {
             Mode::Live,
             &env,
             paper_cfg(),
-            vec![],
-            dummy_prices(),
+            Some(dummy_prices()),
             None,
         )
         .unwrap_err();

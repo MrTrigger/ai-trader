@@ -456,6 +456,73 @@ pub trait PriceSource: Send + Sync {
     async fn mark_price(&self, asset: &str) -> Result<Decimal, VenueError>;
 }
 
+/// The half of a venue that is true regardless of who is trading it.
+///
+/// Instruments, their grids, and the current mark are facts about the exchange,
+/// not about our account. A paper run substitutes exactly one layer - order
+/// submission - and everything above it must come from the real venue, or the
+/// simulation is standing in for a hand-written list rather than for the
+/// exchange. This is that seam.
+#[async_trait]
+pub trait MarketData: Send + Sync {
+    async fn markets(&self) -> Result<Vec<Market>, VenueError>;
+    async fn mark(&self, asset: &str) -> Result<Decimal, VenueError>;
+}
+
+/// Any real venue is market data. This is what lets the paper book wrap the
+/// live adapter instead of standing beside it.
+#[async_trait]
+impl<T: VenueAdapter + PriceSource + ?Sized> MarketData for T {
+    async fn markets(&self) -> Result<Vec<Market>, VenueError> {
+        self.get_markets().await
+    }
+    async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
+        PriceSource::mark_price(self, asset).await
+    }
+}
+
+/// The venue's instruments with someone else's prices.
+///
+/// For offline and fixture work: the instrument universe still comes from the
+/// exchange, because that is what makes a simulated fill one the exchange would
+/// have accepted, while the marks come from a file. Only the prices are
+/// substituted, and the substitution is visible in the type.
+pub struct MarketsWithPrices<M, P> {
+    pub markets: M,
+    pub prices: P,
+}
+
+#[async_trait]
+impl<M: MarketData, P: PriceSource> MarketData for MarketsWithPrices<M, P> {
+    async fn markets(&self) -> Result<Vec<Market>, VenueError> {
+        self.markets.markets().await
+    }
+    async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
+        self.prices.mark_price(asset).await
+    }
+}
+
+/// A fixed instrument list, for tests and for a venue read once and held.
+#[async_trait]
+impl MarketData for Vec<Market> {
+    async fn markets(&self) -> Result<Vec<Market>, VenueError> {
+        Ok(self.clone())
+    }
+    async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
+        Err(VenueError::NoPrice(AssetId::from(asset.to_string())))
+    }
+}
+
+#[async_trait]
+impl<T: MarketData + ?Sized> MarketData for std::sync::Arc<T> {
+    async fn markets(&self) -> Result<Vec<Market>, VenueError> {
+        (**self).markets().await
+    }
+    async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
+        (**self).mark(asset).await
+    }
+}
+
 #[async_trait]
 impl<T: PriceSource + ?Sized> PriceSource for std::sync::Arc<T> {
     async fn mark_price(&self, asset: &str) -> Result<Decimal, VenueError> {

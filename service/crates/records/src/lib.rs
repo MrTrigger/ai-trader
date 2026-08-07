@@ -15,22 +15,6 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-/// One row of a venue's instrument universe.
-///
-/// Numerics travel as text: a lot size of 0.00000001 has to be the same number
-/// here as it is at the venue, and a float round-trip does not guarantee that.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct MarketRow {
-    pub asset: String,
-    pub venue_symbol: String,
-    pub quote_currency: String,
-    pub tick: String,
-    pub lot: String,
-    pub min_notional: String,
-    pub multiplier: String,
-    pub asset_class: String,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RecordsError {
     #[error("database: {0}")]
@@ -670,78 +654,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Replace a venue's instrument universe with what the venue just reported.
-    ///
-    /// Delete-then-insert inside one transaction, because a delisting has to
-    /// disappear: merging would leave a market the exchange no longer offers
-    /// sitting in the store forever, and the planner would keep ranking it.
-    pub async fn put_venue_markets(
-        &self,
-        venue_id: &str,
-        refreshed_at: &str,
-        markets: &[MarketRow],
-    ) -> Result<(), RecordsError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM venue_markets WHERE venue_id = $1")
-            .bind(venue_id)
-            .execute(&mut *tx)
-            .await?;
-        for m in markets {
-            sqlx::query(
-                "INSERT INTO venue_markets (venue_id, asset, venue_symbol, quote_currency,                  tick, lot, min_notional, multiplier, asset_class, refreshed_at)                  VALUES ($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,                 $10::timestamptz)",
-            )
-            .bind(venue_id)
-            .bind(&m.asset)
-            .bind(&m.venue_symbol)
-            .bind(&m.quote_currency)
-            .bind(&m.tick)
-            .bind(&m.lot)
-            .bind(&m.min_notional)
-            .bind(&m.multiplier)
-            .bind(&m.asset_class)
-            .bind(refreshed_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn get_venue_markets(
-        &self,
-        venue_id: &str,
-    ) -> Result<Vec<MarketRow>, RecordsError> {
-        let rows = sqlx::query_as::<_, MarketRow>(
-            "SELECT asset, venue_symbol, quote_currency, tick::text, lot::text,              min_notional::text, multiplier::text, asset_class              FROM venue_markets WHERE venue_id = $1 ORDER BY asset",
-        )
-        .bind(venue_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// The account's cash and positions, as the venue reports them.
-    pub async fn put_account_book(
-        &self,
-        bot_id: &str,
-        quote_currency: &str,
-        cash: &str,
-        positions_json: &str,
-        refreshed_at: &str,
-    ) -> Result<(), RecordsError> {
-        sqlx::query(
-            "INSERT INTO account_book (bot_id, quote_currency, cash, positions, refreshed_at)              VALUES ($1,$2,$3::numeric,$4::jsonb,$5::timestamptz)              ON CONFLICT (bot_id) DO UPDATE SET quote_currency = EXCLUDED.quote_currency,              cash = EXCLUDED.cash, positions = EXCLUDED.positions,              refreshed_at = EXCLUDED.refreshed_at",
-        )
-        .bind(bot_id)
-        .bind(quote_currency)
-        .bind(cash)
-        .bind(positions_json)
-        .bind(refreshed_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn get_sim_state(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
         let row = sqlx::query("SELECT payload::text FROM venue_sim_state WHERE bot_id = $1")
             .bind(bot_id)
@@ -936,39 +848,6 @@ pub mod blocking {
 
         pub fn get_sim_state(&self, bot_id: &str) -> Result<Option<String>, RecordsError> {
             self.wait(self.inner.get_sim_state(bot_id))
-        }
-
-        pub fn put_venue_markets(
-            &self,
-            venue_id: &str,
-            refreshed_at: &str,
-            markets: &[super::MarketRow],
-        ) -> Result<(), RecordsError> {
-            self.wait(self.inner.put_venue_markets(venue_id, refreshed_at, markets))
-        }
-
-        pub fn get_venue_markets(
-            &self,
-            venue_id: &str,
-        ) -> Result<Vec<super::MarketRow>, RecordsError> {
-            self.wait(self.inner.get_venue_markets(venue_id))
-        }
-
-        pub fn put_account_book(
-            &self,
-            bot_id: &str,
-            quote_currency: &str,
-            cash: &str,
-            positions_json: &str,
-            refreshed_at: &str,
-        ) -> Result<(), RecordsError> {
-            self.wait(self.inner.put_account_book(
-                bot_id,
-                quote_currency,
-                cash,
-                positions_json,
-                refreshed_at,
-            ))
         }
     }
 

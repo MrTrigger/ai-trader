@@ -46,15 +46,14 @@ say "cycle $STAMP  config=$CONFIG"
 say "pull"
 ai-trader --config config/default.toml data pull
 
-# 1.5 The account. What the venue lists and what it holds are both facts about
-#     the venue, and the planner has no connection to one - so they are exported
-#     here and passed in. Sizing a plan against a stale local book is how a 30k
-#     account got handed a plan built for 100k.
-say "account"
-"$BOT" --config "$CONFIG" markets --out "$STATE_DIR/tradeable.json"
-"$BOT" --config "$CONFIG" book --out "$STATE_DIR/book.json"
-
 # 2. Decide. Read-only: produces a plan and touches nothing.
+#
+# What the venue lists and what the account holds are facts about the exchange,
+# and the exchange is the data provider in paper exactly as in live. Both are
+# asked for live and piped straight in - never written down. A stored copy can
+# only ever be more wrong than the venue, and a stale one is how a 30k account
+# got handed a plan built for 100k, and how AAVE was refused for not being on a
+# list somebody typed by hand.
 #
 # --for-execution stamps the plan mode "live", which is what makes the executor
 # willing to run it at all. It does NOT mean real money: the bot's venue mode
@@ -62,8 +61,12 @@ say "account"
 # Without the flag the planner emits a "dry" plan and step 3 refuses it every
 # single time, which is how this script sat broken.
 say "plan"
+ai-trader --config config/default.toml universe rank \
+    --start "$(date -u +%Y-%m-%d)" --step-days 1 --overwrite \
+    --tradeable <("$BOT" --config "$CONFIG" markets)
+
 ai-trader --config config/default.toml plan --for-execution \
-    --book "$STATE_DIR/book.json" --out "$PLAN"
+    --book <("$BOT" --config "$CONFIG" book) --out "$PLAN"
 
 # 3. Execute. The only step that can move capital, and the only one that
 #    consults the controls.

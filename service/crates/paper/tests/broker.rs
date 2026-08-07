@@ -63,7 +63,7 @@ fn markets() -> Vec<Market> {
 }
 
 struct Harness {
-    venue: PaperVenue<Arc<ManualPrices>, Arc<ManualClock>>,
+    venue: PaperVenue<venue::MarketsWithPrices<Vec<Market>, Arc<ManualPrices>>, Arc<ManualClock>>,
     prices: Arc<ManualPrices>,
     clock: Arc<ManualClock>,
 }
@@ -85,7 +85,14 @@ fn harness_with(config: PaperConfig) -> Harness {
     ));
 
     Harness {
-        venue: PaperVenue::new(config, markets(), prices.clone(), clock.clone()),
+        venue: PaperVenue::new(
+            config,
+            venue::MarketsWithPrices {
+                markets: markets(),
+                prices: prices.clone(),
+            },
+            clock.clone(),
+        ),
         prices,
         clock,
     }
@@ -657,8 +664,10 @@ async fn a_snapshot_restores_the_book_the_cash_and_the_idempotency_map() {
             initial_cash: dec("100000"),
             ..Default::default()
         },
-        markets(),
-        h.prices.clone(),
+        venue::MarketsWithPrices {
+            markets: markets(),
+            prices: h.prices.clone(),
+        },
         h.clock.clone(),
         &snapshot,
     )
@@ -685,8 +694,10 @@ async fn a_replayed_order_after_a_restart_does_not_place_a_second_one() {
             initial_cash: dec("100000"),
             ..Default::default()
         },
-        markets(),
-        h.prices.clone(),
+        venue::MarketsWithPrices {
+            markets: markets(),
+            prices: h.prices.clone(),
+        },
         h.clock.clone(),
         &snapshot,
     )
@@ -719,8 +730,10 @@ async fn a_restored_venue_keeps_resting_orders_waiting() {
             initial_cash: dec("100000"),
             ..Default::default()
         },
-        markets(),
-        h.prices.clone(),
+        venue::MarketsWithPrices {
+            markets: markets(),
+            prices: h.prices.clone(),
+        },
         h.clock.clone(),
         &h.venue.snapshot().await,
     )

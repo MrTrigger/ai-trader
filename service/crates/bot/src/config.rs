@@ -86,11 +86,6 @@ pub struct BotConfig {
     /// the only way credentials reach a run started from the page.
     #[serde(default)]
     pub env_file: Option<PathBuf>,
-    /// Per-asset market rules. Assets absent here cannot be traded at all,
-    /// which is the safe direction: an unknown lot size is a rejected order,
-    /// not a guessed one.
-    #[serde(default)]
-    pub markets: Vec<MarketConfig>,
 }
 
 fn default_mode() -> crate::active_venue::Mode {
@@ -112,21 +107,6 @@ fn default_max_decision_lag() -> i64 {
 
 fn default_cadence() -> i64 {
     24
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MarketConfig {
-    pub asset: String,
-    pub venue_symbol: String,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub tick: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub lot: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub min_notional: Decimal,
-    #[serde(default = "yes")]
-    pub short: bool,
 }
 
 fn yes() -> bool {
@@ -178,31 +158,6 @@ impl BotConfig {
     /// a bot with its own opinion about value.
     pub fn marks_path(&self) -> PathBuf {
         self.state_dir.join("marks.json")
-    }
-
-    pub fn markets(&self) -> Vec<Market> {
-        self.markets
-            .iter()
-            .map(|m| Market {
-                asset: m.asset.clone(),
-                venue_symbol: m.venue_symbol.clone(),
-                quote_currency: self.quote_currency.clone(),
-                tick: m.tick,
-                lot: m.lot,
-                min_notional: m.min_notional,
-                multiplier: Decimal::ONE,
-                expiry: None,
-                initial_margin: None,
-                asset_class: "crypto".into(),
-                capabilities: Capabilities {
-                    stop_orders: false,
-                    fractional: true,
-                    short: m.short,
-                    max_leverage: Decimal::ONE,
-                    funding: true,
-                },
-            })
-            .collect()
     }
 }
 

@@ -49,8 +49,8 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use venue::{
-    derive_positions, AssetId, Balance, Clock, Fill, Market, OpenOrder, OrderAck, OrderRequest,
-    OrderState, OrderType, Position, PriceSource, Side, VenueAdapter, VenueError,
+    derive_positions, AssetId, Balance, Clock, Fill, Market, MarketData, OpenOrder, OrderAck,
+    OrderRequest, OrderState, OrderType, Position, Side, VenueAdapter, VenueError,
 };
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -171,20 +171,26 @@ impl State {
 /// deployment fills differently from a test: Phase 2 supplies a live feed and
 /// the system clock, a test supplies [`venue::ManualPrices`] and
 /// [`venue::ManualClock`] and gets a deterministic venue.
-pub struct PaperVenue<P, C> {
+/// A simulated book on a real exchange.
+///
+/// Paper substitutes exactly one layer: order submission. Instruments, their
+/// tick and lot grids, and the current mark all come from `upstream` - the same
+/// adapter a live run uses - so a fill simulated here is one the exchange would
+/// have accepted, and the pipeline above is byte-for-byte the pipeline that
+/// goes live. What is simulated is only ever our own account: cash, positions,
+/// resting orders, fills.
+pub struct PaperVenue<U, C> {
     config: PaperConfig,
-    markets: Vec<Market>,
-    prices: P,
+    upstream: U,
     clock: C,
     state: Mutex<State>,
 }
 
-impl<P: PriceSource, C: Clock> PaperVenue<P, C> {
-    pub fn new(config: PaperConfig, markets: Vec<Market>, prices: P, clock: C) -> Self {
+impl<U: MarketData, C: Clock> PaperVenue<U, C> {
+    pub fn new(config: PaperConfig, upstream: U, clock: C) -> Self {
         Self {
             config,
-            markets,
-            prices,
+            upstream,
             clock,
             state: Mutex::new(State::default()),
         }
@@ -210,29 +216,32 @@ impl<P: PriceSource, C: Clock> PaperVenue<P, C> {
 
     /// Rebuild from [`snapshot`](Self::snapshot).
     ///
-    /// Config, markets, prices and clock come from the caller as usual: those
-    /// are deployment choices, and restoring a stale copy of them alongside the
-    /// book is how a venue ends up trading yesterday's fee schedule.
+    /// Config, upstream and clock come from the caller as usual: those are
+    /// deployment choices, and restoring a stale copy of them alongside the
+    /// book is how a venue ends up trading yesterday's fee schedule. Only the
+    /// simulated account is restored - never the exchange's own metadata, which
+    /// is re-read live.
     pub fn restore(
         config: PaperConfig,
-        markets: Vec<Market>,
-        prices: P,
+        upstream: U,
         clock: C,
         snapshot: &str,
     ) -> Result<Self, serde_json::Error> {
         let state: State = serde_json::from_str(snapshot)?;
         Ok(Self {
             config,
-            markets,
-            prices,
+            upstream,
             clock,
             state: Mutex::new(state),
         })
     }
 
-    fn market(&self, asset: &str) -> Result<&Market, VenueError> {
-        self.markets
-            .iter()
+    /// The exchange's rules for one asset, asked of the exchange.
+    async fn market(&self, asset: &str) -> Result<Market, VenueError> {
+        self.upstream
+            .markets()
+            .await?
+            .into_iter()
             .find(|m| m.asset == asset)
             .ok_or_else(|| VenueError::UnknownMarket(asset.to_string()))
     }
@@ -278,7 +287,7 @@ impl<P: PriceSource, C: Clock> PaperVenue<P, C> {
             let mut hit: Option<usize> = None;
 
             for (i, order) in state.resting.iter().enumerate() {
-                let mark = match self.prices.mark_price(&order.asset).await {
+                let mark = match self.upstream.mark(&order.asset).await {
                     Ok(p) => p,
                     Err(VenueError::NoPrice(_)) => continue,
                     Err(e) => return Err(e),
@@ -375,9 +384,11 @@ fn round_to_grid(value: Decimal, increment: Decimal, up: bool) -> Decimal {
 }
 
 #[async_trait]
-impl<P: PriceSource, C: Clock> VenueAdapter for PaperVenue<P, C> {
+impl<U: MarketData, C: Clock> VenueAdapter for PaperVenue<U, C> {
     async fn get_markets(&self) -> Result<Vec<Market>, VenueError> {
-        Ok(self.markets.clone())
+        // Straight through: the exchange decides what is listed, in paper
+        // exactly as in live.
+        self.upstream.markets().await
     }
 
     async fn get_balances(&self) -> Result<Vec<Balance>, VenueError> {
@@ -408,7 +419,7 @@ impl<P: PriceSource, C: Clock> VenueAdapter for PaperVenue<P, C> {
             });
         }
 
-        let market = self.market(&order.asset)?;
+        let market = self.market(&order.asset).await?;
 
         if order.qty <= Decimal::ZERO {
             return Err(VenueError::NonPositiveQty(order.asset.clone()));
@@ -443,7 +454,7 @@ impl<P: PriceSource, C: Clock> VenueAdapter for PaperVenue<P, C> {
                 }
                 price
             }
-            OrderType::Market => self.prices.mark_price(&order.asset).await?,
+            OrderType::Market => self.upstream.mark(&order.asset).await?,
         };
 
         let notional = order.qty * reference;
@@ -522,7 +533,7 @@ impl<P: PriceSource, C: Clock> VenueAdapter for PaperVenue<P, C> {
         // goes if the mark is already through it.
         let immediate = match order.order_type {
             OrderType::Market => true,
-            OrderType::Limit => match self.prices.mark_price(&order.asset).await {
+            OrderType::Limit => match self.upstream.mark(&order.asset).await {
                 Ok(mark) => match order.side {
                     Side::Buy => mark <= reference,
                     Side::Sell => mark >= reference,

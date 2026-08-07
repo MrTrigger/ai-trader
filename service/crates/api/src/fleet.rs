@@ -302,7 +302,10 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     // selection lives in the registry, so it survives restarts and the UI
     // is only ever a view of it.
     let trade = bindings.iter().find(|b| b.scope == "trade");
-    let asset_class = bot.as_ref().map(|b| b.asset_class.clone()).unwrap_or_default();
+    let asset_class = bot
+        .as_ref()
+        .map(|b| b.asset_class.clone())
+        .unwrap_or_default();
     let broker = json!({
         "account_id": trade.map(|b| b.account_id.clone()),
         "venue_id": trade.map(|b| b.venue_id.clone()),

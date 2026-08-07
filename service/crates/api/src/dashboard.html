@@ -839,8 +839,9 @@ function renderFutures(id, d) {
       <a class="back" href="#/">← FLEET</a>
       <span class="dot" style="background:${botColor(id)};box-shadow:none"></span>
       <h1>${esc(id)}</h1>
-      ${halted ? '<span class="pill down">halted</span>' : '<span class="pill up">' + esc(st.state || "—") + "</span>"}
-      <span class="pill ${st.mode === "live" ? "down" : ""}">${esc(st.mode || "?")}</span>
+      ${halted
+        ? '<span class="pill down">halted' + (st.state_reason ? " · " + esc(String(st.state_reason)) : "") + "</span>"
+        : '<span class="pill up">' + esc(st.state || "—") + "</span>"}
       <span class="pill ${hb > 900 ? "warn" : ""}">hb ${esc(ago(hb))}</span>
       <span class="sub">${esc(d.display_name || "")} · ${esc(d.cadence || "")}</span>
     </div>
@@ -898,17 +899,7 @@ function renderFutures(id, d) {
           </div>
         </section>
 
-        <section class="card">
-          <header><span class="eyebrow">Identity</span></header>
-          <div class="pad tight"><dl class="kv">
-            <dt>State</dt><dd>${esc(st.state || "—")}${st.state_reason ? " · " + esc(String(st.state_reason)) : ""}</dd>
-            <dt>Run mode</dt><dd>${esc(st.mode || "—")}</dd>
-            <dt>Heartbeat</dt><dd>${esc(ago(hb))} ago</dd>
-            <dt>Credentials</dt><dd>${esc((d.broker || {}).credential_ref || "—")}</dd>
-            <dt>Decision core</dt><dd>${esc(d.decision_core || "—")}</dd>
-            <dt>Source</dt><dd>${esc(d.source || "files")}</dd>
-          </dl></div>
-        </section>
+
       </div>
     </div>`;
 }
@@ -918,15 +909,37 @@ function renderFutures(id, d) {
 /* What this bot is pointed at. Two independent axes — WHICH BROKER and
    WHOSE MONEY — because they fail differently: the wrong broker is an
    operational annoyance, the wrong money is the thing you cannot undo. */
+/* How the bot's loop behaves, in words that cannot be mistaken for the
+   money question. "live" meant two unrelated things — a real account and
+   a loop that sends orders — so a page could read "paper" and "LIVE" at
+   once and both be true. Execution answers "does it send orders"; Money
+   answers "whose capital". */
+function execution(mode) {
+  switch (mode) {
+    case "live": return { label: "sending orders", danger: true };
+    case "shadow": return { label: "shadow — no orders", danger: false };
+    case "replay": return { label: "replay", danger: false };
+    // the wrapped bot's own vocabulary for the same question
+    case "paper": return { label: "simulated fills", danger: false };
+    case "live-readonly": return { label: "reading only", danger: false };
+    default: return { label: mode || "—", danger: false };
+  }
+}
+
+/* Everything this bot is wired to, in ONE place. Nothing here is repeated
+   in a side panel: a status split across two cards is how a page ends up
+   contradicting itself. */
 function wireStrip(id, d) {
   const b = d.broker || {};
-  const live = b.kind === "live";
+  const realMoney = b.kind === "live";
+  const ex = execution((d.state || {}).mode);
   const cells = [
     ["Broker", esc(b.venue_id || "unbound") +
       (b.protocol && b.protocol !== b.venue_id ? ` <span class="u-dim">via ${esc(b.protocol)}</span>` : ""), ""],
     ["Account", esc(b.account_id || (b.unknown ? "not readable" : "—")), ""],
-    ["Money", b.unknown ? "unknown" : b.account_id ? (live ? "LIVE" : "paper") : "—",
-      live ? "money" : ""],
+    ["Money", b.unknown ? "unknown" : b.account_id ? (realMoney ? "REAL" : "paper") : "—",
+      realMoney ? "money" : ""],
+    ["Execution", esc(ex.label), ex.danger ? "money" : ""],
     ["Registry", d.enabled ? "enabled" : "disabled", d.enabled ? "" : "money"],
   ];
   return `<div class="wire">
@@ -1149,7 +1162,11 @@ function renderRunnerConsole(id, bot) {
       <span class="pill ${live ? "down" : ""}">${esc(s.mode ? s.mode.mode : "?")}</span>
       <span class="sub">${esc(bot?.display_name || "")} · ${esc(bot?.cadence || "")}</span>
     </div>
-    ${wireStrip(id, { broker: localBroker(s), enabled: bot?.enabled })}
+    ${wireStrip(id, {
+      broker: (model.details[id] || {}).broker || localBroker(s),
+      enabled: bot?.enabled,
+      state: { mode: s.mode && s.mode.mode },
+    })}
 
     <div id="localbanner"></div>
 

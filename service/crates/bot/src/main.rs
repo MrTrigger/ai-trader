@@ -72,8 +72,8 @@ commands:
   status                             health, controls and the last run
   history [--limit N]                recent runs, newest first
   positions                          what the venue says we hold
-  markets [--out <file>]             the assets this venue lists, for the planner
-  book [--out <file>]                cash and positions in the planner's format
+  markets                            the assets this venue lists (stdout)
+  book                               cash and positions, planner format (stdout)
   reconcile                          our record against the venue's; changes nothing
   feed [--once] [--interval SECS]    keep marks.json fresh from the venue
   mode                               which venue this is pointed at
@@ -149,8 +149,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "status" => cmd_status(&cfg),
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
         "positions" => block_on(cmd_positions(&cfg)),
-        "markets" => block_on(cmd_markets(&cfg, flags.get("--out").map(PathBuf::from))),
-        "book" => block_on(cmd_book(&cfg, flags.get("--out").map(PathBuf::from))),
+        "markets" => block_on(cmd_markets(&cfg)),
+        "book" => block_on(cmd_book(&cfg)),
         "reconcile" => block_on(cmd_reconcile(&cfg)),
         "feed" => block_on(cmd_feed(
             &cfg,
@@ -318,18 +318,19 @@ async fn open_venue(
 ) -> Result<Venue, String> {
     let env = Env::from_process();
 
-    // Marks. A live feed is the default because a paper run on frozen prices
-    // measures nothing; the file feed stays for fixtures and offline work.
-    let prices: Arc<dyn PriceSource> = match cfg.feed.as_str() {
+    // Marks. The venue's own feed is the default and needs no override at all -
+    // paper reads it through the same adapter a live run uses. The file feed
+    // stays for fixtures and offline work, and substitutes only the prices.
+    let prices: Option<Arc<dyn PriceSource>> = match cfg.feed.as_str() {
         // the configured venue's own feed ("hyperliquid" kept as a legacy alias)
-        "venue" | "hyperliquid" => env.price_source()?,
+        "venue" | "hyperliquid" => None,
         _ => {
             let m = config::read_marks(&cfg.marks_path())?;
             let manual = Arc::new(ManualPrices::new());
             for (asset, price) in &m {
                 manual.set(asset, *price);
             }
-            manual
+            Some(manual)
         }
     };
 
@@ -340,21 +341,6 @@ async fn open_venue(
         maker_fee_bps: cfg.maker_fee_bps,
         slippage_bps: cfg.slippage_bps,
         quote_decimals: 8,
-    };
-
-    // The venue's own metadata is authoritative, and that is as true of a paper
-    // book as a live one: a simulator running off a stale hand-written list is
-    // not standing in for the venue, it is standing in for the list. An
-    // explicit `markets` block in the config still wins, for fixtures and
-    // offline work; otherwise ask the venue.
-    let configured = cfg.markets();
-    let markets = if configured.is_empty() {
-        match active_venue::venue_markets(&cfg.venue_id, &env).await? {
-            Some(m) => m,
-            None => configured,
-        }
-    } else {
-        configured
     };
 
     let snapshot = match rec {
@@ -376,7 +362,6 @@ async fn open_venue(
         cfg.mode,
         &env,
         paper_cfg,
-        markets,
         prices,
         snapshot.as_deref(),
     )
@@ -560,6 +545,14 @@ fn cmd_history(cfg: &BotConfig, limit: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
+/// What the venue actually lists, printed for whoever asked.
+///
+/// Deliberately not stored. The exchange is the data provider in paper exactly
+/// as it is in live, so this answer is available live at the moment it is
+/// needed; writing it to a file or a table would create a second copy that can
+/// only ever be more wrong than the venue itself. The cycle pipes this straight
+/// into the planner and nothing survives the invocation.
+///
 /// What the venue actually lists.
 ///
 /// The planner ranks a universe built from Binance bars, and then the book is
@@ -572,7 +565,7 @@ fn cmd_history(cfg: &BotConfig, limit: Option<usize>) -> Result<(), String> {
 /// weights were solved together, so silently omitting a third of them leaves an
 /// underinvested book nobody designed. The screen belongs upstream, in the
 /// universe, which is what this export feeds.
-async fn cmd_markets(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String> {
+async fn cmd_markets(cfg: &BotConfig) -> Result<(), String> {
     let st = open_stores(cfg)?;
     let venue = open_venue(cfg, st.rec.as_deref()).await?;
     let markets = venue
@@ -587,20 +580,10 @@ async fn cmd_markets(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String
             .unwrap_or_default(),
         "assets": assets,
     });
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    match out {
-        Some(path) => {
-            std::fs::write(&path, &text)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-            eprintln!(
-                "{} asset(s) listed on {} -> {}",
-                assets.len(),
-                cfg.venue_id,
-                path.display()
-            );
-        }
-        None => println!("{text}"),
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
@@ -614,7 +597,7 @@ async fn cmd_markets(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String
 /// Two books that are both authoritative is one book too many. This makes the
 /// venue the source and the planner's copy a derived artefact, refreshed each
 /// cycle before anything is decided.
-async fn cmd_book(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String> {
+async fn cmd_book(cfg: &BotConfig) -> Result<(), String> {
     let st = open_stores(cfg)?;
     let venue = open_venue(cfg, st.rec.as_deref()).await?;
     let positions = venue
@@ -651,21 +634,10 @@ async fn cmd_book(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String> {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    match out {
-        Some(path) => {
-            std::fs::write(&path, &text)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-            eprintln!(
-                "{} {} cash, {} position(s) -> {}",
-                cash,
-                cfg.quote_currency,
-                positions.iter().filter(|p| !p.qty.is_zero()).count(),
-                path.display()
-            );
-        }
-        None => println!("{text}"),
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
