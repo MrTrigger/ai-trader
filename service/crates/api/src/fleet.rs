@@ -449,7 +449,12 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
                     .into_iter()
                     .filter_map(|t| serde_json::from_str(&t).ok())
                     .collect();
-                rows.push((b, status, control, runs, fills));
+                let binding = reg
+                    .bindings(&b.bot_id)
+                    .await?
+                    .into_iter()
+                    .find(|x| x.scope == "trade");
+                rows.push((b, status, control, runs, fills, binding));
             }
             Ok(rows)
         })
@@ -459,7 +464,7 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
     let mut bots_out = Vec::new();
     let mut feed: Vec<Value> = Vec::new();
 
-    for (b, status, control, db_runs, db_fills) in data {
+    for (b, status, control, db_runs, db_fills, binding) in data {
         // Runs: DB first, files as the pre-step-4 fallback.
         let mut runs = db_runs;
         if runs.is_empty() {
@@ -542,6 +547,11 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
             "decision_core": b.decision_core,
             "enabled": b.enabled,
             "status": st,
+            "broker": json!({
+                "venue_id": binding.as_ref().map(|x| x.venue_id.clone()),
+                "account_id": binding.as_ref().map(|x| x.account_id.clone()),
+                "kind": binding.as_ref().map(|x| x.account_kind.clone()),
+            }),
             "series": series,
             "series_kind": series_kind,
         }));

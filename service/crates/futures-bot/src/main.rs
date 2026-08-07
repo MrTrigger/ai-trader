@@ -485,17 +485,20 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // Which venue trades this bot is DATA: the registry's trade binding
     // decides (--venue overrides for dev). The operator switches brokers by
     // updating the binding, not by editing code.
-    let venue_id = match get("--venue") {
-        Some(v) => v,
-        None => reg
-            .bindings(&bot_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|b| b.scope == "trade")
-            .map(|b| b.venue_id)
-            .unwrap_or_else(|| "ib".into()),
-    };
+    let bound = reg
+        .bindings(&bot_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|b| b.scope == "trade");
+    let venue_id = get("--venue")
+        .or_else(|| bound.as_ref().map(|b| b.venue_id.clone()))
+        .unwrap_or_else(|| "ib".into());
+    // Which MONEY is a separate axis from which broker, and both are the
+    // binding's business: the bound account's kind (paper|live) selects the
+    // credential block. `--live` remains what it always was — whether the
+    // loop places orders at all (vs shadow) — and never picks the account.
+    let live_account = bound.as_ref().map(|b| b.account_kind == "live").unwrap_or(false);
     let yes = |k: &str| {
         matches!(
             std::env::var(k).unwrap_or_default().to_lowercase().as_str(),
@@ -506,9 +509,20 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // venue registry: the LIVE block only when --live AND the operator set
     // the venue's ALLOW_LIVE; otherwise paper/demo — which is what "--live
     // on a paper account" means.
+    let allow_live_key = match venue_id.as_str() {
+        "rithmic" => "RITHMIC_ALLOW_LIVE",
+        _ => "IB_ALLOW_LIVE",
+    };
+    if live_account && !yes(allow_live_key) {
+        return Err(format!(
+            "the trade binding points at a LIVE account, but {allow_live_key} is not set. \
+             Real money needs both: the binding (what the operator chose) and the env flag \
+             (what the deployment permits)."
+        ));
+    }
     let trading = match venue_id.as_str() {
         "ib" => {
-            let mut cfg = ib::IbConfig::from_env(live && yes("IB_ALLOW_LIVE"))?;
+            let mut cfg = ib::IbConfig::from_env(live_account)?;
             if !live {
                 cfg.allow_orders = false; // shadow NEVER arms
             }
@@ -517,7 +531,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             ))
         }
         "rithmic" => {
-            let mut cfg = rithmic::RithmicCfg::from_env(live && yes("RITHMIC_ALLOW_LIVE"))?;
+            let mut cfg = rithmic::RithmicCfg::from_env(live_account)?;
             if !live {
                 cfg.allow_orders = false;
             }
@@ -566,7 +580,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<RawBar>(64);
     match &trading {
         Trading::Ib(_) => {
-            let mut feed_cfg = ib::IbConfig::from_env(live && yes("IB_ALLOW_LIVE"))?;
+            let mut feed_cfg = ib::IbConfig::from_env(live_account)?;
             feed_cfg.allow_orders = false; // the feed connection can never trade
             feed_cfg.client_id += 1;
             let feed = ib::IbVenue::connect(feed_cfg)

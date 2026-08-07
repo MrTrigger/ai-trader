@@ -222,6 +222,43 @@
   .bothead .back:hover { color: var(--brand); text-decoration: none; }
   .bothead h1 { font-size: 19px; margin: 0; font-weight: 700; letter-spacing: .01em; }
   .bothead .sub { color: var(--ink3); font-size: 12px; }
+  /* wiring strip: what this bot is pointed at, always visible, every bot */
+  .wire { display: flex; align-items: center; gap: 0; flex-wrap: wrap;
+          background: var(--srf); border: 1px solid var(--line); border-radius: 11px;
+          padding: 2px; margin: 0 0 16px; }
+  .wire .w { display: flex; flex-direction: column; gap: 2px; padding: 9px 16px; min-width: 92px; }
+  .wire .w + .w { border-left: 1px solid var(--line); }
+  .wire .k { font-family: var(--mono); font-size: 9.5px; letter-spacing: .1em;
+             text-transform: uppercase; color: var(--ink3); }
+  .wire .v { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+  .wire .v.money { color: var(--down); }
+  .wire .grow { flex: 1 1 40px; }
+  .wire .gear { margin: 4px 6px 4px 0; }
+
+  /* one settings surface, shared by every bot */
+  .modal { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center;
+           background: color-mix(in srgb, #000 62%, transparent); padding: 20px; }
+  .modal[hidden] { display: none; }
+  .modal-card { width: min(520px, 100%); max-height: 88vh; overflow-y: auto;
+                background: var(--srf); border: 1px solid var(--line2); border-radius: 14px;
+                box-shadow: 0 24px 60px rgba(0,0,0,.55); }
+  .modal-card > header { display: flex; align-items: baseline; gap: 10px;
+                         padding: 15px 18px; border-bottom: 1px solid var(--line); }
+  .modal-card > header h2 { font-size: 15px; margin: 0; font-weight: 650; }
+  .modal-card .body { padding: 16px 18px; display: flex; flex-direction: column; gap: 16px; }
+  .modal-card .foot { display: flex; gap: 8px; justify-content: flex-end;
+                      padding: 14px 18px; border-top: 1px solid var(--line); }
+  .setting .lbl { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
+  .setting .lbl b { font-size: 12.5px; font-weight: 600; }
+  .setting .lbl span { font-size: 11px; color: var(--ink3); }
+  .setting .seg { grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); }
+  .setting .note { font-size: 11px; color: var(--ink3); margin: 7px 0 0; line-height: 1.5; }
+  .resolved { font-family: var(--mono); font-size: 12px; color: var(--ink2);
+              background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+              padding: 9px 11px; }
+  .resolved b { color: var(--ink); }
+  .resolved.bad { color: var(--down); border-color: color-mix(in srgb, var(--down) 40%, transparent); }
+
   .botgrid { display: grid; gap: 16px; grid-template-columns: 1fr; align-items: start; }
   @media (min-width: 1180px) { .botgrid { grid-template-columns: minmax(0,1fr) 330px; } }
   .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
@@ -385,6 +422,7 @@
 </div>
 
 <div class="shell" id="view"><div class="loading">connecting…</div></div>
+<div class="modal" id="modal" hidden></div>
 
 <script>
 "use strict";
@@ -492,6 +530,7 @@ function render() {
   if (keep.who && $("who")) $("who").value = keep.who;
   if (keep.why && $("why")) $("why").value = keep.why;
   if (keep.result && $("ctlresult") && !$("ctlresult").innerHTML) $("ctlresult").innerHTML = keep.result;
+  fillOperator();
 }
 
 function renderChrome() {
@@ -761,6 +800,10 @@ function renderFleet() {
       <div class="head"><span class="dot" style="background:${color};box-shadow:none"></span>
         <span class="name">${esc(b.bot_id)}</span>${pill}</div>
       <div class="meta">${esc(b.display_name !== b.bot_id ? b.display_name + " · " : "")}${esc(b.asset_class)} · ${esc(b.cadence)}</div>
+      <div class="meta">${b.broker?.venue_id
+        ? `via <b>${esc(b.broker.venue_id)}</b> · ${b.broker.kind === "live"
+            ? '<span class="u-down">live money</span>' : "paper"}`
+        : '<span class="u-dim">no broker bound</span>'}</div>
       <div class="spark">${sparkSVG(b.series, b.series_kind, color)}</div>
       <div class="vitals">
         <div><div class="k">Net</div><div class="v ${cls(netVal)}">${netVal == null ? "—" : signedMoney(netVal)}</div></div>
@@ -803,6 +846,7 @@ function renderFutures(id, d) {
       <span class="pill ${hb > 900 ? "warn" : ""}">hb ${esc(ago(hb))}</span>
       <span class="sub">${esc(d.display_name || "")} · ${esc(d.cadence || "")}</span>
     </div>
+    ${wireStrip(id, d)}
 
     <div class="botgrid">
       <div class="col">
@@ -842,23 +886,7 @@ function renderFutures(id, d) {
       </div>
 
       <div class="col">
-        <section class="card">
-          <header><span class="eyebrow">Controls</span><span class="sub">writes the control word</span></header>
-          <div class="pad">
-            <div class="field"><label for="who">Your name</label>
-              <input type="text" id="who" placeholder="who is doing this" autocomplete="off"></div>
-            <div class="field"><label for="why">Reason</label>
-              <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off"></div>
-            <div class="btnrow">
-              <button class="ctl kill" data-fleet-halt="${esc(id)}">Halt</button>
-              <button class="ctl go" data-fleet-resume="${esc(id)}">Resume</button>
-            </div>
-            <p class="ctlnote">The bot reads the newest control word at its own gates — the word takes
-              effect on its next cycle, so the state pill may lag a heartbeat. Halting stops new
-              entries; it does not close what is open.</p>
-            <div class="result" id="ctlresult"></div>
-          </div>
-        </section>
+        ${controlsCard(id)}
 
         <section class="card ${killFrac >= 0.8 ? "alarm" : ""}">
           <header><span class="eyebrow">Kill line</span></header>
@@ -872,15 +900,13 @@ function renderFutures(id, d) {
           </div>
         </section>
 
-        ${brokerCard(d, id)}
-
         <section class="card">
           <header><span class="eyebrow">Identity</span></header>
           <div class="pad tight"><dl class="kv">
             <dt>State</dt><dd>${esc(st.state || "—")}${st.state_reason ? " · " + esc(String(st.state_reason)) : ""}</dd>
-            <dt>Mode</dt><dd>${esc(st.mode || "—")}</dd>
+            <dt>Run mode</dt><dd>${esc(st.mode || "—")}</dd>
             <dt>Heartbeat</dt><dd>${esc(ago(hb))} ago</dd>
-            <dt>Enabled</dt><dd>${d.enabled ? "yes" : "no"}</dd>
+            <dt>Credentials</dt><dd>${esc((d.broker || {}).credential_ref || "—")}</dd>
             <dt>Decision core</dt><dd>${esc(d.decision_core || "—")}</dd>
             <dt>Source</dt><dd>${esc(d.source || "files")}</dd>
           </dl></div>
@@ -889,33 +915,163 @@ function renderFutures(id, d) {
     </div>`;
 }
 
-/* ── broker: which venue account this bot trades through ───────────────── */
-function brokerCard(d, id) {
+/* ── shared bot furniture: every bot page uses these, unchanged ─────────── */
+
+/* What this bot is pointed at. Two independent axes — WHICH BROKER and
+   WHOSE MONEY — because they fail differently: the wrong broker is an
+   operational annoyance, the wrong money is the thing you cannot undo. */
+function wireStrip(id, d) {
   const b = d.broker || {};
-  const opts = b.options || [];
-  if (!opts.length) {
-    return `<section class="card"><header><span class="eyebrow">Broker</span></header>
-      <div class="pad"><div class="empty">No venue accounts registered.</div></div></section>`;
-  }
-  const current = b.account_id || "";
+  const live = b.kind === "live";
+  const cells = [
+    ["Broker", esc(b.venue_id || "unbound"), ""],
+    ["Account", esc(b.account_id || "—"), ""],
+    ["Money", b.account_id ? (live ? "LIVE" : "paper") : "—", live ? "money" : ""],
+    ["Registry", d.enabled ? "enabled" : "disabled", d.enabled ? "" : "money"],
+  ];
+  return `<div class="wire">
+    ${cells.map(([k, v, cl]) => `<div class="w"><span class="k">${k}</span><span class="v ${cl}">${v}</span></div>`).join("")}
+    <span class="grow"></span>
+    <button class="ctl gear" data-settings="${esc(id)}">Settings</button>
+  </div>`;
+}
+
+/* The control word. One implementation for every bot: the name/reason
+   inputs the settings modal also reads live in here, so an operator types
+   who they are once. */
+function controlsCard(id, note) {
   return `<section class="card">
-    <header><span class="eyebrow">Broker</span><span class="sub">trade binding</span></header>
+    <header><span class="eyebrow">Controls</span><span class="sub">writes the control word</span></header>
     <div class="pad">
-      <div class="field"><label for="venuepick">Route orders through</label>
-        <select class="pick" id="venuepick">${opts.map((o) => {
-          const label = `${o.venue_id} · ${o.account_id} (${o.kind})`;
-          return `<option value="${esc(o.account_id)}"${o.account_id === current ? " selected" : ""}>${esc(label)}</option>`;
-        }).join("")}</select></div>
-      <div class="btnrow one">
-        <button class="ctl" data-fleet-venue="${esc(id)}">Apply broker</button>
+      <div class="field"><label for="who">Your name</label>
+        <input type="text" id="who" placeholder="remembered after the first time" autocomplete="off"></div>
+      <div class="field"><label for="why">Reason <span class="u-dim" style="font-weight:400;letter-spacing:0">optional</span></label>
+        <input type="text" id="why" placeholder="optional, except to go live or flatten" autocomplete="off"></div>
+      <div class="btnrow">
+        <button class="ctl kill" data-fleet-halt="${esc(id)}">Halt</button>
+        <button class="ctl go" data-fleet-resume="${esc(id)}">Resume</button>
       </div>
-      <p class="ctlnote">Stored in the registry, so it survives restarts and is what the bot reads
-        when it next starts — a running bot keeps the venue it connected to, because switching
-        mid-session would leave a position on one broker and reconcile against another.
-        Uses the same name and reason as the controls above.</p>
-      <div class="result" id="venueresult"></div>
+      <p class="ctlnote">${note || `The bot reads the newest control word at its own gates — it takes
+        effect on its next cycle, so the state pill may lag a heartbeat. Halting stops new entries;
+        it does not close what is open.`}</p>
+      <div class="result" id="ctlresult"></div>
     </div>
   </section>`;
+}
+
+/* ── settings: one modal, every bot, both axes ──────────────────────────── */
+const settings = { id: null, venue: null, kind: null };
+
+function openSettings(id) {
+  const d = model.details[id] || {};
+  const b = (d && d.broker) || {};
+  settings.id = id;
+  settings.venue = b.venue_id || (b.options || [])[0]?.venue_id || null;
+  settings.kind = b.kind || "paper";
+  renderSettings();
+}
+
+function closeSettings() {
+  settings.id = null;
+  const host = $("modal");
+  host.hidden = true;
+  host.innerHTML = "";
+}
+
+function renderSettings() {
+  const id = settings.id;
+  const d = model.details[id] || {};
+  const b = d.broker || {};
+  const opts = b.options || [];
+  const venues = [...new Set(opts.map((o) => o.venue_id))];
+  const kinds = ["paper", "live"];
+  const accountFor = (v, k) => opts.find((o) => o.venue_id === v && o.kind === k);
+  const chosen = accountFor(settings.venue, settings.kind);
+  const current = b.account_id || null;
+  const changed = chosen && chosen.account_id !== current;
+
+  const host = $("modal");
+  host.hidden = false;
+  host.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="Settings for ${esc(id)}">
+    <header><h2>${esc(id)}</h2><span class="sub">wiring · takes effect at the bot's next start</span></header>
+    <div class="body">
+      <div class="setting">
+        <div class="lbl"><b>Broker</b><span>who routes the orders</span></div>
+        <div class="seg">${venues.map((v) => {
+          const any = kinds.some((k) => accountFor(v, k));
+          return `<button data-pick-venue="${esc(v)}"${settings.venue === v ? ' class="on"' : ""}${any ? "" : " disabled"}>${esc(v)}</button>`;
+        }).join("")}</div>
+      </div>
+
+      <div class="setting">
+        <div class="lbl"><b>Money</b><span>whose capital is at risk</span></div>
+        <div class="seg">${kinds.map((k) => {
+          const acct = accountFor(settings.venue, k);
+          return `<button data-pick-kind="${esc(k)}" class="${k === "live" ? "live" : ""}${settings.kind === k ? " on" : ""}"${acct ? "" : " disabled"}>${k === "live" ? "Live money" : "Paper"}</button>`;
+        }).join("")}</div>
+        <p class="note">Separate from the broker on purpose: switching venue is routine, switching
+          to real money is not. A live account additionally needs the deployment's ALLOW_LIVE flag —
+          the operator's choice and the deployment's permission must agree.</p>
+      </div>
+
+      <div class="resolved ${chosen ? "" : "bad"}">${chosen
+        ? `Account <b>${esc(chosen.account_id)}</b> · credentials <b>${esc(chosen.credential_ref)}</b>` +
+          (changed ? `<br>currently <b>${esc(current || "unbound")}</b> — applying rebinds it`
+                   : "<br>this is what it already uses")
+        : `No <b>${esc(settings.venue || "?")}</b> account registered for <b>${esc(settings.kind)}</b> money.`}</div>
+
+      <div class="field"><label for="setwho">Your name</label>
+        <input type="text" id="setwho" placeholder="remembered after the first time" autocomplete="off"
+               value="${esc($("who")?.value || "")}"></div>
+      <div class="field"><label for="setwhy">Reason
+        <span class="u-dim" style="font-weight:400;letter-spacing:0">${settings.kind === "live" ? "required for live money" : "optional"}</span></label>
+        <input type="text" id="setwhy" placeholder="why, in a sentence" autocomplete="off"
+               value="${esc($("why")?.value || "")}"></div>
+      <div class="result" id="setresult"></div>
+    </div>
+    <div class="foot">
+      <button class="ctl" data-settings-close="1">Cancel</button>
+      <button class="ctl ${settings.kind === "live" ? "kill" : "go"}" data-settings-apply="${esc(id)}"
+        ${chosen && changed ? "" : "disabled"}>Apply</button>
+    </div>
+  </div>`;
+}
+
+async function applySettings(id) {
+  const d = model.details[id] || {};
+  const opts = (d.broker || {}).options || [];
+  const chosen = opts.find((o) => o.venue_id === settings.venue && o.kind === settings.kind);
+  const by = $("setwho")?.value.trim(), reason = $("setwhy")?.value.trim();
+  const out = $("setresult");
+  if (!chosen) return;
+  // Same rule as the controls: a name always, a reason once real money is
+  // involved — the change nobody should be able to make anonymously.
+  if (!by) {
+    out.innerHTML = '<span class="u-down">Your name is required.</span>';
+    $("setwho").focus(); return;
+  }
+  if (settings.kind === "live" && !reason) {
+    out.innerHTML = '<span class="u-down">Pointing a bot at real money needs a reason.</span>';
+    $("setwhy").focus(); return;
+  }
+  if (settings.kind === "live") {
+    const typed = window.prompt(
+      "This points " + id + " at REAL MONEY (" + chosen.account_id + ").\n" +
+      'Type LIVE to confirm.');
+    if (typed !== "LIVE") { out.innerHTML = '<span class="u-dim">Not confirmed — nothing changed.</span>'; return; }
+  }
+  out.innerHTML = '<span class="u-dim">updating the trade binding…</span>';
+  try {
+    const res = await fetch("/api/bots/" + encodeURIComponent(id) + "/venue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ account_id: chosen.account_id, by, reason: reason || "broker change" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    closeSettings();
+    await refreshData();
+    render();
+  } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
 }
 
 function futuresFills(fills) {
@@ -953,6 +1109,7 @@ function renderRunnerRemote(id, bot, d) {
       ${halted ? '<span class="pill down">halted</span>' : controls.paused ? '<span class="pill warn">paused</span>' : '<span class="pill up">running</span>'}
       <span class="sub">${esc(d.display_name || "")} · ${esc(d.cadence || "")}</span>
     </div>
+    ${wireStrip(id, d)}
     <div class="botgrid">
       <div class="col">
         <section class="card">
@@ -961,25 +1118,9 @@ function renderRunnerRemote(id, bot, d) {
         </section>
       </div>
       <div class="col">
-        <section class="card">
-          <header><span class="eyebrow">Controls</span></header>
-          <div class="pad">
-            <div class="field"><label for="who">Your name</label>
-              <input type="text" id="who" placeholder="who is doing this" autocomplete="off"></div>
-            <div class="field"><label for="why">Reason</label>
-              <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off"></div>
-            <div class="btnrow">
-              <button class="ctl kill" data-fleet-halt="${esc(id)}">Halt</button>
-              <button class="ctl go" data-fleet-resume="${esc(id)}">Resume</button>
-            </div>
-            <p class="ctlnote">This bot's full console — book, balances, flatten, venue switch — lives with
-              its own state. Start the api with <span class="num">--state-dir/--bot</span> pointed at it, or use the CLI:</p>
-            <pre class="cmd">bot --config &lt;its config&gt; status | positions | flatten …</pre>
-            <div class="result" id="ctlresult"></div>
-          </div>
-        </section>
-
-        ${brokerCard(d, id)}
+        ${controlsCard(id, `This bot's full book, balances and flatten live with its own state —
+          start the api with <span class="num">--state-dir/--bot</span> pointed at it, or use the CLI:
+          <span class="num">bot --config &lt;its config&gt; status | positions | flatten</span>.`)}
         <section class="card">
           <header><span class="eyebrow">Control word</span></header>
           <div class="pad tight"><dl class="kv">
@@ -1078,9 +1219,9 @@ function renderRunnerConsole(id, bot) {
             <p class="ctlnote" id="modenote" style="margin-bottom:13px"></p>
 
             <div class="field"><label for="who">Your name</label>
-              <input type="text" id="who" placeholder="who is doing this" autocomplete="off"></div>
-            <div class="field"><label for="why">Reason</label>
-              <input type="text" id="why" placeholder="why, in a sentence" autocomplete="off"></div>
+              <input type="text" id="who" placeholder="remembered after the first time" autocomplete="off"></div>
+            <div class="field"><label for="why">Reason <span class="u-dim" style="font-weight:400;letter-spacing:0">optional</span></label>
+              <input type="text" id="why" placeholder="optional, except to go live or flatten" autocomplete="off"></div>
 
             <div class="btnrow">
               <button class="ctl" data-action="pause">Pause</button>
@@ -1329,17 +1470,32 @@ const ACTIONS = {
     confirm: "Point the bot at the paper venue. Real positions are left exactly as they are." },
   "mode-live-readonly": { path: "/api/mode/live-readonly", verb: "Switch to live read-only",
     confirm: "Point the bot at the real account. Real balances and fills; every order refused." },
-  "mode-live": { path: "/api/mode/live", verb: "Go LIVE", typed: "LIVE",
+  "mode-live": { path: "/api/mode/live", verb: "Go LIVE", typed: "LIVE", needsReason: true,
     confirm: "Point the bot at the real account WITH TRADING ENABLED. Scheduled runs will place real orders with real money." },
   halt: { path: "/api/halt", verb: "Halt", confirm: "Stop executing. Planning continues; nothing open is closed." },
   pause: { path: "/api/pause", verb: "Pause", confirm: "Only orders that reduce exposure go out from now on." },
   resume: { path: "/api/resume", verb: "Resume", confirm: "Grant trading authority again. The next scheduled run will trade." },
-  flatten: { path: "/api/flatten", verb: "Flatten", typed: "FLATTEN",
+  flatten: { path: "/api/flatten", verb: "Flatten", typed: "FLATTEN", needsReason: true,
     confirm: "Cancel every resting order and close EVERY open position at market, right now." },
-  adopt: { path: "/api/adopt", verb: "Adopt",
+  adopt: { path: "/api/adopt", verb: "Adopt", needsReason: true,
     confirm: "Write the venue's current positions into our own record as an opening baseline." },
 };
 let controlsEnabled = false;
+
+/* Who is at the keyboard changes about once a year; the control panel used to
+   ask on every click. Remember it, and let the reason field carry the part
+   that actually differs between one halt and the next. */
+const OPERATOR_KEY = "tt.operator";
+function operator() {
+  const typed = $("who")?.value.trim();
+  if (typed) { try { localStorage.setItem(OPERATOR_KEY, typed); } catch (e) {} return typed; }
+  try { return localStorage.getItem(OPERATOR_KEY) || ""; } catch (e) { return ""; }
+}
+function fillOperator() {
+  const el = $("who");
+  if (!el || el.value) return;
+  try { el.value = localStorage.getItem(OPERATOR_KEY) || ""; } catch (e) {}
+}
 
 function renderControlAvailability(enabled) {
   controlsEnabled = !!enabled;
@@ -1371,12 +1527,19 @@ function renderMode(s) {
 async function sendControl(name, extra) {
   const spec = ACTIONS[name];
   if (!spec || !controlsEnabled) return;
-  const by = $("who")?.value.trim(), reason = $("why")?.value.trim();
+  const by = operator();
+  let reason = $("why")?.value.trim();
   const out = $("ctlresult");
-  if (!by || !reason) {
-    out.innerHTML = '<span class="u-down">A name and a reason are both required.</span>';
-    $(by ? "why" : "who").focus(); return;
+  if (!by) {
+    out.innerHTML = '<span class="u-down">Put your name in once — it is remembered after that.</span>';
+    $("who")?.focus(); return;
   }
+  if (!reason && spec.needsReason) {
+    out.innerHTML = '<span class="u-down">' + esc(spec.verb) +
+      ' moves real money or real authority. Say why in a sentence.</span>';
+    $("why")?.focus(); return;
+  }
+  if (!reason) reason = "no reason given";
   if (!window.confirm(spec.verb + "?\n\n" + spec.confirm + "\n\nReason: " + reason)) return;
   if (spec.typed && window.prompt("Type " + spec.typed + " to confirm.") !== spec.typed) {
     out.innerHTML = '<span class="u-dim">Cancelled.</span>'; return;
@@ -1404,11 +1567,12 @@ async function sendControl(name, extra) {
 /* Fleet-level halt/resume: appends a control word to the registry, which every
    bot reads at its own gates. */
 async function fleetControl(id, halt) {
-  const by = $("who")?.value.trim(), reason = $("why")?.value.trim();
+  const by = operator();
+  const reason = $("why")?.value.trim() || "no reason given";
   const out = $("ctlresult");
-  if (!by || !reason) {
-    out.innerHTML = '<span class="u-down">A name and a reason are both required.</span>';
-    $(by ? "why" : "who").focus(); return;
+  if (!by) {
+    out.innerHTML = '<span class="u-down">Put your name in once — it is remembered after that.</span>';
+    $("who")?.focus(); return;
   }
   if (!window.confirm((halt ? "Halt " : "Resume ") + id + "?\n\nReason: " + reason)) return;
   out.innerHTML = '<span class="u-dim">writing control word…</span>';
@@ -1424,30 +1588,6 @@ async function fleetControl(id, halt) {
   } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
 }
 
-async function fleetVenue(id) {
-  const by = $("who")?.value.trim(), reason = $("why")?.value.trim();
-  const account = $("venuepick")?.value;
-  const out = $("venueresult");
-  if (!by || !reason) {
-    out.innerHTML = '<span class="u-down">A name and a reason are both required.</span>';
-    $(by ? "why" : "who").focus(); return;
-  }
-  if (!window.confirm("Route " + id + " through " + account +
-      "?\n\nTakes effect when the bot next starts.\nReason: " + reason)) return;
-  out.innerHTML = '<span class="u-dim">updating the trade binding…</span>';
-  try {
-    const res = await fetch("/api/bots/" + encodeURIComponent(id) + "/venue", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ account_id: account, by, reason }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
-    out.innerHTML = '<span class="u-up">Now bound to ' + esc(data.venue_id) + " · " +
-      esc(data.account_id) + ". " + esc(data.note || "") + "</span>";
-    navigate();
-  } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
-}
-
 /* ── one delegated listener: panels re-render ──────────────────────────── */
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("button, .chip");
@@ -1456,7 +1596,11 @@ document.addEventListener("click", (ev) => {
   if (t.dataset.action) { sendControl(t.dataset.action); return; }
   if (t.dataset.fleetHalt) { fleetControl(t.dataset.fleetHalt, true); return; }
   if (t.dataset.fleetResume) { fleetControl(t.dataset.fleetResume, false); return; }
-  if (t.dataset.fleetVenue) { fleetVenue(t.dataset.fleetVenue); return; }
+  if (t.dataset.settings) { openSettings(t.dataset.settings); return; }
+  if (t.dataset.settingsClose) { closeSettings(); return; }
+  if (t.dataset.settingsApply) { applySettings(t.dataset.settingsApply); return; }
+  if (t.dataset.pickVenue) { settings.venue = t.dataset.pickVenue; renderSettings(); return; }
+  if (t.dataset.pickKind) { settings.kind = t.dataset.pickKind; renderSettings(); return; }
   if (t.dataset.range) { model.range = t.dataset.range; renderFleet(); return; }
   if (t.dataset.toggle) {
     const id = t.dataset.toggle;

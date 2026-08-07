@@ -41,33 +41,92 @@ def _config(args) -> Config:
 # ---------------------------------------------------------------------------
 
 
+def _pull_assets(args, config, root: Path) -> tuple[list[str], str]:
+    """Which assets a pull should refresh, and where that list came from.
+
+    The default is the store, not `config.universe`. The configured list is the
+    Phase 0 path — three names — while what actually gets traded is the ranked
+    universe `universe rank` derives from the store. Pulling only the configured
+    three left the other ~670 assets frozen at whatever date the archive load
+    stopped, and `by_liquidity` then reads a stale tail as delisted. A daily
+    cycle that silently stops refreshing the universe it trades is worse than
+    one that fails, so the default now follows the store.
+    """
+    if args.assets:
+        return [a.strip().upper() for a in args.assets.split(",") if a.strip()], "--assets"
+    if args.universe == "config":
+        return list(config.universe), "config.universe"
+    known = sorted(
+        p.name.removeprefix("asset=") for p in (root / "bars").glob("asset=*")
+    )
+    if known:
+        return known, "the store"
+    return list(config.universe), "config.universe (store is empty)"
+
+
 def cmd_data_pull(args) -> int:
     config = _config(args)
+    root = Path(args.data_root)
     end = _utc(args.end) if args.end else datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     start = end - timedelta(days=args.days)
+    assets, origin = _pull_assets(args, config, root)
+
+    # Both intervals the decision path reads. `pipeline.run` featurizes hourly
+    # bars alongside the daily frame, so refreshing only the daily one leaves
+    # the intraday features running days behind the prices they are paired with.
+    intervals = [config.interval_s]
+    if not args.daily_only and 3600 != config.interval_s:
+        intervals.append(3600)
+
+    print(
+        f"pull {len(assets)} asset(s) from {origin}, "
+        f"{start.date()}..{end.date()}, interval(s) {intervals}"
+    )
     src = BinancePublic()
+    total = 0
+    written = 0
     try:
         import polars as pl
 
-        frames = []
-        for asset in config.universe:
-            df = src.fetch_bars(asset, interval_s=config.interval_s, start=start, end=end)
-            print(f"  {asset}: {df.height} bars")
-            if df.height:
-                frames.append(df)
-        if not frames:
-            print("no bars fetched", file=sys.stderr)
-            return 1
-        combined = pl.concat(frames, how="vertical_relaxed")
-        issues = store.write(combined, root=Path(args.data_root), source=src.name)
+        for interval_s in intervals:
+            frames = []
+            missing = 0
+            for asset in assets:
+                try:
+                    df = src.fetch_bars(asset, interval_s=interval_s, start=start, end=end)
+                except Exception as exc:  # one delisted symbol must not end the pull
+                    missing += 1
+                    if args.verbose:
+                        print(f"  {asset} @{interval_s}s: {exc}")
+                    continue
+                if df.height:
+                    frames.append(df)
+                    total += df.height
+                else:
+                    missing += 1
+                if args.verbose:
+                    print(f"  {asset} @{interval_s}s: {df.height} bars")
+            if not frames:
+                print(f"  interval {interval_s}s: nothing fetched", file=sys.stderr)
+                continue
+            combined = pl.concat(frames, how="vertical_relaxed")
+            issues = store.write(combined, root=root, source=src.name)
+            written += combined.height
+            print(
+                f"  interval {interval_s}s: wrote {combined.height} bars "
+                f"for {len(frames)} asset(s); {missing} returned nothing"
+            )
+            for i in issues:
+                print(f"    [{i.severity.value}] {i.code} x{i.count}: {i.detail}")
     finally:
         src.close()
 
-    print(f"\nwrote {combined.height} bars from {src.name}")
-    for i in issues:
-        print(f"  [{i.severity.value}] {i.code} x{i.count}: {i.detail}")
+    if not written:
+        print("no bars fetched", file=sys.stderr)
+        return 1
+    print(f"\nwrote {written} bars from {src.name}")
     return 0
 
 
@@ -627,6 +686,17 @@ def build_parser() -> argparse.ArgumentParser:
     pull = data.add_parser("pull", help="fetch bars into the store")
     pull.add_argument("--days", type=int, default=400)
     pull.add_argument("--end", help="UTC end, exclusive (default today 00:00)")
+    pull.add_argument(
+        "--universe",
+        choices=["store", "config"],
+        default="store",
+        help="which assets to refresh (default: every asset already in the store, "
+        "because that is what `universe rank` ranks over)",
+    )
+    pull.add_argument("--assets", help="explicit comma-separated list, overrides --universe")
+    pull.add_argument("--daily-only", action="store_true",
+                      help="skip the hourly bars the intraday features read")
+    pull.add_argument("-v", "--verbose", action="store_true", help="one line per asset")
     pull.set_defaults(func=cmd_data_pull)
     data.add_parser("inspect", help="what is in the store").set_defaults(func=cmd_data_inspect)
     data.add_parser(
