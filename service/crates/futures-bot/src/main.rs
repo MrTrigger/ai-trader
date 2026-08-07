@@ -681,9 +681,13 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 halt: true,
                 ..Default::default()
             });
+        // Halt closes nothing; STOP closes. The previous cut flattened on
+        // any halt, which quietly made the two identical and made the
+        // dashboard's promise ("halting does not close what is open") a
+        // lie.
         let was_halted = book.halted.is_some();
         book.apply_control(&control);
-        if book.halted.is_some() && !was_halted && live {
+        if control.flatten && !was_halted && live {
             let _ = trading.flatten_all(&bot_id).await;
         }
 

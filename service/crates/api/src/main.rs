@@ -333,13 +333,24 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             ),
         },
         ("POST", r)
-            if r.starts_with("/api/bots/") && (r.ends_with("/halt") || r.ends_with("/resume")) =>
+            if r.starts_with("/api/bots/")
+                && (r.ends_with("/halt") || r.ends_with("/resume") || r.ends_with("/stop")) =>
         {
-            let halt = r.ends_with("/halt");
+            // Three instructions, not two: halt opens nothing new, stop also
+            // closes the book, resume trades again.
+            let state = if r.ends_with("/halt") {
+                "halted"
+            } else if r.ends_with("/stop") {
+                "stopped"
+            } else {
+                "running"
+            };
+            let halt = state != "running";
             let id = r
                 .trim_start_matches("/api/bots/")
                 .trim_end_matches("/halt")
                 .trim_end_matches("/resume")
+                .trim_end_matches("/stop")
                 .to_string();
             let mut body = vec![0u8; content_length.min(64 * 1024)];
             reader.read_exact(&mut body).ok();
@@ -359,13 +370,7 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or("dashboard");
             {
-                match fleet::set_halt(
-                    &std::env::current_dir().unwrap_or_default(),
-                    &id,
-                    halt,
-                    reason,
-                    by,
-                ) {
+                match fleet::set_state(&id, state, reason, by) {
                     Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
                     Err(e) => json_error(&mut stream, 400, &e),
                 }

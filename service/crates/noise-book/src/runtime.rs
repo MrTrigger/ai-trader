@@ -44,7 +44,13 @@ pub struct SleeveState {
 /// document by the caller.
 #[derive(Debug, Default, Clone)]
 pub struct Control {
+    /// Stop opening: no new entries. Open positions are left alone —
+    /// halting is not an exit.
     pub halt: bool,
+    /// Stop AND close: halt, then flatten what is open. The difference
+    /// matters at 3am, which is why they are two buttons and not one with
+    /// a checkbox.
+    pub flatten: bool,
     pub disabled_sleeves: BTreeSet<String>,
     pub instrument: Option<String>,
     pub units: Option<u32>,
@@ -93,10 +99,13 @@ impl Book {
 
     pub fn apply_control(&mut self, c: &Control) {
         if c.halt {
+            if self.halted.is_none() && c.flatten {
+                self.halted = Some("operator-stop".into());
+            }
             if self.halted.is_none() {
                 self.halted = Some("operator".into());
             }
-        } else if self.halted.as_deref() == Some("operator") {
+        } else if matches!(self.halted.as_deref(), Some("operator") | Some("operator-stop")) {
             // An operator halt is operator-resumable. Rail halts (kill
             // criterion, reconcile mismatch, feed stall, refused orders)
             // stay latched: they mean something is WRONG, and clearing them

@@ -332,6 +332,7 @@
     background: color-mix(in srgb, var(--down) 9%, var(--srf)); }
   .btnrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .btnrow.one { grid-template-columns: 1fr; }
+  .btnrow.three { grid-template-columns: 1fr 1fr 1fr; }
   button.ctl {
     font-family: var(--sans); font-size: 13px; font-weight: 570; cursor: pointer;
     padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line2);
@@ -952,19 +953,34 @@ function wireStrip(id, d) {
 /* The control word. One implementation for every bot: the name/reason
    inputs the settings modal also reads live in here, so an operator types
    who they are once. */
-function controlsCard(id, note) {
+/* The control surface, identical for every bot. Three verbs, because
+   "stop the bot" is genuinely two instructions:
+
+     Start/Resume  trade again
+     Halt          open nothing new; leave the book exactly as it is
+     Stop          open nothing new AND close the book at market
+
+   Halt is the reversible one you reach for at 3am; Stop is the one that
+   costs a spread. Collapsing them into one button — as an earlier cut did
+   by flattening on every halt — removes the choice at the moment it
+   matters most. */
+function controlsCard(id, opts) {
+  const o = opts || {};
   const st = botOf(id)?.status || {};
-  const halted = st.kill_switch === true || !!st.halted;
+  const halted = o.halted != null ? o.halted : (st.kill_switch === true || !!st.halted);
+  const flat = o.flat !== false;
   return `<section class="card">
     <header><span class="eyebrow">Controls</span>
       <span class="sub">${halted ? "halted" : "trading"}</span></header>
     <div class="pad">
-      <div class="btnrow">
-        <button class="ctl kill" data-act="halt" data-bot="${esc(id)}" ${halted ? "disabled" : ""}>Halt</button>
-        <button class="ctl go" data-act="resume" data-bot="${esc(id)}" ${halted ? "" : "disabled"}>Resume</button>
+      <div class="btnrow three">
+        <button class="ctl go" data-act="start" data-bot="${esc(id)}" ${halted ? "" : "disabled"}>${
+          o.everRan === false ? "Start" : "Resume"}</button>
+        <button class="ctl" data-act="halt" data-bot="${esc(id)}" ${halted ? "disabled" : ""}>Halt</button>
+        <button class="ctl kill" data-act="stop" data-bot="${esc(id)}" ${halted && flat ? "disabled" : ""}>Stop</button>
       </div>
-      <p class="ctlnote">${note || `Halting stops new entries at the bot's next cycle; it does not
-        close what is already open.`}</p>
+      <p class="ctlnote">${o.note || `<b>Halt</b> stops new entries at the bot's next cycle and leaves open
+        positions alone. <b>Stop</b> also closes them at market.`}</p>
       <div class="result" id="ctlresult"></div>
     </div>
   </section>`;
@@ -1212,29 +1228,23 @@ function renderRunnerConsole(id, bot) {
       </div>
 
       <div class="col">
-        <section class="card" id="controls">
-          <header><span class="eyebrow">Master control</span><span class="sub" id="controlhint"></span></header>
-          <div class="pad">
+        ${controlsCard(id, {
+          halted: s.control_state !== "running",
+          flat: !(s.book.positions || []).length,
+          note: `<b>Halt</b> stops execution; planning continues, and open positions are left alone.
+                 <b>Stop</b> also cancels every resting order and closes every position at market.`,
+        })}
 
+        <section class="card" id="controls">
+          <header><span class="eyebrow">Maintenance</span><span class="sub" id="controlhint"></span></header>
+          <div class="pad">
             <div class="btnrow">
               <button class="ctl" data-action="pause">Pause</button>
-              <button class="ctl kill" data-action="halt">Kill switch</button>
+              <button class="ctl" data-action="adopt">Adopt book</button>
             </div>
-            <p class="ctlnote">Pause permits only exposure-reducing orders. The kill switch stops execution;
-              planning continues. Neither closes what is open.</p>
-
-            <div class="ctlsplit">
-              <div class="btnrow one"><button class="ctl go" data-action="resume">Resume trading</button></div>
-            </div>
-            <div class="ctlsplit">
-              <div class="btnrow">
-                <button class="ctl kill" data-action="flatten">Flatten all</button>
-                <button class="ctl" data-action="adopt">Adopt book</button>
-              </div>
-              <p class="ctlnote">Flatten cancels every resting order, then closes every position at market —
-                and works while halted. Adopt takes what the venue already holds as our opening state.</p>
-            </div>
-            <div class="result" id="ctlresult"></div>
+            <p class="ctlnote">Pause permits only exposure-reducing orders — a narrower halt, kept here
+              because this bot's planner supports it. Adopt takes what the venue already holds as our
+              opening state.</p>
           </div>
         </section>
 
@@ -1468,7 +1478,7 @@ const ACTIONS = {
   halt: { path: "/api/halt", verb: "Halt", confirm: "Stop executing. Planning continues; nothing open is closed." },
   pause: { path: "/api/pause", verb: "Pause", confirm: "Only orders that reduce exposure go out from now on." },
   resume: { path: "/api/resume", verb: "Resume", confirm: "Grant trading authority again. The next scheduled run will trade." },
-  flatten: { path: "/api/flatten", verb: "Flatten", typed: "FLATTEN", needsReason: true,
+  flatten: { path: "/api/flatten", verb: "Flatten",
     confirm: "Cancel every resting order and close EVERY open position at market, right now." },
   adopt: { path: "/api/adopt", verb: "Adopt", needsReason: true,
     confirm: "Write the venue's current positions into our own record as an opening baseline." },
@@ -1564,6 +1574,38 @@ async function sendControl(name, extra) {
   } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
 }
 
+/* One entry point for the three verbs, whichever kind of bot it is.
+   Registry bots get a control word; the wrapped bot is driven through its
+   own binary, where Stop is halt-then-flatten in that order — the safety
+   half first, so a failed flatten still leaves a stopped bot. */
+async function botAction(id, act) {
+  const bot = botOf(id);
+  const out = $("ctlresult");
+  if (act === "stop" && !window.confirm(
+      "Stop " + id + "?\n\nOpen positions are closed at market. Halt instead if you only " +
+      "want to stop opening new ones.")) return;
+  if (bot?.local && model.local) {
+    if (act === "start") return sendControl("resume");
+    if (act === "halt") return sendControl("halt");
+    await sendControl("halt");
+    return sendControl("flatten");
+  }
+  const verb = act === "start" ? "resume" : act;
+  out.innerHTML = '<span class="u-dim">writing control word…</span>';
+  try {
+    const res = await fetch("/api/bots/" + encodeURIComponent(id) + "/" + verb, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    out.innerHTML = '<span class="u-up">' +
+      (act === "start" ? "Resumed." : act === "halt" ? "Halted — open positions untouched." :
+        "Stopped — the bot closes its book at its next cycle.") + "</span>";
+    navigate();
+  } catch (e) { out.innerHTML = '<span class="u-down">' + esc(e.message) + "</span>"; }
+}
+
 /* Fleet-level halt/resume: appends a control word to the registry, which every
    bot reads at its own gates. */
 async function fleetControl(id, halt) {
@@ -1593,8 +1635,7 @@ document.addEventListener("click", (ev) => {
   if (!t) return;
   if (t.id === "adopt-unknown") { sendControl("adopt", "/api/adopt-accepting-unknown-fills"); return; }
   if (t.dataset.action) { sendControl(t.dataset.action); return; }
-  if (t.dataset.act === "halt") { fleetControl(t.dataset.bot, true); return; }
-  if (t.dataset.act === "resume") { fleetControl(t.dataset.bot, false); return; }
+  if (t.dataset.act) { botAction(t.dataset.bot, t.dataset.act); return; }
   if (t.dataset.fleetHalt) { fleetControl(t.dataset.fleetHalt, true); return; }
   if (t.dataset.fleetResume) { fleetControl(t.dataset.fleetResume, false); return; }
   if (t.dataset.settings) { openSettings(t.dataset.settings); return; }

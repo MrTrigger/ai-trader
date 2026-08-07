@@ -227,9 +227,24 @@ pub fn set_halt(
     reason: &str,
     by: &str,
 ) -> Result<Value, String> {
+    set_state(bot_id, if halt { "halted" } else { "running" }, reason, by)
+}
+
+/// Write a control state. Three of them, because "stop the bot" is two
+/// different instructions: `halted` opens nothing new and leaves the book
+/// alone; `stopped` also closes it.
+pub fn set_state(bot_id: &str, state: &str, reason: &str, by: &str) -> Result<Value, String> {
+    // Only these three, spelled out: a typo must not become a control word
+    // the bots then read as "not running" and obey forever.
+    if !matches!(state, "running" | "halted" | "stopped") {
+        return Err(format!(
+            "unknown control state {state:?} — running, halted or stopped"
+        ));
+    }
     let reason = reason.to_string();
     let by = by.to_string();
     let bot_id = bot_id.to_string();
+    let state = state.to_string();
     with_registry(move |reg| {
         Box::pin(async move {
             if reg.bot(&bot_id).await?.is_none() {
@@ -262,7 +277,6 @@ pub fn set_halt(
             let now = time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default();
-            let state = if halt { "halted" } else { "running" };
             let mut payload = json!({
                 "schema": 1,
                 "state": state,
@@ -274,7 +288,7 @@ pub fn set_halt(
             if !overrides.is_null() {
                 payload["overrides"] = overrides;
             }
-            reg.set_control(&bot_id, state, &reason, &by, &payload.to_string())
+            reg.set_control(&bot_id, &state, &reason, &by, &payload.to_string())
                 .await?;
             Ok(payload)
         })

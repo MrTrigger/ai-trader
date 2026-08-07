@@ -47,14 +47,30 @@ pub fn market_should_be_open(ts_utc: DateTime<Utc>) -> bool {
 
 /// Resolve the canonical control document (schema 1) — or the legacy
 /// dialect — into the runtime's Control. Unknown states read as halted.
+/// Resolve the canonical control document. Three states, because an
+/// operator stopping a bot means one of two different things:
+///
+///   running  trade
+///   halted   open nothing new; leave open positions alone
+///   stopped  open nothing new AND close what is open
+///
+/// Anything unrecognised reads as halted — fail closed, and never as
+/// `stopped`, because inventing a flatten is worse than inventing a pause.
 pub fn control_from_payload(payload: &serde_json::Value) -> Control {
-    let (halt, overrides) = if payload.get("schema").is_some() {
+    let (halt, flatten, overrides) = if payload.get("schema").is_some() {
+        let state = payload["state"].as_str().unwrap_or("halted");
         (
-            payload["state"].as_str() != Some("running"),
+            state != "running",
+            state == "stopped",
             payload.get("overrides").cloned().unwrap_or_default(),
         )
     } else {
-        (payload["halt"].as_bool().unwrap_or(false), payload.clone())
+        // legacy dialect: a bare halt, which never meant flatten
+        (
+            payload["halt"].as_bool().unwrap_or(false),
+            false,
+            payload.clone(),
+        )
     };
     let disabled = overrides["sleeves"]
         .as_object()
@@ -67,6 +83,7 @@ pub fn control_from_payload(payload: &serde_json::Value) -> Control {
         .unwrap_or_default();
     Control {
         halt,
+        flatten,
         disabled_sleeves: disabled,
         instrument: overrides["instrument"].as_str().map(str::to_string),
         units: overrides["sizing"]["fixed_units"]
@@ -388,6 +405,11 @@ mod tests {
             "schema": 1, "state": "wedged", "reason": "?"
         }));
         assert!(c.halt);
+        assert!(!c.flatten, "an unknown state must never be read as flatten");
+        let c = control_from_payload(&serde_json::json!({"schema": 1, "state": "stopped"}));
+        assert!(c.halt && c.flatten);
+        let c = control_from_payload(&serde_json::json!({"schema": 1, "state": "halted"}));
+        assert!(c.halt && !c.flatten, "halt is not an exit");
         let c = control_from_payload(&serde_json::json!({
             "schema": 1, "state": "running",
             "overrides": {"sleeves": {"G-NOISE": false}, "sizing": {"fixed_units": 2}}
