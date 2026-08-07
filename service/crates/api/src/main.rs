@@ -84,6 +84,10 @@ and --bot-config that local view is read-only.
 ";
 
 struct Config {
+    /// Where the built frontend lives. Present → serve `frontend/dist`
+    /// (the React app the design spec calls for). Absent → the legacy
+    /// single-file page, until the port is finished.
+    static_dir: Option<PathBuf>,
     /// `None` = pure fleet control plane: no local book view, DB only.
     state_dir: Option<PathBuf>,
     /// How to invoke the bot. `None` makes this a read-only dashboard.
@@ -153,6 +157,10 @@ fn main() -> ExitCode {
     }
     println!("  http://127.0.0.1:{}", cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
+    match &cfg.static_dir {
+        Some(d) => println!("  ui: {} (built frontend)", d.display()),
+        None => println!("  ui: legacy embedded page — run `bun run build` in frontend/"),
+    }
     match std::env::var("DATABASE_URL") {
         Ok(_) => println!("  fleet: identity registry configured"),
         Err(_) => println!("  fleet: no DATABASE_URL, so the fleet view is unavailable"),
@@ -200,6 +208,12 @@ fn parse(args: &[String]) -> Result<Config, String> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    // Default to the repo's built frontend when it exists, so `api` with no
+    // flags serves the real UI; --static-dir overrides for a deployment.
+    let static_dir = get("--static-dir").map(PathBuf::from).or_else(|| {
+        let d = PathBuf::from("frontend/dist");
+        d.join("index.html").exists().then_some(d)
+    });
     let state_dir = get("--state-dir").map(PathBuf::from);
     let initial_cash: Decimal = match get("--initial-cash") {
         Some(c) => c
@@ -220,6 +234,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
         None => DEFAULT_PORT,
     };
     Ok(Config {
+        static_dir,
         state_dir,
         bot: BotCommand::new(get("--bot"), get("--bot-config"))?,
         initial_cash,
@@ -294,13 +309,24 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
     }
 
     match (method.as_str(), route.as_str()) {
-        ("GET" | "HEAD", "/") => respond(
-            &mut stream,
-            200,
-            "text/html; charset=utf-8",
-            page::HTML.as_bytes(),
-            method == "HEAD",
-        ),
+        ("GET" | "HEAD", "/") => serve_index(&mut stream, cfg, method == "HEAD"),
+        // Hashed asset files from the built frontend. Everything under
+        // /assets/ is content-addressed by the bundler, so it can be cached
+        // hard; index.html never is, or a deploy would serve stale markup
+        // pointing at assets that no longer exist.
+        ("GET" | "HEAD", r) if r.starts_with("/assets/") => {
+            serve_asset(&mut stream, cfg, r, method == "HEAD")
+        }
+        // Client-routed paths (/bot/futures-noise) are the SAME document —
+        // the app resolves them. Without this a refresh or a pasted link
+        // 404s, which is the classic way a single-page app feels broken.
+        ("GET" | "HEAD", r)
+            if cfg.static_dir.is_some()
+                && !r.starts_with("/api/")
+                && !r.contains('.') =>
+        {
+            serve_index(&mut stream, cfg, method == "HEAD")
+        }
         ("GET", r) if r.starts_with("/api/bots/") && r.ends_with("/state") => {
             let id = r
                 .trim_start_matches("/api/bots/")
@@ -404,6 +430,11 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                 }
             }
         }
+        ("GET", "/api/build") => json(
+            &mut stream,
+            200,
+            format!(r#"{{"built":"{}"}}"#, env!("BUILD_STAMP")).as_bytes(),
+        ),
         ("GET", "/api/state") if cfg.state_dir.is_none() => {
             // Fleet control plane: no wrapped bot, so no local book — a 200
             // sentinel rather than an error, because this is the expected
@@ -529,6 +560,56 @@ fn json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Re
     json(stream, status, &body)
 }
 
+/// The SPA entry point. A router path like /bot/futures-noise is served the
+/// same document — the app resolves it client-side — so a refresh or a
+/// pasted link lands where it should instead of 404ing.
+fn serve_index(stream: &mut TcpStream, cfg: &Config, head_only: bool) -> std::io::Result<()> {
+    match cfg.static_dir.as_ref().map(|d| std::fs::read(d.join("index.html"))) {
+        Some(Ok(body)) => respond(stream, 200, "text/html; charset=utf-8", &body, head_only),
+        _ => respond(
+            stream,
+            200,
+            "text/html; charset=utf-8",
+            page::HTML.as_bytes(),
+            head_only,
+        ),
+    }
+}
+
+fn serve_asset(
+    stream: &mut TcpStream,
+    cfg: &Config,
+    path: &str,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let Some(dir) = cfg.static_dir.as_ref() else {
+        return json_error(stream, 404, "no built frontend is being served");
+    };
+    // Path traversal is the one attack a static file server invites, and
+    // this one is reachable from a browser on the same machine: take the
+    // file name only, never a caller-supplied path.
+    let name = path.trim_start_matches("/assets/");
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return json_error(stream, 404, "no such asset");
+    }
+    match std::fs::read(dir.join("assets").join(name)) {
+        Ok(body) => respond(stream, 200, content_type(name), &body, head_only),
+        Err(_) => json_error(stream, 404, "no such asset"),
+    }
+}
+
+fn content_type(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("") {
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        _ => "application/octet-stream",
+    }
+}
+
 fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -550,8 +631,9 @@ fn respond(
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
-         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
-         script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'\r\n\
+         Content-Security-Policy: default-src 'none'; script-src 'self'; \
+         style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; \
+         img-src 'self' data:; base-uri 'none'; form-action 'none'\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );

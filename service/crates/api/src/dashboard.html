@@ -549,6 +549,23 @@ function renderChrome() {
   $("dbchip").className = "dbchip" + (okDb ? "" : " off");
   $("dbchiptext").textContent = okDb ? "registry" : "registry down";
   $("clockel").textContent = new Date().toISOString().slice(0, 16).replace("T", " ") + "Z";
+  checkBuild();
+}
+
+/* This page is compiled into the api binary, so a rebuilt-but-not-restarted
+   process keeps serving the old UI — indistinguishable, from the browser,
+   from a change that never worked. Ask the server which build it is and say
+   so when it no longer matches the page you are looking at. */
+let pageBuild = null;
+async function checkBuild() {
+  try {
+    const { built } = await getJSON("/api/build");
+    if (pageBuild === null) { pageBuild = built; return; }
+    if (built !== pageBuild) {
+      $("dbchip").className = "dbchip off";
+      $("dbchiptext").textContent = "reload — server rebuilt";
+    }
+  } catch (e) { /* older api without the route: nothing to compare */ }
 }
 
 /* ── charts ────────────────────────────────────────────────────────────── */
