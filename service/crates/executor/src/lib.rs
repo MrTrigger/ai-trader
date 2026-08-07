@@ -131,6 +131,12 @@ pub struct ExecutionRecord {
     /// Orders not attempted because an earlier one failed. Named rather than
     /// counted: "3 skipped" is not actionable and "we skipped these three" is.
     pub not_attempted: Vec<String>,
+    /// Orders whose quantity rounded to nothing on the venue's lot grid, with
+    /// what they were before. A plan can legitimately ask for less than one
+    /// lot; dropping that silently would leave a target the book never reaches
+    /// and no record of why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rounded_out: Vec<String>,
     pub reconciled: bool,
     /// True when a pause restricted this run to risk-reducing orders.
     pub paused: bool,
@@ -234,12 +240,73 @@ fn check_sequence(orders: &[Order]) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn to_request(bot_id: &str, plan_id: &str, order: &Order, slice: Option<u8>) -> OrderRequest {
+/// Round a quantity down onto the venue's lot grid.
+///
+/// Down, never up, and toward zero on either side: rounding up would submit
+/// more than the plan authorised, which is the one direction a rounding rule
+/// must never go. A venue rejects anything off its grid outright, so without
+/// this no plan reaches any venue at all - the planner sizes in weights and
+/// has no idea what a lot is on the exchange it happens to be pointed at.
+fn round_to_lot(qty: Decimal, lot: Decimal) -> Decimal {
+    if lot <= Decimal::ZERO {
+        return qty;
+    }
+    (qty / lot).trunc() * lot
+}
+
+/// The venue's lot grid, as an asset -> lot map.
+pub async fn lot_grid<V: VenueAdapter + ?Sized>(
+    venue: &V,
+) -> Result<BTreeMap<String, Decimal>, ExecError> {
+    Ok(venue
+        .get_markets()
+        .await
+        .map_err(ExecError::Venue)?
+        .into_iter()
+        .map(|m| (m.asset.to_string(), m.lot))
+        .collect())
+}
+
+/// Put every order onto the grid, dropping the ones that round to nothing.
+///
+/// An asset the grid does not mention is passed through untouched, so the
+/// venue refuses it by name rather than us inventing a lot size for it.
+pub fn on_lot_grid(orders: &[Order], lots: &BTreeMap<String, Decimal>) -> Vec<Order> {
+    orders
+        .iter()
+        .filter_map(|o| {
+            let qty = match lots.get(&o.asset) {
+                Some(lot) => round_to_lot(o.qty, *lot),
+                None => o.qty,
+            };
+            if qty.is_zero() {
+                return None;
+            }
+            Some(Order { qty, ..o.clone() })
+        })
+        .collect()
+}
+
+fn to_request(
+    bot_id: &str,
+    plan_id: &str,
+    order: &Order,
+    slice: Option<u8>,
+    qty: Decimal,
+) -> OrderRequest {
+    // The id is derived from the quantity actually sent, not the one asked for.
+    // Deriving it from the pre-rounding number would give a replay a different
+    // id than the venue already holds, and the venue would treat the retry as a
+    // second order.
+    let rounded = Order {
+        qty,
+        ..order.clone()
+    };
     OrderRequest {
-        client_order_id: id_for(bot_id, plan_id, order, slice),
+        client_order_id: id_for(bot_id, plan_id, &rounded, slice),
         asset: AssetId::from(order.asset.clone()),
         side: order.side,
-        qty: order.qty,
+        qty,
         order_type: match order.order_type {
             plan::OrderType::Market => VenueOrderType::Market,
             plan::OrderType::Limit => VenueOrderType::Limit,
@@ -326,6 +393,7 @@ pub async fn execute_slice<V: VenueAdapter + ?Sized>(
         started_at: now,
         submitted: Vec::new(),
         not_attempted: Vec::new(),
+        rounded_out: Vec::new(),
         reconciled: false,
         paused: false,
         halted_reason: None,
@@ -382,14 +450,17 @@ pub async fn execute_slice<V: VenueAdapter + ?Sized>(
             record.not_attempted.push(order.asset.clone());
             continue;
         }
-        let req = to_request(&plan.bot_id, &plan_id, order, slice);
+        // Already on the venue's grid: the runner rounds before it authorises,
+        // so that the id written to the ledger is the id that goes out.
+        let qty = order.qty;
+        let req = to_request(&plan.bot_id, &plan_id, order, slice, qty);
         let coid = req.client_order_id.clone();
         match venue.place_order(&req).await {
             Ok(ack) => record.submitted.push(OrderOutcome {
                 client_order_id: coid,
                 asset: order.asset.clone(),
                 side: format!("{:?}", order.side),
-                qty: order.qty,
+                qty,
                 reason: format!("{:?}", order.reason),
                 venue_order_id: Some(ack.venue_order_id),
                 error: None,
@@ -400,7 +471,7 @@ pub async fn execute_slice<V: VenueAdapter + ?Sized>(
                     client_order_id: coid,
                     asset: order.asset.clone(),
                     side: format!("{:?}", order.side),
-                    qty: order.qty,
+                    qty,
                     reason: format!("{:?}", order.reason),
                     venue_order_id: None,
                     error: Some(e.to_string()),

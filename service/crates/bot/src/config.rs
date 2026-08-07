@@ -63,9 +63,16 @@ pub struct BotConfig {
     /// numbers came from.
     #[serde(default)]
     pub schedule: runner::Schedule,
-    /// How old a plan may be when the first slice goes out.
+    /// How long the plan file may have sat on disk when the first slice goes out.
     #[serde(default = "default_max_age")]
     pub max_plan_age_minutes: i64,
+    /// How far behind its own decision moment a fill may be.
+    ///
+    /// A daily plan is stamped `as_of` midnight UTC, so this is measured in
+    /// hours by nature, not minutes. Separate from `max_plan_age_minutes`
+    /// because the two ask different questions - see `runner::check_decision_lag`.
+    #[serde(default = "default_max_decision_lag")]
+    pub max_decision_lag_minutes: i64,
     /// How often a run is expected. Health goes bad at a cadence and a half.
     #[serde(default = "default_cadence")]
     pub cadence_hours: i64,
@@ -95,6 +102,14 @@ fn default_feed() -> String {
 fn default_max_age() -> i64 {
     120
 }
+/// A daily book decides at midnight UTC and the cycle is cronned just after,
+/// so the fill lag in normal operation is minutes. Six hours leaves room for a
+/// late cron or a long execution window while still refusing a decision the
+/// market has moved a full session away from.
+fn default_max_decision_lag() -> i64 {
+    360
+}
+
 fn default_cadence() -> i64 {
     24
 }

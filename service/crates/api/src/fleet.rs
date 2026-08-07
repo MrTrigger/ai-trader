@@ -302,16 +302,23 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     // selection lives in the registry, so it survives restarts and the UI
     // is only ever a view of it.
     let trade = bindings.iter().find(|b| b.scope == "trade");
+    let asset_class = bot.as_ref().map(|b| b.asset_class.clone()).unwrap_or_default();
     let broker = json!({
         "account_id": trade.map(|b| b.account_id.clone()),
         "venue_id": trade.map(|b| b.venue_id.clone()),
+        "protocol": trade.map(|b| b.protocol.clone()),
         "kind": trade.map(|b| b.account_kind.clone()),
         "credential_ref": trade.map(|b| b.credential_ref.clone()),
+        // Only brokers that can trade what this bot trades. Offering a
+        // futures book a crypto venue is not a harmless extra row: it is a
+        // one-click way to bind a bot to something that cannot fill it.
         "options": accounts
             .iter()
+            .filter(|a| a.asset_classes.iter().any(|c| c == &asset_class))
             .map(|a| json!({
                 "account_id": a.account_id,
                 "venue_id": a.venue_id,
+                "protocol": a.protocol,
                 "kind": a.kind,
                 "credential_ref": a.credential_ref,
             }))
@@ -549,6 +556,7 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
             "status": st,
             "broker": json!({
                 "venue_id": binding.as_ref().map(|x| x.venue_id.clone()),
+                "protocol": binding.as_ref().map(|x| x.protocol.clone()),
                 "account_id": binding.as_ref().map(|x| x.account_id.clone()),
                 "kind": binding.as_ref().map(|x| x.account_kind.clone()),
             }),

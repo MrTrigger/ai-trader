@@ -11,6 +11,7 @@ any number**, so a plan is never read as more complete than it is.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -246,6 +247,15 @@ def cmd_universe_rank(args) -> int:
         print("no bars in the store; nothing to rank", file=sys.stderr)
         return 2
 
+    # What the execution venue lists, exported by `bot markets --out`. Deliberately
+    # a file and not a network call: the planner stays reproducible offline, and a
+    # snapshot of the listing set is itself part of the record.
+    tradeable = None
+    if args.tradeable:
+        doc = json.loads(Path(args.tradeable).read_text())
+        tradeable = {a.upper() for a in doc["assets"]}
+        print(f"screening against {len(tradeable)} asset(s) listed on {doc.get('venue_id','?')}")
+
     # Step at the decision cadence, not the bar interval: a snapshot is only
     # needed where a decision is taken, and recording daily ones for a weekly
     # rebalance writes thousands of files nothing reads.
@@ -271,6 +281,7 @@ def cmd_universe_rank(args) -> int:
             lookback_days=args.lookback,
             min_history_bars=config.min_history_bars,
             min_turnover=float(config.min_dollar_volume),
+            tradeable=tradeable,
         )
         if not members:
             skipped += 1
@@ -555,12 +566,21 @@ def cmd_plan(args) -> int:
         hour=0, minute=0, second=0, microsecond=0
     )
 
+    # `mode` says whether this document is meant to be executed at all. It is
+    # NOT paper-versus-real-money: that is the bot's venue mode, set separately
+    # and deliberately, so that a plan cannot decide for itself what it trades
+    # against. The executor refuses a `dry` plan outright, which is the whole
+    # point of the flag - and until now nothing could emit anything else, so
+    # `bin/cycle.sh` built a plan the bot was always going to refuse.
+    mode = "live" if args.for_execution else "dry"
+
     try:
         result = pipeline.run(
             as_of=as_of,
             config=config,
-            mode="dry",
+            mode=mode,
             data_root=Path(args.data_root),
+            book_path=Path(args.book) if args.book else None,
             created_at=_utc(args.created_at) if args.created_at else None,
         )
     except pipeline.GateFailure as exc:
@@ -734,6 +754,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="snapshot cadence in days (default: the config rebalance cadence). "
         "Use the finest grid a sweep will test.",
     )
+    rank.add_argument(
+        "--tradeable",
+        help="JSON from `bot markets --out`: screen the universe to what the execution "
+        "venue lists. Omit for backtests - today's listing set is not what was "
+        "listable in the past, and applying it backwards is survivorship bias.",
+    )
     rank.add_argument("--overwrite", action="store_true", help="correct a recording error")
     rank.set_defaults(func=cmd_universe_rank)
 
@@ -794,6 +820,19 @@ def build_parser() -> argparse.ArgumentParser:
     pl_.add_argument("--out", help="write the plan JSON here")
     pl_.add_argument("--json", action="store_true", help="print canonical JSON only")
     pl_.add_argument("--created-at", help="override the wall-clock stamp")
+    pl_.add_argument(
+        "--book",
+        help="the current book, from `bot book --out`. The venue is the authority on "
+        "what the account holds and what it can spend; without this the plan is "
+        "sized against whatever cash data/book.json happens to say.",
+    )
+    pl_.add_argument(
+        "--for-execution",
+        action="store_true",
+        help="stamp the plan mode 'live' so the executor will run it. This says the "
+        "plan is meant to be executed, not that it trades real money - the bot's "
+        "own venue mode (paper / live-readonly / live) decides that.",
+    )
     pl_.set_defaults(func=cmd_plan)
 
     ver = pl_sub.add_parser("verify", help="the Phase 0 gate: determinism across runs")

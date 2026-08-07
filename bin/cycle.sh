@@ -46,9 +46,24 @@ say "cycle $STAMP  config=$CONFIG"
 say "pull"
 ai-trader --config config/default.toml data pull
 
+# 1.5 The account. What the venue lists and what it holds are both facts about
+#     the venue, and the planner has no connection to one - so they are exported
+#     here and passed in. Sizing a plan against a stale local book is how a 30k
+#     account got handed a plan built for 100k.
+say "account"
+"$BOT" --config "$CONFIG" markets --out "$STATE_DIR/tradeable.json"
+"$BOT" --config "$CONFIG" book --out "$STATE_DIR/book.json"
+
 # 2. Decide. Read-only: produces a plan and touches nothing.
+#
+# --for-execution stamps the plan mode "live", which is what makes the executor
+# willing to run it at all. It does NOT mean real money: the bot's venue mode
+# decides that, and a paper bot fed this plan fills it against the simulator.
+# Without the flag the planner emits a "dry" plan and step 3 refuses it every
+# single time, which is how this script sat broken.
 say "plan"
-ai-trader --config config/default.toml plan --out "$PLAN"
+ai-trader --config config/default.toml plan --for-execution \
+    --book "$STATE_DIR/book.json" --out "$PLAN"
 
 # 3. Execute. The only step that can move capital, and the only one that
 #    consults the controls.

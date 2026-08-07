@@ -494,11 +494,27 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let venue_id = get("--venue")
         .or_else(|| bound.as_ref().map(|b| b.venue_id.clone()))
         .unwrap_or_else(|| "ib".into());
+    // The ADAPTER is chosen by protocol, never by the broker's name: AMP and
+    // Ironbeam are different companies reached the same way, and a bot that
+    // matched on "amp" would need a code change to add the second one.
+    let protocol = bound
+        .as_ref()
+        .filter(|b| b.venue_id == venue_id)
+        .map(|b| b.protocol.clone())
+        .unwrap_or_else(|| match venue_id.as_str() {
+            // --venue given without a binding (dev): the only names we can
+            // resolve without the registry are the ones we ship adapters for.
+            "amp" | "rithmic" => "rithmic".into(),
+            other => other.to_string(),
+        });
     // Which MONEY is a separate axis from which broker, and both are the
     // binding's business: the bound account's kind (paper|live) selects the
     // credential block. `--live` remains what it always was — whether the
     // loop places orders at all (vs shadow) — and never picks the account.
-    let live_account = bound.as_ref().map(|b| b.account_kind == "live").unwrap_or(false);
+    let live_account = bound
+        .as_ref()
+        .map(|b| b.account_kind == "live")
+        .unwrap_or(false);
     let yes = |k: &str| {
         matches!(
             std::env::var(k).unwrap_or_default().to_lowercase().as_str(),
@@ -509,7 +525,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // venue registry: the LIVE block only when --live AND the operator set
     // the venue's ALLOW_LIVE; otherwise paper/demo — which is what "--live
     // on a paper account" means.
-    let allow_live_key = match venue_id.as_str() {
+    let allow_live_key = match protocol.as_str() {
         "rithmic" => "RITHMIC_ALLOW_LIVE",
         _ => "IB_ALLOW_LIVE",
     };
@@ -520,7 +536,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
              (what the deployment permits)."
         ));
     }
-    let trading = match venue_id.as_str() {
+    let trading = match protocol.as_str() {
         "ib" => {
             let mut cfg = ib::IbConfig::from_env(live_account)?;
             if !live {
@@ -543,12 +559,13 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         }
         other => {
             return Err(format!(
-                "the futures bot trades on ib or rithmic; the {other:?} binding is not one"
+                "no adapter speaks {other:?} (the {venue_id:?} binding). The futures bot \
+                 speaks the ib and rithmic protocols."
             ))
         }
     };
     let symbol = trading.symbol_root();
-    eprintln!("{}", trading.describe());
+    eprintln!("broker {venue_id} via {protocol}: {}", trading.describe());
     if live && !trading.is_armed() {
         return Err(
             "--live but the adapter is not armed (the venue's ALLOW_ORDERS / ALLOW_LIVE \

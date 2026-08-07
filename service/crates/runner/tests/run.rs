@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use runner::{
-    check_freshness, fills_for_plan, health, slice_plan, ControlFile, Ledger, RunRecord, RunStore,
-    Runner, RunnerError, Schedule, Timer,
+    check_decision_lag, check_freshness, fills_for_plan, health, slice_plan, ControlFile, Ledger,
+    RunRecord, RunStore, Runner, RunnerError, Schedule, Timer,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -48,6 +48,15 @@ fn plan_with(orders: serde_json::Value, as_of: &str) -> plan::Plan {
     v["orders"] = orders;
     v["as_of"] = serde_json::json!(as_of);
     v["created_at"] = serde_json::json!(as_of);
+    plan::Plan::parse(&v.to_string()).expect("fixture stays valid")
+}
+
+/// A plan whose decision moment and write time differ, which is the normal case
+/// the two gates had been unable to tell apart.
+fn plan_decided_at_written_at(as_of: &str, created_at: &str) -> plan::Plan {
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+    v["as_of"] = serde_json::json!(as_of);
+    v["created_at"] = serde_json::json!(created_at);
     plan::Plan::parse(&v.to_string()).expect("fixture stays valid")
 }
 
@@ -517,6 +526,10 @@ fn runner<'a>(
         controls: runner::ControlStore::File(controls),
         schedule,
         max_plan_age_minutes: 120,
+        // Wide enough that fixtures dated at their own `as_of` are not caught by a
+        // gate they are not testing; the lag gate has its own tests below.
+        max_decision_lag_minutes: 10_000,
+        accept_decision_lag: false,
     }
 }
 
@@ -981,6 +994,77 @@ async fn flatten_records_who_asked_and_why() {
     assert!(detail.contains("weekend risk"), "got {detail}");
 }
 
+/// The id the ledger authorises must be the id that goes out.
+///
+/// Rounding is unavoidable - slicing divides quantities and every venue refuses
+/// anything off its lot grid - and the client order id is derived from the
+/// quantity. Round after authorising and the two diverge: the ledger holds an
+/// id the venue never saw, the venue reports a fill under an id the ledger
+/// never wrote, and reconciliation calls our own arithmetic an intrusion and
+/// halts the account. It did exactly that once; this is the guard.
+#[tokio::test]
+async fn an_off_grid_quantity_is_rounded_before_it_is_authorised() {
+    let dir = tmpdir("lotgrid");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+
+    // FakeVenue's BTC lot is 0.0001, and this asks for eight decimal places.
+    let plan = plan_with(
+        serde_json::json!([order("BTC", "buy", "0.40007777", "entry")]),
+        "2026-08-01T00:00:00Z",
+    );
+
+    let outcome = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("an off-grid quantity is rounded, not refused");
+    assert_eq!(outcome.outcome, "executed", "detail: {:?}", outcome.detail);
+
+    // Every id that went out carries a quantity on the venue's 0.0001 grid.
+    // The plan is sliced first, so the division happens before the rounding -
+    // which is the case that made this necessary in the first place.
+    let sent = venue.submitted_ids();
+    assert!(!sent.is_empty(), "something must have been sent");
+    for id in &sent {
+        let qty: Decimal = id
+            .split('-')
+            .rev()
+            .nth(1)
+            .expect("the id carries a quantity")
+            .parse()
+            .expect("that quantity parses");
+        assert!(
+            (qty / dec("0.0001")).fract().is_zero(),
+            "{id} is off the 0.0001 lot grid"
+        );
+        // Down, never up: rounding up would trade more than was authorised.
+        assert!(qty <= dec("0.40007777"), "{id} rounded away from zero");
+    }
+
+    // And the ledger holds that same id, so nothing reads as unauthorised.
+    let known = venue.get_fills(None).await.expect("fills");
+    let theirs = venue.get_positions().await.expect("positions");
+    let report = ledger
+        .reconcile(&theirs, &known, dec("0.00000001"))
+        .expect("ledger readable");
+    assert!(
+        report.unknown_fills.is_empty(),
+        "the ledger must have authorised exactly what was sent, got {:?}",
+        report.unknown_fills
+    );
+    assert!(report.agrees, "our record and the venue must agree");
+}
+
 // --- freshness, history, health --------------------------------------------
 
 #[test]
@@ -988,6 +1072,80 @@ fn a_fresh_plan_passes_the_freshness_gate() {
     let plan = standard_plan("2026-08-01T00:00:00Z");
     assert!(check_freshness(&plan, t("2026-08-01T01:00:00Z"), 120).is_ok());
     assert!(check_freshness(&plan, t("2026-08-01T03:00:00Z"), 120).is_err());
+}
+
+/// Freshness asks how long the file sat on disk, and nothing else.
+///
+/// It used to measure from `as_of`, which for a daily book is midnight UTC. That
+/// made a plan built at 09:00 for today's decision instantly nine hours "stale",
+/// and the whole pipeline unexecutable outside a two-hour window after midnight.
+#[test]
+fn freshness_measures_the_write_time_not_the_decision_date() {
+    // Decided at midnight, written at 09:00, executed at 09:30: half an hour old.
+    let plan = plan_decided_at_written_at("2026-08-01T00:00:00Z", "2026-08-01T09:00:00Z");
+    assert!(check_freshness(&plan, t("2026-08-01T09:30:00Z"), 120).is_ok());
+    // ...and four hours after it was written, it is not.
+    assert!(check_freshness(&plan, t("2026-08-01T13:00:00Z"), 120).is_err());
+}
+
+/// Decision lag asks the other question: how far behind its own decision the
+/// fill is. A freshly written plan can still describe a decision the market has
+/// left behind, and that is what the Phase 1 lag study measured.
+#[test]
+fn decision_lag_is_refused_even_when_the_plan_was_just_written() {
+    let plan = plan_decided_at_written_at("2026-08-01T00:00:00Z", "2026-08-01T09:00:00Z");
+    let now = t("2026-08-01T09:05:00Z");
+
+    // Written five minutes ago, so the freshness gate is happy...
+    assert!(check_freshness(&plan, now, 120).is_ok());
+    // ...but the decision is 545 minutes behind the fill.
+    let err = check_decision_lag(&plan, now, 360, false).expect_err("545 > 360");
+    assert!(matches!(err, RunnerError::DecisionLagTooLarge { .. }));
+
+    // Inside the limit it passes.
+    assert!(check_decision_lag(&plan, now, 600, false).is_ok());
+}
+
+#[test]
+fn the_decision_lag_override_lets_a_paper_run_through() {
+    let plan = plan_decided_at_written_at("2026-08-01T00:00:00Z", "2026-08-01T09:00:00Z");
+    let now = t("2026-08-01T09:05:00Z");
+    assert!(check_decision_lag(&plan, now, 360, false).is_err());
+    assert!(check_decision_lag(&plan, now, 360, true).is_ok());
+}
+
+/// The override is a paper-mode flag, and the refusal is recorded either way.
+#[tokio::test]
+async fn a_run_past_the_decision_lag_limit_is_refused_and_recorded() {
+    let dir = tmpdir("declag");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T09:05:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+    v["orders"] = serde_json::json!([order("BTC", "buy", "0.4", "entry")]);
+    v["as_of"] = serde_json::json!("2026-08-01T00:00:00Z");
+    v["created_at"] = serde_json::json!("2026-08-01T09:00:00Z");
+    let plan = plan::Plan::parse(&v.to_string()).expect("fixture stays valid");
+
+    let mut r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    );
+    r.max_decision_lag_minutes = 360;
+
+    let err = r
+        .run(&plan)
+        .await
+        .expect_err("545 minutes of lag is refused");
+    assert!(matches!(err, RunnerError::DecisionLagTooLarge { .. }));
+    assert!(venue.submitted_ids().is_empty(), "nothing may go out");
+    assert_eq!(store.recent(1).unwrap()[0].outcome, "refused");
 }
 
 #[test]

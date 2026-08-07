@@ -1,6 +1,12 @@
-//! Rithmic (R|Protocol) venue adapter over `rithmic-rs` — the road to
-//! AMP-cleared CME futures without IB's currency-conversion fee on every
-//! trade (the operator's reason for the switch, 2026-08-07).
+//! The Rithmic (R|Protocol) adapter, over `rithmic-rs`.
+//!
+//! Rithmic is a PROTOCOL, not a broker. The broker here is AMP Futures —
+//! the FCM that holds the account, clears the trades, and issues these
+//! credentials — chosen over IB because IB charges a currency conversion
+//! on every trade (the operator's reason for the switch, 2026-08-07).
+//! Ironbeam, Optimus and others are also reached this way, so the registry
+//! names the broker (`venue_id = amp`) and selects this adapter by the
+//! venue's `protocol` column. Adding another Rithmic broker is a row.
 //!
 //! Same defensive posture as the IB adapter, deliberately identical:
 //!

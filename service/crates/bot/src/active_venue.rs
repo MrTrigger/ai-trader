@@ -292,6 +292,41 @@ fn load_dotenv(path: &std::path::Path) {
 
 /// Build the venue for a mode, refusing rather than degrading.
 ///
+/// The instrument universe a paper book should trade, taken from the venue.
+///
+/// Paper used to get its markets from a hand-written list in the bot config,
+/// which made the simulator a different venue from the one it stands in for:
+/// it refused `AAVE` because the list was short, while Hyperliquid lists it,
+/// and it would have happily filled a lot size the real venue rejects. Every
+/// exchange needed its own hand-maintained copy, so paper behaved differently
+/// per venue for no reason anyone chose.
+///
+/// Reading markets is public data - no signing key - so this works for any
+/// venue the bot can name, and the paper book inherits that venue's real
+/// tick, lot, min-notional and listing set.
+///
+/// Returns `Ok(None)` rather than an error when the venue cannot be reached:
+/// paper must still run offline against a fixture feed, and that is exactly
+/// when the configured list is the right fallback.
+pub async fn venue_markets(venue_id: &str, env: &Env) -> Result<Option<Vec<Market>>, String> {
+    let adapter = match open_live(venue_id, Mode::LiveReadonly, env) {
+        Ok(Active::Live { adapter, .. }) => adapter,
+        Ok(_) => return Ok(None),
+        // Not configured for this venue (no address, offline fixture run, an
+        // unknown venue id): the caller falls back to the configured list.
+        Err(_) => return Ok(None),
+    };
+    match adapter.get_markets().await {
+        Ok(m) if !m.is_empty() => Ok(Some(m)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read the market list from {venue_id}: {e}. Paper takes its instrument \
+             universe from the venue so that a simulated fill is one the venue would have \
+             accepted; fix the connection, or list `markets` in the bot config to run offline."
+        )),
+    }
+}
+
 /// Every refusal names the specific thing that is missing. "Cannot start in
 /// live mode" is useless at 3am; "HL_AGENT_PRIVATE_KEY is empty" is a fix.
 pub fn open(
@@ -329,9 +364,13 @@ fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
     match venue_id {
         "hyperliquid" => open_hyperliquid(mode, env),
         "ib" => open_ib(mode),
-        "rithmic" => open_rithmic(mode),
+        // Broker names, not protocol names: AMP is the FCM, Rithmic is the
+        // gateway it is reached through. This process has no registry to
+        // consult, so the mapping is spelled out here; the futures bot,
+        // which does have one, dispatches on the venue's `protocol` column.
+        "amp" | "rithmic" => open_rithmic(mode),
         other => Err(format!(
-            "unknown venue_id {other:?}. Known live venues: hyperliquid, ib (planned)."
+            "unknown venue_id {other:?}. Known live venues: hyperliquid, ib, amp."
         )),
     }
 }

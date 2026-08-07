@@ -232,6 +232,21 @@ fn parse(args: &[String]) -> Result<Config, String> {
     })
 }
 
+/// The records handle and bot id the local book view should read through.
+///
+/// Opened per request rather than held: this server is thread-per-connection
+/// and the handle is cheap, and a connection that went stale between requests
+/// would otherwise wedge the page rather than simply retry.
+fn records_for(cfg: &Config) -> Option<(std::sync::Arc<records::blocking::Records>, String)> {
+    let path = &cfg.bot.as_ref()?.config;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let bot_id = v.get("bot_id")?.as_str()?.to_string();
+    let url = std::env::var("DATABASE_URL").ok()?;
+    let rec = records::blocking::Records::connect(&url).ok()?;
+    Some((rec, bot_id))
+}
+
 fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
     let Some(state_dir) = cfg.state_dir.as_deref() else {
         return Err(
@@ -246,6 +261,7 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
         expectation_path: cfg.expectation.as_deref(),
         controls_enabled: cfg.bot.is_some(),
         bot_config: cfg.bot.as_ref().map(|b| b.config.as_path()),
+        records: records_for(cfg),
         run_limit: 200,
         // Enough to see the last run or two land, not enough to bury everything
         // below it. The full log is `bot positions` and the fill store; this is
@@ -328,11 +344,21 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             let mut body = vec![0u8; content_length.min(64 * 1024)];
             reader.read_exact(&mut body).ok();
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-            let by = v.get("by").and_then(|s| s.as_str()).unwrap_or("");
-            if reason.is_empty() || by.is_empty() {
-                json_error(&mut stream, 400, "body must carry non-empty reason and by")
-            } else {
+            // Single-operator tool: the dashboard asks neither who nor why,
+            // so the API demands neither. The row still records that the
+            // action came from the dashboard — the only distinction that
+            // carries information here. No invented sentences.
+            let reason = v
+                .get("reason")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("");
+            let by = v
+                .get("by")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("dashboard");
+            {
                 match fleet::set_halt(
                     &std::env::current_dir().unwrap_or_default(),
                     &id,
@@ -354,14 +380,18 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             reader.read_exact(&mut body).ok();
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let account = v.get("account_id").and_then(|s| s.as_str()).unwrap_or("");
-            let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-            let by = v.get("by").and_then(|s| s.as_str()).unwrap_or("");
-            if account.is_empty() || reason.is_empty() || by.is_empty() {
-                json_error(
-                    &mut stream,
-                    400,
-                    "body must carry non-empty account_id, reason and by",
-                )
+            let reason = v
+                .get("reason")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("");
+            let by = v
+                .get("by")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("dashboard");
+            if account.is_empty() {
+                json_error(&mut stream, 400, "body must carry account_id")
             } else {
                 match fleet::set_venue(&id, account, reason, by) {
                     Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),

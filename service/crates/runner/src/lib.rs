@@ -80,13 +80,27 @@ pub enum RunnerError {
     AlreadyExecuted { plan_id: String, when: String },
 
     #[error(
-        "plan {plan_id} is {age_minutes} minutes old, past the {max_minutes} minute limit. \
-         A stale plan was computed against prices that no longer exist; executing it means \
-         trading on a view nobody currently holds."
+        "plan {plan_id} was written {age_minutes} minutes ago, past the {max_minutes} minute \
+         limit. It sat on disk while prices moved; executing it now means trading on a view \
+         nobody currently holds. Build a new one."
     )]
     PlanTooOld {
         plan_id: String,
         age_minutes: i64,
+        max_minutes: i64,
+    },
+
+    #[error(
+        "plan {plan_id} decided as of {as_of}, {lag_minutes} minutes ago, past the \
+         {max_minutes} minute decision-lag limit. Filling this long after the decision is not \
+         the strategy that was tested - at a 24h lag the backtest Sharpe falls from 2.22 to \
+         0.29. Run the cycle closer to the decision, or in paper mode pass \
+         --accept-decision-lag to exercise the pipeline anyway (recorded on the run)."
+    )]
+    DecisionLagTooLarge {
+        plan_id: String,
+        as_of: String,
+        lag_minutes: i64,
         max_minutes: i64,
     },
 
@@ -839,6 +853,16 @@ pub struct Runner<'a, V: VenueAdapter + ?Sized, C: Timer> {
     pub schedule: Schedule,
     /// How old a plan may be when the first slice goes out.
     pub max_plan_age_minutes: i64,
+    /// How long after its own decision moment a plan may still be filled.
+    ///
+    /// Distinct from `max_plan_age_minutes`, which asks how long the file sat
+    /// on disk. A daily plan's `as_of` is midnight UTC, so measuring disk age
+    /// from `as_of` made the whole pipeline unexecutable after 02:00 - the
+    /// cycle could not be run at all outside a two-hour window nobody was
+    /// awake for. They are now asked separately.
+    pub max_decision_lag_minutes: i64,
+    /// Paper-only escape hatch for the decision-lag gate, recorded on the run.
+    pub accept_decision_lag: bool,
 }
 
 impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
@@ -866,6 +890,16 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             return Err(e);
         }
 
+        if let Err(e) = check_decision_lag(
+            plan,
+            now,
+            self.max_decision_lag_minutes,
+            self.accept_decision_lag,
+        ) {
+            self.store
+                .record(&RunRecord::refused(plan, e.to_string(), &controls, now))?;
+            return Err(e);
+        }
         if let Err(e) = check_freshness(plan, now, self.max_plan_age_minutes) {
             self.store
                 .record(&RunRecord::refused(plan, e.to_string(), &controls, now))?;
@@ -903,6 +937,25 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             risk_checks: plan.risk_report.checks.clone(),
             slices: Vec::new(),
         };
+
+        // The venue's lot grid, read once. Slicing divides each quantity, so
+        // even a plan that arrived on-grid comes out of `slice_plan` off it,
+        // and every venue refuses an order that is not a multiple of its lot.
+        //
+        // Rounding here rather than inside the executor is what keeps the
+        // ledger honest: the ledger authorises client order ids, the id is
+        // derived from the quantity, and rounding after authorisation would
+        // have us submit an id we never wrote down - which surfaces as an
+        // unauthorised fill and halts the run, accusing the venue of an
+        // intrusion that was our own arithmetic.
+        let lots = executor::lot_grid(self.venue).await?;
+        let slices: Vec<PlanSlice> = slices
+            .into_iter()
+            .map(|mut sl| {
+                sl.plan.orders = executor::on_lot_grid(&sl.plan.orders, &lots);
+                sl
+            })
+            .collect();
 
         for slice in &slices {
             self.clock.sleep_until(slice.send_at).await;
@@ -1314,21 +1367,50 @@ fn slice_value(slice: &PlanSlice, exec: &ExecutionRecord) -> serde_json::Value {
     })
 }
 
-/// Refuse a plan that has gone stale.
+/// Refuse a plan that sat on disk while prices moved.
 ///
-/// A plan is a view about prices at a moment. Executing an old one means trading
-/// on a view nobody currently holds, and the wider the gap the less it resembles
-/// the strategy that was tested.
+/// Measured from `created_at`, which is wall clock at the moment the planner
+/// wrote the file. This is the "something delayed the run" guard: the plan was
+/// built against live prices, then hours passed before anyone executed it.
 pub fn check_freshness(
     plan: &Plan,
     now: OffsetDateTime,
     max_minutes: i64,
 ) -> Result<(), RunnerError> {
-    let age = (now - plan.as_of).whole_minutes();
+    let age = (now - plan.created_at).whole_minutes();
     if age > max_minutes {
         return Err(RunnerError::PlanTooOld {
             plan_id: plan.plan_id.to_string(),
             age_minutes: age,
+            max_minutes,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a plan whose decision moment is too far behind the fill.
+///
+/// Measured from `as_of` - the moment the decision describes, which for a daily
+/// book is midnight UTC regardless of when the file was written. This is the
+/// guard the Phase 1 lag study actually motivates: Sharpe 2.22 at a 1h fill lag
+/// against 0.29 at 24h. A plan can be freshly written and still describe a
+/// decision the market has long since left behind.
+///
+/// `accepted` is the paper-mode override. It never suppresses the check in live
+/// mode - the caller is responsible for only setting it under a paper venue -
+/// and the run records that it was used.
+pub fn check_decision_lag(
+    plan: &Plan,
+    now: OffsetDateTime,
+    max_minutes: i64,
+    accepted: bool,
+) -> Result<(), RunnerError> {
+    let lag = (now - plan.as_of).whole_minutes();
+    if lag > max_minutes && !accepted {
+        return Err(RunnerError::DecisionLagTooLarge {
+            plan_id: plan.plan_id.to_string(),
+            as_of: plan.as_of.to_string(),
+            lag_minutes: lag,
             max_minutes,
         });
     }

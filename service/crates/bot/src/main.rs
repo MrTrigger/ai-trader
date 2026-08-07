@@ -65,10 +65,15 @@ const USAGE: &str = "\
 usage: bot --config <file> <command>
 
 commands:
-  run --plan <file>                  execute a plan across its slices
+  run --plan <file> [--accept-decision-lag]
+                                     execute a plan across its slices
+                                     (--accept-decision-lag: paper only, fills a
+                                      decision older than the lag limit)
   status                             health, controls and the last run
   history [--limit N]                recent runs, newest first
   positions                          what the venue says we hold
+  markets [--out <file>]             the assets this venue lists, for the planner
+  book [--out <file>]                cash and positions in the planner's format
   reconcile                          our record against the venue's; changes nothing
   feed [--once] [--interval SECS]    keep marks.json fresh from the venue
   mode                               which venue this is pointed at
@@ -133,12 +138,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let plan_path = flags.need("--plan")?;
             block_on(async {
                 require_registered(&cfg).await?;
-                cmd_run(&cfg, PathBuf::from(plan_path)).await
+                cmd_run(
+                    &cfg,
+                    PathBuf::from(plan_path),
+                    flags.has("--accept-decision-lag"),
+                )
+                .await
             })
         }
         "status" => cmd_status(&cfg),
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
         "positions" => block_on(cmd_positions(&cfg)),
+        "markets" => block_on(cmd_markets(&cfg, flags.get("--out").map(PathBuf::from))),
+        "book" => block_on(cmd_book(&cfg, flags.get("--out").map(PathBuf::from))),
         "reconcile" => block_on(cmd_reconcile(&cfg)),
         "feed" => block_on(cmd_feed(
             &cfg,
@@ -300,7 +312,10 @@ fn open_stores(cfg: &BotConfig) -> Result<Stores, String> {
 /// invocation would start flat and the executor would reconcile a real
 /// intention against a book that had forgotten everything. The live venue keeps
 /// its own books, so there is nothing to restore.
-fn open_venue(cfg: &BotConfig, rec: Option<&records::blocking::Records>) -> Result<Venue, String> {
+async fn open_venue(
+    cfg: &BotConfig,
+    rec: Option<&records::blocking::Records>,
+) -> Result<Venue, String> {
     let env = Env::from_process();
 
     // Marks. A live feed is the default because a paper run on frozen prices
@@ -327,11 +342,20 @@ fn open_venue(cfg: &BotConfig, rec: Option<&records::blocking::Records>) -> Resu
         quote_decimals: 8,
     };
 
-    // Markets from the config if it lists any, otherwise from the venue itself.
-    // Listing them by hand is the safe default for paper; against a real venue
-    // its own metadata is authoritative and a stale local copy is how an order
-    // gets rejected for a lot size that changed last month.
-    let markets = cfg.markets();
+    // The venue's own metadata is authoritative, and that is as true of a paper
+    // book as a live one: a simulator running off a stale hand-written list is
+    // not standing in for the venue, it is standing in for the list. An
+    // explicit `markets` block in the config still wins, for fixtures and
+    // offline work; otherwise ask the venue.
+    let configured = cfg.markets();
+    let markets = if configured.is_empty() {
+        match active_venue::venue_markets(&cfg.venue_id, &env).await? {
+            Some(m) => m,
+            None => configured,
+        }
+    } else {
+        configured
+    };
 
     let snapshot = match rec {
         Some(rec) => rec
@@ -395,10 +419,33 @@ async fn save_venue(
 
 // --- commands ---------------------------------------------------------------
 
-async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
+async fn cmd_run(
+    cfg: &BotConfig,
+    plan_path: PathBuf,
+    accept_decision_lag: bool,
+) -> Result<(), String> {
     let text = std::fs::read_to_string(&plan_path)
         .map_err(|e| format!("cannot read plan {}: {e}", plan_path.display()))?;
     let plan = plan::Plan::parse(&text).map_err(|e| format!("plan is not valid: {e}"))?;
+
+    // The override exists to exercise the pipeline against a simulated book, and
+    // that is the only place it is allowed. Under a real venue a stale decision
+    // is a stale decision, and no flag talks its way past that.
+    if accept_decision_lag && cfg.mode != crate::active_venue::Mode::Paper {
+        return Err(
+            "--accept-decision-lag is a paper-mode flag. In live or live-readonly the \
+             decision-lag limit is not overridable: build a fresh plan instead."
+                .into(),
+        );
+    }
+    if accept_decision_lag {
+        eprintln!(
+            "bot: --accept-decision-lag: filling a decision from {} against the paper book. \
+             The fill prices are live but the decision is not; do not read this run as \
+             evidence about the strategy.",
+            plan.as_of
+        );
+    }
 
     let Stores {
         rec,
@@ -406,7 +453,7 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
         ledger,
         controls,
     } = open_stores(cfg)?;
-    let venue = open_venue(cfg, rec.as_deref())?;
+    let venue = open_venue(cfg, rec.as_deref()).await?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -417,6 +464,8 @@ async fn cmd_run(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
         controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag,
     };
 
     let outcome = runner.run(&plan).await;
@@ -511,9 +560,118 @@ fn cmd_history(cfg: &BotConfig, limit: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
+/// What the venue actually lists.
+///
+/// The planner ranks a universe built from Binance bars, and then the book is
+/// held on whatever venue the bot points at. Those are not the same list: BANK
+/// trades on Binance and is not listed on Hyperliquid, so a plan that ranks it
+/// into the top 30 produces an order no venue will ever accept, and the run
+/// halts partway through with the book half-built.
+///
+/// Dropping unlisted names at execution time would be worse than halting: the
+/// weights were solved together, so silently omitting a third of them leaves an
+/// underinvested book nobody designed. The screen belongs upstream, in the
+/// universe, which is what this export feeds.
+async fn cmd_markets(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String> {
+    let st = open_stores(cfg)?;
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
+    let markets = venue
+        .get_markets()
+        .await
+        .map_err(|e| format!("cannot read the market list: {e}"))?;
+    let assets: Vec<&str> = markets.iter().map(|m| m.asset.as_str()).collect();
+    let doc = serde_json::json!({
+        "venue_id": cfg.venue_id,
+        "as_of": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        "assets": assets,
+    });
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &text)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            eprintln!(
+                "{} asset(s) listed on {} -> {}",
+                assets.len(),
+                cfg.venue_id,
+                path.display()
+            );
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+/// The account's cash and positions, in the shape the planner's book expects.
+///
+/// The planner kept its own `book.json` and sized every plan against the cash
+/// written there. Whatever the account actually held, it planned for the
+/// number in the file - so a 30k paper account was handed a plan built for
+/// 100k and ran out of money nine orders in.
+///
+/// Two books that are both authoritative is one book too many. This makes the
+/// venue the source and the planner's copy a derived artefact, refreshed each
+/// cycle before anything is decided.
+async fn cmd_book(cfg: &BotConfig, out: Option<PathBuf>) -> Result<(), String> {
+    let st = open_stores(cfg)?;
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
+    let positions = venue
+        .get_positions()
+        .await
+        .map_err(|e| format!("cannot read positions: {e}"))?;
+    let balances = venue
+        .get_balances()
+        .await
+        .map_err(|e| format!("cannot read balances: {e}"))?;
+
+    // Cash is the quote currency's free balance. A book sized off the total
+    // would count margin already pledged against open positions as spendable.
+    let cash = balances
+        .iter()
+        .find(|b| b.currency == cfg.quote_currency)
+        .map(|b| b.available)
+        .ok_or_else(|| {
+            format!(
+                "the venue reports no {} balance, so there is no cash figure to plan \
+                 against. Fund the account, or check the quote_currency in the bot config.",
+                cfg.quote_currency
+            )
+        })?;
+
+    let doc = serde_json::json!({
+        "cash": cash.to_string(),
+        "positions": positions
+            .iter()
+            .filter(|p| !p.qty.is_zero())
+            .map(|p| serde_json::json!({ "asset": p.asset, "qty": p.qty.to_string() }))
+            .collect::<Vec<_>>(),
+        "as_of": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &text)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            eprintln!(
+                "{} {} cash, {} position(s) -> {}",
+                cash,
+                cfg.quote_currency,
+                positions.iter().filter(|p| !p.qty.is_zero()).count(),
+                path.display()
+            );
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
 async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
     let st = open_stores(cfg)?;
-    let venue = open_venue(cfg, st.rec.as_deref())?;
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
     let positions = venue
         .get_positions()
         .await
@@ -545,7 +703,7 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
         ledger,
         controls,
     } = open_stores(cfg)?;
-    let venue = open_venue(cfg, rec.as_deref())?;
+    let venue = open_venue(cfg, rec.as_deref()).await?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -556,6 +714,8 @@ async fn cmd_reconcile(cfg: &BotConfig) -> Result<(), String> {
         controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag: false,
     };
     let report = runner
         .inspect()
@@ -580,7 +740,7 @@ async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         ledger,
         controls,
     } = open_stores(cfg)?;
-    let venue = open_venue(cfg, rec.as_deref())?;
+    let venue = open_venue(cfg, rec.as_deref()).await?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -591,6 +751,8 @@ async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag: false,
     };
     let record = runner
         .adopt(&reason, &by, flags.has("--accept-unknown-fills"))
@@ -659,7 +821,7 @@ async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), St
 
 /// What venue this is pointed at, and whether it could trade.
 async fn cmd_mode_show(cfg: &BotConfig) -> Result<(), String> {
-    let venue = open_venue(cfg, open_stores(cfg)?.rec.as_deref())?;
+    let venue = open_venue(cfg, open_stores(cfg)?.rec.as_deref()).await?;
     // Derived from the key whatever mode we are in, because "is the agent I
     // configured the one the account approved" is a question you want answered
     // *before* switching to live, not by a rejected order afterwards.
@@ -759,6 +921,7 @@ async fn cmd_mode_set(
     probe.mode = mode;
     let stores = open_stores(cfg)?;
     let venue = open_venue(&probe, stores.rec.as_deref())
+        .await
         .map_err(|e| format!("cannot switch to {}: {e}", mode.as_str()))?;
     let described = venue.describe();
 
@@ -863,7 +1026,7 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         ledger,
         controls,
     } = open_stores(cfg)?;
-    let venue = open_venue(cfg, rec.as_deref())?;
+    let venue = open_venue(cfg, rec.as_deref()).await?;
     let clock = SystemClock;
     let runner = Runner {
         bot_id: cfg.bot_id.clone(),
@@ -874,6 +1037,8 @@ async fn cmd_flatten(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
         controls,
         schedule: cfg.schedule,
         max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag: false,
     };
 
     let outcome = runner.flatten(&reason, &by).await;

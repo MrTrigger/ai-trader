@@ -139,6 +139,7 @@ def by_liquidity(
     lookback_days: int = 30,
     min_history_bars: int = 90,
     min_turnover: float = 0.0,
+    tradeable: set[str] | None = None,
 ) -> list[UniverseMember]:
     """Rank assets by trailing median quote turnover as of `as_of`.
 
@@ -155,6 +156,19 @@ def by_liquidity(
     silently omits what it considered is not a record of a decision - and the
     delisted in particular have to stay visible, or reading history back gives
     the survivors again by a different route.
+
+    `tradeable` is the set of assets the execution venue actually lists, and it
+    is a screen like any other: ranked, recorded, and given a reason. The bars
+    come from Binance and the book is held somewhere else, so the two lists do
+    not match - BANK ranks well on Binance turnover and is not listed on
+    Hyperliquid at all. Screening here rather than at execution is deliberate:
+    the weights are solved together, so dropping names after construction
+    leaves an underinvested book nobody designed, while screening before it
+    lets the optimiser fill the slot with something that can actually be held.
+
+    Left as None the screen is not applied, which is what a backtest wants:
+    today's listing set says nothing about what was listable in 2019, and
+    applying it backwards is survivorship bias wearing a venue's name.
     """
     if top_n <= 0:
         raise ValueError(f"top_n must be positive, got {top_n}")
@@ -197,7 +211,10 @@ def by_liquidity(
     scored = []
     for row in stats.iter_rows(named=True):
         turnover = row["turnover"]
-        if not bars_mod.is_canonical_asset(row["asset"]):
+        if tradeable is not None and row["asset"] not in tradeable:
+            reason = "not listed on the execution venue"
+            eligible = False
+        elif not bars_mod.is_canonical_asset(row["asset"]):
             # A venue can list something whose base asset is not expressible as
             # a canonical id - Binance carries one whose ticker is CJK text.
             # Caught here, where eligibility is decided, rather than at plan

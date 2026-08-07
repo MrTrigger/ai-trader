@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use runner::{ControlFile, Health, RunRecord, RunStore};
+use runner::{ControlFile, ControlStore, Health, RunRecord, RunStore};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -175,21 +175,50 @@ pub struct Inputs<'a> {
     pub bot_config: Option<&'a Path>,
     pub run_limit: usize,
     pub fill_limit: usize,
+    /// The records DB and the bot whose rows to read, when there is one.
+    ///
+    /// The bot writes its controls, runs and paper book to Postgres whenever
+    /// DATABASE_URL is set, and to files only when it is not. The dashboard was
+    /// reading the files unconditionally, so against a DB-backed bot it showed
+    /// a flat book and "nothing has run yet" while the account held fifteen
+    /// positions. Same backend as the writer, or the page is fiction.
+    pub records: Option<(std::sync::Arc<records::blocking::Records>, String)>,
 }
 
 pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
     let now = time::OffsetDateTime::now_utc();
     let mut warnings = Vec::new();
 
-    let controls = ControlFile::read(&inputs.state_dir.join("controls.json"));
-    let store = RunStore::new(inputs.state_dir);
+    let (controls, store) = match &inputs.records {
+        Some((rec, bot_id)) => (
+            ControlStore::db(rec.clone(), bot_id.clone()).read(),
+            RunStore::db(rec.clone(), bot_id.clone()),
+        ),
+        None => (
+            ControlFile::read(&inputs.state_dir.join("controls.json")),
+            RunStore::new(inputs.state_dir),
+        ),
+    };
     let runs = store.recent(inputs.run_limit).map_err(|e| e.to_string())?;
     let health =
         runner::health(&controls, &store, inputs.cadence_hours, now).map_err(|e| e.to_string())?;
 
     let marks = read_marks(&inputs.state_dir.join("marks.json"), &mut warnings);
-    let fills = read_fills(&inputs.state_dir.join("venue-state.json"), &mut warnings);
-    let open_orders = read_open_orders(&inputs.state_dir.join("venue-state.json"));
+    // The paper book: from the DB when the bot keeps it there, else the file.
+    let snapshot_text = match &inputs.records {
+        Some((rec, bot_id)) => rec.get_sim_state(bot_id).ok().flatten(),
+        None => None,
+    };
+    let (fills, open_orders) = match snapshot_text {
+        Some(text) => (
+            fills_in(&text, "the records db", &mut warnings),
+            open_orders_in(&text),
+        ),
+        None => (
+            read_fills(&inputs.state_dir.join("venue-state.json"), &mut warnings),
+            read_open_orders(&inputs.state_dir.join("venue-state.json")),
+        ),
+    };
     let book = fold_book(
         &fills,
         &marks,
@@ -232,7 +261,7 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
     // nothing, so the ledger is compared against the same fills everything else
     // on this page is folded from.
     let mut health = health;
-    let reconciliation = reconcile_view(inputs.state_dir, &fills, &mut warnings);
+    let reconciliation = reconcile_view(inputs, &fills, &mut warnings);
     // Health has to account for this. `runner::health` is about controls and
     // cadence and knows nothing of the ledger, so a dashboard showing "ok"
     // beside "reconciliation disagrees" would be telling an operator the system
@@ -288,11 +317,17 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
 
 /// Our ledger against the book, for display only.
 fn reconcile_view(
-    state_dir: &Path,
+    inputs: &Inputs,
     fills: &[Fill],
     warnings: &mut Vec<String>,
 ) -> Option<serde_json::Value> {
-    let ledger = runner::Ledger::open(state_dir);
+    // The same ledger the bot authorises through. Reading the file copy while
+    // the bot writes the DB made every legitimate fill look unauthorised - the
+    // page cried intrusion on its own bot's orders.
+    let ledger = match &inputs.records {
+        Some((rec, bot_id)) => runner::Ledger::db(rec.clone(), bot_id.clone()),
+        None => runner::Ledger::open(inputs.state_dir),
+    };
     let eps: rust_decimal::Decimal = "0.00000001".parse().ok()?;
     let positions = derive_positions(fills);
     match ledger.reconcile(&positions, fills, eps) {
@@ -356,6 +391,23 @@ fn read_marks(path: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, Decim
             BTreeMap::new()
         }
     }
+}
+
+fn fills_in(text: &str, origin: &str, warnings: &mut Vec<String>) -> Vec<Fill> {
+    match paper::fills_in_snapshot(text) {
+        Ok(f) => f,
+        Err(e) => {
+            warnings.push(format!(
+                "the venue state in {origin} could not be read ({e}); the book shown here is \
+                 empty and is not what the account holds"
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn open_orders_in(text: &str) -> Vec<venue::OpenOrder> {
+    paper::open_orders_in_snapshot(text).unwrap_or_default()
 }
 
 fn read_fills(path: &Path, warnings: &mut Vec<String>) -> Vec<Fill> {
