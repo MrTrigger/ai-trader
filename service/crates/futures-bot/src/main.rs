@@ -44,6 +44,12 @@ usage: futures-bot <command>
       resolved front month, balances, positions, and a 15s market-data
       test. Run this the day the market-data subscription activates.
 
+  backfill --bars <jsonl> [--days N]
+      Fetch recent 5-minute bars from IB historical data and append the
+      ones newer than the file's last bar. Closes the gap between the
+      lab's stored history and now, so today's noise bands are computed
+      from actual recent sessions.
+
   run --bars <warmup jsonl> [--live] [--bot-id ID]
       The live loop: IB 5s bars -> 5min -> the SAME stack replay parity
       proved. Default is SHADOW (never armed, simulated fills, published
@@ -69,6 +75,7 @@ fn main() -> ExitCode {
         Some("replay") => replay(&get),
         Some("features") => features_cmd(&get),
         Some("ib-check") => block_on_async(ib_check(&get)),
+        Some("backfill") => block_on_async(backfill(&get)),
         Some("run") => block_on_async(run_live(&get)),
         _ => {
             println!("{USAGE}");
@@ -376,7 +383,34 @@ fn block_on_async(
 
 async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let live = get("--live").is_some() || std::env::args().any(|a| a == "--live");
-    let cfg = ib::IbConfig::from_env(live)?;
+    let cfg = match ib::IbConfig::from_env(live) {
+        Ok(c) => c,
+        Err(e) if e.contains("account not configured") => {
+            // The probe's job is discovery: connect anyway, report what the
+            // Gateway holds, and continue with it if it is unambiguous.
+            let host = std::env::var("IB_PAPER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+            let port: u16 = std::env::var("IB_PAPER_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4002);
+            let addr = format!("{host}:{port}");
+            let client = ibapi::Client::connect(&addr, 8)
+                .await
+                .map_err(|e| format!("cannot connect to IB Gateway at {addr}: {e}"))?;
+            let accounts = client.managed_accounts().await.map_err(|e| e.to_string())?;
+            println!("gateway holds account(s): {accounts:?}");
+            let [only] = accounts.as_slice() else {
+                return Err(format!(
+                    "{e}. Set IB_PAPER_ACCOUNT to one of {accounts:?} in .env."
+                ));
+            };
+            println!("using {only} for this probe — set IB_PAPER_ACCOUNT in .env to keep it");
+            drop(client);
+            std::env::set_var("IB_PAPER_ACCOUNT", only);
+            ib::IbConfig::from_env(live)?
+        }
+        Err(e) => return Err(e),
+    };
     println!("connecting to {}:{} ...", cfg.host, cfg.port);
     let venue = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
     println!("connected: server v{}", venue.server_version());
@@ -440,7 +474,15 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     reg.require_enabled(&bot_id).await.map_err(|e| e.to_string())?;
     let rec = records::blocking::Records::connect(&url).map_err(|e| e.to_string())?;
 
-    let mut cfg = ib::IbConfig::from_env(live)?;
+    // The account block follows the arming intent, exactly like the venue
+    // registry: the LIVE block only when --live AND the operator set
+    // IB_ALLOW_LIVE; otherwise the paper block — which is what "--live on a
+    // paper account" means.
+    let allow_live = matches!(
+        std::env::var("IB_ALLOW_LIVE").unwrap_or_default().to_lowercase().as_str(),
+        "yes" | "true" | "1"
+    );
+    let mut cfg = ib::IbConfig::from_env(live && allow_live)?;
     if !live {
         // Shadow NEVER arms, whatever the env says.
         cfg.allow_orders = false;
@@ -468,53 +510,74 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         );
     }
 
-    let sub = venue_conn
-        .client()
-        .realtime_bars(venue_conn.contract())
-        .subscribe()
-        .await
-        .map_err(|e| format!("realtime bars refused: {e}"))?;
-    let mut stream = sub.filter_data();
-    let mut agg = live::Aggregate5s::default();
+    // The feed rides its OWN Gateway connection (client id +1): a feed
+    // hiccup must never share fate with the order path. Realtime 5s bars
+    // are tried first; if nothing arrives (no live CME subscription — the
+    // situation on this account today), the producer falls back to polling
+    // IB historical 5-minute bars, which this account DOES have. The bot
+    // decides on completed bars either way; polling adds seconds of
+    // latency to a decision that executes at the next bar open.
+    let (bar_tx, mut bar_rx) = tokio::sync::mpsc::channel::<RawBar>(64);
+    {
+        let mut feed_cfg = ib::IbConfig::from_env(live && allow_live)?;
+        feed_cfg.allow_orders = false; // the feed connection can never trade
+        feed_cfg.client_id += 1;
+        let feed = ib::IbVenue::connect(feed_cfg).await.map_err(|e| e.to_string())?;
+        tokio::spawn(feed_task(feed, bar_tx));
+    }
     eprintln!("run loop started ({mode}); ctrl-c to stop");
 
+    // Never feed a bar the feature streams already consumed: warmup covers
+    // the file, marks cover a restored session. Duplicates would corrupt
+    // the incremental state (slots counted twice).
+    let mut high_water: Option<chrono::DateTime<chrono::Utc>> = warmup.last().map(|b| b.ts_utc);
+    for m in marks.values().flatten() {
+        if Some(*m) > high_water {
+            high_water = Some(*m);
+        }
+    }
+
+    let mut last_bar_seen = chrono::Utc::now();
     loop {
-        let next = tokio::time::timeout(
-            std::time::Duration::from_secs(live::STALL_SECONDS),
-            stream.next(),
-        )
-        .await;
-        let bar5s = match next {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(120), bar_rx.recv()).await;
+        let done = match next {
             Err(_) => {
-                // Feed stall: the watchdog rail. Flatten (live), halt, tell.
-                if live {
-                    let _ = venue_conn.flatten_all(&bot_id).await;
+                // No completed bar lately. During the daily break, weekends
+                // and holidays that is correct; while the market should be
+                // printing, >70 minutes of silence is a stall: flatten
+                // (live) and halt.
+                let now = chrono::Utc::now();
+                let silent = now.signed_duration_since(last_bar_seen).num_minutes();
+                if live::market_should_be_open(now) && silent > 70 {
+                    if live {
+                        let _ = venue_conn.flatten_all(&bot_id).await;
+                    }
+                    book.halted = Some("feed-stall".into());
+                    live::publish_live(&rec, &book, &bot_id, mode, Some("feed stall — halted"))?;
+                    return Err(format!("no completed bar for {silent}m in market hours — halted"));
                 }
-                book.halted = Some("feed-stall".into());
-                live::publish_live(&rec, &book, &bot_id, mode, Some("feed stall — halted"))?;
-                return Err(format!("no 5s bar for {}s — flattened (live) and halted", live::STALL_SECONDS));
+                // Heartbeat so the dashboard sees a live process either way.
+                live::publish_live(&rec, &book, &bot_id, mode, None)?;
+                continue;
             }
             Ok(None) => {
                 book.halted = Some("feed-closed".into());
                 live::publish_live(&rec, &book, &bot_id, mode, Some("feed closed — halted"))?;
-                return Err("the bar stream ended — halted".into());
+                return Err("the bar feed ended — halted".into());
             }
-            Ok(Some(Err(e))) => {
-                eprintln!("bar stream error: {e}; continuing");
-                continue;
-            }
-            Ok(Some(Ok(b))) => b,
+            Ok(Some(b)) => b,
         };
-
-        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(bar5s.date.unix_timestamp(), 0)
-            .ok_or("bar timestamp out of range")?;
-        let Some(done) = agg.on_bar(ts, bar5s.open, bar5s.high, bar5s.low, bar5s.close, bar5s.volume)
-        else {
+        last_bar_seen = chrono::Utc::now();
+        if high_water.map(|h| done.ts_utc <= h).unwrap_or(false) {
             continue;
-        };
+        }
+        high_water = Some(done.ts_utc);
 
         // Controls, fresh every completed bar. Halt stops entries now and,
         // in live mode, flattens.
+        // The canonical contract: NO control row means HALTED, fail closed.
+        // Running is a deliberate act — a resume row with a reason and a
+        // name. (An unparseable row also reads as halted.)
         let control = rec
             .current_control(&bot_id)
             .map_err(|e| e.to_string())?
@@ -526,11 +589,30 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                         ..Default::default()
                     })
             })
-            .unwrap_or_default();
+            .unwrap_or(noise_book::runtime::Control {
+                halt: true,
+                ..Default::default()
+            });
         let was_halted = book.halted.is_some();
         book.apply_control(&control);
         if book.halted.is_some() && !was_halted && live {
             let _ = venue_conn.flatten_all(&bot_id).await;
+        }
+
+        // Catch-up gate: the poll feed replays the last day's bars at
+        // startup to rebuild today's session state. Those bars are history —
+        // no ENTRY may fire on them (a stale decision filled now at market
+        // is a different trade than the validated one). Exits on an open
+        // position still run: shedding risk late beats holding it. Entries
+        // unlock when bars are current.
+        let stale = chrono::Utc::now()
+            .signed_duration_since(done.ts_utc)
+            .num_seconds()
+            > 600;
+        if stale {
+            for st in &book.sleeves {
+                book.disabled.insert(st.cfg.key.to_string());
+            }
         }
 
         let outcome = live::drive_bar(&mut book, &mut globex, &mut rth, &frames, &done);
@@ -581,5 +663,165 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         if book.halted.is_some() {
             eprintln!("halted: {:?} — loop stays up publishing state", book.halted);
         }
+    }
+}
+
+async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    use ibapi::market_data::historical::BarTimestamp;
+    use ibapi::prelude::{HistoricalBarSize, HistoricalWhatToShow};
+
+    let path = get("--bars").ok_or("--bars is required")?;
+    let days: i32 = get("--days").map(|d| d.parse().unwrap_or(5)).unwrap_or(5);
+    let existing = read_bars(&path)?;
+    let last = existing.last().map(|b| b.ts_utc).ok_or("bars file is empty")?;
+
+    let cfg = ib::IbConfig::from_env(false)?;
+    let venue = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
+    eprintln!("{}", venue.describe());
+    let data = venue
+        .client()
+        .historical_data(venue.contract(), HistoricalBarSize::Min5)
+        .what_to_show(HistoricalWhatToShow::Trades)
+        .trading_hours(ibapi::prelude::TradingHours::Extended)
+        .duration(ibapi::market_data::historical::Duration::days(days))
+        .ending(time::OffsetDateTime::now_utc())
+        .fetch()
+        .await
+        .map_err(|e| format!("historical data refused: {e}"))?;
+
+    let mut fresh: Vec<RawBar> = Vec::new();
+    for b in &data.bars {
+        let BarTimestamp::DateTime(dt) = &b.date else {
+            continue;
+        };
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(dt.unix_timestamp(), 0)
+            .ok_or("bar timestamp out of range")?;
+        if ts <= last {
+            continue;
+        }
+        fresh.push(RawBar {
+            ts_utc: ts,
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume.max(0.0),
+        });
+    }
+    fresh.sort_by_key(|b| b.ts_utc);
+    if fresh.is_empty() {
+        println!("nothing to append: file already ends at {last} and IB returned no newer bars");
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("{path}: {e}"))?;
+    for b in &fresh {
+        let row = serde_json::json!({
+            "ts_utc": b.ts_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+            "volume": b.volume,
+        });
+        writeln!(f, "{row}").map_err(|e| e.to_string())?;
+    }
+    println!(
+        "appended {} bars ({} -> {})",
+        fresh.len(),
+        fresh.first().expect("nonempty").ts_utc,
+        fresh.last().expect("nonempty").ts_utc
+    );
+    Ok(())
+}
+
+/// The bar producer: realtime 5s bars when the subscription allows, else
+/// poll IB historical 5-minute bars. Sends COMPLETED 5-minute buckets.
+async fn feed_task(feed: ib::IbVenue, tx: tokio::sync::mpsc::Sender<RawBar>) {
+    // Attempt realtime first: subscribe and wait up to 45s for a first bar.
+    match feed.client().realtime_bars(feed.contract()).subscribe().await {
+        Ok(sub) => {
+            let mut stream = sub.filter_data();
+            match tokio::time::timeout(std::time::Duration::from_secs(45), stream.next()).await {
+                Ok(Some(Ok(first))) => {
+                    eprintln!("feed: realtime 5s bars streaming");
+                    let mut agg = live::Aggregate5s::default();
+                    let mut push = |b: &ibapi::market_data::realtime::Bar,
+                                    agg: &mut live::Aggregate5s|
+                     -> Option<RawBar> {
+                        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            b.date.unix_timestamp(),
+                            0,
+                        )?;
+                        agg.on_bar(ts, b.open, b.high, b.low, b.close, b.volume)
+                    };
+                    if let Some(done) = push(&first, &mut agg) {
+                        let _ = tx.send(done).await;
+                    }
+                    while let Some(item) = stream.next().await {
+                        let Ok(b) = item else { continue };
+                        if let Some(done) = push(&b, &mut agg) {
+                            if tx.send(done).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    return; // stream ended; receiver's timeout handles it
+                }
+                _ => eprintln!(
+                    "feed: no realtime bars in 45s (no live subscription) — \
+                     falling back to historical polling"
+                ),
+            }
+        }
+        Err(e) => eprintln!("feed: realtime refused ({e}) — falling back to historical polling"),
+    }
+
+    // Poll mode: every 20s fetch the last day of 5-minute bars and emit the
+    // buckets that completed since the last emission. A bucket is complete
+    // once its 5 minutes have fully elapsed.
+    use ibapi::market_data::historical::BarTimestamp;
+    use ibapi::prelude::{HistoricalBarSize, HistoricalWhatToShow};
+    let mut last_sent: Option<chrono::DateTime<chrono::Utc>> = None;
+    loop {
+        let fetched = feed
+            .client()
+            .historical_data(feed.contract(), HistoricalBarSize::Min5)
+            .what_to_show(HistoricalWhatToShow::Trades)
+            .trading_hours(ibapi::prelude::TradingHours::Extended)
+            .duration(ibapi::market_data::historical::Duration::days(1))
+            .ending(time::OffsetDateTime::now_utc())
+            .fetch()
+            .await;
+        match fetched {
+            Ok(data) => {
+                let now = chrono::Utc::now();
+                for b in &data.bars {
+                    let BarTimestamp::DateTime(dt) = &b.date else { continue };
+                    let Some(ts) =
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(dt.unix_timestamp(), 0)
+                    else {
+                        continue;
+                    };
+                    let complete = ts + chrono::Duration::seconds(302) <= now;
+                    let fresh = last_sent.map(|l| ts > l).unwrap_or(true);
+                    if complete && fresh {
+                        last_sent = Some(ts);
+                        let bar = RawBar {
+                            ts_utc: ts,
+                            open: b.open,
+                            high: b.high,
+                            low: b.low,
+                            close: b.close,
+                            volume: b.volume.max(0.0),
+                        };
+                        if tx.send(bar).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("feed: historical poll failed ({e}); retrying"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
 }

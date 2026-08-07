@@ -12,7 +12,8 @@ ib = { path = "../ib" }
 ibapi = { version = "3", default-features = false, features = ["async"] }
 venue = { workspace = true }
 rust_decimal = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
+time = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

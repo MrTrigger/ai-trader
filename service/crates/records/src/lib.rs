@@ -535,8 +535,19 @@ pub mod blocking {
     use super::{ControlRow, RecordsError, Registry, StatusRow};
 
     pub struct Records {
-        rt: tokio::runtime::Runtime,
+        rt: Option<tokio::runtime::Runtime>,
         inner: Registry,
+    }
+
+    impl Drop for Records {
+        fn drop(&mut self) {
+            // A Runtime dropped inside an async context panics tokio;
+            // shutdown_background never blocks, so this handle is safe to
+            // drop anywhere — including an async caller's error path.
+            if let Some(rt) = self.rt.take() {
+                rt.shutdown_background();
+            }
+        }
     }
 
     impl Records {
@@ -546,7 +557,7 @@ pub mod blocking {
                 .build()
                 .expect("tokio current-thread runtime");
             let inner = wait_on(&rt, Registry::connect(database_url))?;
-            Ok(Arc::new(Self { rt, inner }))
+            Ok(Arc::new(Self { rt: Some(rt), inner }))
         }
 
         pub fn registry(&self) -> &Registry {
@@ -558,7 +569,7 @@ pub mod blocking {
             F: std::future::Future + Send,
             F::Output: Send,
         {
-            wait_on(&self.rt, fut)
+            wait_on(self.rt.as_ref().expect("runtime lives until drop"), fut)
         }
 
         pub fn record_run(

@@ -28,6 +28,23 @@ use venue::VenueAdapter;
 
 pub const STALL_SECONDS: u64 = 90;
 
+/// Whether CME equity-index futures SHOULD be printing bars right now:
+/// Sun 18:00 ET through Fri 17:00 ET, minus the daily 17:00-18:00 break.
+/// Holidays are deliberately unmodelled — a holiday reads as a stall,
+/// halts, and a human resumes; that failure direction costs opportunity,
+/// not money (same philosophy as venue::calendar::CmeGlobex).
+pub fn market_should_be_open(ts_utc: DateTime<Utc>) -> bool {
+    use chrono::{Datelike, Timelike, Weekday};
+    let et = features_cme::to_exchange_time(ts_utc);
+    let (wd, hour) = (et.weekday(), et.hour());
+    match wd {
+        Weekday::Sat => false,
+        Weekday::Sun => hour >= 18,
+        Weekday::Fri => hour < 17,
+        _ => hour != 17,
+    }
+}
+
 /// Resolve the canonical control document (schema 1) — or the legacy
 /// dialect — into the runtime's Control. Unknown states read as halted.
 pub fn control_from_payload(payload: &serde_json::Value) -> Control {

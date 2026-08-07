@@ -164,13 +164,16 @@ impl IbVenue {
 
         // Resolve the front month: every listed expiry, keep the nearest one
         // at or after today.
-        let probe = ibapi::contracts::ContractBuilder::futures(
-            cfg.symbol.as_str(),
-            "CME",
-            "USD",
-        )
-        .build()
-        .map_err(|e| VenueError::Unreachable(format!("contract probe: {e}")))?;
+        // A month-less FUT probe: contract_details enumerates every listed
+        // expiry for the symbol (the builder refuses month-less on purpose;
+        // enumeration is exactly what we want here).
+        let probe = Contract {
+            symbol: cfg.symbol.as_str().into(),
+            security_type: SecurityType::Future,
+            exchange: "CME".into(),
+            currency: "USD".into(),
+            ..Default::default()
+        };
         let details = client
             .contract_details(&probe)
             .await
