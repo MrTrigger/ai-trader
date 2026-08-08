@@ -36,12 +36,19 @@ test("the control word outranks a failing feed", () => {
   expect(activity({ enabled: true, control: "halted", feed: { healthy: false } }).key).toBe("halted");
 });
 
-test("a control the bot has not seen yet says so", () => {
-  // Stop on a cron bot can sit unacknowledged for hours. "stopped" would
-  // promise the book is closed; it is not, and the operator must know
-  // which of the two they are looking at.
-  expect(activity({ enabled: true, control: "stopped", pending: true }).label).toBe("stopping");
-  expect(activity({ enabled: true, control: "halted", pending: true }).label).toBe("halting");
+test("Halt is patient, Stop is not", () => {
+  // Halt only prevents the NEXT entry, so noticing it a cycle later costs
+  // nothing — "halting" stays a quiet transition however long it takes.
+  expect(activity({ enabled: true, control: "halted", unackSeconds: 99_999 }).key).toBe("halted");
+  expect(activity({ enabled: true, control: "halted", unackSeconds: 99_999 }).tone).toBe("quiet");
+
+  // Stop means "be flat". Briefly in flight is a transition...
+  expect(activity({ enabled: true, control: "stopped", unackSeconds: 3 }).key).toBe("stopping");
+  // ...but past the grace nothing is listening, and the operator is
+  // carrying risk they believe they cancelled. That is a fault, in red.
+  const stuck = activity({ enabled: true, control: "stopped", unackSeconds: 600 });
+  expect(stuck.key).toBe("stop-not-applied");
+  expect(stuck.tone).toBe("alarm");
 });
 
 test("a bot with no feed is never called idle", () => {

@@ -31,7 +31,15 @@ import type { FeedHealth } from "../api/types";
  * deployed for, and that should not wear the same green as one that is.
  */
 export type Activity = {
-  key: "disabled" | "stopped" | "halted" | "failure" | "idle" | "working";
+  key:
+    | "disabled"
+    | "stopped"
+    | "stopping"
+    | "stop-not-applied"
+    | "halted"
+    | "failure"
+    | "idle"
+    | "working";
   /** Fleet-card length. */
   label: string;
   /** Bot-page header length; keeps the control word visible. */
@@ -39,16 +47,29 @@ export type Activity = {
   tone?: "quiet" | "go" | "alarm" | "consequence";
 };
 
+/**
+ * How long a Stop may sit unapplied before it is a fault rather than a
+ * transition. The bot reads controls every few seconds, so anything past
+ * this means nothing is listening.
+ */
+export const STOP_GRACE_S = 30;
+
 export function activity(a: {
   enabled?: boolean;
   /** The canonical control word: running | halted | stopped. */
   control?: string | null;
   /**
-   * The control was set after the bot last published, so the bot has not
-   * seen it yet. Worth its own word: "stopped" and "stopping" are
-   * different promises, and a cron bot can sit in the second for hours.
+   * Seconds the control has gone unacknowledged — the bot has not
+   * published since it was set. Undefined once it has.
+   *
+   * The two verbs need different patience. Halt only prevents the NEXT
+   * entry, so noticing it a cycle later costs nothing and "halting" is
+   * simply true. Stop means "be flat", the bot reads controls every few
+   * seconds, and an unapplied Stop is market risk the operator believes
+   * they already cancelled — so it stops being a pending state and
+   * becomes a fault.
    */
-  pending?: boolean;
+  unackSeconds?: number;
   feed?: FeedHealth;
 }): Activity {
   if (a.enabled === false) {
@@ -60,11 +81,21 @@ export function activity(a: {
   // `kill_switch` field that the schema-1 document does not have, so Stop
   // resolved to false and the pill stayed green on a stopped bot.
   if (a.control === "stopped") {
-    const label = a.pending ? "stopping" : "stopped";
-    return { key: "stopped", label, long: label, tone: "quiet" };
+    if (a.unackSeconds == null) {
+      return { key: "stopped", label: "stopped", long: "stopped", tone: "quiet" };
+    }
+    if (a.unackSeconds < STOP_GRACE_S) {
+      return { key: "stopping", label: "stopping", long: "stopping", tone: "quiet" };
+    }
+    return {
+      key: "stop-not-applied",
+      label: "not stopped",
+      long: "stop not applied",
+      tone: "alarm",
+    };
   }
   if (a.control === "halted") {
-    const label = a.pending ? "halting" : "halted";
+    const label = a.unackSeconds != null ? "halting" : "halted";
     return { key: "halted", label, long: label, tone: "quiet" };
   }
 

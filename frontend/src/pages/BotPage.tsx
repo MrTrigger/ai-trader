@@ -22,14 +22,16 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const ctl = d.controls as { state?: string; set_at?: string } | null;
   // Has the bot seen the control yet? Its last publish is now minus the
   // heartbeat age; if the operator set the word after that, it has not.
-  const pending =
-    !!ctl?.set_at &&
-    d.heartbeat_age_seconds != null &&
-    Date.parse(ctl.set_at) > Date.now() - d.heartbeat_age_seconds * 1000;
+  const lastPublish =
+    d.heartbeat_age_seconds != null ? Date.now() - d.heartbeat_age_seconds * 1000 : null;
+  const unackSeconds =
+    ctl?.set_at && lastPublish != null && Date.parse(ctl.set_at) > lastPublish
+      ? Math.max(0, (Date.now() - Date.parse(ctl.set_at)) / 1000)
+      : undefined;
   // What it is doing, which is not what it was told (the control word) and
   // not what it is wired to do (the route chain). See lib/activity.
-  const act = activity({ enabled: d.enabled, control: ctl?.state, pending, feed });
-  const halted = act.key === "halted" || act.key === "stopped";
+  const act = activity({ enabled: d.enabled, control: ctl?.state, unackSeconds, feed });
+  const halted = ["halted", "stopped", "stopping", "stop-not-applied"].includes(act.key);
   const failing = act.key === "failure";
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
@@ -214,6 +216,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
             <Controls
               botId={id}
               control={ctl?.state}
+              stopping={act.key === "stopping"}
               // Only claim flat when we can actually see the book. The
               // sleeve list is the futures bot's shape; for anything else
               // `open` is 0 by absence, which would grey out Stop on a bot

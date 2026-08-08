@@ -648,8 +648,24 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // Starting false also means a process that comes up while stopped
     // flattens once, which is the correct reading of a stopped book.
     let mut flatten_asked = false;
+    // Stop must not wait for the next evaluation. The two verbs differ in
+    // how urgent they are, and the loop has to reflect that: Halt only
+    // prevents the NEXT entry, so noticing it a cycle later costs nothing,
+    // while Stop means "be flat", and every second between the press and
+    // the order is market risk the operator thought they had cancelled.
+    // Controls are therefore read on a short tick rather than at bar
+    // cadence — this loop woke every 120s, so Stop could sit two minutes.
+    const CONTROL_TICK_S: u64 = 5;
+    // Status publishing stays at a human cadence; only the control read
+    // needs to be quick, and a status row every 5s is noise in the DB.
+    const PUBLISH_EVERY_S: u64 = 60;
+    let mut last_publish = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(PUBLISH_EVERY_S))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(120), bar_rx.recv()).await;
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(CONTROL_TICK_S), bar_rx.recv())
+                .await;
         let done = match next {
             Err(_) => {
                 // No completed bar lately. During the daily break, weekends
@@ -688,8 +704,11 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                     let _ = trading.flatten_all(&bot_id).await;
                 }
                 flatten_asked = control.flatten;
-                let fh = feed_health.lock().expect("feed health").clone();
-                live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
+                if last_publish.elapsed().as_secs() >= PUBLISH_EVERY_S {
+                    let fh = feed_health.lock().expect("feed health").clone();
+                    live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
+                    last_publish = std::time::Instant::now();
+                }
                 continue;
             }
             Ok(None) => {
@@ -782,6 +801,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         {
             let fh = feed_health.lock().expect("feed health").clone();
             live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
+            last_publish = std::time::Instant::now();
         }
         if book.halted.is_some() {
             eprintln!("halted: {:?} — loop stays up publishing state", book.halted);

@@ -4,12 +4,14 @@ import { api } from "../api/client";
 /**
  * Three verbs over a three-state machine.
  *
- *   running  --halt-->  halted   open nothing new; leave the book as it is
+ *   running  --halt-->  halted   take nothing new on; wind down what is held
  *   running  --stop-->  stopped  open nothing new AND close at market
  *   halted   --resume--> running
  *   stopped  --start-->  running
  *
- * Halt is the reversible one you reach for at 3am. Stop costs a spread.
+ * Halt is the graceful one: the book stops taking positions on, and the
+ * ones it holds still exit when the strategy says so. Stop is the abrupt
+ * one — everything closes at market, now, and it costs a spread.
  * They are separate buttons so the choice exists at the moment it matters.
  *
  * This took a boolean `halted` until it turned out a boolean cannot hold
@@ -22,6 +24,7 @@ import { api } from "../api/client";
 export function Controls({
   botId,
   control,
+  stopping = false,
   flat,
   note,
   onDone,
@@ -29,6 +32,8 @@ export function Controls({
   botId: string;
   /** The canonical control word: running | halted | stopped. */
   control?: string | null;
+  /** A Stop is in flight; starting now would race the flatten. */
+  stopping?: boolean;
   flat: boolean;
   note?: string;
   onDone: () => void;
@@ -41,7 +46,7 @@ export function Controls({
 
   async function run(verb: "resume" | "halt" | "stop") {
     if (verb === "stop" && !window.confirm(
-      `Stop ${botId}?\n\nOpen positions are closed at market. Halt instead if you only want to stop opening new ones.`,
+      `Stop ${botId}?\n\nEverything open is closed at market, now. Halt instead to stop opening new positions and let the book wind down on its own exits.`,
     )) return;
     setBusy(verb);
     setMsg(null);
@@ -50,7 +55,7 @@ export function Controls({
       setMsg({
         text:
           verb === "resume" ? `${startVerb === "Start" ? "Started" : "Resumed"}. Trading again at the next cycle.`
-          : verb === "halt" ? "Halted. Open positions untouched."
+          : verb === "halt" ? "Halted. Nothing new opens; what is held still exits on its own signals."
           : "Stopping. The book closes at the bot's next cycle.",
       });
       onDone();
@@ -64,7 +69,7 @@ export function Controls({
   return (
     <div>
       <div className="grid grid-cols-3 gap-2">
-        <Btn kind="go" disabled={!halted || !!busy} busy={busy === "resume"} onClick={() => run("resume")}>
+        <Btn kind="go" disabled={!halted || stopping || !!busy} busy={busy === "resume"} onClick={() => run("resume")}>
           {startVerb}
         </Btn>
         <Btn kind="quiet" disabled={halted || !!busy} busy={busy === "halt"} onClick={() => run("halt")}>
@@ -79,8 +84,9 @@ export function Controls({
       <p className="mt-3 text-[11px] leading-relaxed text-faint">
         {note ?? (
           <>
-            <b className="text-dim">Halt</b> stops new entries at the next cycle and leaves open positions alone.{" "}
-            <b className="text-dim">Stop</b> also closes them at market.
+            <b className="text-dim">Halt</b> takes nothing new on and lets the book wind down — open
+            positions still close when the strategy exits them.{" "}
+            <b className="text-dim">Stop</b> closes everything at market immediately.
           </>
         )}
       </p>

@@ -44,8 +44,9 @@ pub struct SleeveState {
 /// document by the caller.
 #[derive(Debug, Default, Clone)]
 pub struct Control {
-    /// Stop opening: no new entries. Open positions are left alone —
-    /// halting is not an exit.
+    /// Graceful stop: take nothing new on. What is already open keeps
+    /// being managed and closes when the strategy exits it — a halt is not
+    /// an exit, but it is not a freeze either.
     pub halt: bool,
     /// Stop AND close: halt, then flatten what is open. The difference
     /// matters at 3am, which is why they are two buttons and not one with
@@ -146,9 +147,19 @@ impl Book {
     /// Feed one enriched bar to one sleeve. Bars must arrive in global ts
     /// order; the same bar goes to every sleeve of its frame.
     pub fn on_bar(&mut self, sleeve_idx: usize, bar: &EnrichedBar) {
-        if self.halted.is_some() {
-            return;
-        }
+        // NOTE: a halt does not freeze the book — it is a graceful stop.
+        //
+        // This used to return early, which skipped the whole bar: step 1
+        // (managing the open position) never ran, so a halted book held
+        // through its own stop-loss, through its noise exit, and through
+        // the session-end flat. The operator was told "open positions are
+        // left alone" and it was true in the worst sense — a halted bot
+        // ignored its own risk exits and carried the position indefinitely.
+        //
+        // The intended design was already here and unreachable: `halted`
+        // below gates step 2, opening a new position, and nothing else. So
+        // a halt stops the book taking anything on, and lets what it holds
+        // wind down the way the strategy says it should.
         let costs = self.costs;
         let instrument = self.instrument.clone();
         let units = self.units;
@@ -560,6 +571,149 @@ mod control_tests {
             b.halted.as_deref(),
             Some("operator-stop"),
             "downgrading to a plain halt would misreport why the book is shut"
+        );
+    }
+}
+
+#[cfg(test)]
+mod halt_semantics_tests {
+    use super::*;
+    use crate::book_sleeves;
+    use features_cme::{in_frame, segment, to_exchange_time, Frame, FrameStream, RawBar};
+
+    /// Three months of seeded 5-minute bars — enough to clear the 14-session
+    /// noise-band warmup and trade. Same generator as the live-path gate.
+    fn bars() -> Vec<RawBar> {
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_783_288_800, 0).expect("epoch");
+        let mut seed: u64 = 0x5EED_1234_ABCD_0001;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut px = 20_000.0f64;
+        (0..24_192)
+            .map(|i| {
+                let open = px;
+                let shock = if rng() < 0.02 { 9.0 } else { 1.0 };
+                px = (px + (rng() - 0.5) * 14.0 * shock).max(1_000.0);
+                let (hi, lo) = (open.max(px), open.min(px));
+                RawBar {
+                    ts_utc: t0 + chrono::Duration::minutes(5 * i),
+                    open,
+                    high: hi + rng() * 5.0,
+                    low: lo - rng() * 5.0,
+                    close: px,
+                    volume: 500.0 + rng() * 3_000.0,
+                }
+            })
+            .collect()
+    }
+
+    struct Driver {
+        book: Book,
+        gx: FrameStream,
+        rth: FrameStream,
+        frames: Vec<Frame>,
+    }
+
+    impl Driver {
+        fn new() -> Self {
+            let sleeves = book_sleeves();
+            let frames = sleeves.iter().map(|s| s.frame).collect();
+            Self {
+                book: Book::new(sleeves),
+                gx: FrameStream::new(Frame::Globex),
+                rth: FrameStream::new(Frame::Rth),
+                frames,
+            }
+        }
+        fn feed(&mut self, raw: &RawBar) {
+            let seg = segment(to_exchange_time(raw.ts_utc));
+            let g = self.gx.on_bar(raw);
+            let r = in_frame(seg, Frame::Rth).then(|| self.rth.on_bar(raw));
+            for (idx, frame) in self.frames.clone().iter().enumerate() {
+                match frame {
+                    Frame::Globex => self.book.on_bar(idx, &g),
+                    Frame::Rth => {
+                        if let Some(b) = &r {
+                            self.book.on_bar(idx, b);
+                        }
+                    }
+                }
+            }
+        }
+        fn open_positions(&self) -> usize {
+            self.book.sleeves.iter().filter(|s| s.position.is_some()).count()
+        }
+    }
+
+    /// Halt is a GRACEFUL stop: it stops the book taking anything new on,
+    /// and lets what it already holds wind down the way the strategy says.
+    /// The bug this pins: `on_bar` returned early while halted, so an open
+    /// position was never managed again — it sailed through its stop-loss,
+    /// its noise exit and the session-end flat, held indefinitely.
+    #[test]
+    fn a_halted_book_still_closes_what_it_holds() {
+        let all = bars();
+        let mut d = Driver::new();
+
+        // Run until the book is carrying something.
+        let mut i = 0;
+        while i < all.len() && d.open_positions() == 0 {
+            d.feed(&all[i]);
+            i += 1;
+        }
+        assert!(d.open_positions() > 0, "never opened a position — test is vacuous");
+        let fills_at_halt = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+
+        d.book.apply_control(&Control { halt: true, ..Default::default() });
+
+        // A week of further bars. Everything held must wind down.
+        let end = (i + 2016).min(all.len());
+        for b in &all[i..end] {
+            d.feed(b);
+        }
+
+        assert_eq!(
+            d.open_positions(),
+            0,
+            "a halted book held its position through a week of bars — exits never ran"
+        );
+        let fills_after = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+        assert!(fills_after > fills_at_halt, "the wind-down booked no fills");
+    }
+
+    /// The other half of the same contract: graceful, not passive. A halt
+    /// must still refuse to open anything new.
+    #[test]
+    fn a_halted_book_opens_nothing_new() {
+        let all = bars();
+        let mut d = Driver::new();
+        for b in &all[..12_000] {
+            d.feed(b);
+        }
+        d.book.apply_control(&Control { halt: true, ..Default::default() });
+
+        // Let anything already open wind down first.
+        let mut i = 12_000;
+        while i < all.len() && d.open_positions() > 0 {
+            d.feed(&all[i]);
+            i += 1;
+        }
+        assert_eq!(d.open_positions(), 0, "never wound down");
+
+        let fills_flat = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+        let end = (i + 4032).min(all.len());
+        for b in &all[i..end] {
+            d.feed(b);
+        }
+        assert_eq!(d.open_positions(), 0, "a halted book opened a new position");
+        assert_eq!(
+            d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>(),
+            fills_flat,
+            "a halted book booked a new fill"
         );
     }
 }
