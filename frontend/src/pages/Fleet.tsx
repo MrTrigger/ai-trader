@@ -3,7 +3,7 @@ import type { Overview } from "../api/types";
 import { Card, Heart, Pill } from "../components/Card";
 import { Spark } from "../components/Spark";
 import { execution } from "../components/RouteChain";
-import { FeedStatus, type Feed } from "../components/FeedStatus";
+import { FeedStatus } from "../components/FeedStatus";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 /**
@@ -63,6 +63,7 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                   <h3 className="font-display text-[15px] font-semibold">{b.bot_id}</h3>
                   {!b.enabled ? <Pill>disabled</Pill>
                     : isHalted ? <Pill tone="alarm">halted</Pill>
+                    : st.feed?.healthy === false ? <Pill tone="consequence">degraded</Pill>
                     : <Pill tone="go">running</Pill>}
                   <span className="ml-auto"><Heart age={st.heartbeat_age_seconds} /></span>
                 </div>
@@ -84,7 +85,7 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                 </p>
 
                 <div className="mt-2">
-                  <FeedStatus feed={(st as { feed?: Feed }).feed} compact />
+                  <FeedStatus feed={st.feed} compact />
                 </div>
 
                 <div className="mt-3"><Spark points={series} /></div>

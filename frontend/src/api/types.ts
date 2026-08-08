@@ -23,7 +23,21 @@ export const Broker = z.object({
 });
 export type Broker = z.infer<typeof Broker>;
 
+/** What the feed is doing. The bot judges its own health — it knows
+ *  whether the market should be printing right now. */
+export const FeedHealth = z.object({
+  source: z.string().optional(),
+  last_bar_utc: z.string().nullable().optional(),
+  last_bar_age_seconds: z.number().nullable().optional(),
+  failures: z.number().optional(),
+  last_error: z.string().nullable().optional(),
+  market_open: z.boolean().optional(),
+  healthy: z.boolean().optional(),
+});
+export type FeedHealth = z.infer<typeof FeedHealth>;
+
 export const Status = z.object({
+  feed: FeedHealth.optional(),
   contract: z.string().optional(),
   mode: z.string().nullable().optional(),
   halted: z.unknown().optional(),
@@ -118,6 +132,11 @@ export const BotDetail = z.object({
           sleeves: z.record(Sleeve).optional(),
           trades_total: z.number().optional(),
           net_total: z.number().optional(),
+          // Without this the schema SILENTLY DROPPED it: zod strips keys it
+          // was not told about, so the dashboard reported "feed: not
+          // reported" while the bot was publishing feed health every cycle.
+          feed: FeedHealth.optional(),
+          note: z.string().optional(),
         })
         .optional(),
     })

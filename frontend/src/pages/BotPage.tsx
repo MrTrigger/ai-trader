@@ -6,7 +6,7 @@ import { Controls } from "../components/Controls";
 import { KillRail } from "../components/KillRail";
 import { RouteChain } from "../components/RouteChain";
 import { SettingsModal } from "../components/SettingsModal";
-import { FeedStatus, type Feed } from "../components/FeedStatus";
+import { FeedStatus } from "../components/FeedStatus";
 import { LogModal } from "../components/LogModal";
 import { LocalConsole } from "../components/LocalConsole";
 import { money, num, signed, stamp, tone } from "../lib/format";
@@ -17,7 +17,11 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const st = d.state ?? {};
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
-  const feed = (det as { feed?: Feed }).feed;
+  const feed = det.feed;
+  // "Running" is about the control word; it says nothing about whether the
+  // bot can see the market. Degraded is that second axis, surfaced next to
+  // the first instead of buried one modal deep.
+  const degraded = feed ? feed.healthy === false : false;
   const halted = st.state === "halted" || (d.controls as { kill_switch?: boolean } | null)?.kill_switch === true;
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
@@ -30,6 +34,8 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         <h1 className="font-display text-[20px] font-semibold">{id}</h1>
         {halted ? (
           <Pill tone="alarm">halted{st.state_reason ? ` · ${String(st.state_reason)}` : ""}</Pill>
+        ) : degraded ? (
+          <Pill tone="consequence">running · degraded</Pill>
         ) : (
           <Pill tone="go">{st.state ?? "—"}</Pill>
         )}
@@ -43,6 +49,33 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
           Log
         </button>
       </div>
+
+      {degraded && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-alarm/40 bg-alarm/[0.07] px-4 py-3">
+          <span className="font-display text-[12px] font-semibold uppercase tracking-wide text-alarm">
+            Feed problem
+          </span>
+          <span className="text-[12.5px] text-ink">
+            {feed?.failures
+              ? `${feed.failures} failed fetch${feed.failures === 1 ? "" : "es"} in a row.`
+              : "No bars are arriving."}{" "}
+            {feed?.market_open
+              ? "The market is open — the bot is blind and halts itself if this continues."
+              : "The market is closed, so nothing is being missed yet."}
+          </span>
+          {feed?.last_error && (
+            <span className="w-full font-mono text-[11px] leading-relaxed text-alarm/90">
+              {feed.last_error}
+            </span>
+          )}
+          <button
+            onClick={() => setLogs(true)}
+            className="ml-auto rounded-lg border border-alarm/40 px-3 py-1.5 font-display text-[12px] text-alarm hover:bg-alarm/10"
+          >
+            Open log
+          </button>
+        </div>
+      )}
 
       <RouteChain
         broker={d.broker}
