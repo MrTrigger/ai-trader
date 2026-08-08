@@ -381,7 +381,7 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             } else {
                 "running"
             };
-            let halt = state != "running";
+
             let id = r
                 .trim_start_matches("/api/bots/")
                 .trim_end_matches("/halt")
@@ -407,7 +407,19 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                 .unwrap_or("dashboard");
             {
                 match fleet::set_state(&id, state, reason, by) {
-                    Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+                    Ok(mut v) => {
+                        // Start is two acts: record the intent, and launch a
+                        // process to act on it if none is alive — Stop exits
+                        // the bot process rather than idling it, so Start
+                        // must be able to bring one back.
+                        if state == "running" {
+                            match fleet::maybe_spawn(&std::env::current_dir().unwrap_or_default(), &id) {
+                                Ok(sp) => v["spawn"] = sp,
+                                Err(e) => v["spawn"] = serde_json::json!({ "spawned": false, "error": e }),
+                            }
+                        }
+                        json(&mut stream, 200, &serde_json::to_vec(&v).unwrap())
+                    }
                     Err(e) => json_error(&mut stream, 400, &e),
                 }
             }

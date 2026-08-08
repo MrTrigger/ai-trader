@@ -44,6 +44,9 @@ pub struct BotRow {
     /// Where the bot publishes state (repo-relative), until step 4 moves
     /// operational records into Postgres proper.
     pub state_dir: Option<String>,
+    /// How the api launches this bot's process (repo-relative command).
+    /// NULL: the api cannot start it and the dashboard says so.
+    pub launch: Option<String>,
 }
 
 /// A venue account the fleet knows about. Credentials are NOT here — only
@@ -109,7 +112,7 @@ impl Registry {
 
     pub async fn bot(&self, bot_id: &str) -> Result<Option<BotRow>, RecordsError> {
         let row = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch \
              FROM bots WHERE bot_id = $1",
         )
         .bind(bot_id)
@@ -123,12 +126,13 @@ impl Registry {
             decision_core: r.get(4),
             enabled: r.get(5),
             state_dir: r.get(6),
+            launch: r.get(7),
         }))
     }
 
     pub async fn list_bots(&self) -> Result<Vec<BotRow>, RecordsError> {
         let rows = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch \
              FROM bots ORDER BY bot_id",
         )
         .fetch_all(&self.pool)
@@ -143,6 +147,7 @@ impl Registry {
                 decision_core: r.get(4),
                 enabled: r.get(5),
                 state_dir: r.get(6),
+                launch: r.get(7),
             })
             .collect())
     }

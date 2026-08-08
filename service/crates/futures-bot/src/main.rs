@@ -751,6 +751,17 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                     live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
                     last_publish = std::time::Instant::now();
                 }
+                // STOP ends the process, not just the trading. The book is
+                // flat (the flatten above), the final state is published —
+                // idling on from here would spend a Gateway connection and
+                // a heartbeat on doing nothing. The api relaunches on
+                // Start; a halt stays resident because winding an open
+                // position down still requires evaluating bars.
+                if control.flatten {
+                    let _ = rec.log_line(&bot_id, "info", "stopped by operator — process exiting; Start relaunches");
+                    eprintln!("stopped by operator — process exiting");
+                    return Ok(());
+                }
                 continue;
             }
             Ok(None) => {

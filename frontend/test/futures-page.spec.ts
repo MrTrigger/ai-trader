@@ -48,8 +48,10 @@ test("the futures page reflects its controls, fast", async ({ page }) => {
   // refetch after a press.
   if (initialControl !== "running") {
     await btn(page, "Start").click();
+    // Start SPAWNS a process now (Stop exits it), so this budget covers a
+    // boot — Gateway connect, snapshot restore — not just a control write.
     await expect
-      .poll(async () => (await pill(page).textContent())?.trim(), { timeout: 10_000, intervals: [500] })
+      .poll(async () => (await pill(page).textContent())?.trim(), { timeout: 60_000, intervals: [1_000] })
       .toMatch(/^RUNNING/i);
   }
 
@@ -69,8 +71,9 @@ test("the futures page reflects its controls, fast", async ({ page }) => {
   await expect(btn(page, "Stop")).toBeDisabled(); // flat + stopped: nothing left to close
 
   await btn(page, "Start").click();
+  // A fresh boot again — Stop just exited the process.
   await expect
-    .poll(async () => (await pill(page).textContent())?.trim(), { timeout: 10_000, intervals: [500] })
+    .poll(async () => (await pill(page).textContent())?.trim(), { timeout: 60_000, intervals: [1_000] })
     .toMatch(/^RUNNING/i);
 
   // Leave the bot exactly as the operator had it.

@@ -298,6 +298,93 @@ pub fn set_state(bot_id: &str, state: &str, reason: &str, by: &str) -> Result<Va
     })
 }
 
+/// Start's second half: a stopped bot's process has EXITED (Stop flattens,
+/// publishes a final state and quits rather than idling on a connection),
+/// so writing `running` moves nothing until something launches a process
+/// to read it. The api is that something — it is the pod's one long-lived
+/// resident, which makes it the supervisor by topology.
+///
+/// Spawn only when the bot is silent: a fresh heartbeat means a process is
+/// already attached and will pick the control up itself (Resume out of a
+/// halt, where the process never exited). The dedupe window guards the
+/// gap between spawn and first publish, where a double-click would
+/// otherwise launch twins.
+pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
+    use std::sync::Mutex;
+    /// The last child spawned per press. Deduping by wall-clock window kept
+    /// refusing legitimate relaunches (Stop exits the process, so
+    /// Stop-then-Start inside the window found "a launch in flight" that
+    /// was already a corpse). The pid answers the actual question: is the
+    /// previous launch still a live process?
+    static LAST_CHILD: Mutex<Option<(String, u32)>> = Mutex::new(None);
+
+    let id = bot_id.to_string();
+    let (bot, status) = with_registry(move |reg| {
+        Box::pin(async move {
+            let bot = reg.bot(&id).await?;
+            let status = reg.get_status(&id).await?;
+            Ok((bot, status))
+        })
+    })?;
+    let Some(bot) = bot else {
+        return Err(format!("unknown bot {bot_id:?}"));
+    };
+    let Some(launch) = bot.launch.as_deref() else {
+        return Ok(json!({ "spawned": false, "why": "no launch command registered" }));
+    };
+    let alive = status
+        // A healthy bot publishes every 60s; missing a cycle and a half
+        // means nothing is attached. But freshness alone lies right after
+        // a Stop: the process publishes its final state and EXITS, so a
+        // seconds-old heartbeat can belong to a corpse. The final document
+        // says so — exit paths publish reasons no resident process carries
+        // (a resident halt says "operator") — and that outranks the clock.
+        .map(|s| {
+            let doc: Value = serde_json::from_str(&s.payload).unwrap_or(Value::Null);
+            let reason = doc.get("state_reason").and_then(|r| r.as_str()).unwrap_or("");
+            let exited = doc.get("state").and_then(|v| v.as_str()) == Some("halted")
+                && matches!(reason, "operator-stop" | "feed-stall" | "feed-closed");
+            s.heartbeat_age_seconds < 90 && !exited
+        })
+        .unwrap_or(false);
+    if alive {
+        return Ok(json!({ "spawned": false, "why": "a process is already publishing" }));
+    }
+    {
+        let last = LAST_CHILD.lock().expect("spawn dedupe");
+        if let Some((last_id, pid)) = last.as_ref() {
+            let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+            if last_id == bot_id && alive {
+                return Ok(json!({ "spawned": false, "why": "the previous launch is still running" }));
+            }
+        }
+    }
+    let log = repo_root.join(format!("var/{}.launch.log", bot_id.replace('/', "_")));
+    let logfile = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(launch)
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(logfile.try_clone().map_err(|e| e.to_string())?)
+        .stderr(logfile)
+        .spawn()
+        .map_err(|e| format!("launch failed: {e}"))?;
+    let pid = child.id();
+    *LAST_CHILD.lock().expect("spawn dedupe") = Some((bot_id.to_string(), pid));
+    // Reap on exit; an unwaited child lingers as a zombie under the api.
+    // (Reaping also flips the /proc liveness the dedupe reads.)
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    Ok(json!({ "spawned": true, "pid": pid, "launch": launch, "log": log.display().to_string() }))
+}
+
 /// GET /api/bots/{id}/state — the per-bot detail document the dashboard's
 /// bot view renders. Served from the records DB; a bot that has never
 /// published a status row falls back to its state_dir files (dev only).

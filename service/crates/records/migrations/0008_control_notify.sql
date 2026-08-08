@@ -15,7 +15,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS control_events_notify ON control_events;
 CREATE TRIGGER control_events_notify
     AFTER INSERT ON control_events
     FOR EACH ROW EXECUTE FUNCTION notify_bot_control();

@@ -22,10 +22,29 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const ctl = d.controls as { state?: string; set_at?: string } | null;
   // Has the bot seen the control yet? Its last publish is now minus the
   // heartbeat age; if the operator set the word after that, it has not.
+  // Has the bot seen the control? Ask the bot first: its published state
+  // naming the control's outcome IS the acknowledgement, no clocks needed.
+  // (Only the botstate contract publishes this; the runner path falls
+  // through to timestamps.)
+  const semanticAck =
+    ctl?.state === "running"
+      ? st.state === "running"
+      : ctl?.state === "stopped" || ctl?.state === "halted"
+        ? st.state === "halted"
+        : false;
   const lastPublish =
     d.heartbeat_age_seconds != null ? Date.now() - d.heartbeat_age_seconds * 1000 : null;
+  // Timestamp fallback, with a margin WIDER than its own noise. The ack
+  // publish lands ~0.3s after set_at (the control is pushed), but
+  // heartbeat_age_seconds is an integer, so now-minus-age carries up to a
+  // second of rounding — more than the gap being measured. Without the
+  // margin, an acknowledged Stop could read as pending on a coin flip and
+  // go red at the 30s grace until the next periodic publish rescued it.
   const unackSeconds =
-    ctl?.set_at && lastPublish != null && Date.parse(ctl.set_at) > lastPublish
+    !semanticAck &&
+    ctl?.set_at &&
+    lastPublish != null &&
+    Date.parse(ctl.set_at) > lastPublish + 2_000
       ? Math.max(0, (Date.now() - Date.parse(ctl.set_at)) / 1000)
       : undefined;
   // What it is doing, which is not what it was told (the control word) and
@@ -44,12 +63,34 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         <h1 className="font-display text-[20px] font-semibold">{id}</h1>
         <Pill tone={act.tone}>
           {act.long}
-          {halted && st.state_reason ? ` · ${String(st.state_reason)}` : ""}
+          {/* A rail reason (feed-stall, kill criterion…) is information; the
+              operator verbs just repeat the word beside them. */}
+          {halted &&
+          st.state_reason &&
+          !["operator", "operator-stop"].includes(String(st.state_reason))
+            ? ` · ${String(st.state_reason)}`
+            : ""}
         </Pill>
         {act.key === "idle" && (
           <span className="text-[12px] text-faint">nothing due — the market is closed</span>
         )}
-        <Heart age={d.heartbeat_age_seconds} />
+        {/* Stop ENDS the process (flatten, final publish, exit) — idling on
+            a Gateway connection to do nothing was waste. So a stopped bot
+            with a stale heartbeat is the system at rest, not a fault, and
+            gets words instead of a red pulse. Every other state keeps the
+            heart: there a dead publisher is exactly what it must reveal. */}
+        {act.key === "stopped" ? (
+          <span className="text-[12px] text-faint">no process — Start launches one</span>
+        ) : act.key === "halted" && (d.heartbeat_age_seconds ?? Infinity) < 180 ? (
+          <>
+            <span className="text-[12px] text-faint">
+              winding down — the process stays up until the book is flat
+            </span>
+            <Heart age={d.heartbeat_age_seconds} />
+          </>
+        ) : (
+          <Heart age={d.heartbeat_age_seconds} />
+        )}
         <span className="text-[12px] text-faint">{d.display_name} · {d.cadence}</span>
         <button
           onClick={() => setLogs(true)}

@@ -38,10 +38,19 @@ test("a running bot obeys Stop in seconds, and Start brings it back", async ({ r
   const initialControl: string = before.control_state;
 
   if (initialControl !== "running") {
+    // Start spawns a process (Stop exits it); wait out the boot, and also
+    // require a FRESH heartbeat — a stale "running" row from the previous
+    // process would let the stop measurement race the boot.
     expect((await request.post(`/api/bots/${BOT}/resume`)).ok()).toBeTruthy();
     await expect
-      .poll(async () => (await status(request)).halted ?? null, { timeout: OBEY_WITHIN_MS, intervals: [250] })
-      .toBeNull();
+      .poll(
+        async () => {
+          const s = await status(request);
+          return (s.halted ?? null) === null && (s.heartbeat_age_seconds ?? 999) < 30;
+        },
+        { timeout: 60_000, intervals: [1_000], message: "the spawned bot never came up" },
+      )
+      .toBe(true);
   }
 
   const t0 = Date.now();
@@ -60,9 +69,11 @@ test("a running bot obeys Stop in seconds, and Start brings it back", async ({ r
 
   // Start clears an operator stop — the transition the dashboard's Start
   // depends on, and the one that would make the button a no-op if broken.
+  // After the measured Stop the process has EXITED; Start must spawn a
+  // fresh one and the halt clears once it publishes.
   expect((await request.post(`/api/bots/${BOT}/resume`)).ok()).toBeTruthy();
   await expect
-    .poll(async () => (await status(request)).halted ?? null, { timeout: OBEY_WITHIN_MS, intervals: [250] })
+    .poll(async () => (await status(request)).halted ?? null, { timeout: 60_000, intervals: [1_000] })
     .toBeNull();
 
   const after = await status(request);
