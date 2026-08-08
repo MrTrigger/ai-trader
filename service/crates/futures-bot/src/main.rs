@@ -904,15 +904,28 @@ async fn feed_task(
     use ibapi::prelude::{HistoricalBarSize, HistoricalWhatToShow};
     let mut last_sent: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
-        let fetched = feed
-            .client()
-            .historical_data(feed.contract(), HistoricalBarSize::Min5)
-            .what_to_show(HistoricalWhatToShow::Trades)
-            .trading_hours(ibapi::prelude::TradingHours::Extended)
-            .duration(ibapi::market_data::historical::Duration::days(1))
-            .ending(time::OffsetDateTime::now_utc())
-            .fetch()
-            .await;
+        // Bounded, like every other venue read. A Gateway that restarts
+        // leaves a half-open socket, and an unbounded fetch parks on it
+        // forever: the feed stops looping, stops reporting its own health,
+        // and the process stays alive looking fine. A timeout turns that
+        // silence into a failure the operator can see.
+        let fetched = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            feed.client()
+                .historical_data(feed.contract(), HistoricalBarSize::Min5)
+                .what_to_show(HistoricalWhatToShow::Trades)
+                .trading_hours(ibapi::prelude::TradingHours::Extended)
+                .duration(ibapi::market_data::historical::Duration::days(1))
+                .ending(time::OffsetDateTime::now_utc())
+                .fetch(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(ibapi::Error::Simple(
+                "historical fetch timed out after 30s (Gateway restarting?)".into(),
+            )),
+        };
         match fetched {
             Ok(data) => {
                 let recovered = {
