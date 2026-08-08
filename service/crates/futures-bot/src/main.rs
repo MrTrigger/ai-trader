@@ -699,12 +699,20 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 // unapplied — the book stayed open precisely when somebody
                 // had just asked for it to be closed.
                 let control = read_control(&rec, &bot_id)?;
+                let halted_before = book.halted.clone();
                 book.apply_control(&control);
                 if control.flatten && !flatten_asked && live {
                     let _ = trading.flatten_all(&bot_id).await;
                 }
                 flatten_asked = control.flatten;
-                if last_publish.elapsed().as_secs() >= PUBLISH_EVERY_S {
+                // A control that changed the book is the one event worth
+                // publishing the instant it happens. Reacting in 5s but
+                // reporting on a 60s cadence looks identical, from the
+                // dashboard, to nothing listening at all — the operator
+                // presses Stop and watches "stopping" for a minute, which
+                // is the limbo the short tick was supposed to remove.
+                let changed = book.halted != halted_before;
+                if changed || last_publish.elapsed().as_secs() >= PUBLISH_EVERY_S {
                     let fh = feed_health.lock().expect("feed health").clone();
                     live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
                     last_publish = std::time::Instant::now();

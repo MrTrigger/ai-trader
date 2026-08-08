@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "../api/client";
+import { ago } from "../lib/format";
 
 /**
  * Three verbs over a three-state machine.
@@ -25,6 +26,7 @@ export function Controls({
   botId,
   control,
   stopping = false,
+  staleSeconds,
   flat,
   note,
   onDone,
@@ -34,10 +36,20 @@ export function Controls({
   control?: string | null;
   /** A Stop is in flight; starting now would race the flatten. */
   stopping?: boolean;
+  /**
+   * Age of the bot's last published state. A control is only an
+   * instruction if something is listening for it, and this is how we know.
+   */
+  staleSeconds?: number | null;
   flat: boolean;
   note?: string;
   onDone: () => void;
 }) {
+  // Nothing has published in two minutes: whatever we write, no process is
+  // going to act on it. Saying so at the moment of pressing is the whole
+  // point — a promise about "the next cycle" is a lie when there is no next
+  // cycle, and this bot's book stays open until something runs it.
+  const unreachable = staleSeconds != null && staleSeconds > 120;
   const stopped = control === "stopped";
   const halted = stopped || control === "halted";
   const startVerb = stopped ? "Start" : "Resume";
@@ -46,7 +58,10 @@ export function Controls({
 
   async function run(verb: "resume" | "halt" | "stop") {
     if (verb === "stop" && !window.confirm(
-      `Stop ${botId}?\n\nEverything open is closed at market, now. Halt instead to stop opening new positions and let the book wind down on its own exits.`,
+      `Stop ${botId}?\n\nEverything open is closed at market, now. Halt instead to stop opening new positions and let the book wind down on its own exits.` +
+      (unreachable
+        ? `\n\nWARNING: nothing has run this bot in ${ago(staleSeconds)}. The stop is recorded, but no process is listening — the book stays open until something runs it.`
+        : ""),
     )) return;
     setBusy(verb);
     setMsg(null);
@@ -54,9 +69,14 @@ export function Controls({
       await api.control(botId, verb);
       setMsg({
         text:
-          verb === "resume" ? `${startVerb === "Start" ? "Started" : "Resumed"}. Trading again at the next cycle.`
-          : verb === "halt" ? "Halted. Nothing new opens; what is held still exits on its own signals."
-          : "Stopping. The book closes at the bot's next cycle.",
+          unreachable
+            ? `Recorded. Nothing has run this bot in ${ago(staleSeconds)}, so nothing will act on it yet.`
+            : verb === "resume"
+              ? `${startVerb === "Start" ? "Started" : "Resumed"}.`
+              : verb === "halt"
+                ? "Halted. Nothing new opens; what is held still exits on its own signals."
+                : "Stopping. Closing everything at market.",
+        bad: unreachable,
       });
       onDone();
     } catch (e) {

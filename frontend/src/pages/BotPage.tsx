@@ -217,6 +217,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
               botId={id}
               control={ctl?.state}
               stopping={act.key === "stopping"}
+              staleSeconds={d.heartbeat_age_seconds}
               // Only claim flat when we can actually see the book. The
               // sleeve list is the futures bot's shape; for anything else
               // `open` is 0 by absence, which would grey out Stop on a bot
