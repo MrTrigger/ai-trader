@@ -9,7 +9,7 @@ interval_s = 86400
 target_gross_exposure = "0.80"
 # equal_weight is the baseline every constructor must beat; conviction_tilt
 # and inverse_vol are the candidates. Compared, not argued about (4.5).
-constructor = "conviction_tilt"
+constructor = "risk_adjusted"
 
 # The learned cross-sectional ranker. TWO candidates failed the Phase 1 gate and
 # neither may be named here: `xs_momentum` and `gc_breakout`. See
@@ -40,7 +40,19 @@ min_cross_section = 15
 
 # Intervals between decisions. Weekly on daily bars: the horizon is
 # hours-to-weeks, and every rebalance costs spread. Swept, not assumed (10.3).
-rebalance_every = 7
+# Daily, because the model is trained to predict the 24h return from a fill 1h
+# after the signal (`training::build(.., 1, 24)`) and the horizon is not
+# configurable. At 7 the book held a one-day forecast for a week: one day of
+# signal and six of drift, paying spread to get in. Walk-forward folds at 7 came
+# out negative while the model's own out-of-sample rank IC is +0.032 (t 5.76).
+#
+# NOT the cadence the research picked. docs/research/cadence.json chose "weekly,
+# 7 tranches" - seven staggered sleeves, a seventh of the book turning over each
+# day - which beat daily on Sharpe (1.30 vs 0.94). Tranching was never migrated
+# to Rust: `backtest.rs` computes one cadence and rotates the whole book on it.
+# Until that exists, daily is the only setting that matches what the model was
+# trained to forecast.
+rebalance_every = 1
 
 # Superseded by `crypto-portfolio universe-rank`, which ranks by trailing liquidity
 # from the bar store and records a point-in-time snapshot per decision date.

@@ -211,7 +211,11 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.bot_id, "crypto-portfolio");
-        assert_eq!(cfg.signal, "placeholder_equal_long");
+        // The deployed strategy: the learned ranker under the risk-adjusted
+        // construction. If this assertion surprises you, the deployment changed
+        // and this test is doing its job.
+        assert_eq!(cfg.signal, "ml_ranker");
+        assert_eq!(cfg.constructor, "risk_adjusted");
         assert_eq!(cfg.costs.commission_bps, Decimal::from_str("4.5").unwrap());
     }
 }

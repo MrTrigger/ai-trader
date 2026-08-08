@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Expanding walk-forward: retrain at every fold boundary, score only forward.
 #
-#   bin/walk-forward.sh [start] [end] [folds] [outdir]
+#   bin/walk-forward.sh [start] [end] [folds] [outdir] [reward]
+#
+#   reward: "return" (demean(ret), the documented default) or "per_risk"
+#   (demean(ret/vol)). The artefact records which; inference adapts.
 #
 # WHY THIS EXISTS
 #
@@ -33,9 +36,13 @@ START="${1:-2022-09-18}"
 END="${2:-2026-07-30}"
 FOLDS="${3:-6}"
 OUT="${4:-var/research/walk-forward}"
+REWARD="${5:-return}"
+# Extra args passed through to every `backtest` invocation. Exists for exactly
+# one caller: the funding-leak parity diagnostic.
+EXTRA="${6:-}"
 
-CP=service/target/debug/crypto-portfolio
-[ -x "$CP" ] || CP=service/target/release/crypto-portfolio
+CP=service/target/release/crypto-portfolio
+[ -x "$CP" ] || CP=service/target/debug/crypto-portfolio
 [ -x "$CP" ] || { echo "walk-forward: build crypto-portfolio first" >&2; exit 2; }
 PY=training/.venv/bin/python
 [ -x "$PY" ] || { echo "walk-forward: training/.venv missing — see training/README.md" >&2; exit 2; }
@@ -59,9 +66,10 @@ block = span // folds
 for i in range(folds):
     a = start + timedelta(days=i * block)
     b = end if i == folds - 1 else start + timedelta(days=(i + 1) * block - 1)
-    # One-day purge: the model may not see the day immediately before its test
-    # block either, because that day's label overlaps the first test decision.
-    print(f"{(a - timedelta(days=1)).isoformat()} {a.isoformat()} {b.isoformat()}")
+    # Two-day purge: the guard now compares the newest FEATURE date (decision
+    # minus one) against the cutoff, and the cutoff row's label runs into the
+    # following day - so both of those days stay out of the test block.
+    print(f"{(a - timedelta(days=2)).isoformat()} {a.isoformat()} {b.isoformat()}")
 PY
 )
 
@@ -75,7 +83,7 @@ for i in "${!BOUNDS[@]}"; do
 
   say "fold $n/$FOLDS  train<=$CUTOFF  test $TSTART..$TEND"
 
-  "$PY" training/train.py --matrix "$MATRIX" --through "$CUTOFF" --out "$MODEL"
+  "$PY" training/train.py --matrix "$MATRIX" --through "$CUTOFF" --out "$MODEL" --reward "$REWARD"
 
   # A per-fold config, because `backtest` takes its model from the config and
   # the whole point is that each fold uses a different one.
@@ -87,8 +95,9 @@ text = re.sub(r'^model_path\s*=.*$', f'model_path = "{model}"', text, flags=re.M
 pathlib.Path(cfg).write_text(text)
 PY
 
+  # shellcheck disable=SC2086
   "$CP" backtest --config "$CFG" --data-root data \
-    --start "$TSTART" --end "$TEND" --initial-cash 100000 --out "$FOLDOUT"
+    --start "$TSTART" --end "$TEND" --initial-cash 100000 --out "$FOLDOUT" $EXTRA
 done
 
 say "stitching"

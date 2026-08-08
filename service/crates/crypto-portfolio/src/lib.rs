@@ -8,6 +8,7 @@ pub mod backtest;
 pub mod binance;
 pub mod binance_archive;
 pub mod config;
+pub mod funding;
 pub mod gate;
 pub mod ic;
 pub mod inspect;
@@ -455,6 +456,17 @@ fn generate_signal(
                     let Some(volatility) = volatility.filter(|v| *v > 0.0) else {
                         continue;
                     };
+                    // Conviction is an EXPECTED RETURN in every construction
+                    // downstream: the cost threshold compares it to a
+                    // round-trip in return units, and the risk-adjusted sizing
+                    // divides it by vol exactly once. A per-risk model emits
+                    // return-per-unit-risk, so its score is multiplied back
+                    // into return units here rather than teaching every
+                    // constructor about reward types.
+                    let expected_return = match model.reward.as_str() {
+                        "per_risk" => score.abs() * volatility,
+                        _ => score.abs(),
+                    };
                     out.push(Signal {
                         asset: row.asset.clone(),
                         direction: if score > 0.0 {
@@ -462,7 +474,7 @@ fn generate_signal(
                         } else {
                             Direction::Short
                         },
-                        conviction: d(score.abs())?,
+                        conviction: d(expected_return)?,
                         volatility: Some(d(volatility)?),
                     });
                 }
@@ -591,29 +603,60 @@ fn construct(signals: &[Signal], cfg: &Config) -> Result<Construction, String> {
                     shorts.len()
                 ));
             } else {
-                let half = cfg.target_gross_exposure / Decimal::from(2);
-                for (side, sign) in [(longs, Decimal::ONE), (shorts, -Decimal::ONE)] {
-                    let total: Decimal = side.iter().map(|(s, vol)| s.conviction / *vol).sum();
-                    for (s, vol) in side {
-                        weights.insert(s.asset.clone(), sign * half * (s.conviction / vol) / total);
+                // Faithful to the recovered harness: the floating book is the
+                // top 24 by |expected return| ACROSS both sides, split
+                // afterwards - not a per-side cap, and not ranked per-risk.
+                // Risk enters at the sizing step (edge/vol within each side),
+                // not at selection. A 20L/4S day is legal; a 1-sided one is not.
+                let mut all: Vec<_> = usable.clone();
+                all.sort_by(|(a, _), (b, _)| {
+                    b.conviction
+                        .partial_cmp(&a.conviction)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                all.truncate(24);
+                let longs: Vec<_> = all
+                    .iter()
+                    .copied()
+                    .filter(|(s, _)| s.direction == Direction::Long)
+                    .collect();
+                let shorts: Vec<_> = all
+                    .iter()
+                    .copied()
+                    .filter(|(s, _)| s.direction == Direction::Short)
+                    .collect();
+                if longs.len() < 2 || shorts.len() < 2 {
+                    notes.push(format!(
+                        "top-24 book has {} long and {} short; a two-sided book cannot form",
+                        longs.len(),
+                        shorts.len()
+                    ));
+                } else {
+                    let half = cfg.target_gross_exposure / Decimal::from(2);
+                    for (side, sign) in [(longs, Decimal::ONE), (shorts, -Decimal::ONE)] {
+                        let total: Decimal = side.iter().map(|(s, vol)| s.conviction / *vol).sum();
+                        for (s, vol) in side {
+                            weights
+                                .insert(s.asset.clone(), sign * half * (s.conviction / vol) / total);
+                        }
                     }
-                }
-                let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
-                if largest > cfg.limits.max_position {
-                    let scale = cfg.limits.max_position / largest;
-                    for weight in weights.values_mut() {
-                        *weight *= scale;
+                    let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+                    if largest > cfg.limits.max_position {
+                        let scale = cfg.limits.max_position / largest;
+                        for weight in weights.values_mut() {
+                            *weight *= scale;
+                        }
+                        notes.push(format!(
+                            "per-position cap binds: whole book scaled by {}",
+                            q(scale, 3)
+                        ));
                     }
                     notes.push(format!(
-                        "per-position cap binds: whole book scaled by {}",
-                        q(scale, 3)
+                        "{} long and {} short, sized by edge/volatility",
+                        weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                        weights.values().filter(|v| **v < Decimal::ZERO).count()
                     ));
                 }
-                notes.push(format!(
-                    "{} long and {} short, sized by edge/volatility",
-                    weights.values().filter(|v| **v > Decimal::ZERO).count(),
-                    weights.values().filter(|v| **v < Decimal::ZERO).count()
-                ));
             }
         }
         other => return Err(format!("unknown constructor {other:?}")),
@@ -1015,7 +1058,15 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
             hourly.insert(row.asset.clone(), row);
         }
     }
-    let generated = generate_signal(&cross, &hourly, input.as_of.date_naive(), cfg)?;
+    // The leakage guard compares against the newest FEATURE date, not the
+    // decision date. Training rows are dated by their decision stamp D and
+    // carry a label whose return window runs into D+1; a model trained through
+    // C therefore contains information about D = C+1. Handing the guard the
+    // decision date let exactly that day through — one leaked date per fold,
+    // which the Python side (comparing `frame["ts_utc"].max()`, the last closed
+    // bar) always refused. Match the stricter side.
+    let newest_feature_date = input.as_of.date_naive().pred_opt().ok_or("date underflow")?;
+    let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg)?;
     let construction = construct(&generated.values, cfg)?;
     let betas: BTreeMap<_, _> = latest
         .iter()
@@ -1268,6 +1319,35 @@ mod tests {
             ret_30_skip_7: Some(0.15),
             vol_30: Some(0.5),
             adv_quote: Some(100_000_000.0),
+            ret_180: None,
+            vol_7: None,
+            vol_90: None,
+            skew_30: None,
+            semivol_30: None,
+            dist_high_90: None,
+            dist_low_90: None,
+            amihud_30: None,
+            turnover_20: None,
+            range_frac_14: None,
+            band_width: None,
+            dist_upper: None,
+            dist_lower: None,
+            breakout_age_f: None,
+            vol_ratio: None,
+            f_gap: None,
+            f_range: None,
+            f_clv: None,
+            f_volsurp: None,
+            f_trsurp: None,
+            f_amihud: None,
+            f_ret2: None,
+            f_ret3: None,
+            f_accel: None,
+            f_dvol: None,
+            funding_7d: None,
+            funding_30d: None,
+            funding_chg: None,
+            funding_z: None,
             beta_bench: Some(1.0),
             gc_filter: Some(close),
             gc_upper: Some(close * 1.1),
@@ -1282,7 +1362,15 @@ mod tests {
     fn config() -> Config {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
-        Config::load(&path).unwrap()
+        let mut cfg = Config::load(&path).unwrap();
+        // The fixtures below encode the placeholder baseline; the deployed
+        // config now names the ranker, which needs a model artefact these unit
+        // tests deliberately do not have. Tests exercising another signal or
+        // constructor set it themselves.
+        cfg.signal = "placeholder_equal_long".into();
+        cfg.constructor = "conviction_tilt".into();
+        cfg.model_path = None;
+        cfg
     }
 
     #[test]

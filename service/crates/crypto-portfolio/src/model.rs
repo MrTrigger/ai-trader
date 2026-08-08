@@ -23,9 +23,21 @@ pub struct Model {
     pub n_rows: usize,
     pub n_dates: usize,
     pub features: Vec<String>,
+    /// What the trees were fit to predict. "return" is the documented reward,
+    /// demean(ret); "per_risk" is demean(ret/vol), whose output is already in
+    /// return-per-unit-risk units. Inference has to know which, because a
+    /// per-risk score divided by volatility again would double-count risk and
+    /// quietly rebuild the concentration the sizing study removed. Absent on
+    /// artefacts fit before the field existed, all of which were "return".
+    #[serde(default = "default_reward")]
+    pub reward: String,
     pub tree_info: Vec<Tree>,
     #[serde(skip)]
     pub model_id: String,
+}
+
+fn default_reward() -> String {
+    "return".into()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -194,6 +206,7 @@ mod tests {
             feature_set_version: features_crypto::FEATURE_SET_VERSION.into(),
             trained_through: "2025-01-01".parse().unwrap(),
             trained_at: "fixture".into(),
+            reward: default_reward(),
             n_rows: 1,
             n_dates: 1,
             features: vec!["x_ret_7".into()],
