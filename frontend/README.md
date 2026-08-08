@@ -4,9 +4,16 @@ React + TypeScript + Vite + Tailwind, per `docs/design-spec.md` §"Preference:
 Rust in the backend, React + TypeScript in the frontend" — the same stack
 `trading-journal` maintains.
 
+    ../bin/dev.sh   # both halves, both reloading: vite HMR on :5174 and
+                    # cargo-watch rebuilding the api on :7434
+
     bun install
-    bun run dev     # :5174, HMR, proxies /api to the Rust api on :7434
+    bun run dev     # :5174 alone, HMR, proxies /api to the api on :7434
     bun run build   # tsc --noEmit && vite build -> dist/
+
+Work on :5174 while editing the UI (instant), and open :7434 to see what a
+deployment actually serves. The api resolves `frontend/dist` per request, so
+a rebuild goes live without restarting it.
 
 The api serves `frontend/dist` when it exists (auto-detected; `--static-dir`
 overrides), so a built bundle needs no flags. Until this port covers every

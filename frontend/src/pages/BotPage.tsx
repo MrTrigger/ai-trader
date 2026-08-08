@@ -8,6 +8,7 @@ import { RouteChain } from "../components/RouteChain";
 import { SettingsModal } from "../components/SettingsModal";
 import { FeedStatus, type Feed } from "../components/FeedStatus";
 import { LogModal } from "../components/LogModal";
+import { LocalConsole } from "../components/LocalConsole";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefresh: () => void }) {
@@ -140,6 +141,8 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
               </Card>
             </>
           ) : (
+            <>
+            <LocalConsole />
             <Card title="Run history" aside={`${(d.runs ?? []).length} recorded`}>
               {(d.runs ?? []).length === 0 ? (
                 <p className="text-[12px] text-faint">Nothing has run yet.</p>
@@ -161,6 +164,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
                 </div>
               )}
             </Card>
+            </>
           )}
         </div>
 

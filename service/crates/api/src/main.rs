@@ -43,7 +43,6 @@
 
 mod control;
 mod fleet;
-mod page;
 mod state;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -157,7 +156,7 @@ fn main() -> ExitCode {
     }
     println!("  http://127.0.0.1:{}", cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
-    match &cfg.static_dir {
+    match cfg.static_dir.as_ref().filter(|d| d.join("index.html").exists()) {
         Some(d) => println!("  ui: {} (built frontend)", d.display()),
         None => println!("  ui: legacy embedded page — run `bun run build` in frontend/"),
     }
@@ -210,10 +209,11 @@ fn parse(args: &[String]) -> Result<Config, String> {
     };
     // Default to the repo's built frontend when it exists, so `api` with no
     // flags serves the real UI; --static-dir overrides for a deployment.
-    let static_dir = get("--static-dir").map(PathBuf::from).or_else(|| {
-        let d = PathBuf::from("frontend/dist");
-        d.join("index.html").exists().then_some(d)
-    });
+    // Checked per REQUEST, not here: probing once at startup meant an api
+    // launched before `bun run build` served the legacy page forever, with
+    // no hint why — the operator sees an old UI and reasonably concludes
+    // the change never landed.
+    let static_dir = Some(get("--static-dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("frontend/dist")));
     let state_dir = get("--state-dir").map(PathBuf::from);
     let initial_cash: Decimal = match get("--initial-cash") {
         Some(c) => c
@@ -321,7 +321,10 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
         // the app resolves them. Without this a refresh or a pasted link
         // 404s, which is the classic way a single-page app feels broken.
         ("GET" | "HEAD", r)
-            if cfg.static_dir.is_some()
+            if cfg
+                .static_dir
+                .as_ref()
+                .is_some_and(|d| d.join("index.html").exists())
                 && !r.starts_with("/api/")
                 && !r.contains('.') =>
         {
@@ -573,11 +576,17 @@ fn json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Re
 fn serve_index(stream: &mut TcpStream, cfg: &Config, head_only: bool) -> std::io::Result<()> {
     match cfg.static_dir.as_ref().map(|d| std::fs::read(d.join("index.html"))) {
         Some(Ok(body)) => respond(stream, 200, "text/html; charset=utf-8", &body, head_only),
+        // No fallback page any more. An api with no bundle says so, with
+        // the command that fixes it — which is more useful than serving a
+        // second, older UI that looks like the real one and is not.
         _ => respond(
             stream,
-            200,
+            503,
             "text/html; charset=utf-8",
-            page::HTML.as_bytes(),
+            b"<!doctype html><meta charset=utf-8><title>TriggerTrader</title>\
+              <body style=\"background:#0B0E14;color:#E6EAF2;font:14px system-ui;padding:40px\">\
+              <p>No built frontend. Run <code>bun install &amp;&amp; bun run build</code> in \
+              <code>frontend/</code>, then reload; the api picks it up without restarting.</p>",
             head_only,
         ),
     }
