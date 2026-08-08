@@ -646,6 +646,15 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 // printing, >70 minutes of silence is a stall: flatten
                 // (live) and halt.
                 let now = chrono::Utc::now();
+                // Silence only counts while the market should be printing.
+                // Without this the clock runs all weekend and the first
+                // check after Sunday's open sees ~3700 quiet minutes and
+                // kills the process before the first bar can possibly
+                // arrive — the watchdog firing at exactly the moment the
+                // bot is supposed to start working.
+                if !live::market_should_be_open(now) {
+                    last_bar_seen = now;
+                }
                 let silent = now.signed_duration_since(last_bar_seen).num_minutes();
                 if live::market_should_be_open(now) && silent > 70 {
                     if live {

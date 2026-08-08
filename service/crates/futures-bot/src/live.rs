@@ -432,6 +432,103 @@ pub fn prepare(
 mod tests {
     use super::*;
 
+    /// `drive_bar` is the live loop's evaluation step, and `replay`'s inner
+    /// loop is the same sequence written a second time. Only the replay copy
+    /// is covered by the parity fixture, so the path that actually trades
+    /// real money had no gate at all: the two could drift — a reordered
+    /// frame, a dropped RTH gate — and every offline check would still pass
+    /// while live silently took different trades.
+    ///
+    /// Drive one synthetic week through both and require identical books.
+    /// Synthetic rather than recorded bars keeps this hermetic; what is
+    /// being compared is two implementations against each other, so the
+    /// prices only have to be varied enough to open and close positions.
+    #[test]
+    fn drive_bar_matches_the_replay_loop() {
+        use features_cme::{in_frame, segment, to_exchange_time, EnrichedBar, FrameStream};
+        use noise_book::book_sleeves;
+        use noise_book::runtime::Book;
+
+        // The noise band needs NOISE_LOOKBACK (14) completed sessions per
+        // slot before it reads at all, so a week of bars can only ever
+        // produce an empty book. Three months of continuous 5-minute bars
+        // from a seeded walk clears warmup and leaves room for the sleeves
+        // to trade; the fills assertion below is what keeps that honest.
+        let t0 = DateTime::<Utc>::from_timestamp(1_783_288_800, 0).expect("epoch");
+        let mut seed: u64 = 0x5EED_1234_ABCD_0001;
+        let mut rng = move || {
+            // xorshift64* — deterministic across platforms, unlike hashing.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut px = 20_000.0f64;
+        let bars: Vec<RawBar> = (0..24_192)
+            .map(|i| {
+                let open = px;
+                // Mostly small moves with an occasional burst, so bands are
+                // both established and breached.
+                let shock = if rng() < 0.02 { 9.0 } else { 1.0 };
+                let step = (rng() - 0.5) * 14.0 * shock;
+                px = (px + step).max(1_000.0);
+                let (hi, lo) = (open.max(px), open.min(px));
+                RawBar {
+                    ts_utc: t0 + chrono::Duration::minutes(5 * i),
+                    open,
+                    high: hi + rng() * 5.0,
+                    low: lo - rng() * 5.0,
+                    close: px,
+                    volume: 500.0 + rng() * 3_000.0,
+                }
+            })
+            .collect();
+
+        // A: the replay loop, verbatim in shape (no window, no marks — both
+        // predicates are constant-true there, which is what drive_bar does).
+        let sleeves = book_sleeves();
+        let frames: Vec<Frame> = sleeves.iter().map(|s| s.frame).collect();
+        let mut book_a = Book::new(sleeves);
+        let mut gx_a = FrameStream::new(Frame::Globex);
+        let mut rth_a = FrameStream::new(Frame::Rth);
+        for raw in &bars {
+            let seg = segment(to_exchange_time(raw.ts_utc));
+            let g_bar: EnrichedBar = gx_a.on_bar(raw);
+            let r_bar: Option<EnrichedBar> = in_frame(seg, Frame::Rth).then(|| rth_a.on_bar(raw));
+            for (idx, frame) in frames.iter().enumerate() {
+                match frame {
+                    Frame::Globex => book_a.on_bar(idx, &g_bar),
+                    Frame::Rth => {
+                        if let Some(b) = &r_bar {
+                            book_a.on_bar(idx, b);
+                        }
+                    }
+                }
+            }
+        }
+
+        // B: the live path.
+        let mut book_b = Book::new(book_sleeves());
+        let mut gx_b = FrameStream::new(Frame::Globex);
+        let mut rth_b = FrameStream::new(Frame::Rth);
+        for raw in &bars {
+            drive_bar(&mut book_b, &mut gx_b, &mut rth_b, &frames, raw);
+        }
+
+        let (a, b) = (book_a.sleeve_totals(), book_b.sleeve_totals());
+        assert_eq!(a, b, "live drive_bar diverged from the replay loop");
+        // A test that compares two empty books proves nothing.
+        let fills: usize = a.values().map(|(n, _)| *n).sum();
+        assert!(fills > 0, "synthetic week produced no fills — test is vacuous");
+
+        for (sa, sb) in book_a.sleeves.iter().zip(book_b.sleeves.iter()) {
+            let pos = |s: &noise_book::runtime::SleeveState| {
+                s.position.as_ref().map(|p| (p.direction, p.contracts))
+            };
+            assert_eq!(pos(sa), pos(sb), "{} ended on a different position", sa.cfg.key);
+        }
+    }
+
     #[test]
     fn aggregation_completes_buckets_on_the_boundary() {
         let mut agg = Aggregate5s::default();
