@@ -606,10 +606,17 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             let mut feed_cfg = ib::IbConfig::from_env(live_account)?;
             feed_cfg.allow_orders = false; // the feed connection can never trade
             feed_cfg.client_id += 1;
-            let feed = ib::IbVenue::connect(feed_cfg)
+            let feed = ib::IbVenue::connect(feed_cfg.clone())
                 .await
                 .map_err(|e| e.to_string())?;
-            tokio::spawn(feed_task(feed, bar_tx, feed_health.clone(), rec.clone(), bot_id.clone()));
+            tokio::spawn(feed_task(
+                feed,
+                feed_cfg,
+                bar_tx,
+                feed_health.clone(),
+                rec.clone(),
+                bot_id.clone(),
+            ));
         }
         Trading::Rithmic(v) => {
             // The history plant rides its own websocket inside the same
@@ -838,6 +845,7 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 /// poll IB historical 5-minute bars. Sends COMPLETED 5-minute buckets.
 async fn feed_task(
     feed: ib::IbVenue,
+    feed_cfg: ib::IbConfig,
     tx: tokio::sync::mpsc::Sender<RawBar>,
     health: std::sync::Arc<std::sync::Mutex<live::FeedHealth>>,
     rec: std::sync::Arc<records::blocking::Records>,
@@ -883,7 +891,11 @@ async fn feed_task(
                             }
                         }
                     }
-                    return; // stream ended; receiver's timeout handles it
+                    // The stream ended — the Gateway dropped it. Falling out
+                    // of the task here would leave the process alive with no
+                    // feed at all, so drop through to polling instead.
+                    health.lock().expect("feed health").source = "poll".into();
+                    say("warn", "realtime stream ended — falling back to polling".into());
                 }
                 _ => {
                     health.lock().expect("feed health").source = "poll".into();
@@ -903,7 +915,44 @@ async fn feed_task(
     use ibapi::market_data::historical::BarTimestamp;
     use ibapi::prelude::{HistoricalBarSize, HistoricalWhatToShow};
     let mut last_sent: Option<chrono::DateTime<chrono::Utc>> = None;
+    // A timed-out fetch is not free. The one-shot historical API has no
+    // cancel — dropping the future forgets the request locally while the
+    // Gateway keeps it open forever — and IB stops answering entirely once
+    // 50 historical requests are open, with no error to say so. So a run of
+    // timeouts silently spends the budget and the feed never comes back.
+    // Dropping the connection is what hands those slots back, so do it long
+    // before the cap: three failures is a minute of silence, and reconnecting
+    // costs one round trip.
+    const RECONNECT_AFTER: u32 = 3;
+    let mut feed = Some(feed);
     loop {
+        // Don't ask a closed market for bars. IB answers a request over a
+        // dead session by never answering at all, so polling through a
+        // weekend is how the open-request budget got spent in the first
+        // place: 50 unanswerable requests, then silence that outlives the
+        // close. Idling here is also the honest reading — no bar is due.
+        if !live::market_should_be_open(chrono::Utc::now()) {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            continue;
+        }
+        if feed.is_none() {
+            match ib::IbVenue::connect(feed_cfg.clone()).await {
+                Ok(v) => {
+                    feed = Some(v);
+                    say("info", "reconnected to the Gateway".into());
+                }
+                Err(e) => {
+                    // Narrate the first refusal only; health carries the rest.
+                    if health.lock().expect("feed health").failures == RECONNECT_AFTER {
+                        say("error", format!("reconnect refused: {e}"));
+                    }
+                    health.lock().expect("feed health").failures += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    continue;
+                }
+            }
+        }
+        let live_feed = feed.as_ref().expect("feed connected");
         // Bounded, like every other venue read. A Gateway that restarts
         // leaves a half-open socket, and an unbounded fetch parks on it
         // forever: the feed stops looping, stops reporting its own health,
@@ -911,8 +960,9 @@ async fn feed_task(
         // silence into a failure the operator can see.
         let fetched = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            feed.client()
-                .historical_data(feed.contract(), HistoricalBarSize::Min5)
+            live_feed
+                .client()
+                .historical_data(live_feed.contract(), HistoricalBarSize::Min5)
                 .what_to_show(HistoricalWhatToShow::Trades)
                 .trading_hours(ibapi::prelude::TradingHours::Extended)
                 .duration(ibapi::market_data::historical::Duration::days(1))
@@ -968,14 +1018,26 @@ async fn feed_task(
                 }
             }
             Err(e) => {
-                let first = {
+                let n = {
                     let mut h = health.lock().expect("feed health");
                     h.failures += 1;
                     h.last_error = Some(e.to_string());
-                    h.failures == 1
+                    h.failures
                 };
-                if first {
+                if n == 1 {
                     say("error", format!("historical poll failed: {e}"));
+                }
+                if n % RECONNECT_AFTER == 0 {
+                    if n == RECONNECT_AFTER {
+                        say(
+                            "warn",
+                            format!(
+                                "{n} consecutive poll failures — dropping the Gateway \
+                                 connection so IB releases the requests they left open"
+                            ),
+                        );
+                    }
+                    feed = None; // drop closes the socket; IB frees the slots
                 }
             }
         }
