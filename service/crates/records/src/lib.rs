@@ -697,6 +697,40 @@ impl Registry {
     }
 }
 
+/// Wake the caller the moment a control is written for `bot_id`.
+///
+/// The operator's kill switch used to travel by poll: press Stop, wait for
+/// the bot's next control read. Postgres pushes instead — a trigger on
+/// control_events NOTIFYs, this LISTENs, and the returned channel yields
+/// within milliseconds of the INSERT committing.
+///
+/// The channel closing means the listener connection died. Callers must
+/// treat that as "go back to polling", never as "no more controls" — a
+/// dropped LISTEN must degrade to slow, not to deaf.
+pub async fn listen_controls(
+    database_url: &str,
+    bot_id: &str,
+) -> Result<tokio::sync::mpsc::Receiver<()>, RecordsError> {
+    let mut listener = sqlx::postgres::PgListener::connect(database_url).await?;
+    listener.listen("bot_control").await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let bot_id = bot_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match listener.recv().await {
+                Ok(n) if n.payload() == bot_id => {
+                    // A full channel just means a wake-up is already
+                    // queued; coalescing is the point.
+                    let _ = tx.try_send(());
+                }
+                Ok(_) => {}
+                Err(_) => return, // rx closes; the caller's poll takes over
+            }
+        }
+    });
+    Ok(rx)
+}
+
 /// Synchronous facade for callers that are not async (the runner's money
 /// path). One current-thread runtime, one pool, shared behind an `Arc`.
 pub mod blocking {

@@ -596,6 +596,22 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // latency to a decision that executes at the next bar open.
     // The feed's health is shared, not inferred: the producer knows why it
     // is quiet, and the loop publishes what it knows.
+    // The operator's controls arrive by push, not poll: a trigger on
+    // control_events NOTIFYs, this listener wakes the loop within
+    // milliseconds of the row committing. If the listener cannot be set up
+    // (or its connection later dies) the channel closes and the loop's
+    // fallback tick still reads controls — degraded to slow, never deaf.
+    let mut ctrl_rx: Option<tokio::sync::mpsc::Receiver<()>> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match records::listen_controls(&url, &bot_id).await {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                eprintln!("control push unavailable ({e}) — falling back to polling");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
     let feed_health = std::sync::Arc::new(std::sync::Mutex::new(live::FeedHealth {
         source: "starting".into(),
         ..Default::default()
@@ -653,8 +669,8 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // prevents the NEXT entry, so noticing it a cycle later costs nothing,
     // while Stop means "be flat", and every second between the press and
     // the order is market risk the operator thought they had cancelled.
-    // Controls are therefore read on a short tick rather than at bar
-    // cadence — this loop woke every 120s, so Stop could sit two minutes.
+    // The primary path is push (ctrl_rx, milliseconds); this tick is the
+    // fallback for a dead listener, and the reason it exists at all.
     const CONTROL_TICK_S: u64 = 5;
     // Status publishing stays at a human cadence; only the control read
     // needs to be quick, and a status row every 5s is noise in the DB.
@@ -663,9 +679,27 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         .checked_sub(std::time::Duration::from_secs(PUBLISH_EVERY_S))
         .unwrap_or_else(std::time::Instant::now);
     loop {
-        let next =
-            tokio::time::timeout(std::time::Duration::from_secs(CONTROL_TICK_S), bar_rx.recv())
-                .await;
+        // Three wake sources, one loop body: a completed bar (evaluate), a
+        // control notification (obey now), or the fallback tick (obey soon
+        // even if the listener died). The last two take the same idle path.
+        let next: Result<Option<RawBar>, ()> = tokio::select! {
+            b = bar_rx.recv() => Ok(b),
+            closed = async {
+                match ctrl_rx.as_mut() {
+                    Some(rx) => rx.recv().await.is_none(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if closed {
+                    // Listener died: stop selecting on a closed channel
+                    // (it would win every select) and live on the tick.
+                    ctrl_rx = None;
+                    eprintln!("control listener lost — polling controls instead");
+                }
+                Err(())
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(CONTROL_TICK_S)) => Err(()),
+        };
         let done = match next {
             Err(_) => {
                 // No completed bar lately. During the daily break, weekends

@@ -13,8 +13,13 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
  * is flat, and restores running at the end.
  */
 const BOT = "futures-noise";
-/** Loop tick is 5s and a control change publishes at once; 15s is slack. */
-const OBEY_WITHIN_MS = 15_000;
+/**
+ * Postgres pushes the control (trigger → LISTEN), the bot applies it and
+ * publishes at once, and this poll checks every 250ms — so the honest
+ * budget is well under a second, and 3s only covers a loaded machine.
+ * When this was a 5s poll the same measurement read 44.9s.
+ */
+const OBEY_WITHIN_MS = 3_000;
 
 async function status(api: APIRequestContext) {
   const bots = (await (await api.get("/api/bots")).json()).bots;

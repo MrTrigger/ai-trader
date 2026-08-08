@@ -76,6 +76,12 @@ export function Controls({
     setMsg(null);
     try {
       await api.control(botId, verb);
+      // The bot obeys in under a second now (Postgres pushes the control);
+      // the page's 10s poll must not be the thing that makes it look slow.
+      // Refetch in a short burst so the pill catches the acknowledgement.
+      for (const delay of [400, 1200, 2500, 5000]) {
+        setTimeout(onDone, delay);
+      }
       setMsg({
         text:
           unreachable
