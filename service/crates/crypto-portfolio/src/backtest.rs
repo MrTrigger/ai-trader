@@ -127,7 +127,12 @@ pub struct Prepared {
     opens: BTreeMap<DateTime<Utc>, BTreeMap<String, Decimal>>,
 }
 
-pub fn prepare(cfg: &Config, root: &Path, require_hourly: bool) -> Result<Prepared, String> {
+pub fn prepare(
+    cfg: &Config,
+    root: &Path,
+    require_hourly: bool,
+    funding_window: features_crypto::FundingWindow,
+) -> Result<Prepared, String> {
     let daily_bars: Vec<_> = store::read(root, cfg.interval_s as i32)?
         .into_iter()
         .filter(|bar| canonical(&bar.asset))
@@ -136,7 +141,13 @@ pub fn prepare(cfg: &Config, root: &Path, require_hourly: bool) -> Result<Prepar
         return Err("daily store is empty".into());
     }
     let listings = store::funding_listings(root)?;
-    let daily = features_crypto::daily(&daily_bars, cfg.benchmark.as_deref(), &listings)?;
+    let daily = features_crypto::daily(
+        &daily_bars,
+        cfg.benchmark.as_deref(),
+        &listings,
+        &crate::funding::load(root)?,
+        funding_window,
+    )?;
     let hourly = if require_hourly {
         let bars: Vec<_> = store::read(root, 3_600)?
             .into_iter()
@@ -173,8 +184,9 @@ pub fn replay(
     root: &Path,
     initial_cash: Decimal,
     slippage_multiple: Decimal,
+    funding_window: features_crypto::FundingWindow,
 ) -> Result<BacktestResult, String> {
-    let prepared = prepare(cfg, root, cfg.signal == "ml_ranker")?;
+    let prepared = prepare(cfg, root, cfg.signal == "ml_ranker", funding_window)?;
     replay_prepared(
         cfg,
         start,

@@ -56,7 +56,13 @@ pub fn measure(
         return Err("no daily bars in the store".into());
     }
     let listings = store::funding_listings(root)?;
-    let features = features_crypto::daily(&bars, cfg.benchmark.as_deref(), &listings)?;
+    let features = features_crypto::daily(
+        &bars,
+        cfg.benchmark.as_deref(),
+        &listings,
+        &crate::funding::load(root)?,
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let by_stamp: BTreeMap<_, Vec<_>> = {
         let mut grouped: BTreeMap<DateTime<Utc>, Vec<_>> = BTreeMap::new();
         for row in &features {

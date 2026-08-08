@@ -200,7 +200,13 @@ fn load_decision(args: &[String]) -> Result<LoadedDecision, String> {
     if bars.is_empty() {
         return Err(format!("{} has no daily bars", root.display()));
     }
-    let features = daily(&bars, config.benchmark.as_deref(), &listings(&root)?)?;
+    let features = daily(
+        &bars,
+        config.benchmark.as_deref(),
+        &listings(&root)?,
+        &crypto_portfolio::funding::load(&root)?,
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let (hourly_features, hourly_hash_bars) = if config.signal == "ml_ranker" {
         let hourly_horizon = as_of - chrono::Duration::hours(1);
         let bars: Vec<_> = store::read(&root, 3_600)?
@@ -345,7 +351,13 @@ fn cmd_features(args: &[String]) -> Result<(), String> {
                             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
                 })
                 .collect();
-            let rows = daily(&bars, Some(&benchmark), &listings(&root)?)?;
+            let rows = daily(
+                &bars,
+                Some(&benchmark),
+                &listings(&root)?,
+                &crypto_portfolio::funding::load(&root)?,
+                features_crypto::FundingWindow::Trailing,
+            )?;
             write_jsonl(&out, &rows)?;
             println!(
                 "wrote {} Rust daily feature rows -> {}",
@@ -665,7 +677,13 @@ fn cmd_scores(args: &[String]) -> Result<(), String> {
     if bars.is_empty() {
         return Err(format!("no bars at or before {horizon}"));
     }
-    let frame = daily(&bars, config.benchmark.as_deref(), &listings(&root)?)?;
+    let frame = daily(
+        &bars,
+        config.benchmark.as_deref(),
+        &listings(&root)?,
+        &crypto_portfolio::funding::load(&root)?,
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let mut latest: BTreeMap<String, &DailyRow> = BTreeMap::new();
     for row in frame.iter().filter(|row| eligible.contains(&row.asset)) {
         if latest
@@ -865,7 +883,17 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         .parse::<NaiveDate>()
         .map_err(|e| e.to_string())?;
     let path = PathBuf::from(need(args, "--out")?);
-    let matrix = crypto_portfolio::training::build(&root, &cfg, start, end, 1, 24)?;
+    let funding_window = if args.iter().any(|a| a == "--leaky-funding-diagnostic") {
+        eprintln!(
+            "training-matrix: FORWARD funding windows - future realised rates in the \
+             features. Parity diagnostic ONLY; models fit on this matrix recite the \
+             future and every number downstream of them is fiction."
+        );
+        features_crypto::FundingWindow::ForwardLeakyDiagnostic
+    } else {
+        features_crypto::FundingWindow::Trailing
+    };
+    let matrix = crypto_portfolio::training::build(&root, &cfg, start, end, 1, 24, funding_window)?;
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut out = std::io::BufWriter::new(file);
     use std::io::Write;
@@ -908,8 +936,21 @@ fn cmd_backtest(args: &[String]) -> Result<(), String> {
         })
         .transpose()?
         .unwrap_or(rust_decimal::Decimal::ONE);
-    let result =
-        crypto_portfolio::backtest::replay(&cfg, start, end, &root, initial_cash, slippage)?;
+    let funding_window = if args.iter().any(|a| a == "--leaky-funding-diagnostic") {
+        eprintln!("backtest: FORWARD funding windows - parity diagnostic ONLY.");
+        features_crypto::FundingWindow::ForwardLeakyDiagnostic
+    } else {
+        features_crypto::FundingWindow::Trailing
+    };
+    let result = crypto_portfolio::backtest::replay(
+        &cfg,
+        start,
+        end,
+        &root,
+        initial_cash,
+        slippage,
+        funding_window,
+    )?;
     let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     if let Some(path) = get(args, "--out") {

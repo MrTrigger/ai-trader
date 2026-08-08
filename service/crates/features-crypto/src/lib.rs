@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-crypto-1";
+pub const FEATURE_SET_VERSION: &str = "fs-rust-crypto-4";
 pub const DAILY_FEATURE_NAMES: &[&str] = &[
     "ret_7",
     "ret_30",
@@ -25,6 +25,54 @@ pub const DAILY_FEATURE_NAMES: &[&str] = &[
     "adv_quote",
     "beta_bench",
     "gc_regime_slope",
+    // The slow daily block, restored. The migration carried over only eight
+    // daily features while the research record's strongest signals were slow
+    // daily ones; fold-level IC halved (0.064 -> 0.032). These are the standard
+    // cross-sectional factors that block covered. Levels are fine everywhere a
+    // ratio might seem needed: inputs are rank-normalised within each date, so
+    // any monotone transform of a feature scores identically.
+    "ret_180",
+    "vol_7",
+    "vol_90",
+    "skew_30",
+    "semivol_30",
+    "dist_high_90",
+    "dist_low_90",
+    "amihud_30",
+    "turnover_20",
+    "range_frac_14",
+    // The one missing feature the record actually names: IC -0.124 in the
+    // Phase 1 screen, second only to vol_30. Its inputs were computed here all
+    // along and then dropped on the floor.
+    "band_width",
+    // The rest of the recovered harness's daily block, ported from the
+    // reconstructed dataset builder (var/research/recovered/dataset.py).
+    // Channel geometry the EMA cascade already pays for:
+    "dist_upper",
+    "dist_lower",
+    "breakout_age",
+    "vol_ratio",
+    // The fast-daily block - refresh every day, several screened better at the
+    // 1-day horizon than anything slow:
+    "f_gap",
+    "f_range",
+    "f_clv",
+    "f_volsurp",
+    "f_trsurp",
+    "f_amihud",
+    "f_ret2",
+    "f_ret3",
+    "f_accel",
+    "f_dvol",
+    // Funding, STRICTLY TRAILING. The original harness summed these windows
+    // FORWARD - realised funding from days that had not happened yet - and
+    // that one character (+k for -k) was the whole difference between the
+    // recorded Sharpe 2.70 and the honest 1.05. The replay proves it:
+    // flip the window and the backtest collapses from +760% to +135%.
+    "funding_7d",
+    "funding_30d",
+    "funding_chg",
+    "funding_z",
 ];
 pub const HOURLY_FEATURE_NAMES: &[&str] = &[
     "rv_6h",
@@ -145,6 +193,35 @@ pub struct DailyRow {
     pub ret_30_skip_7: Option<f64>,
     pub vol_30: Option<f64>,
     pub adv_quote: Option<f64>,
+    pub ret_180: Option<f64>,
+    pub vol_7: Option<f64>,
+    pub vol_90: Option<f64>,
+    pub skew_30: Option<f64>,
+    pub semivol_30: Option<f64>,
+    pub dist_high_90: Option<f64>,
+    pub dist_low_90: Option<f64>,
+    pub amihud_30: Option<f64>,
+    pub turnover_20: Option<f64>,
+    pub range_frac_14: Option<f64>,
+    pub band_width: Option<f64>,
+    pub dist_upper: Option<f64>,
+    pub dist_lower: Option<f64>,
+    pub breakout_age_f: Option<f64>,
+    pub vol_ratio: Option<f64>,
+    pub f_gap: Option<f64>,
+    pub f_range: Option<f64>,
+    pub f_clv: Option<f64>,
+    pub f_volsurp: Option<f64>,
+    pub f_trsurp: Option<f64>,
+    pub f_amihud: Option<f64>,
+    pub f_ret2: Option<f64>,
+    pub f_ret3: Option<f64>,
+    pub f_accel: Option<f64>,
+    pub f_dvol: Option<f64>,
+    pub funding_7d: Option<f64>,
+    pub funding_30d: Option<f64>,
+    pub funding_chg: Option<f64>,
+    pub funding_z: Option<f64>,
     pub beta_bench: Option<f64>,
     pub gc_filter: Option<f64>,
     pub gc_upper: Option<f64>,
@@ -164,6 +241,35 @@ impl DailyRow {
             "ret_30_skip_7" => self.ret_30_skip_7,
             "vol_30" => self.vol_30,
             "adv_quote" => self.adv_quote,
+            "ret_180" => self.ret_180,
+            "vol_7" => self.vol_7,
+            "vol_90" => self.vol_90,
+            "skew_30" => self.skew_30,
+            "semivol_30" => self.semivol_30,
+            "dist_high_90" => self.dist_high_90,
+            "dist_low_90" => self.dist_low_90,
+            "amihud_30" => self.amihud_30,
+            "turnover_20" => self.turnover_20,
+            "range_frac_14" => self.range_frac_14,
+            "band_width" => self.band_width,
+            "dist_upper" => self.dist_upper,
+            "dist_lower" => self.dist_lower,
+            "breakout_age" => self.breakout_age_f,
+            "vol_ratio" => self.vol_ratio,
+            "f_gap" => self.f_gap,
+            "f_range" => self.f_range,
+            "f_clv" => self.f_clv,
+            "f_volsurp" => self.f_volsurp,
+            "f_trsurp" => self.f_trsurp,
+            "f_amihud" => self.f_amihud,
+            "f_ret2" => self.f_ret2,
+            "f_ret3" => self.f_ret3,
+            "f_accel" => self.f_accel,
+            "f_dvol" => self.f_dvol,
+            "funding_7d" => self.funding_7d,
+            "funding_30d" => self.funding_30d,
+            "funding_chg" => self.funding_chg,
+            "funding_z" => self.funding_z,
             "beta_bench" => self.beta_bench,
             "gc_regime_slope" => self.gc_regime_slope,
             _ => None,
@@ -318,6 +424,31 @@ fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
+/// Sample skewness (g1). None below three points or under zero variance.
+fn sample_skew(values: &[f64]) -> Option<f64> {
+    let n = values.len();
+    if n < 3 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let m2 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let m3 = values.iter().map(|v| (v - mean).powi(3)).sum::<f64>() / n as f64;
+    if m2 <= 0.0 {
+        return None;
+    }
+    finite(m3 / m2.powf(1.5))
+}
+
+/// Downside deviation: dispersion of the losing days only, against zero.
+fn downside_std(values: &[f64]) -> Option<f64> {
+    let n = values.len();
+    if n < 2 {
+        return None;
+    }
+    let sum: f64 = values.iter().map(|v| v.min(0.0).powi(2)).sum();
+    finite((sum / (n - 1) as f64).sqrt())
+}
+
 fn sample_std(values: &[f64]) -> Option<f64> {
     if values.len() < 2 || values.iter().any(|v| !v.is_finite()) {
         return None;
@@ -370,10 +501,31 @@ impl EmaCascade {
 }
 
 /// Compute the complete daily feature frame.
+/// Per-asset funding: day -> realised daily rate. Missing assets or days read
+/// as 0.0, matching the harness (funding was patchy for small names).
+pub type FundingTable = BTreeMap<String, BTreeMap<NaiveDate, f64>>;
+
+/// Which way the funding feature windows run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FundingWindow {
+    /// Days up to and including the feature row's own day. The only honest
+    /// choice: everything in the window has already printed.
+    #[default]
+    Trailing,
+    /// The original harness's bug, kept ONLY as a parity diagnostic: windows
+    /// run forward over realised rates from days that have not happened at
+    /// decision time. Reproducing the recorded +760%/Sharpe 2.5 through this
+    /// path is the proof that the Rust port is computationally equivalent to
+    /// the Python harness. Nothing outside that test may use it.
+    ForwardLeakyDiagnostic,
+}
+
 pub fn daily(
     bars: &[Bar],
     benchmark: Option<&str>,
     perp_listed_from: &BTreeMap<String, NaiveDate>,
+    funding: &FundingTable,
+    funding_window: FundingWindow,
 ) -> Result<Vec<DailyRow>, String> {
     let grouped = checked_grouped(bars, 86_400)?;
     let mut rows = Vec::new();
@@ -390,6 +542,9 @@ pub fn daily(
         let mut frozen_open = None;
         let mut frozen_close = None;
         let mut breakout_age = None;
+        // Histories for the fast-daily rolling windows.
+        let mut trs: Vec<f64> = Vec::with_capacity(bars.len());
+        let asset_funding = funding.get(&asset);
 
         for (i, bar) in bars.iter().enumerate() {
             let ret_1 = i
@@ -412,6 +567,7 @@ pub fn daily(
                     .max((bar.high - bars[i - 1].close).abs())
                     .max((bar.low - bars[i - 1].close).abs())
             };
+            trs.push(tr);
             let gf = gc_price.push(typical);
             let gtr = gc_tr.push(tr);
             let rf = regime_price.push(typical);
@@ -461,6 +617,159 @@ pub fn daily(
                 None
             };
 
+            // The restored slow daily block. Same conventions as vol_30: a
+            // window is only computed once fully populated, gaps poison it to
+            // None rather than shortening it, and vols are annualised.
+            let ret_window = |n: usize| -> Option<Vec<f64>> {
+                (i + 1 > n)
+                    .then(|| returns[i + 1 - n..=i].iter().copied().collect())
+                    .flatten()
+            };
+            let vol_7 = ret_window(7)
+                .and_then(|w| sample_std(&w))
+                .map(|v| v * 365.0_f64.sqrt());
+            let vol_90 = ret_window(90)
+                .and_then(|w| sample_std(&w))
+                .map(|v| v * 365.0_f64.sqrt());
+            let skew_30 = ret_window(30).and_then(|w| sample_skew(&w));
+            let semivol_30 = ret_window(30)
+                .and_then(|w| downside_std(&w))
+                .map(|v| v * 365.0_f64.sqrt());
+            let (dist_high_90, dist_low_90) = if i + 1 >= 90 {
+                let w = &closes[i + 1 - 90..=i];
+                let hi = w.iter().copied().fold(f64::MIN, f64::max);
+                let lo = w.iter().copied().fold(f64::MAX, f64::min);
+                (finite(bar.close / hi - 1.0), finite(bar.close / lo - 1.0))
+            } else {
+                (None, None)
+            };
+            let amihud_30 = if i + 1 >= 30 {
+                let terms: Option<Vec<f64>> = (i + 1 - 30..=i)
+                    .map(|j| {
+                        returns[j].zip(bars[j].quote_volume).and_then(|(r, qv)| {
+                            (qv > 0.0).then(|| r.abs() / qv)
+                        })
+                    })
+                    .collect();
+                terms.and_then(|t| finite(t.iter().sum::<f64>() / t.len() as f64))
+            } else {
+                None
+            };
+            let turnover_20 = if i + 1 >= 20 {
+                bars[i + 1 - 20..=i]
+                    .iter()
+                    .map(|b| b.quote_volume)
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|w| finite(w.iter().sum::<f64>() / w.len() as f64))
+            } else {
+                None
+            };
+            let range_frac_14 = if i + 1 >= 14 {
+                let terms: Vec<f64> = bars[i + 1 - 14..=i]
+                    .iter()
+                    .filter_map(|b| finite((b.high - b.low) / b.close))
+                    .collect();
+                (terms.len() == 14).then(|| terms.iter().sum::<f64>() / 14.0)
+            } else {
+                None
+            };
+
+            // --- the recovered harness's fast-daily block ------------------
+            // Simple returns here, not log: the originals were close/prev - 1
+            // and f_accel is their first difference.
+            let pc = (i >= 1).then(|| bars[i - 1].close);
+            let sret = |k: usize| -> Option<f64> {
+                i.checked_sub(k)
+                    .and_then(|j| finite(bar.close / bars[j].close - 1.0))
+            };
+            let f_gap = pc.and_then(|pc| finite((bar.open - pc) / pc));
+            let f_range = finite((bar.high - bar.low) / bar.close);
+            let f_clv = if bar.high > bar.low {
+                finite((bar.close - bar.low) / (bar.high - bar.low))
+            } else {
+                Some(0.5)
+            };
+            // rolling windows of 20 INCLUDING today, at least 10 present -
+            // polars rolling_*(20, min_samples=10) semantics.
+            let window20 = |xs: &dyn Fn(usize) -> Option<f64>| -> Vec<f64> {
+                (i.saturating_sub(19)..=i).filter_map(xs).collect()
+            };
+            let qv_window = window20(&|j| bars[j].quote_volume);
+            let f_volsurp = bar.quote_volume.and_then(|qv| {
+                (qv_window.len() >= 10)
+                    .then(|| median(qv_window.clone()))
+                    .flatten()
+                    .and_then(|m| (m > 0.0).then(|| finite(qv / m)).flatten())
+            });
+            let tr_window = window20(&|j| Some(trs[j]));
+            let f_trsurp = (tr_window.len() >= 10)
+                .then(|| tr_window.iter().sum::<f64>() / tr_window.len() as f64)
+                .and_then(|m| finite(tr / m));
+            let f_amihud = pc.zip(bar.quote_volume).and_then(|(pc, qv)| {
+                (qv > 0.0)
+                    .then(|| finite((bar.close / pc - 1.0).abs() / qv))
+                    .flatten()
+            });
+            let f_ret2 = sret(2);
+            let f_ret3 = sret(3);
+            let f_accel = match (sret(1), i.checked_sub(2)) {
+                (Some(r1), Some(j)) => finite(r1 - (bars[i - 1].close / bars[j].close - 1.0)),
+                _ => None,
+            };
+            let f_dvol = (i >= 1)
+                .then(|| bars[i - 1].quote_volume.zip(bar.quote_volume))
+                .flatten()
+                .and_then(|(pv, qv)| (pv > 0.0).then(|| finite(qv / pv - 1.0)).flatten());
+
+            // --- channel geometry --------------------------------------------
+            let dist_upper = gc_upper
+                .filter(|u| *u != 0.0)
+                .and_then(|u| finite((bar.close - u) / u.abs()));
+            let dist_lower = gc_lower
+                .filter(|l| *l != 0.0)
+                .and_then(|l| finite((bar.close - l) / l.abs()));
+
+            // --- funding ------------------------------------------------------
+            // A sum over days relative to this row's own date. Trailing k runs
+            // 0..n (today backwards); the leaky diagnostic runs 1..=n forward.
+            let day0 = bar.ts_utc.date_naive();
+            let fsum = |n: i64| -> f64 {
+                let Some(t) = asset_funding else { return 0.0 };
+                (0..n)
+                    .map(|k| {
+                        let d = match funding_window {
+                            FundingWindow::Trailing => day0 - chrono::Duration::days(k),
+                            FundingWindow::ForwardLeakyDiagnostic => {
+                                day0 + chrono::Duration::days(k + 1)
+                            }
+                        };
+                        t.get(&d).copied().unwrap_or(0.0)
+                    })
+                    .sum()
+            };
+            let fsum_prev7 = |_: ()| -> f64 {
+                let Some(t) = asset_funding else { return 0.0 };
+                (0..7)
+                    .map(|k| {
+                        let d = match funding_window {
+                            FundingWindow::Trailing => day0 - chrono::Duration::days(7 + k),
+                            FundingWindow::ForwardLeakyDiagnostic => {
+                                day0 - chrono::Duration::days(6 - k)
+                            }
+                        };
+                        t.get(&d).copied().unwrap_or(0.0)
+                    })
+                    .sum()
+            };
+            let f7 = fsum(7);
+            let f30 = fsum(30);
+            let funding_chg = f7 - fsum_prev7(());
+            let funding_z = (f7 - f30 / 30.0 * 7.0) / (f30.abs() / 30.0 * 7.0 + 1e-6);
+            let ret_90_now = shifted_return(&closes, i, 90);
+            let vol_ratio = vol_30
+                .zip(ret_90_now.filter(|r| *r != 0.0))
+                .and_then(|(v, r)| finite(v / r.abs()));
+
             rows.push(DailyRow {
                 ts_utc: bar.ts_utc,
                 asset: asset.clone(),
@@ -482,6 +791,41 @@ pub fn daily(
                 ret_30_skip_7: i.checked_sub(30).map(|j| closes[i - 7] / closes[j] - 1.0),
                 vol_30,
                 adv_quote,
+                ret_180: shifted_return(&closes, i, 180),
+                vol_7,
+                vol_90,
+                skew_30,
+                semivol_30,
+                dist_high_90,
+                dist_low_90,
+                amihud_30,
+                turnover_20,
+                range_frac_14,
+                // Channel width relative to its centre: a volatility regime
+                // reading the EMA cascade already paid for.
+                band_width: match (gc_upper, gc_lower, gc_filter) {
+                    (Some(u), Some(l), Some(f)) if f != 0.0 => finite((u - l) / f),
+                    _ => None,
+                },
+                dist_upper,
+                dist_lower,
+                // The harness read a missing age as zero, not as missing.
+                breakout_age_f: Some(breakout_age.map(|a: u32| a as f64).unwrap_or(0.0)),
+                vol_ratio,
+                f_gap,
+                f_range,
+                f_clv,
+                f_volsurp,
+                f_trsurp,
+                f_amihud,
+                f_ret2,
+                f_ret3,
+                f_accel,
+                f_dvol,
+                funding_7d: finite(f7),
+                funding_30d: finite(f30),
+                funding_chg: finite(funding_chg),
+                funding_z: finite(funding_z),
                 beta_bench: None,
                 gc_filter,
                 gc_upper,
@@ -817,10 +1161,10 @@ mod tests {
     fn daily_features_are_prefix_invariant() {
         let mut input = bars(86_400, 200, "BTC", 1.0);
         input.extend(bars(86_400, 200, "ETH", 20.0));
-        let full = daily(&input, Some("BTC"), &BTreeMap::new()).unwrap();
+        let full = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
         let cutoff = input.iter().map(|b| b.ts_utc).min().unwrap() + TimeDelta::days(159);
         let prefix_bars: Vec<_> = input.into_iter().filter(|b| b.ts_utc <= cutoff).collect();
-        let prefix = daily(&prefix_bars, Some("BTC"), &BTreeMap::new()).unwrap();
+        let prefix = daily(&prefix_bars, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
         let expected: Vec<_> = full.into_iter().filter(|r| r.ts_utc <= cutoff).collect();
         assert_eq!(prefix, expected);
     }
@@ -851,7 +1195,7 @@ mod tests {
     #[test]
     fn beta_of_benchmark_is_one() {
         let input = bars(86_400, 200, "BTC", 1.0);
-        let out = daily(&input, Some("BTC"), &BTreeMap::new()).unwrap();
+        let out = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
         assert!((out.last().unwrap().beta_bench.unwrap() - 1.0).abs() < 1e-12);
     }
 
@@ -890,7 +1234,7 @@ mod tests {
         // deterministic `bars` series above. This fixture keeps
         // the old validated semantics without keeping a second implementation.
         let input = bars(86_400, 200, "BTC", 1.0);
-        let out = daily(&input, Some("BTC"), &BTreeMap::new()).unwrap();
+        let out = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
         let r = out.last().unwrap();
         close(r.ret_1, 0.009771636483385665);
         close(r.ret_7, -0.008905970393982998);

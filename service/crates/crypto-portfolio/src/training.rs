@@ -11,7 +11,16 @@ use crate::{config::Config, store, universe};
 pub struct TrainingRow {
     pub date: NaiveDate,
     pub asset: String,
+    /// Demeaned forward return - the reward the model has always been fit on.
     pub target: f64,
+    /// The same return before demeaning, plus the asset's realised vol at the
+    /// decision. Emitted so a trainer can build ALTERNATIVE rewards - e.g. the
+    /// risk-adjusted target demean(ret/vol) - without a second matrix pass.
+    /// The record only documents the demeaned-return reward; whether a
+    /// risk-adjusted one came later lived in the uncommitted harness, so the
+    /// comparison has to be re-run rather than remembered.
+    pub raw_ret: f64,
+    pub vol: Option<f64>,
     pub features: BTreeMap<String, f64>,
 }
 
@@ -27,6 +36,7 @@ pub fn build(
     end: NaiveDate,
     lag_hours: i64,
     hold_hours: i64,
+    funding_window: features_crypto::FundingWindow,
 ) -> Result<TrainingMatrix, String> {
     if end < start {
         return Err("training end precedes start".into());
@@ -59,7 +69,13 @@ pub fn build(
         .filter(|bar| bar.ts_utc >= feature_start && bar.ts_utc <= feature_end)
         .collect();
     let listings = store::funding_listings(root)?;
-    let daily = features_crypto::daily(&daily_bars, cfg.benchmark.as_deref(), &listings)?;
+    let daily = features_crypto::daily(
+        &daily_bars,
+        cfg.benchmark.as_deref(),
+        &listings,
+        &crate::funding::load(root)?,
+        funding_window,
+    )?;
     let hourly =
         features_crypto::hourly_before_daily_decision(&hourly_bars, cfg.benchmark.as_deref())?;
 
@@ -123,17 +139,22 @@ pub fn build(
                 .iter()
                 .map(|name| daily.value(name).or_else(|| hour.value(name)))
                 .collect::<Vec<_>>();
-            block.push((asset.to_owned(), p1 / p0 - 1.0, values));
+            // Vol at the decision, same preference order as inference: the
+            // 24h realised vol if the hourly store has it, else 30-day daily.
+            let vol = hour.rv_24h.or(daily.vol_30).filter(|v| *v > 0.0);
+            block.push((asset.to_owned(), p1 / p0 - 1.0, vol, values));
         }
         if block.len() >= 12 {
-            let raw = block.iter().map(|(_, _, v)| v.clone()).collect::<Vec<_>>();
+            let raw = block.iter().map(|(_, _, _, v)| v.clone()).collect::<Vec<_>>();
             let normalised = features_crypto::rank_normalise(&raw)?;
-            let mean_target = block.iter().map(|(_, y, _)| y).sum::<f64>() / block.len() as f64;
-            for ((asset, target, _), values) in block.into_iter().zip(normalised) {
+            let mean_target = block.iter().map(|(_, y, _, _)| y).sum::<f64>() / block.len() as f64;
+            for ((asset, target, vol, _), values) in block.into_iter().zip(normalised) {
                 rows.push(TrainingRow {
                     date: day,
                     asset,
                     target: target - mean_target,
+                    raw_ret: target,
+                    vol,
                     features: feature_names.iter().cloned().zip(values).collect(),
                 });
             }
