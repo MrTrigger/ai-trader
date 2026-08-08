@@ -1,17 +1,23 @@
-# Live UI checks
+# Live UI checks (Playwright)
 
-Not unit tests: these launch the real browser against a running api and
-click the real buttons. They exist because "it compiled" and "the copy is
-right" turned out to be different claims — twice — and because the only
-way to know how fast a control is obeyed is to press it and time it.
+    bun run test:ui
 
-    bun run frontend/test/test_controls.ts       # verbs, copy, enablement
-    bun run frontend/test/test_stop_latency.ts   # unapplied stop → red; stop latency
+Not hermetic. These launch a browser against a **running api and real
+bots**, and click the real buttons — which is the only way to catch what
+kept slipping through: copy that no longer matched behaviour, a control
+verb that was disabled when it shouldn't be, and how long a bot actually
+takes to obey Stop. Every assertion here corresponds to something that
+shipped wrong.
 
-Both need the api on :7434 and a Chromium at the path in `uidrive.ts`
-(Playwright's cached download is fine — no Playwright package needed;
-`uidrive.ts` speaks CDP directly).
+Needs the api on :7434 (override with `API_BASE`).
 
-`test_stop_latency.ts` stops and restarts **futures-noise**. It asserts the
-bot is flat before doing so and restores it to running at the end, but do
-not run it with a position open.
+`stop-latency.spec.ts` stops and restarts **futures-noise**. It asserts the
+book is flat first and restores running at the end — but it does press Stop
+on a live bot, so don't run it with a position open.
+
+`controls.spec.ts` drives **crypto-portfolio**, which has no process running
+it. That is deliberate: a control nothing is listening for must not look
+like one that was obeyed, and this is the bot where that is true.
+
+One worker, no retries, on purpose: a retry would press Stop a second time
+and paper over exactly the flakiness worth knowing about.
