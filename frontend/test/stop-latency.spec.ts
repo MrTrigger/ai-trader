@@ -29,10 +29,20 @@ async function status(api: APIRequestContext) {
 test("a running bot obeys Stop in seconds, and Start brings it back", async ({ request }) => {
   const before = await status(request);
   expect(before, `${BOT} is not reporting — is it running?`).toBeTruthy();
-  expect(before.control_state, "expected to start from running").toBe("running");
-  // Never exercise this against an open book.
+  // Never exercise this against an open book. That is the one hard guard;
+  // the control word is a precondition this test can ESTABLISH, not a
+  // reason to fail — demanding "running" made the suite's outcome depend
+  // on which state the operator (or the previous spec's faithful restore)
+  // happened to leave the bot in.
   expect(before.headline?.fills ?? 0, "refusing to Stop a bot with fills today").toBe(0);
-  expect(before.halted ?? null).toBeNull();
+  const initialControl: string = before.control_state;
+
+  if (initialControl !== "running") {
+    expect((await request.post(`/api/bots/${BOT}/resume`)).ok()).toBeTruthy();
+    await expect
+      .poll(async () => (await status(request)).halted ?? null, { timeout: OBEY_WITHIN_MS, intervals: [250] })
+      .toBeNull();
+  }
 
   const t0 = Date.now();
   expect((await request.post(`/api/bots/${BOT}/stop`)).ok()).toBeTruthy();
@@ -57,4 +67,13 @@ test("a running bot obeys Stop in seconds, and Start brings it back", async ({ r
 
   const after = await status(request);
   expect(after.control_state).toBe("running");
+
+  // Leave the bot exactly as the operator had it.
+  if (initialControl !== "running") {
+    const verb = initialControl === "stopped" ? "stop" : "halt";
+    expect((await request.post(`/api/bots/${BOT}/${verb}`)).ok()).toBeTruthy();
+    await expect
+      .poll(async () => (await status(request)).control_state, { timeout: OBEY_WITHIN_MS })
+      .toBe(initialControl);
+  }
 });

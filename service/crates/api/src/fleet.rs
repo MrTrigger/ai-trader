@@ -348,6 +348,14 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
 
     if let Some(srow) = status {
         let state: Value = serde_json::from_str(&srow.payload).unwrap_or(Value::Null);
+        // The operator's control word travels with BOTH contracts. It was
+        // only on the runner branch, so the futures page had no `controls`
+        // at all: its pill fell through to the feed rules and drew
+        // RUNNING·IDLE over a bot whose operator had just pressed Stop —
+        // with the toast promising the close and nothing else moving.
+        let controls: Value = control
+            .map(|c| serde_json::from_str(&c.payload).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
         if dialect_of(&state) == "botstate" {
             // Chronological, like the journal file the shape came from.
             let fills: Vec<Value> = fills
@@ -365,13 +373,11 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
                 "enabled": bot.enabled,
                 "heartbeat_age_seconds": srow.heartbeat_age_seconds,
                 "broker": broker,
+                "controls": controls,
                 "state": state,
                 "fills": fills,
             }));
         }
-        let controls: Value = control
-            .map(|c| serde_json::from_str(&c.payload).unwrap_or(Value::Null))
-            .unwrap_or(Value::Null);
         let runs: Vec<Value> = runs
             .into_iter()
             .filter_map(|t| serde_json::from_str(&t).ok())
