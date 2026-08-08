@@ -10,6 +10,7 @@ import { FeedStatus } from "../components/FeedStatus";
 import { LogModal } from "../components/LogModal";
 import { LocalConsole } from "../components/LocalConsole";
 import { money, num, signed, stamp, tone } from "../lib/format";
+import { activity } from "../lib/activity";
 
 export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefresh: () => void }) {
   const [settings, setSettings] = useState(false);
@@ -18,11 +19,11 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
   const feed = det.feed;
-  // "Running" is about the control word; it says nothing about whether the
-  // bot can see the market. Degraded is that second axis, surfaced next to
-  // the first instead of buried one modal deep.
-  const degraded = feed ? feed.healthy === false : false;
   const halted = st.state === "halted" || (d.controls as { kill_switch?: boolean } | null)?.kill_switch === true;
+  // What it is doing, which is not what it was told (the control word) and
+  // not what it is wired to do (the route chain). See lib/activity.
+  const act = activity({ enabled: d.enabled, halted, feed });
+  const degraded = act.key === "degraded";
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
   return (
@@ -32,12 +33,12 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
           ← Fleet
         </Link>
         <h1 className="font-display text-[20px] font-semibold">{id}</h1>
-        {halted ? (
-          <Pill tone="alarm">halted{st.state_reason ? ` · ${String(st.state_reason)}` : ""}</Pill>
-        ) : degraded ? (
-          <Pill tone="consequence">running · degraded</Pill>
-        ) : (
-          <Pill tone="go">{st.state ?? "—"}</Pill>
+        <Pill tone={act.tone}>
+          {act.long}
+          {halted && st.state_reason ? ` · ${String(st.state_reason)}` : ""}
+        </Pill>
+        {act.key === "idle" && (
+          <span className="text-[12px] text-faint">nothing due — the market is closed</span>
         )}
         <Heart age={d.heartbeat_age_seconds} />
         <span className="text-[12px] text-faint">{d.display_name} · {d.cadence}</span>

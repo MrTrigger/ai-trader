@@ -3,12 +3,13 @@ import type { Overview } from "../api/types";
 import { Card, Heart, Pill } from "../components/Card";
 import { Spark } from "../components/Spark";
 import { execution } from "../components/RouteChain";
+import { activity } from "../lib/activity";
 import { FeedStatus } from "../components/FeedStatus";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 /**
  * The fleet answers one question before any other: is everything as I left
- * it? So the band leads with STATE — how many bots, how many sending
+ * it? So the band leads with STATE — how many bots, how many armed to send
  * orders, how many halted, and whether any real money is exposed. P&L is
  * second, because a portfolio app opens with money and an operations
  * console opens with control.
@@ -29,7 +30,7 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
             <p className="font-display text-[26px] font-semibold leading-none">
               {bots.length} bot{bots.length === 1 ? "" : "s"}
               <span className="text-faint"> · </span>
-              <span className={sending ? "text-go" : "text-dim"}>{sending} sending orders</span>
+              <span className={sending ? "text-go" : "text-dim"}>{sending} armed</span>
               <span className="text-faint"> · </span>
               <span className={halted ? "text-alarm" : "text-dim"}>{halted} halted</span>
             </p>
@@ -61,10 +62,10 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
               >
                 <div className="flex items-center gap-2.5">
                   <h3 className="font-display text-[15px] font-semibold">{b.bot_id}</h3>
-                  {!b.enabled ? <Pill>disabled</Pill>
-                    : isHalted ? <Pill tone="alarm">halted</Pill>
-                    : st.feed?.healthy === false ? <Pill tone="consequence">degraded</Pill>
-                    : <Pill tone="go">running</Pill>}
+                  {(() => {
+                    const act = activity({ enabled: b.enabled, halted: isHalted, feed: st.feed });
+                    return <Pill tone={act.tone}>{act.label}</Pill>;
+                  })()}
                   <span className="ml-auto"><Heart age={st.heartbeat_age_seconds} /></span>
                 </div>
 

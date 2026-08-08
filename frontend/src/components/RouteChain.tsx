@@ -82,7 +82,11 @@ function Connector() {
 
 export function execution(mode?: string | null): { label: string; live: boolean } {
   switch (mode) {
-    case "live": return { label: "sending orders", live: true };
+    // "sending orders" reads as something happening now, and this cell is
+    // wiring, not activity — it said "sending orders" all weekend with the
+    // market shut and the bot idle. Armed is a state you can check before
+    // an open, which is the question this cell exists to answer.
+    case "live": return { label: "orders armed", live: true };
     case "shadow": return { label: "shadow, no orders", live: false };
     case "replay": return { label: "replay", live: false };
     case "paper": return { label: "simulated fills", live: false };
