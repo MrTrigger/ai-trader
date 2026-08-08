@@ -637,6 +637,17 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     }
 
     let mut last_bar_seen = chrono::Utc::now();
+    // Flatten fires on the RISING EDGE of the operator asking for it, not on
+    // the halt transition. Guarding it with "was not already halted" meant
+    // Halt-then-Stop never flattened: the book was halted, so the Stop's
+    // flatten was skipped and the position stayed open while the dashboard
+    // said "the book closes at the bot's next cycle". Halt-then-Stop is the
+    // 3am path the two buttons exist for — halt now, decide to be out a
+    // minute later — so it is the one that must work.
+    //
+    // Starting false also means a process that comes up while stopped
+    // flattens once, which is the correct reading of a stopped book.
+    let mut flatten_asked = false;
     loop {
         let next = tokio::time::timeout(std::time::Duration::from_secs(120), bar_rx.recv()).await;
         let done = match next {
@@ -672,11 +683,11 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 // unapplied — the book stayed open precisely when somebody
                 // had just asked for it to be closed.
                 let control = read_control(&rec, &bot_id)?;
-                let was_halted = book.halted.is_some();
                 book.apply_control(&control);
-                if control.flatten && !was_halted && live {
+                if control.flatten && !flatten_asked && live {
                     let _ = trading.flatten_all(&bot_id).await;
                 }
+                flatten_asked = control.flatten;
                 let fh = feed_health.lock().expect("feed health").clone();
                 live::publish_with_feed(&rec, &book, &bot_id, mode, None, Some(&fh))?;
                 continue;
@@ -697,15 +708,14 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         // Controls, fresh every completed bar. Halt stops entries now and,
         // in live mode, flattens.
         let control = read_control(&rec, &bot_id)?;
-        // Halt closes nothing; STOP closes. The previous cut flattened on
-        // any halt, which quietly made the two identical and made the
-        // dashboard's promise ("halting does not close what is open") a
-        // lie.
-        let was_halted = book.halted.is_some();
+        // Halt closes nothing; STOP closes. An earlier cut flattened on any
+        // halt, which quietly made the two identical and made the
+        // dashboard's promise ("halting does not close what is open") a lie.
         book.apply_control(&control);
-        if control.flatten && !was_halted && live {
+        if control.flatten && !flatten_asked && live {
             let _ = trading.flatten_all(&bot_id).await;
         }
+        flatten_asked = control.flatten;
 
         // Catch-up gate: the poll feed replays the last day's bars at
         // startup to rebuild today's session state. Those bars are history —

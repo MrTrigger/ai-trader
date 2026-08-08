@@ -19,11 +19,18 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
   const feed = det.feed;
-  const halted = st.state === "halted" || (d.controls as { kill_switch?: boolean } | null)?.kill_switch === true;
+  const ctl = d.controls as { state?: string; set_at?: string } | null;
+  // Has the bot seen the control yet? Its last publish is now minus the
+  // heartbeat age; if the operator set the word after that, it has not.
+  const pending =
+    !!ctl?.set_at &&
+    d.heartbeat_age_seconds != null &&
+    Date.parse(ctl.set_at) > Date.now() - d.heartbeat_age_seconds * 1000;
   // What it is doing, which is not what it was told (the control word) and
   // not what it is wired to do (the route chain). See lib/activity.
-  const act = activity({ enabled: d.enabled, halted, feed });
-  const degraded = act.key === "degraded";
+  const act = activity({ enabled: d.enabled, control: ctl?.state, pending, feed });
+  const halted = act.key === "halted" || act.key === "stopped";
+  const failing = act.key === "failure";
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
   return (
@@ -51,7 +58,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         </button>
       </div>
 
-      {degraded && (
+      {failing && (
         <div className="flex flex-wrap items-center gap-3 rounded-xl border border-alarm/40 bg-alarm/[0.07] px-4 py-3">
           <span className="font-display text-[12px] font-semibold uppercase tracking-wide text-alarm">
             Feed problem
@@ -203,11 +210,16 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         </div>
 
         <div className="space-y-5">
-          <Card title="Controls" aside={halted ? "halted" : "trading"}>
+          <Card title="Controls" aside={ctl?.state ?? "trading"}>
             <Controls
               botId={id}
-              halted={halted}
-              flat={open === 0}
+              control={ctl?.state}
+              // Only claim flat when we can actually see the book. The
+              // sleeve list is the futures bot's shape; for anything else
+              // `open` is 0 by absence, which would grey out Stop on a bot
+              // holding positions. Unknown must fail towards being able to
+              // flatten.
+              flat={d.contract === "botstate" && open === 0}
               onDone={onRefresh}
             />
           </Card>

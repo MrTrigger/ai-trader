@@ -3,6 +3,7 @@ import { NavLink, Route, Routes, useParams } from "react-router-dom";
 import { api } from "./api/client";
 import { Fleet } from "./pages/Fleet";
 import { BotPage } from "./pages/BotPage";
+import { activity } from "./lib/activity";
 
 const POLL = 10_000;
 
@@ -11,7 +12,20 @@ export default function App() {
 
   return (
     <div className="mx-auto min-h-screen max-w-[1360px] px-5 pb-16">
-      <Chrome bots={ov.data?.bots.map((b) => ({ id: b.bot_id, ok: !b.status?.halted && b.enabled })) ?? []} />
+      {/* The nav dot is the same state a third time; derive it from the one
+          rule so it cannot contradict the card and the header. */}
+      <Chrome
+        bots={
+          ov.data?.bots.map((b) => ({
+            id: b.bot_id,
+            tone: activity({
+              enabled: b.enabled,
+              control: b.status?.control_state,
+              feed: b.status?.feed,
+            }).tone,
+          })) ?? []
+        }
+      />
       <main className="pt-5">
         {ov.isLoading && <p className="text-[12px] text-faint">Connecting to the registry…</p>}
         {ov.isError && (
@@ -39,7 +53,9 @@ function BotRoute() {
   return <BotPage id={id} d={q.data!} onRefresh={() => q.refetch()} />;
 }
 
-function Chrome({ bots }: { bots: { id: string; ok: boolean }[] }) {
+type Tone = ReturnType<typeof activity>["tone"];
+
+function Chrome({ bots }: { bots: { id: string; tone: Tone }[] }) {
   return (
     <header className="flex flex-wrap items-center gap-x-6 gap-y-3 border-b border-line py-4">
       <NavLink to="/" className="flex items-center gap-2.5">
@@ -52,7 +68,7 @@ function Chrome({ bots }: { bots: { id: string; ok: boolean }[] }) {
         <Tab to="/" end>Fleet</Tab>
         {bots.map((b) => (
           <Tab key={b.id} to={`/bot/${encodeURIComponent(b.id)}`}>
-            <span className={`mr-1.5 inline-block h-[6px] w-[6px] rounded-full ${b.ok ? "bg-go" : "bg-consequence"}`} />
+            <span className={`mr-1.5 inline-block h-[6px] w-[6px] rounded-full ${DOT[b.tone ?? "quiet"]}`} />
             {b.id}
           </Tab>
         ))}
@@ -93,3 +109,10 @@ function Reticle() {
     </svg>
   );
 }
+
+const DOT: Record<string, string> = {
+  quiet: "bg-line2",
+  go: "bg-go",
+  consequence: "bg-consequence",
+  alarm: "bg-alarm",
+};

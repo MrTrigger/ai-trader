@@ -11,7 +11,8 @@ const cases: [string, Parameters<typeof activity>[0], Activity["key"], Activity[
   ["bars arriving", { enabled: true, feed: { healthy: true, market_open: true } }, "working", "go"],
   ["market closed", { enabled: true, feed: { healthy: true, market_open: false } }, "idle", "consequence"],
   ["feed unhealthy", { enabled: true, feed: { healthy: false, market_open: true } }, "failure", "alarm"],
-  ["halted by operator", { enabled: true, halted: true }, "halted", "quiet"],
+  ["halted by operator", { enabled: true, control: "halted" }, "halted", "quiet"],
+  ["stopped by operator", { enabled: true, control: "stopped" }, "stopped", "quiet"],
   ["disabled in registry", { enabled: false }, "disabled", "quiet"],
 ];
 
@@ -29,10 +30,18 @@ test("a failing feed outranks a closed market", () => {
   expect(activity({ enabled: true, feed: { healthy: false, market_open: false } }).key).toBe("failure");
 });
 
-test("halted outranks a failing feed", () => {
+test("the control word outranks a failing feed", () => {
   // A halted bot is not going to trade whatever the feed does; leading
   // with the fault would imply there is something to fix first.
-  expect(activity({ enabled: true, halted: true, feed: { healthy: false } }).key).toBe("halted");
+  expect(activity({ enabled: true, control: "halted", feed: { healthy: false } }).key).toBe("halted");
+});
+
+test("a control the bot has not seen yet says so", () => {
+  // Stop on a cron bot can sit unacknowledged for hours. "stopped" would
+  // promise the book is closed; it is not, and the operator must know
+  // which of the two they are looking at.
+  expect(activity({ enabled: true, control: "stopped", pending: true }).label).toBe("stopping");
+  expect(activity({ enabled: true, control: "halted", pending: true }).label).toBe("halting");
 });
 
 test("a bot with no feed is never called idle", () => {

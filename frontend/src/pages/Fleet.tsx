@@ -17,7 +17,9 @@ import { money, num, signed, stamp, tone } from "../lib/format";
 export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }) {
   const bots = ov.bots ?? [];
   const sending = bots.filter((b) => b.status?.mode === "live").length;
-  const halted = bots.filter((b) => b.status?.kill_switch === true || !!b.status?.halted).length;
+  // Counted off the control word, so Stop registers here too — the old
+  // kill_switch reading missed it entirely.
+  const stopped = bots.filter((b) => ["halted", "stopped"].includes(b.status?.control_state ?? "")).length;
   const real = bots.filter((b) => b.broker?.kind === "live");
   const net = bots.reduce((a, b) => a + num(b.status?.net_total), 0);
 
@@ -32,7 +34,7 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
               <span className="text-faint"> · </span>
               <span className={sending ? "text-go" : "text-dim"}>{sending} armed</span>
               <span className="text-faint"> · </span>
-              <span className={halted ? "text-alarm" : "text-dim"}>{halted} halted</span>
+              <span className={stopped ? "text-consequence" : "text-dim"}>{stopped} stopped</span>
             </p>
             <p className="mt-2 text-[12px] text-faint">
               {real.length === 0
@@ -51,7 +53,6 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
         <div className="grid gap-4 sm:grid-cols-2">
           {bots.map((b) => {
             const st = b.status ?? {};
-            const isHalted = st.kill_switch === true || !!st.halted;
             const ex = execution(st.mode);
             const series = (b.series ?? []).map(([, v]) => num(v));
             return (
@@ -63,7 +64,11 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                 <div className="flex items-center gap-2.5">
                   <h3 className="font-display text-[15px] font-semibold">{b.bot_id}</h3>
                   {(() => {
-                    const act = activity({ enabled: b.enabled, halted: isHalted, feed: st.feed });
+                    const act = activity({
+                      enabled: b.enabled,
+                      control: st.control_state,
+                      feed: st.feed,
+                    });
                     return <Pill tone={act.tone}>{act.label}</Pill>;
                   })()}
                   <span className="ml-auto"><Heart age={st.heartbeat_age_seconds} /></span>

@@ -2,28 +2,40 @@ import { useState } from "react";
 import { api } from "../api/client";
 
 /**
- * Three verbs, because stopping a bot is two different instructions.
+ * Three verbs over a three-state machine.
  *
- *   Resume  trade again
- *   Halt    open nothing new; leave the book exactly as it is
- *   Stop    open nothing new AND close the book at market
+ *   running  --halt-->  halted   open nothing new; leave the book as it is
+ *   running  --stop-->  stopped  open nothing new AND close at market
+ *   halted   --resume--> running
+ *   stopped  --start-->  running
  *
  * Halt is the reversible one you reach for at 3am. Stop costs a spread.
  * They are separate buttons so the choice exists at the moment it matters.
+ *
+ * This took a boolean `halted` until it turned out a boolean cannot hold
+ * three states: a stopped bot read as neither halted nor running, so the
+ * way back was disabled and Stop was a one-way door from the dashboard.
+ * The first button is therefore named for the transition it performs —
+ * Start out of stopped, Resume out of halted — because those are
+ * different promises about what happens to the book.
  */
 export function Controls({
   botId,
-  halted,
+  control,
   flat,
   note,
   onDone,
 }: {
   botId: string;
-  halted: boolean;
+  /** The canonical control word: running | halted | stopped. */
+  control?: string | null;
   flat: boolean;
   note?: string;
   onDone: () => void;
 }) {
+  const stopped = control === "stopped";
+  const halted = stopped || control === "halted";
+  const startVerb = stopped ? "Start" : "Resume";
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
 
@@ -37,7 +49,7 @@ export function Controls({
       await api.control(botId, verb);
       setMsg({
         text:
-          verb === "resume" ? "Resumed."
+          verb === "resume" ? `${startVerb === "Start" ? "Started" : "Resumed"}. Trading again at the next cycle.`
           : verb === "halt" ? "Halted. Open positions untouched."
           : "Stopping. The book closes at the bot's next cycle.",
       });
@@ -53,12 +65,14 @@ export function Controls({
     <div>
       <div className="grid grid-cols-3 gap-2">
         <Btn kind="go" disabled={!halted || !!busy} busy={busy === "resume"} onClick={() => run("resume")}>
-          Resume
+          {startVerb}
         </Btn>
         <Btn kind="quiet" disabled={halted || !!busy} busy={busy === "halt"} onClick={() => run("halt")}>
           Halt
         </Btn>
-        <Btn kind="alarm" disabled={(halted && flat) || !!busy} busy={busy === "stop"} onClick={() => run("stop")}>
+        {/* Stop stays available whenever anything is open, whatever the
+            control word says — flattening is never the thing to withhold. */}
+        <Btn kind="alarm" disabled={(stopped && flat) || !!busy} busy={busy === "stop"} onClick={() => run("stop")}>
           Stop
         </Btn>
       </div>

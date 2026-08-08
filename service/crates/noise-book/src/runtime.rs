@@ -482,3 +482,84 @@ impl Book {
         out
     }
 }
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::book_sleeves;
+
+    fn book() -> Book {
+        Book::new(book_sleeves())
+    }
+    /// The three canonical control words, as the runtime sees them.
+    fn running() -> Control {
+        Control::default()
+    }
+    fn halt() -> Control {
+        Control { halt: true, ..Default::default() }
+    }
+    fn stop() -> Control {
+        Control { halt: true, flatten: true, ..Default::default() }
+    }
+
+    #[test]
+    fn every_operator_transition_round_trips() {
+        let mut b = book();
+        assert!(b.halted.is_none(), "a fresh book trades");
+
+        b.apply_control(&halt());
+        assert_eq!(b.halted.as_deref(), Some("operator"));
+
+        b.apply_control(&running());
+        assert!(b.halted.is_none(), "Resume must clear an operator halt");
+
+        b.apply_control(&stop());
+        assert_eq!(b.halted.as_deref(), Some("operator-stop"));
+
+        // The one the dashboard could not reach until now: after a Stop the
+        // only way back is Start, and if this does not clear, the button
+        // writes a row and nothing happens.
+        b.apply_control(&running());
+        assert!(b.halted.is_none(), "Start must clear a stop");
+    }
+
+    #[test]
+    fn a_rail_halt_is_not_operator_resumable() {
+        // Kill criterion, reconcile mismatch, feed stall, refused orders:
+        // these mean something is WRONG. Clearing them is a restart after a
+        // human has looked, never a button on a web page.
+        for reason in ["kill-criterion", "feed-stall", "reconcile-mismatch"] {
+            let mut b = book();
+            b.halted = Some(reason.into());
+            b.apply_control(&running());
+            assert_eq!(b.halted.as_deref(), Some(reason), "{reason} must stay latched");
+        }
+    }
+
+    #[test]
+    fn repeating_a_control_is_idempotent() {
+        // The loop re-reads the control every bar, so every word is applied
+        // over and over. None of them may drift on repetition.
+        let mut b = book();
+        for _ in 0..5 {
+            b.apply_control(&stop());
+        }
+        assert_eq!(b.halted.as_deref(), Some("operator-stop"));
+        for _ in 0..5 {
+            b.apply_control(&running());
+        }
+        assert!(b.halted.is_none());
+    }
+
+    #[test]
+    fn halting_an_already_stopped_book_keeps_the_stronger_reason() {
+        let mut b = book();
+        b.apply_control(&stop());
+        b.apply_control(&halt());
+        assert_eq!(
+            b.halted.as_deref(),
+            Some("operator-stop"),
+            "downgrading to a plain halt would misreport why the book is shut"
+        );
+    }
+}
