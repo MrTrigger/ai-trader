@@ -37,6 +37,10 @@ export type Activity = {
     | "stopping"
     | "stop-not-applied"
     | "halted"
+    | "halting"
+    | "halt-not-applied"
+    | "starting"
+    | "not-running"
     | "failure"
     | "idle"
     | "working";
@@ -53,6 +57,15 @@ export type Activity = {
  * this means nothing is listening.
  */
 export const STOP_GRACE_S = 30;
+
+/**
+ * How long any other control may sit unacknowledged before we stop calling
+ * it a transition. Nothing is at risk while a Halt or a Start is in
+ * flight, so this is looser than the Stop grace — but past it, the
+ * instruction is not being carried out and the page must not pretend
+ * otherwise.
+ */
+export const APPLY_GRACE_S = 120;
 
 export function activity(a: {
   enabled?: boolean;
@@ -95,8 +108,26 @@ export function activity(a: {
     };
   }
   if (a.control === "halted") {
-    const label = a.unackSeconds != null ? "halting" : "halted";
-    return { key: "halted", label, long: label, tone: "quiet" };
+    if (a.unackSeconds == null) {
+      return { key: "halted", label: "halted", long: "halted", tone: "quiet" };
+    }
+    if (a.unackSeconds < APPLY_GRACE_S) {
+      return { key: "halting", label: "halting", long: "halting", tone: "quiet" };
+    }
+    return { key: "halt-not-applied", label: "not halted", long: "halt not applied", tone: "alarm" };
+  }
+
+  // An unacknowledged RUNNING is the one that got away, twice. Nothing
+  // above matches it and there is no feed to fault, so it fell through to
+  // "working" and drew a green RUNNING pill on a bot that had not run in a
+  // day. Pressing Start does not make a bot run — it records that it
+  // should — and until something picks that up, saying "running" is the
+  // same lie the feed used to tell.
+  if (a.control === "running" && a.unackSeconds != null) {
+    if (a.unackSeconds < APPLY_GRACE_S) {
+      return { key: "starting", label: "starting", long: "starting", tone: "quiet" };
+    }
+    return { key: "not-running", label: "not running", long: "not running", tone: "alarm" };
   }
 
   // A feed that reports itself unhealthy outranks everything below: the bot

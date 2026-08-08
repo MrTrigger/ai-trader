@@ -37,10 +37,9 @@ test("the control word outranks a failing feed", () => {
 });
 
 test("Halt is patient, Stop is not", () => {
-  // Halt only prevents the NEXT entry, so noticing it a cycle later costs
-  // nothing — "halting" stays a quiet transition however long it takes.
-  expect(activity({ enabled: true, control: "halted", unackSeconds: 99_999 }).key).toBe("halted");
-  expect(activity({ enabled: true, control: "halted", unackSeconds: 99_999 }).tone).toBe("quiet");
+  // Halt only prevents the NEXT entry, so a cycle's delay costs nothing and
+  // "halting" stays quiet inside the grace.
+  expect(activity({ enabled: true, control: "halted", unackSeconds: 20 }).tone).toBe("quiet");
 
   // Stop means "be flat". Briefly in flight is a transition...
   expect(activity({ enabled: true, control: "stopped", unackSeconds: 3 }).key).toBe("stopping");
@@ -49,6 +48,26 @@ test("Halt is patient, Stop is not", () => {
   const stuck = activity({ enabled: true, control: "stopped", unackSeconds: 600 });
   expect(stuck.key).toBe("stop-not-applied");
   expect(stuck.tone).toBe("alarm");
+});
+
+test("an unacknowledged Start is not 'running'", () => {
+  // The hole that produced a green RUNNING pill on a bot which had not run
+  // in 25 hours: nothing above matched control=running, there was no feed
+  // to fault, so it fell through to "working". Pressing Start records that
+  // a bot SHOULD run; it does not make one run.
+  expect(activity({ enabled: true, control: "running", unackSeconds: 5 }).key).toBe("starting");
+  const stuck = activity({ enabled: true, control: "running", unackSeconds: 90_000 });
+  expect(stuck.key).toBe("not-running");
+  expect(stuck.tone).toBe("alarm");
+  // Acknowledged, and 24/7 so no market to be closed for: plain working.
+  expect(activity({ enabled: true, control: "running" }).key).toBe("working");
+});
+
+test("an unapplied Halt is also reported", () => {
+  expect(activity({ enabled: true, control: "halted", unackSeconds: 5 }).key).toBe("halting");
+  expect(activity({ enabled: true, control: "halted", unackSeconds: 90_000 }).key).toBe(
+    "halt-not-applied",
+  );
 });
 
 test("a bot with no feed is never called idle", () => {

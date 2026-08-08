@@ -51,8 +51,17 @@ export function Controls({
   // cycle, and this bot's book stays open until something runs it.
   const unreachable = staleSeconds != null && staleSeconds > 120;
   const stopped = control === "stopped";
-  const halted = stopped || control === "halted";
+  const running = control === "running";
   const startVerb = stopped ? "Start" : "Resume";
+
+  // Each verb is offered exactly when pressing it would change something.
+  // Both Start and Stop were enabled on an already-stopped bot, which asks
+  // the operator to guess what a second Stop would do: nothing. The one
+  // exception is a book that may still be open on a bot we can actually
+  // reach — flattening is never the thing to withhold.
+  const canStart = !running;
+  const canHalt = running;
+  const canStop = !stopped || (!flat && !unreachable);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
 
@@ -89,15 +98,15 @@ export function Controls({
   return (
     <div>
       <div className="grid grid-cols-3 gap-2">
-        <Btn kind="go" disabled={!halted || stopping || !!busy} busy={busy === "resume"} onClick={() => run("resume")}>
+        <Btn kind="go" disabled={!canStart || stopping || !!busy} busy={busy === "resume"} onClick={() => run("resume")}>
           {startVerb}
         </Btn>
-        <Btn kind="quiet" disabled={halted || !!busy} busy={busy === "halt"} onClick={() => run("halt")}>
+        <Btn kind="quiet" disabled={!canHalt || !!busy} busy={busy === "halt"} onClick={() => run("halt")}>
           Halt
         </Btn>
         {/* Stop stays available whenever anything is open, whatever the
             control word says — flattening is never the thing to withhold. */}
-        <Btn kind="alarm" disabled={(stopped && flat) || !!busy} busy={busy === "stop"} onClick={() => run("stop")}>
+        <Btn kind="alarm" disabled={!canStop || !!busy} busy={busy === "stop"} onClick={() => run("stop")}>
           Stop
         </Btn>
       </div>
@@ -110,6 +119,16 @@ export function Controls({
           </>
         )}
       </p>
+      {/* Standing notice, not a toast. "Stop closes everything at market
+          immediately" is false for a bot nothing is running, and the
+          operator needs that on the page rather than once, in a message
+          they have already dismissed. */}
+      {unreachable && (
+        <p className="mt-2 text-[12px] leading-relaxed text-alarm">
+          Nothing has run this bot in {ago(staleSeconds)}. Controls are recorded, but no process is
+          listening — none of these take effect until something runs it.
+        </p>
+      )}
       {msg && (
         <p className={`mt-2 text-[12px] ${msg.bad ? "text-alarm" : "text-go"}`}>{msg.text}</p>
       )}
