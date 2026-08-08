@@ -1914,3 +1914,44 @@ configuration runs 2.32, 5.01, 1.73, 2.96, 2.30, **1.26** — positive throughou
 but fold 6 (2025-12 to 2026-07) is half the average. Whether that is noise in a
 seven-month window or the start of decay cannot be settled with this data. It is
 the number to watch first in paper trading.
+
+## Addendum: the funding windows ran forward, and what survives their correction
+
+Dated 2026-08-08. Everything in this section was measured after recovering the
+harness (docs/research/harness/) and finding that `dataset.py` summed
+`funding_7d/30d/chg/z` FORWARD from the decision date over realised rates. The
+walk-forward structure above was sound; those four features carried the future.
+One character - `+k` for `-k` - separates the recorded +875.5%/Sharpe 2.70 from
+the corrected +134.9%/1.05, same code, same data, same folds.
+
+Corrected numbers, all on trailing windows, per-fold retraining, zero leaked
+dates:
+
+| measurement | return | Sharpe | maxDD |
+|---|---|---|---|
+| Python harness, GBM (was +875.5% / 2.70) | +134.9% | 1.05 | -20.8% |
+| Rust pipeline, GBM, per-risk reward | +179.0% | 1.32 | -30.3% |
+| Python, GBM + LSTM blend 50/50 (was +890.1% / 2.64) | +190.0% | 1.22 | -24.3% |
+
+The Rust port is computationally equivalent: run with the leak reproduced on
+purpose (--leaky-funding-diagnostic) it returns +672% with fold Sharpes of 5.27
+and 4.21 on -7% drawdowns, against Python's +760.7% - the signature of a model
+reading next month's funding, in either language.
+
+**The LSTM survives, diminished.** On clean data the raw-target blend is a
+smooth hump peaking at +0.17 Sharpe over pure GBM (1.22 vs 1.05), stable across
+weights 0.2-0.65. That is a real second signal, not the +890% the leaked
+dataset promised. The per-risk-target blend sweep is NOT usable: adjacent
+weights swing Sharpe 0.76 to 1.41 and back, which is the cost-threshold
+reshuffle confound this document already caught once (see the blend section
+above). The 1.41 is recorded here precisely so nobody mistakes finding it again
+for discovering it.
+
+**The reward finding stands, in Rust.** demean(ret/vol) against demean(ret) on
+the full feature set: +179.0% (5/6 folds positive) against +1.2% (2/6). The
+reward travels on the artefact and inference multiplies volatility back exactly
+once - see model.rs.
+
+Configurations examined since the correction, for the multiplicity ledger:
+eleven walk-forward runs and two blend sweeps. Every one is reported either
+here or in the walk-forward output directories; none were discarded.
