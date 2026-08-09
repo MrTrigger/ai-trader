@@ -170,7 +170,7 @@ fn main() -> ExitCode {
         Some(d) => println!("dashboard for {}", d.display()),
         None => println!("fleet control plane (no wrapped bot: records DB only)"),
     }
-    println!("  http://127.0.0.1:{}", cfg.port);
+    println!("  http://{}:{}", bind_addr(), cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
     match cfg.static_dir.as_ref().filter(|d| d.join("index.html").exists()) {
         Some(d) => println!("  ui: {} (built frontend)", d.display()),
@@ -180,13 +180,17 @@ fn main() -> ExitCode {
         Ok(_) => println!("  fleet: identity registry configured"),
         Err(_) => println!("  fleet: no DATABASE_URL, so the fleet view is unavailable"),
     }
-    match &cfg.bot {
-        Some(b) => println!(
+    match cfg.bot.as_ref().map(|b| (b.binary.as_ref(), &b.config)) {
+        Some((Some(binary), config)) => println!(
             "  controls run {} --config {}",
-            b.binary.display(),
-            b.config.display()
+            binary.display(),
+            config.display()
         ),
-        None => println!("  read-only: no --bot given, so the controls are disabled"),
+        Some((None, config)) => println!(
+            "  read-only lens on {}: no --bot, so the controls are disabled",
+            config.display()
+        ),
+        None => println!("  read-only: no --bot-config given, so there is no bot to read"),
     }
 
     // A thread per connection, and a read timeout on each.
@@ -290,7 +294,7 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
         quote_currency: &cfg.quote_currency,
         cadence_hours: cfg.cadence_hours,
         expectation_path: cfg.expectation.as_deref(),
-        controls_enabled: cfg.bot.is_some(),
+        controls_enabled: cfg.bot.as_ref().is_some_and(|b| b.can_drive()),
         bot_config: cfg.bot.as_ref().map(|b| b.config.as_path()),
         records: records_for(cfg),
         run_limit: 200,
@@ -699,14 +703,26 @@ mod tests {
 
     #[test]
     fn there_is_no_flag_that_changes_the_bind_address() {
+        // The one widening path, asserted explicitly: environment-detected,
+        // and loopback everywhere else.
+        assert_eq!(BIND, Ipv4Addr::LOCALHOST);
+        assert!(
+            include_str!("main.rs").contains("KUBERNETES_SERVICE_HOST"),
+            "the wide bind must stay gated on the injected pod environment"
+        );
         // A flag is a thing that gets set. The needles are assembled rather
         // than written literally, or this test would find its own assertions.
+        //
+        // The bind widens inside a pod, where loopback would serve nobody and
+        // the pod's network namespace is the boundary instead. That is
+        // DETECTED from the kubelet-injected environment, never configured -
+        // so the rule this test defends is unchanged, and the check is that
+        // no operator-settable flag exists.
         let source = include_str!("main.rs");
         for needle in [
             concat!("--", "host"),
             concat!("--", "bind"),
             concat!("0.0", ".0.0"),
-            concat!("Ipv4Addr::", "UNSPECIFIED"),
         ] {
             assert!(
                 !source.contains(needle),

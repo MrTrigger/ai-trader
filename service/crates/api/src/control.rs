@@ -104,38 +104,58 @@ impl Action {
     }
 }
 
-/// Where the bot lives. Absent means the write controls are simply unavailable.
+/// Which bot this page is about, and whether it may be driven.
+///
+/// Two separate questions that used to be one. The config says which bot to
+/// READ - its id, its venue, its mode - and the binary is what makes the write
+/// controls available. A deployment can legitimately want the first without
+/// the second: the cluster dashboard is a lens whose hands live in `kubectl
+/// exec`, where an intervention is authenticated and audited. Conflating them
+/// meant removing the binary also blinded the page, which then read
+/// file-backed state and reported a running bot as halted.
 #[derive(Debug, Clone)]
 pub struct BotCommand {
-    pub binary: PathBuf,
+    /// `None` when the page may look but not touch.
+    pub binary: Option<PathBuf>,
     pub config: PathBuf,
 }
 
 impl BotCommand {
-    /// Both or neither. A binary with no config, or a config with no binary,
-    /// would fail at the first click rather than at startup — and a control
-    /// that fails only when someone urgently needs it is worse than one that
-    /// was never offered.
+    /// A binary still requires a config. The reverse is now allowed and means
+    /// read-only: a control that fails at the moment someone needs it is worse
+    /// than one that was never offered, but a page that cannot say what the
+    /// bot is doing is worse than both.
     pub fn new(binary: Option<String>, config: Option<String>) -> Result<Option<Self>, String> {
         match (binary, config) {
             (None, None) => Ok(None),
-            (Some(b), Some(c)) => {
-                let binary = PathBuf::from(b);
+            (binary, Some(c)) => {
                 let config = PathBuf::from(c);
-                if !binary.is_file() {
-                    return Err(format!("--bot {} is not a file", binary.display()));
-                }
                 if !config.is_file() {
                     return Err(format!("--bot-config {} is not a file", config.display()));
                 }
+                let binary = match binary {
+                    Some(b) => {
+                        let b = PathBuf::from(b);
+                        if !b.is_file() {
+                            return Err(format!("--bot {} is not a file", b.display()));
+                        }
+                        Some(b)
+                    }
+                    None => None,
+                };
                 Ok(Some(Self { binary, config }))
             }
-            _ => Err(
-                "--bot and --bot-config go together: one without the other would offer controls \
-                 that fail at the moment someone needs them"
+            (Some(_), None) => Err(
+                "--bot needs --bot-config: a binary with no config would offer controls that \
+                 fail at the moment someone needs them"
                     .into(),
             ),
         }
+    }
+
+    /// True when the write controls may be offered at all.
+    pub fn can_drive(&self) -> bool {
+        self.binary.is_some()
     }
 }
 
@@ -152,7 +172,16 @@ pub struct Outcome {
 /// values that come from the request, and each is one argv entry to a process
 /// spawned without a shell — no quoting, no globbing, nothing to escape.
 pub fn run(bot: &BotCommand, action: Action, reason: &str, by: &str) -> Result<Outcome, String> {
-    let mut cmd = Command::new(&bot.binary);
+    // Refused here as well as at the routing layer: a read-only deployment
+    // must not be one edit away from becoming a writable one.
+    let Some(binary) = bot.binary.as_ref() else {
+        return Err(
+            "this dashboard is read-only: it was started without --bot. Interventions go \
+             through the bot CLI, where they are authenticated and audited."
+                .into(),
+        );
+    };
+    let mut cmd = Command::new(binary);
     cmd.arg("--config")
         .arg(&bot.config)
         .arg(action.subcommand());
@@ -172,7 +201,7 @@ pub fn run(bot: &BotCommand, action: Action, reason: &str, by: &str) -> Result<O
 
     let out = cmd
         .output()
-        .map_err(|e| format!("cannot run {}: {e}", bot.binary.display()))?;
+        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
     Ok(Outcome {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -186,11 +215,12 @@ pub fn as_typed(bot: Option<&BotCommand>, action: Action) -> String {
         .map(|b| b.config.display().to_string())
         .unwrap_or_else(|| "<file>".into());
     let binary = bot
-        .map(|b| {
-            Path::new(&b.binary)
+        .and_then(|b| b.binary.as_ref())
+        .map(|p| {
+            Path::new(p)
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| b.binary.display().to_string())
+                .unwrap_or_else(|| p.display().to_string())
         })
         .unwrap_or_else(|| "bot".into());
     let mut s = format!("{binary} --config {config} {}", action.subcommand());
@@ -260,7 +290,23 @@ mod tests {
     #[test]
     fn a_bot_binary_without_a_config_is_refused_at_startup() {
         let err = BotCommand::new(Some("/bin/true".into()), None).unwrap_err();
-        assert!(err.contains("go together"));
+        assert!(err.contains("needs --bot-config"), "{err}");
         assert!(BotCommand::new(None, None).unwrap().is_none());
+    }
+
+    /// A config without a binary is a lens: it names the bot to read and
+    /// offers no way to drive it. Both halves are asserted, because the
+    /// dangerous half-failure is a page that looks read-only and is not.
+    #[test]
+    fn a_config_without_a_binary_reads_but_cannot_drive() {
+        let cfg = std::env::temp_dir().join("api-lens-test.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let bot = BotCommand::new(None, Some(cfg.display().to_string()))
+            .unwrap()
+            .expect("a config alone is a valid read-only lens");
+        assert!(!bot.can_drive());
+        let err = run(&bot, Action::Halt, "why", "who").unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+        std::fs::remove_file(&cfg).ok();
     }
 }
