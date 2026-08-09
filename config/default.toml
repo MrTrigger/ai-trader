@@ -27,7 +27,7 @@ signal = "ml_ranker"
 # refuses an artifact whose feature catalogue or ordered feature names disagree
 # with the Rust runtime's own. The artifact carries `trained_through`, and
 # scoring on or before that date is refused rather than silently allowed.
-model_path = "data/models/ranker.rust.json"
+model_path = "data/models/ranker-rank-1.json"
 
 # How many names the signal holds. Distinct from limits.max_position_count,
 # which is a hard risk limit: this is what the strategy intends, that is what it
