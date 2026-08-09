@@ -74,6 +74,10 @@ st = {k: stats(v) for k, v in series.items()}
 
 # ---- svg ---------------------------------------------------------------------
 COLORS = {"TriggerTrader": "#3987e5", "BTC buy & hold": "#d95926", "S&P 500": "#199e70"}
+LEV = [(1.0, "0.8x gross", "#8fc1f0"), (1.5, "1.2x gross", "#5fa0e3"),
+       (2.0, "1.6x gross", "#2a78d6"), (3.0, "2.4x gross", "#1b5fc1")]
+for _, name, color in LEV:
+    COLORS[name] = color
 W, H, PL, PR, PT, PB = 1120, 330, 56, 176, 14, 26
 N = len(dates)
 
@@ -125,6 +129,27 @@ pct = lambda v: f"{(v-1)*100:+.0f}%" if v >= 0 else f"{v*100:.0f}%"
 eq_svg = chart(series, lambda v: f"{(v-1)*100:+.0f}%")
 dd_svg = chart(dd, lambda v: f"{v*100:.0f}%", hi=0.0)
 
+# ---- leverage panels: alpha, vol and FEES all scale with gross, so scaling
+# the net daily return is the correct first-order model. Log scale for growth,
+# because 3x compounding on a linear axis makes every other line a floor.
+lev_series, lev_dd = {}, {}
+for mult, name, _ in LEV:
+    eq, out = 1.0, []
+    for _, r in bot:
+        eq *= 1 + mult * r
+        out.append(eq)
+    lev_series[name] = out
+    lev_dd[name] = [v / max(out[: i + 1]) - 1 for i, v in enumerate(out)]
+lev_log = {k: [math.log10(v) for v in vs] for k, vs in lev_series.items()}
+lev_eq_svg = chart(lev_log, lambda v: f"{10**v:,.0f}x" if v >= 0.5 else f"{(10**v-1)*100:+.0f}%")
+lev_dd_svg = chart(lev_dd, lambda v: f"{v*100:.0f}%", hi=0.0)
+lev_stats = "".join(
+    f"<div class='card'><div class='who'><span class='sw' style='background:{c}'></span>{n}</div>"
+    f"<div class='big'>{(lev_series[n][-1]-1)*100:+,.0f}%</div>"
+    f"<div class='sub'>CAGR {(lev_series[n][-1]**(1/( len(bot)/365.25))-1)*100:+.1f}% · "
+    f"maxDD {min(lev_dd[n])*100:.1f}% · fees ~{8.9*m_:.1f}%/yr</div></div>"
+    for (m_, n, c) in LEV)
+
 fold_rows = "".join(
     f"<tr><td>{i+1}</td><td class='m'>{sorted(f['steps'],key=lambda s:s['as_of'])[0]['as_of'][:10]} → "
     f"{sorted(f['steps'],key=lambda s:s['as_of'])[-1]['as_of'][:10]}</td>"
@@ -169,6 +194,14 @@ generated {datetime.date.today().isoformat()} by bin/build-research-report.py</d
 <div class="cards">{stat_cells}</div>
 <h2>GROWTH OF $1 (P&amp;L)</h2><div class="wrap" id="c1">{eq_svg}<div class="tip"></div></div>
 <h2>DRAWDOWN</h2><div class="wrap" id="c2">{dd_svg}<div class="tip"></div></div>
+<h2>LEVERAGE — SAME BOOK, SCALED GROSS (log scale)</h2>
+<div class="cards">{lev_stats}</div>
+<div class="wrap" id="c3">{lev_eq_svg}<div class="tip"></div></div>
+<h2>LEVERAGE — DRAWDOWN</h2><div class="wrap" id="c4">{lev_dd_svg}<div class="tip"></div></div>
+<p class="note">Sharpe is identical on every line ({st['TriggerTrader']['sharpe']:.2f}): fees scale with traded notional, so
+scaling gross scales alpha, volatility and cost drag together. What changes is the compounding and the drawdown path.
+Backtest tails, not live tails - outages, funding spikes and gaps hit a levered book harder than linearly. Spec §9.2:
+leverage stays at 1x until Phase 3 passes; this panel is the dial's map, not a decision.</p>
 <h2>FOLDS</h2>
 <table><tr><th>#</th><th>TEST WINDOW</th><th>RETURN</th><th>SHARPE</th><th>MAX DD</th></tr>{fold_rows}</table>
 <p class="note">The bot series is stitched from six independently trained walk-forward folds: every date is priced by a
@@ -179,7 +212,9 @@ docs/research/harness/README.md.</p>
 const DATES={json.dumps(dates[::7])}; const STEP=7;
 const SERIES={json.dumps({k: [round(v,4) for v in vs[::7]] for k, vs in series.items()})};
 const DDS={json.dumps({k: [round(v,4) for v in vs[::7]] for k, vs in dd.items()})};
-for (const [id, data] of [["c1", SERIES], ["c2", DDS]]) {{
+const LEVS={json.dumps({k: [round(v,3) for v in vs[::7]] for k, vs in lev_series.items()})};
+const LEVDD={json.dumps({k: [round(v,4) for v in vs[::7]] for k, vs in lev_dd.items()})};
+for (const [id, data] of [["c1", SERIES], ["c2", DDS], ["c3", LEVS], ["c4", LEVDD]]) {{
   const wrap=document.getElementById(id), svg=wrap.querySelector("svg"), tip=wrap.querySelector(".tip"),
         xh=wrap.querySelector(".xh"), n=DATES.length;
   svg.addEventListener("mousemove", e => {{
@@ -190,7 +225,7 @@ for (const [id, data] of [["c1", SERIES], ["c2", DDS]]) {{
     tip.style.display="block";
     tip.style.left=Math.min(e.clientX-r.left+14, r.width-230)+"px"; tip.style.top=(e.clientY-r.top-10)+"px";
     tip.innerHTML="<b>"+DATES[i]+"</b><br>"+Object.entries(data).map(([k,vs])=>
-      k+": "+(id==="c1"?((vs[i]-1)*100).toFixed(1):(vs[i]*100).toFixed(1))+"%").join("<br>");
+      k+": "+((id==="c1"||id==="c3")?((vs[i]-1)*100).toFixed(1):(vs[i]*100).toFixed(1))+"%").join("<br>");
   }});
   svg.addEventListener("mouseleave", () => {{ tip.style.display="none"; xh.setAttribute("opacity",0); }});
 }}
