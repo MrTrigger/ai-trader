@@ -75,7 +75,10 @@ sleep 20
 kubectl annotate kustomization aitrader-paper -n trader \
   reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite >/dev/null
 sleep 10
-kubectl rollout status deployment/aitrader-paper -n trader --timeout=600s
+# Longer than the init chain it is waiting on: ib-gateway plus a bootstrap
+# cycle that can be a full 7-minute data pull. A timeout shorter than the thing
+# it waits for reports failure on a healthy rollout.
+kubectl rollout status deployment/aitrader-paper -n trader --timeout=1200s
 
 # Verify what is RUNNING, not what was asked for. The whole point.
 #

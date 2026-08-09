@@ -7,54 +7,48 @@
 # one run - see cycle.sh for why that is the honest exception rather than a
 # loosening of the gate.
 #
-# Idempotent by design: it asks the run history first and does nothing if a
-# clean run landed inside the window. So a pod restart at 03:00 does not
-# re-trade a book the 00:05 cycle already set.
+# No interpreter. The first version parsed `history` with python3, which is not
+# in the runtime image; the error was swallowed by an `|| echo ""` and read as
+# "this bot has never run", so every pod restart ran a spurious cycle against a
+# 22-position book. The bot already computes the number - ask it for that
+# rather than re-deriving it from JSON in a shell.
 set -euo pipefail
 WINDOW_HOURS="${BOOTSTRAP_WINDOW_HOURS:-20}"
 BOT=/usr/local/bin/bot
 BOTCFG=/app/bot.json
 say() { echo "[$(date -u +%H:%M:%SZ)] bootstrap: $*"; }
 
-# Enough rows that a refusal or a venue-change at the head cannot hide the
-# executed run behind it: --limit 1 did exactly that, and the script concluded
-# a bot with 22 open positions had never run.
-if ! hist=$($BOT --config $BOTCFG history --limit 25 2>/dev/null); then
+if ! status=$("$BOT" --config "$BOTCFG" status 2>&1); then
   # Fail CLOSED. A missed bootstrap costs one cycle; a bootstrap that fires
-  # because it could not read the history trades a stale decision against a
-  # book it knows nothing about. The scheduled cycle is along in hours anyway.
-  say "cannot read the run history - skipping rather than trading blind"
+  # because it could not read the state trades a stale decision against a book
+  # it knows nothing about. The scheduled cycle is along in hours anyway.
+  say "cannot read status - skipping rather than trading blind"
+  say "$status"
   exit 0
 fi
 
-last=$(printf '%s' "$hist" | python3 -c "
-import json,sys
-try:
-    rows = json.load(sys.stdin)
-except Exception:
-    print('UNREADABLE'); raise SystemExit
-clean = [r for r in rows if r.get('outcome') == 'executed']
-print(clean[0]['recorded_at'] if clean else '')
-")
+# The VALUE after the colon: a number, or the literal null when nothing has
+# ever run. Filtering characters out of the whole line does not work - the key
+# name contains an "n", which made every reading look like "null".
+age=$(printf '%s\n' "$status" \
+      | grep -m1 '"hours_since_last_run"' \
+      | cut -d: -f2 | tr -d ' ,' || true)
 
-if [ "$last" = "UNREADABLE" ]; then
-  say "run history did not parse - skipping rather than trading blind"
-  exit 0
-fi
-
-if [ -n "$last" ]; then
-  age=$(python3 -c "
-from datetime import datetime, timezone
-t = datetime.fromisoformat('$last'.replace('Z', '+00:00'))
-print(int((datetime.now(timezone.utc) - t).total_seconds() // 3600))
-")
-  if [ "$age" -lt "$WINDOW_HOURS" ]; then
-    say "last clean run was ${age}h ago, inside the ${WINDOW_HOURS}h window - nothing to do"
-    exit 0
-  fi
-  say "last clean run was ${age}h ago; running a catch-up cycle"
-else
-  say "no clean run on record; running the first cycle"
-fi
+case "$age" in
+  "" )
+    say "status did not report hours_since_last_run - skipping rather than trading blind"
+    exit 0 ;;
+  null )
+    say "no run on record; running the first cycle" ;;
+  *[!0-9]* )
+    say "hours_since_last_run was \"$age\", which is neither a number nor null - skipping"
+    exit 0 ;;
+  * )
+    if [ "$age" -lt "$WINDOW_HOURS" ]; then
+      say "last run was ${age}h ago, inside the ${WINDOW_HOURS}h window - nothing to do"
+      exit 0
+    fi
+    say "last run was ${age}h ago; running a catch-up cycle" ;;
+esac
 
 BOOTSTRAP=1 exec /usr/local/bin/cycle.sh
