@@ -39,7 +39,17 @@ $CP plan --config $CFG --data-root $DATA \
   --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --for-execution \
   --book <($BOT --config $BOTCFG book) --out "$STATE/plan.json"
 
+# The decision-lag gate refuses to fill a decision far behind the fill, because
+# the backtest says a 24h lag takes Sharpe from 2.22 to 0.29. On the daily
+# schedule the lag is five minutes and the gate never fires. A BOOTSTRAP run is
+# the one honest exception: starting from flat, holding the target book on a
+# stale decision beats holding nothing until midnight, and the next scheduled
+# cycle corrects it. Paper-only - the flag is refused under a live venue.
 say "execute"
-$BOT --config $BOTCFG run --plan "$STATE/plan.json"
+if [ "${BOOTSTRAP:-0}" = "1" ]; then
+  $BOT --config $BOTCFG run --plan "$STATE/plan.json" --accept-decision-lag
+else
+  $BOT --config $BOTCFG run --plan "$STATE/plan.json"
+fi
 
 say "done"

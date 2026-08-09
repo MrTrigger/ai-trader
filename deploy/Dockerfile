@@ -24,6 +24,7 @@ COPY config/default.toml /app/config.toml
 COPY deploy/config-patch.py /app/config-patch.py
 COPY deploy/bot.cluster.json /app/bot.json
 COPY deploy/cycle.sh /usr/local/bin/cycle.sh
+COPY deploy/bootstrap-cycle.sh /usr/local/bin/bootstrap-cycle.sh
 COPY data/models/ranker-rank-1.json /app/ranker-rank-1.json
 COPY --from=frontend /src/frontend/dist /app/frontend/dist
 # the cluster config is the repo config with the model path pinned to the image

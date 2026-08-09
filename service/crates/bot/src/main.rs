@@ -1066,6 +1066,7 @@ async fn cmd_identity(cfg: &BotConfig, rest: &[String]) -> Result<(), String> {
                 "cron",
                 "crypto",
                 "crypto-portfolio (Rust decide)",
+                Some(&cfg.state_dir.display().to_string()),
             )
             .await
             .map_err(|e| e.to_string())?;

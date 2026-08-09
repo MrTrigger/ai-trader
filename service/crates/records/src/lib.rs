@@ -240,18 +240,26 @@ impl Registry {
         cadence: &str,
         asset_class: &str,
         decision_core: &str,
+        state_dir: Option<&str>,
     ) -> Result<(), RecordsError> {
+        // state_dir is how anything finds this bot's files before it has ever
+        // run and written a status row. Left null, the fleet view falls all the
+        // way through to `{"contract":"none"}` and the page renders a
+        // registered, enabled bot as unbound and disabled - which is what a
+        // freshly deployed bot looked like until this was recorded.
         sqlx::query(
-            "INSERT INTO bots (bot_id, display_name, cadence, asset_class, decision_core) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO bots (bot_id, display_name, cadence, asset_class, decision_core, \
+             state_dir) VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (bot_id) DO UPDATE SET display_name = $2, cadence = $3, \
-             asset_class = $4, decision_core = $5",
+             asset_class = $4, decision_core = $5, \
+             state_dir = COALESCE(EXCLUDED.state_dir, bots.state_dir)",
         )
         .bind(bot_id)
         .bind(display_name)
         .bind(cadence)
         .bind(asset_class)
         .bind(decision_core)
+        .bind(state_dir)
         .execute(&self.pool)
         .await?;
         Ok(())
