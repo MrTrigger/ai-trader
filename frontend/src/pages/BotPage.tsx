@@ -136,7 +136,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
       />
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_330px]">
-        <div className="space-y-5">
+        <div className="min-w-0 space-y-5">
           {d.contract === "botstate" ? (
             <>
               <Card

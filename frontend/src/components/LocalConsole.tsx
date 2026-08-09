@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Card } from "./Card";
+import { NavChart } from "./NavChart";
+import { Positions, type Position } from "./Positions";
 import { money, num, signed, tone } from "../lib/format";
 
 type Local = {
@@ -10,11 +12,14 @@ type Local = {
     cash?: string | number;
     total_pnl?: string | number;
     unrealised_pnl?: string | number;
+    realised_pnl?: string | number;
+    fees_paid?: string | number;
     gross_exposure?: string | number;
     net_exposure?: string | number;
-    positions?: { asset: string; qty: string | number; avg_price?: string | number; value?: string | number }[];
-    balances?: { currency: string; total: string | number; available: string | number }[];
+    positions?: Position[];
+    fills_count?: number;
   };
+  runs?: { recorded_at?: string; nav?: string | number; outcome?: string }[];
   reconciliation?: { agrees?: boolean; explain?: string; ledger_entries?: number };
   health?: { ok?: boolean; notes?: string[] };
 };
@@ -22,9 +27,9 @@ type Local = {
 /**
  * The book of a bot this api process wraps directly.
  *
- * Only this process can read it — it has the state dir and the bot binary —
- * so the panel appears for that bot and stays absent everywhere else,
- * rather than showing empty cards that imply missing data.
+ * Only this process can read it — it has the state dir — so the panel appears
+ * for that bot and stays absent everywhere else, rather than showing empty
+ * cards that imply missing data.
  */
 export function LocalConsole() {
   const q = useQuery({
@@ -43,62 +48,55 @@ export function LocalConsole() {
   if (!s) return null;
   const b = s.book ?? {};
   const positions = b.positions ?? [];
-  const balances = b.balances ?? [];
+  const runs = s.runs ?? [];
+
+  // Cash is the only real balance on a perps book: everything else in the
+  // balances array is a position quantity, and showing it as money made the
+  // page claim a $70,958 DOGE "balance" for a $5k position.
+  const invested = positions.reduce((a, p) => a + Math.abs(num(p.notional)), 0);
 
   return (
     <>
       <Card title="Book" aside="as this process reads it">
-        <div className="flex flex-wrap items-end justify-between gap-6">
+        <div className="flex flex-wrap items-end justify-between gap-x-8 gap-y-4">
           <div>
             <p className="eyebrow mb-1.5">Net asset value</p>
-            <p className="num text-[30px] font-medium leading-none">{money(b.nav ?? 0)}</p>
+            <p className="num text-[32px] font-medium leading-none">{money(b.nav ?? 0)}</p>
             <p className={`num mt-1.5 text-[12px] ${tone(b.total_pnl)}`}>
               {signed(b.total_pnl ?? 0)} <span className="text-faint">since inception</span>
             </p>
           </div>
-          <div className="flex gap-7 text-right">
+          <div className="grid grid-cols-3 gap-x-7 gap-y-3 text-right sm:grid-cols-6">
             <Stat k="Gross" v={pctOf(b.gross_exposure)} />
-            <Stat k="Net" v={pctOf(b.net_exposure)} />
+            <Stat k="Net" v={pctOf(b.net_exposure)} cls={netTone(b.net_exposure)} />
             <Stat k="Unrealised" v={signed(b.unrealised_pnl ?? 0)} cls={tone(b.unrealised_pnl)} />
+            <Stat k="Realised" v={signed(b.realised_pnl ?? 0)} cls={tone(b.realised_pnl)} />
+            <Stat k="Fees" v={money(b.fees_paid ?? 0)} cls="text-dim" />
+            <Stat k="Names" v={String(positions.length)} />
           </div>
         </div>
 
-        <div className="mt-5">
-          <p className="eyebrow mb-2">Positions</p>
-          {positions.length === 0 ? (
-            <p className="text-[12px] text-faint">Flat — nothing open.</p>
-          ) : (
-            <table className="w-full text-[12px]">
-              <tbody className="num">
-                {positions.map((p) => (
-                  <tr key={p.asset} className="border-b border-line/50">
-                    <td className="py-1.5 font-display">{p.asset}</td>
-                    <td className="pr-4 text-right">{String(p.qty)}</td>
-                    <td className="pr-4 text-right text-dim">{p.avg_price ? money(p.avg_price) : "—"}</td>
-                    <td className="text-right">{p.value ? money(p.value) : ""}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        <div className="mt-5 border-t border-line pt-4">
+          <NavChart runs={runs} initialCash={num(b.nav) - num(b.total_pnl)} />
+        </div>
+
+        <div className="mt-5 border-t border-line pt-4">
+          <Positions positions={positions} />
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-x-6 gap-y-1 border-t border-line pt-3 text-[11px] text-faint">
+          <span className="num">
+            cash <span className="text-dim">{money(b.cash ?? 0)}</span>
+          </span>
+          <span className="num">
+            invested <span className="text-dim">{money(invested, 0)}</span>
+          </span>
+          {b.fills_count != null && (
+            <span className="num">
+              fills <span className="text-dim">{b.fills_count}</span>
+            </span>
           )}
         </div>
-
-        {balances.length > 0 && (
-          <div className="mt-5">
-            <p className="eyebrow mb-2">Balances</p>
-            <table className="w-full text-[12px]">
-              <tbody className="num">
-                {balances.map((x) => (
-                  <tr key={x.currency} className="border-b border-line/50">
-                    <td className="py-1.5 font-display">{x.currency}</td>
-                    <td className="pr-4 text-right">{money(x.total)}</td>
-                    <td className="text-right text-dim">{money(x.available)} available</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
       </Card>
 
       <Card title="Reconciliation" aside={s.reconciliation?.agrees ? "agrees" : "disagrees"}>
@@ -124,10 +122,13 @@ function Stat({ k, v, cls = "" }: { k: string; v: string; cls?: string }) {
   return (
     <div>
       <p className="eyebrow">{k}</p>
-      <p className={`num mt-1 text-[14px] ${cls}`}>{v}</p>
+      <p className={`num mt-1 text-[13.5px] ${cls}`}>{v}</p>
     </div>
   );
 }
 
 const pctOf = (v: unknown) =>
   v === "n/a" || v == null ? "—" : `${(num(v) * 100).toFixed(1)}%`;
+
+/** Net is a deviation from dollar-neutral, not a gain: amber past 20%. */
+const netTone = (v: unknown) => (Math.abs(num(v)) > 0.2 ? "text-consequence" : "");
