@@ -37,6 +37,7 @@ pub fn build(
     lag_hours: i64,
     hold_hours: i64,
     funding_window: features_crypto::FundingWindow,
+    include_unlisted: bool,
 ) -> Result<TrainingMatrix, String> {
     if end < start {
         return Err("training end precedes start".into());
@@ -123,7 +124,11 @@ pub fn build(
             if !eligible.contains(asset) {
                 continue;
             }
-            if listings.get(asset).is_none_or(|listed| *listed > day) {
+            // A perp listing gates TRADING, not learning: the ranker can be
+            // taught by 2017-2018 spot cross-sections even though no perp
+            // existed to trade them. Inference eligibility is untouched - this
+            // flag only widens what the trees get to see.
+            if !include_unlisted && listings.get(asset).is_none_or(|listed| *listed > day) {
                 continue;
             }
             let (Some(p0), Some(p1)) = (

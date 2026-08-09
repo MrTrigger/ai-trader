@@ -163,7 +163,8 @@ html = f"""<!doctype html><html><head><meta charset="utf-8">
   .note {{ color:#8b94a1; font-size:12px; max-width:75ch; }}
 </style></head><body>
 <h1>TriggerTrader — clean walk-forward vs benchmarks</h1>
-<div class="meta">{dates[0]} → {dates[-1]} · 6 expanding folds, model retrained per fold, trailing funding, zero leaked dates ·
+<div class="meta">{dates[0]} → {dates[-1]} · {len(folds)} expanding folds, model retrained per fold, trailing funding, zero leaked dates ·
+NET of 4.5bp taker commission + 0.5bp half-spread per fill, 1h execution lag, 10bp round-trip entry floor · impact & funding carry not modelled ·
 generated {datetime.date.today().isoformat()} by bin/build-research-report.py</div>
 <div class="cards">{stat_cells}</div>
 <h2>GROWTH OF $1 (P&amp;L)</h2><div class="wrap" id="c1">{eq_svg}<div class="tip"></div></div>

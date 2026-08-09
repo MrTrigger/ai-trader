@@ -117,6 +117,13 @@ fn get(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+fn flag_i64(args: &[String], name: &str) -> Option<i64> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+}
+
 fn need(args: &[String], name: &str) -> Result<String, String> {
     get(args, name).ok_or_else(|| format!("{name} is required"))
 }
@@ -893,7 +900,21 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     } else {
         features_crypto::FundingWindow::Trailing
     };
-    let matrix = crypto_portfolio::training::build(&root, &cfg, start, end, 1, 24, funding_window)?;
+    // The label must match the hold: a 2-day cadence trained on a 24h target
+    // takes positions on one day of signal and a day of drift. Lag stays 1h -
+    // that is the execution path - but the hold is the cadence in hours.
+    let lag_hours = flag_i64(args, "--lag-hours").unwrap_or(1);
+    let hold_hours = flag_i64(args, "--hold-hours").unwrap_or(24);
+    let matrix = crypto_portfolio::training::build(
+        &root,
+        &cfg,
+        start,
+        end,
+        lag_hours,
+        hold_hours,
+        funding_window,
+        args.iter().any(|a| a == "--include-unlisted-training"),
+    )?;
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut out = std::io::BufWriter::new(file);
     use std::io::Write;

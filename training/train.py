@@ -9,6 +9,7 @@ trees and exporting them to the auditable Rust runtime format.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -88,8 +89,61 @@ def main() -> None:
     args = parser.parse_args()
 
     manifest, features, rows, x, y = load_matrix(args.matrix, args.through, args.reward)
-    booster = lgb.train(PARAMS, lgb.Dataset(x, label=y), num_boost_round=NUM_ROUNDS)
-    dump = booster.dump_model()
+
+    # TRAIN_DROP: comma-separated features to exclude from the fit. The model
+    # artefact names its features, so inference follows automatically; the
+    # matrix stays complete and the experiment lives entirely here.
+    drop = {f.strip() for f in os.environ.get("TRAIN_DROP", "").split(",") if f.strip()}
+    if drop:
+        keep_ix = [i for i, f in enumerate(features) if f not in drop]
+        features = [features[i] for i in keep_ix]
+        x = x[:, keep_ix]
+        print(f"dropped {len(drop)}, fitting on {len(features)} features")
+
+    # TRAIN_SEEDS: fit N boosters differing only in their sampling seeds and
+    # average them. A sum-of-trees model averages exactly by concatenating the
+    # trees with every leaf scaled by 1/N, so the artefact format is unchanged
+    # and Rust inference needs no concept of an ensemble.
+    # TRAIN_OBJECTIVE: l2 (default) / l1 / huber. The target is skewed +2.6
+    # with kurtosis 45; an L2 loss spends most of its gradient on the tail.
+    objective = os.environ.get("TRAIN_OBJECTIVE", "regression")
+    alias = {"l2": "regression", "l1": "regression_l1", "huber": "huber"}
+    objective = alias.get(objective, objective)
+
+    # TRAIN_RANK=1: replace the reward with its within-date uniform rank in
+    # [-1, 1]. Composes with --reward per_risk (rank of return-per-risk), and
+    # the per_risk artefact tag keeps inference converting score*vol exactly
+    # once, so the cost threshold still bites in return units.
+    if os.environ.get("TRAIN_RANK") == "1":
+        from collections import defaultdict
+        byday = defaultdict(list)
+        for i, row in enumerate(rows):
+            byday[row["date"]].append(i)
+        for ixs in byday.values():
+            order = sorted(ixs, key=lambda i: y[i])
+            n = max(1, len(order) - 1)
+            for r, i in enumerate(order):
+                y[i] = 2.0 * r / n - 1.0
+        print("reward replaced by within-date uniform rank")
+
+    n_seeds = int(os.environ.get("TRAIN_SEEDS", "1"))
+    def scale_leaves(node, k):
+        if "leaf_value" in node and node["leaf_value"] is not None:
+            node["leaf_value"] *= k
+        for side in ("left_child", "right_child"):
+            if isinstance(node.get(side), dict):
+                scale_leaves(node[side], k)
+    trees = []
+    for seed in range(n_seeds):
+        params = dict(PARAMS, objective=objective, seed=seed,
+                      bagging_seed=seed + 100, feature_fraction_seed=seed + 200)
+        booster = lgb.train(params, lgb.Dataset(x, label=y), num_boost_round=NUM_ROUNDS)
+        dumped = booster.dump_model()["tree_info"]
+        if n_seeds > 1:
+            for t in dumped:
+                scale_leaves(t["tree_structure"], 1.0 / n_seeds)
+        trees.extend(dumped)
+    dump = {"tree_info": trees}
     document = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,
