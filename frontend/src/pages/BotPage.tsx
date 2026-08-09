@@ -226,7 +226,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
             </>
           ) : (
             <>
-            <LocalConsole />
+            <LocalConsole botId={id} />
             <Card title="Run history" aside={`${(d.runs ?? []).length} recorded`}>
               {(d.runs ?? []).length === 0 ? (
                 <p className="text-[12px] text-faint">Nothing has run yet.</p>

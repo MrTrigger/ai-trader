@@ -5,6 +5,7 @@ import { Positions, type Position } from "./Positions";
 import { money, num, signed, tone } from "../lib/format";
 
 type Local = {
+  bot_id?: string;
   control_state?: string;
   controls_enabled?: boolean;
   book?: {
@@ -30,8 +31,14 @@ type Local = {
  * Only this process can read it — it has the state dir — so the panel appears
  * for that bot and stays absent everywhere else, rather than showing empty
  * cards that imply missing data.
+ *
+ * `botId` is the page being viewed, and the panel refuses to render unless the
+ * local view is OF that bot. It used to render for any runner-contract bot,
+ * which meant /bot/futures-noise showed crypto-portfolio's positions under the
+ * futures bot's name — the worst kind of wrong, because every number on it was
+ * real.
  */
-export function LocalConsole() {
+export function LocalConsole({ botId }: { botId?: string }) {
   const q = useQuery({
     queryKey: ["local"],
     queryFn: async () => {
@@ -46,6 +53,8 @@ export function LocalConsole() {
 
   const s = q.data;
   if (!s) return null;
+  // A local view that cannot name its bot cannot prove it is the right one.
+  if (!s.bot_id || (botId && s.bot_id !== botId)) return null;
   const b = s.book ?? {};
   const positions = b.positions ?? [];
   const runs = s.runs ?? [];

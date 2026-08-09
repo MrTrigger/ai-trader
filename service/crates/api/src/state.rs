@@ -100,6 +100,13 @@ pub struct FillView {
 /// The dashboard's whole payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    /// Which bot this local view is OF.
+    ///
+    /// Without it the page had no way to tell whose book it was looking at, so
+    /// the panel rendered on every runner-contract bot and showed this
+    /// process's book under another bot's name - two different bots, one set
+    /// of positions, no indication anything was wrong.
+    pub bot_id: Option<String>,
     pub generated_at: String,
     pub control_state: String,
     pub controls: ControlFile,
@@ -295,6 +302,11 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         .collect();
 
     Ok(Snapshot {
+        bot_id: inputs
+            .records
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .or_else(|| local_bot_id(inputs.bot_config)),
         generated_at: stamp(now),
         control_state: controls.state().into(),
         controls,
@@ -347,6 +359,14 @@ fn reconcile_view(
 /// The bot's own config is the authority on which venue is in use. This reads
 /// it rather than keeping a copy, because two places to change the mode is one
 /// place too many.
+/// The bot id from the wrapped bot's own config, for deployments with no
+/// records DB to name it.
+fn local_bot_id(path: Option<&Path>) -> Option<String> {
+    let text = std::fs::read_to_string(path?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(v.get("bot_id")?.as_str()?.to_owned())
+}
+
 fn read_mode(path: Option<&Path>, warnings: &mut Vec<String>) -> Option<ModeView> {
     let path = path?;
     let text = std::fs::read_to_string(path).ok()?;

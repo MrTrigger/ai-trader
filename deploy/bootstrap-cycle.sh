@@ -16,16 +16,31 @@ BOT=/usr/local/bin/bot
 BOTCFG=/app/bot.json
 say() { echo "[$(date -u +%H:%M:%SZ)] bootstrap: $*"; }
 
-last=$($BOT --config $BOTCFG history --limit 1 2>/dev/null \
-       | python3 -c "
+# Enough rows that a refusal or a venue-change at the head cannot hide the
+# executed run behind it: --limit 1 did exactly that, and the script concluded
+# a bot with 22 open positions had never run.
+if ! hist=$($BOT --config $BOTCFG history --limit 25 2>/dev/null); then
+  # Fail CLOSED. A missed bootstrap costs one cycle; a bootstrap that fires
+  # because it could not read the history trades a stale decision against a
+  # book it knows nothing about. The scheduled cycle is along in hours anyway.
+  say "cannot read the run history - skipping rather than trading blind"
+  exit 0
+fi
+
+last=$(printf '%s' "$hist" | python3 -c "
 import json,sys
 try:
     rows = json.load(sys.stdin)
 except Exception:
-    print(''); raise SystemExit
+    print('UNREADABLE'); raise SystemExit
 clean = [r for r in rows if r.get('outcome') == 'executed']
 print(clean[0]['recorded_at'] if clean else '')
-" || echo "")
+")
+
+if [ "$last" = "UNREADABLE" ]; then
+  say "run history did not parse - skipping rather than trading blind"
+  exit 0
+fi
 
 if [ -n "$last" ]; then
   age=$(python3 -c "
