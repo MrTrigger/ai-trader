@@ -1,0 +1,8 @@
+# The build needs: service/, config/, deploy/, and the frozen model artefact.
+# Everything else - 800MB of bars, venvs, transcripts of research - stays out.
+*
+!service/
+service/target/
+!config/
+!deploy/
+!data/models/ranker-rank-1.json

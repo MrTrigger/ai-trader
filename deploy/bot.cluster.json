@@ -1,0 +1,15 @@
+{
+  "bot_id": "crypto-portfolio",
+  "venue_id": "hyperliquid",
+  "notes": "paper account on the triggerlab cluster; sized per the capital plan",
+  "state_dir": "/data/state",
+  "mode": "paper",
+  "feed": "venue",
+  "quote_currency": "USDC",
+  "initial_cash": "100000",
+  "taker_fee_bps": "4.5",
+  "maker_fee_bps": "1.5",
+  "slippage_bps": "0.5",
+  "max_plan_age_minutes": 120,
+  "cadence_hours": 24
+}
