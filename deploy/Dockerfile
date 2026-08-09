@@ -1,6 +1,13 @@
 # TriggerTrader paper stack: bot (executor+feed), crypto-portfolio (planner),
 # api (dashboard). One image, three entrypoints - the same binaries a human
 # runs, which is the §8.1 rule that keeps cron and shell from drifting apart.
+FROM oven/bun:1 AS frontend
+WORKDIR /src/frontend
+COPY frontend/package.json frontend/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY frontend/ ./
+RUN bun run build
+
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY service/ service/
@@ -18,6 +25,7 @@ COPY deploy/config-patch.py /app/config-patch.py
 COPY deploy/bot.cluster.json /app/bot.json
 COPY deploy/cycle.sh /usr/local/bin/cycle.sh
 COPY data/models/ranker-rank-1.json /app/ranker-rank-1.json
+COPY --from=frontend /src/frontend/dist /app/frontend/dist
 # the cluster config is the repo config with the model path pinned to the image
 RUN python3 /app/config-patch.py || sed -i 's|^model_path = .*|model_path = "/app/ranker-rank-1.json"|' /app/config.toml
 RUN useradd -u 1000 -m trader

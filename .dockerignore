@@ -6,3 +6,6 @@ service/target/
 !config/
 !deploy/
 !data/models/ranker-rank-1.json
+!frontend/
+frontend/node_modules/
+frontend/dist/
