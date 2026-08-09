@@ -183,7 +183,16 @@ pub fn known_assets(root: &Path) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())?
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().into_string().ok()?;
-            name.strip_prefix("asset=").map(str::to_owned)
+            let asset = name.strip_prefix("asset=")?.to_owned();
+            // The archive loader can land venue oddities in the store - one
+            // Binance listing has a CJK ticker - and a refresh that dies on
+            // them kills the nightly cycle. Skip what Bar::validate would
+            // refuse; the canonical-id rule lives at write time, this mirror
+            // of it lives at enumerate time.
+            (!asset.is_empty()
+                && asset.len() <= 20
+                && asset.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+            .then_some(asset)
         })
         .collect::<Vec<_>>();
     assets.sort();
