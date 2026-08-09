@@ -18,9 +18,21 @@ say "pull"
 $CP data-pull --config $CFG --data-root $DATA --days 8
 
 say "universe (venue-screened)"
-$CP universe-rank --config $CFG --data-root $DATA \
-  --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --step-days 1 \
-  --tradeable <($BOT --config $BOTCFG markets)
+# Snapshots are append-only and never backfilled - that rule is what makes a
+# historical universe reconstruction honest. A cycle re-run on the same day is
+# not a violation of it, it is the idempotent case, so tolerate exactly that
+# one refusal and nothing else.
+if ! out=$($CP universe-rank --config $CFG --data-root $DATA \
+      --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --step-days 1 \
+      --tradeable <($BOT --config $BOTCFG markets) 2>&1); then
+  case "$out" in
+    *"already exists; snapshots are append-only"*)
+      say "today's snapshot is already recorded; keeping it" ;;
+    *) echo "$out" >&2; exit 1 ;;
+  esac
+else
+  echo "$out"
+fi
 
 say "plan (frozen rank artefact, live book)"
 $CP plan --config $CFG --data-root $DATA \
