@@ -16,9 +16,19 @@ LAB="${TRIGGERLAB:-$HOME/dev/magnus/triggerlab}"
 export KUBECONFIG="${KUBECONFIG:-$LAB/kubeconfig}"
 say() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
 
+# The image is built by CI from the pushed SHA, so local edits never reach the
+# cluster - but a dirty tree usually means the change you think you are
+# shipping is still sitting here. Say which files, and let an explicit flag
+# through: this repo sometimes has another agent's work in flight beside yours,
+# and their half-finished file is not a reason to block your deploy.
 if [ -n "$(git status --porcelain)" ]; then
-  echo "deploy: working tree is dirty - commit first, or the cluster runs code that is not in git" >&2
-  exit 1
+  echo "deploy: uncommitted changes (the image is built from ${SHA:0:7}, so these will NOT ship):" >&2
+  git status --porcelain | sed 's/^/  /' >&2
+  if [ "${1:-}" != "--allow-dirty" ]; then
+    echo "deploy: commit them, or re-run with --allow-dirty if they are not yours" >&2
+    exit 1
+  fi
+  echo "deploy: --allow-dirty given, continuing" >&2
 fi
 
 # A committed-but-unpushed HEAD is the same failure wearing a clean shirt: the
