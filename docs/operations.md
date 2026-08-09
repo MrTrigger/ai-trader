@@ -1,320 +1,305 @@
-# Running it
+# Operations
 
-Three processes, none of which knows about the others at runtime. They meet through files.
+Two places this system runs, and they are not the same thing.
+
+- **Laptop** — research, backtests, and a paper book you can throw away. Loopback
+  only, state under `var/`, nothing scheduled.
+- **Cluster** (`triggerlab`, namespace `trader`) — the Phase 2 paper run. Runs
+  unattended, keeps its state on a PVC and its records in Postgres, and is the
+  only instance whose numbers count.
+
+Everything below is the whole loop: change code, ship it, watch it, intervene.
+
+---
+
+## 1. The daily cycle, and why it is a script
+
+One decision-and-execution cycle is four commands, in `deploy/cycle.sh` on the
+cluster and `bin/cycle.sh` on the laptop:
 
 ```
-  crypto-portfolio (Rust)   bot (Rust)                  api (Rust)
-  read-only venue key       trade-scoped key            no key
-  decides                   executes                    shows
-        │                        │                          │
-        └──── plan.json ────────►│                          │
-                                 ├──► runs/*.json ─────────►│
-                                 ├──► ledger.jsonl ────────►│
-                                 ├──► venue-state.json ────►│
-                                 │◄─── controls.json ◄──────┘
+data-pull        refresh daily and hourly bars
+universe-rank    record today's point-in-time universe, screened to what the venue lists
+plan             decide, against the venue's book, with the frozen model
+bot run          execute the plan across its slices
 ```
 
-The arrow that matters is the last one. The dashboard writes controls and reads everything else;
-it cannot place an order because it holds nothing that could. See design spec §3.3 and §8.2.
+Design spec §8.1: **the scheduler invokes the same commands a human does.** No
+private path into the engine, so cron and your shell cannot drift apart. Every
+stage failing is fatal to the cycle — a plan built on stale data is worse than
+no plan.
 
-## Venues, and what each one can do
+The cycle takes 5–10 minutes, dominated by `data-pull` walking ~670 assets (most
+long delisted, and kept deliberately: dropping them would reintroduce
+survivorship bias into the universe ranking).
 
-| mode | reads | trades | needs |
-|---|---|---|---|
-| **paper** | live prices | a fake broker | nothing |
-| **live-readonly** | your real account | nothing — every order refused | `HL_ACCOUNT_ADDRESS` |
-| **live** | your real account | real orders, real money | the above, plus an agent key and `HL_ALLOW_LIVE=yes` |
+---
 
-The middle one is the point. Going from *reading a real account* to *trading it* should be one
-deliberate step, not the same step as connecting at all.
-
-Switch from the dashboard, or:
+## 2. Laptop: research and a local paper book
 
 ```bash
-bot --config var/live/bot.json mode                       # where am I pointed?
-bot --config var/live/bot.json mode set live-readonly \
-    --reason "watching the real account" --by magnus --confirm
-```
+cd ~/dev/magnus/ai-trader
+cargo build --release -p crypto-portfolio -p bot -p api   # in service/
 
-Three separate things must line up before real money is reachable: `mode = "live"` in the config,
-an agent key in `.env`, and `HL_ALLOW_LIVE=yes`. They live in different places on purpose — a
-config copied between machines carries the mode, a `.env` copied carries the key, and needing both
-plus an explicit switch means no single careless copy starts trading.
-
-**Unified accounts.** Hyperliquid can run an account either way. A *classic* account keeps perps
-and spot in separate pots and you transfer between them; a *unified* one trades from a single
-balance, greys the transfer button out, and holds the collateral on the **spot** side while the
-perps view reports zero. The adapter tells them apart by a field the venue returns only for unified
-accounts, because reading the perps side alone reports a funded unified account as empty — which is
-exactly the sort of wrong number a strategy would either refuse to size against or divide by.
-
-**Use an agent wallet, never your main key.** Hyperliquid's API wallets can place and cancel and
-cannot withdraw, which is exactly the boundary spec §3.3 asks for. Generate one in the Hyperliquid
-UI under More → API. They expire; if live orders start being rejected as unauthorised, make a new
-one.
-
-## Prices
-
-Nothing about a paper run means anything without them. The feed is one always-on process that
-writes `marks.json`, and everything else reads that file:
-
-```bash
-bot --config var/live/bot.json feed --interval 20     # keep it fresh
-bot --config var/live/bot.json feed --once            # one snapshot
-```
-
-Hyperliquid's info API is public, so this needs no credentials. Write-then-rename on every tick, so
-a reader never catches a half-written file; and a failed poll leaves the last good prices in place
-rather than deleting them — a stale price is visibly stale and can be reasoned about, a missing one
-makes the whole book unvaluable.
-
-Set `"feed": "file"` in the bot config to work offline from a static `marks.json`. The dashboard
-says so loudly when you do, because frozen prices produce no P&L, no slippage and no drawdown —
-none of what a forward test measures.
-
-## The daily loop
-
-```bash
+# a full cycle against the local paper book
 bin/cycle.sh var/live/bot.json
+
+# the dashboard (loopback, no flag to change that)
+./service/target/release/api --state-dir var/live/state \
+  --initial-cash 100000 --quote-currency USDC \
+  --bot ./service/target/release/bot --bot-config var/live/bot.json
 ```
 
-which is exactly these three, in order, failing the whole cycle if any of them does:
+### Research: walk-forward is the only measurement that counts
 
 ```bash
-crypto-portfolio data-pull --config config/default.toml --data-root data --days 7
-crypto-portfolio universe-rank --config config/default.toml --data-root data \
-  --as-of YYYY-MM-DD --top 30 --tradeable <markets.json> --overwrite
-crypto-portfolio plan --config config/default.toml --data-root data \
-  --as-of YYYY-MM-DD --book <book.json> --out <state>/plan.json --for-execution
-bot --config var/live/bot.json run --plan <state>/plan.json
+# 1. the matrix (Rust owns every feature; ~25 min)
+service/target/release/crypto-portfolio training-matrix \
+  --config config/default.toml --data-root data \
+  --start 2019-10-01 --end 2026-08-01 --out data/models/training.jsonl
+
+# 2. six expanding folds, a model retrained at each, two-day purge (~15 min)
+bin/walk-forward.sh 2022-09-18 2026-07-30 6 var/research/wf-experiment per_risk
+
+# 3. the report: equity, drawdown, leverage panels, vs BTC and the S&P
+python3 bin/build-research-report.py var/research/wf-experiment \
+  <spx.json> <btc.json> docs/research/report.html
 ```
 
-Read-only preflight and research commands use the same Rust implementation:
+Knobs, all environment variables read by `training/train.py`, all reproducible:
 
-```bash
-crypto-portfolio data-inspect --data-root data
-crypto-portfolio data-verify --data-root data --interval daily \
-  --asset BTC --cross-interval
-crypto-portfolio plan-verify --config config/default.toml --data-root data \
-  --as-of YYYY-MM-DD --book <book.json> --runs 3
-crypto-portfolio research --config config/default.toml --data-root data \
-  --start YYYY-MM-DD --end YYYY-MM-DD --initial-cash 100000 --out <record.json>
-crypto-portfolio report --record <record.json> --out <report.html>
-```
-
-`data-verify` always checks that timestamps lie on the expected UTC interval
-grid. Consecutive close-to-open gaps are a liquidity diagnostic and are
-warnings unless `--strict-continuity` is set: a thin market can legitimately
-gap between its last and next trade. `--cross-interval` additionally requires
-daily OHLC to agree with the aggregation of 24 hourly candles (within a
-configurable 5-bps default tolerance). It never repairs or deletes data.
-`report` is a pure lens over a saved record and computes no statistic.
-
-For a historical rebuild, use the public monthly archive rather than today's
-venue list; `--all-listed` includes delisted USDT symbols and excludes Binance
-leveraged tokens:
-
-```bash
-crypto-portfolio data-archive --config config/default.toml --data-root data \
-  --start 2019-10-01 --end 2026-08-01 --all-listed --interval daily
-```
-
-Cron it, and leave the feed running alongside:
-
-```cron
-5 0 * * *  cd /path/to/ai-trader && bin/cycle.sh >> var/live/cycle.log 2>&1
-@reboot    cd /path/to/ai-trader && bot --config var/live/bot.json feed --interval 20
-```
-
-The cycle takes a lock: the execution window is hours long, and two overlapping runs would each
-diff against a book the other is moving. A second cycle finding the lock held exits quietly rather
-than queueing.
-
-There is deliberately no scheduler daemon. Spec §8.1 — the scheduler invokes the same commands a
-human does, and a bespoke one would be a second way to run things, which is the way nobody tests.
-
-Step 3 is the only one that can move capital, and it is one process per run: cron starts it, it
-does one thing, it exits. Everything it cares about is on disk before it goes.
-
-The exception is the execution window itself — `run` stays alive across its slices, because that
-*is* the run. With the default schedule the first slice goes out an hour after the plan's `as_of`
-and the second an hour after that, so the process lives for roughly two hours. Cron should not
-start the next one on top of it; the freshness gate and the already-executed gate will refuse a
-double-run, but refusing is not a schedule.
-
-## Watching it
-
-```bash
-api --state-dir var/bot --initial-cash 30000 \
-    --bot ./bot --bot-config config/bot.json \
-    --expectation docs/research/backtest.json
-```
-
-Then <http://127.0.0.1:7434>. Loopback only, with no flag to change that.
-
-The page is **fleet-first**: the landing view is the whole operation — combined net P&L across
-every registered bot (each rebased to its own start, so a NAV and a futures ledger can share one
-axis), the combined drawdown as an underwater band beneath it, a summary card per bot, and one
-merged activity feed. Each bot then has its own console at `#/bot/<id>`, and the consoles are
-**not** the same page: a runner bot gets book/positions/balances/venue controls, a futures book
-gets sleeves, its kill line and its fills. Equity is drawn as steps, not slopes — it only changes
-when a run lands, and a slope between two runs would invent motion nothing recorded.
-
-Without `--bot` and `--bot-config` the page shows everything and changes nothing. That is the
-default: a dashboard that could act the moment it was pointed at a state directory would be one
-nobody chose to give authority to.
-
-Everything on the page is folded from the fill log, which is the only stored truth. There is no
-cached NAV anywhere, because a cached NAV is a second opinion about the account with no way to
-tell which one is right — and the wrong one looks exactly as authoritative on a dashboard.
-
-The same numbers without a browser:
-
-```bash
-bot --config config/bot.json status      # health, controls, exit code 1 if anything is off
-bot --config config/bot.json history     # recent runs, newest first
-bot --config config/bot.json positions   # what the venue says we hold
-```
-
-`status` carries its answer in the exit code as well as the JSON, so a monitoring script does not
-have to parse anything to know something is wrong.
-
-## Connecting to an account that already has a book
-
-A fresh install, a new machine, a restored backup, or the first connection to a funded venue all
-look the same from inside: the venue holds positions and our ledger explains none of them.
-
-**That is a halt, not something absorbed.** Adopting whatever the venue says is exactly the
-auto-repair the executor refuses to do — it would turn evidence of a bug into an opening position.
-But a permanent halt is no good either, or the system could never be pointed at a real account at
-all. So there is one deliberate, attributed command:
-
-```bash
-bot --config config/bot.json reconcile     # what do the two sides say? changes nothing
-bot --config config/bot.json adopt --reason "first connection, checked the account" \
-    --by magnus --confirm
-```
-
-`adopt` writes an opening baseline into the ledger, with the name and the reason attached, and
-records it as a run. From then on the ledger explains the book and reconciliation has teeth again.
-
-### The order ledger
-
-`state_dir/ledger.jsonl` is **our** record, kept deliberately apart from the venue's. Every order id
-is written there *before* it is sent, so a venue fill carrying an id we never issued is visible.
-
-That check is the point. Without it, "our" positions would be folded from the venue's own fill log —
-the venue on both sides of the comparison, which cannot disagree with itself — and the reconcile that
-exists to catch a compromised key, a second process on the account, or a stale order from an earlier
-deployment would pass every time.
-
-A fill we never authorised means one of: someone else trading the account, a stale order, a stolen
-key — or, benignly, that this bot's ledger was lost and the venue still remembers what it did. Those
-are indistinguishable from in here, so the system stops and a human decides:
-
-```bash
-bot --config config/bot.json adopt --reason "restored from backup; checked by hand" \
-    --by magnus --confirm --accept-unknown-fills
-```
-
-The fills are recorded as acknowledged, with who and why, rather than erased. They are not folded
-into our position — the baseline written alongside them already accounts for where the book ended
-up.
-
-## Stopping it
-
-| | What it does |
+| variable | meaning |
 |---|---|
-| **halt** | Plans, never executes. The strongest stop. |
-| **pause** | Only orders that reduce exposure go out. A paused book can still get out. |
-| **resume** | Permits trading again. |
-| **flatten** | Cancels every resting order, then closes every open position at market. |
-| **adopt** | Takes pre-existing venue positions on as our opening state. |
+| `TRAIN_RANK=1` | fit the within-date rank of the reward (**the shipped setting**) |
+| `TRAIN_SEEDS=n` | average n boosters (concatenated trees, leaves scaled 1/n) |
+| `TRAIN_DROP=a,b` | exclude features from the fit |
+| `TRAIN_OBJECTIVE=` | `l2` (default), `l1`, `huber` |
 
-All five are on the dashboard and all five are CLI commands. They are the same thing: the page runs
-the `bot` binary, so there is exactly one implementation of what each control means and a button
-cannot drift from a shell.
+and on `training-matrix`: `--hold-hours`, `--step-hours`, `--include-unlisted-training`,
+`--leaky-funding-diagnostic` (see §7).
+
+**The signal is frozen.** Every additional configuration measured against
+2022–2026 degrades the Sharpe estimate that justifies trading it. Reopen only on
+live evidence. `docs/phase-1-findings.md` records what was tried and rejected.
+
+---
+
+## 3. Cluster: what is deployed
+
+| piece | what it is |
+|---|---|
+| `CronJob aitrader-paper-cycle` | the decision cycle, 00:05 UTC daily |
+| `Deployment aitrader-paper` | two sidecars: the Hyperliquid marks feed, and the dashboard |
+| `PVC aitrader-paper-data` | bars, universe snapshots, funding, paper venue state (10Gi, `local-path`, pinned to `talos-2`) |
+| `Secret aitrader-paper-secret` | `DATABASE_URL` only — sops-encrypted in git |
+| Postgres `ai_trader` | identity registry, controls, runs, fills, ledger, paper book |
+
+- Dashboard: **https://trader.wallintech.eu** (also a homepage tile)
+- The manifests live in `triggerlab`, at
+  `kubernetes/apps/trader/aitrader-paper/`
+
+### The dashboard on the cluster is a lens, not a hand
+
+It runs **without `--bot`**, so its control endpoints refuse. Interventions go
+through `kubectl exec` (§6), where they are authenticated by your kubeconfig and
+audited by the cluster. Ingress is restricted by NetworkPolicy to the gateway and
+the homepage monitor.
+
+The laptop instance keeps its hands — it is loopback-only and drives a throwaway
+book.
+
+### No venue credentials anywhere in this stack
+
+Paper needs public market data and the account address. There is no
+`HL_AGENT_PRIVATE_KEY` in the image, the manifests, or the cluster. Going live
+is a deliberate, separate act.
+
+---
+
+## 4. Ship a change
+
+The image is built by GitHub Actions on every push touching `service/`,
+`config/default.toml` or `deploy/`, and pushed to
+`ghcr.io/mrtrigger/aitrader-paper:latest`.
 
 ```bash
-bot --config config/bot.json halt    --reason "drawdown breach" --by magnus
-bot --config config/bot.json resume  --reason "reviewed, cause understood" --by magnus
-bot --config config/bot.json flatten --reason "weekend risk" --by magnus --confirm
+# 1. change code, and prove it
+cd service && cargo test --release && cargo fmt --all
+
+# 2. push - CI builds the image (~5 min)
+git push
+gh run watch -R MrTrigger/ai-trader
+
+# 3. roll the cluster onto it
+export KUBECONFIG=~/dev/magnus/triggerlab/kubeconfig
+kubectl rollout restart deployment/aitrader-paper -n trader
+kubectl rollout status  deployment/aitrader-paper -n trader
 ```
 
-A reason and a name are required every time, including from the dashboard. The person who finds
-the bot stopped at 3am is usually not the person who stopped it, and "halted" without "why" invites
-the worst available response, which is to clear it and see.
+CronJobs pick up the new image on their next run; nothing to restart.
 
-**Halt does not close anything.** It stops the system taking on new risk and does nothing about the
-risk already on the book. Getting flat is `flatten`, which works even while halted — the moment you
-most want to stop trading is usually the moment you most want to be out.
+**Manifest changes** live in the `triggerlab` repo and go through Flux:
 
-**Flatten cancels before it sells.** Resting orders go first, then positions close, and the
-positions are re-read in between because cancelling releases inventory a resting sell had claimed.
-A flatten that only sold would leave a working buy alive to fill an hour later and re-open the book
-— and every record would say it worked. If any part fails the record says THE ACCOUNT IS NOT FLAT
-and names what is still live.
+```bash
+cd ~/dev/magnus/triggerlab
+kubectl kustomize kubernetes/apps/trader/aitrader-paper/app   # validate first
+git commit && git push
+kubectl annotate gitrepository flux-system -n flux-system \
+  reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite
+kubectl annotate kustomization aitrader-paper -n trader \
+  reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite
+```
 
-### How the dashboard can do this without holding a key
+### Shipping a new model
 
-It does not perform controls; it runs `bot`, which holds the credential. The `api` process still
-has none, and the argument vector it builds comes from a closed list — nothing the browser sends
-becomes a flag, an option or a path. That is the difference between a page that can *ask* for a
-flatten and a web server that can place an order.
+The artefact is committed (`data/models/ranker-rank-1.json`, 2.8MB) and baked
+into the image, because it *is* the deployable strategy — leaving it out of git
+would leave the strategy behind.
 
-Every action still needs a name and a reason, still passes the bot's own gates, and still lands in
-the run history. Flatten additionally asks you to type FLATTEN, because it is the one control whose
-effect cannot be undone by pressing something else.
+```bash
+TRAIN_RANK=1 training/.venv/bin/python training/train.py \
+  --matrix data/models/training.jsonl --through <cutoff> \
+  --reward per_risk --out data/models/ranker-rank-1.json
+git add -f data/models/ranker-rank-1.json && git commit && git push   # CI + rollout
+```
 
-The api's console log records every control run from the page, marking the ones that move capital
-or grant authority — "who flattened the book at 02:14" is a question that gets asked.
+Rust refuses an artefact whose feature-catalogue version or ordered feature
+names disagree with its own, and refuses to score any date at or before
+`trained_through`. Both are hard failures, not warnings.
 
-## Failing closed
+---
 
-- **No control file, or an unreadable one, means halted.** A deleted file, a failed disk or a
-  botched deploy costs opportunity, not money.
-- **A stale plan is refused.** Past `max_plan_age_minutes` it was computed against prices that no
-  longer exist.
-- **A plan that already ran is refused.** Re-running it would submit against a book that has moved,
-  and none of the order ids would collide because the quantities differ.
-- **Reconciliation drift halts and is never repaired.** Our ledger against the venue's book, before
-  every slice rather than once per run — the execution window is hours long, and the account can
-  change underneath it. A mismatch means one of our assumptions is wrong, and trading on top of it
-  turns a bug into a loss.
-- **A venue we cannot read is a halt, not a guess.** Reads are retried three times while the venue
-  is unreachable; writes never are, because a submission that may or may not have landed is how a
-  position gets doubled. Order ids carry the idempotency instead.
-- **A run that submitted nothing leaves its plan runnable.** The replay guard exists to stop a
-  double submission; blocking a retry after a halt would force a re-plan at exactly the moment
-  something has gone wrong.
-- **A failed order stops the run** with the remaining orders named. A partially applied plan
-  matches no plan at all; the next run diffs from wherever the book actually is.
-- **Every run is recorded, including the ones that did nothing.** A halted run and a run that never
-  happened look identical in a directory of successes.
+## 5. Watch it
 
-## Files under `state_dir`
+```bash
+export KUBECONFIG=~/dev/magnus/triggerlab/kubeconfig
+kubectl get pods,cronjob,job -n trader | grep aitrader
+kubectl logs -n trader deploy/aitrader-paper -c feed --tail=20     # marks feed
+kubectl logs -n trader deploy/aitrader-paper -c api  --tail=20     # dashboard
+kubectl logs -n trader job/<the-cycle-job> | tail -40              # a cycle
 
-| File | Written by | What it is |
-|---|---|---|
-| `controls.json` | operator, CLI or dashboard | the kill switch and pause, with who and why |
-| `marks.json` | `bot feed` | `{"BTC": "64000.50"}`, rewritten every tick from the venue |
-| `venue-state.json` | `bot` | the paper venue's books — fill log, resting orders, idempotency map |
-| `runs/*.json` | `bot` | one file per run; timestamp-prefixed, so a listing is chronological |
-| `ledger.jsonl` | `bot` | our own append-only record: order ids we authorised, positions we adopted, fills we acknowledged |
+POD=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
+        --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json status
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json positions
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json reconcile
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json history --limit 10
+```
 
-One file per run rather than one growing log: a half-written line in a shared log corrupts the
-whole history, and a run that died mid-write should cost its own record and no others.
+Run a cycle by hand (the CronJob's own definition, so it cannot drift):
 
-## What is not built yet
+```bash
+kubectl create job -n trader cycle-manual --from=cronjob/aitrader-paper-cycle
+```
 
-- **A verified live *write* path.** The Hyperliquid read path is checked against the real API on
-  every run of `cargo test -p hyperliquid --test live_read -- --ignored`. Order placement and
-  cancellation are implemented and unit-tested, but no order has ever been sent — that needs an
-  account. Testnet first: point `HL_API_URL` at `api.hyperliquid-testnet.xyz`, where live mode
-  needs no `HL_ALLOW_LIVE`.
-- **Bars from the venue being traded.** The planner ranks on Binance history while the strategy
-  trades Hyperliquid perps. That was a documented proxy for the backtest; live it is a basis
-  difference, and worth deciding about deliberately rather than by default.
-- **Adaptive execution.** Slices are a fixed hourly schedule. Real execution reads the order book —
-  accelerating into depth, waiting out thin patches, posting rather than crossing. A fixed time
-  slice is the honest floor (design spec §6.3).
+### What Phase 2 is actually grading
+
+**Plumbing and cost realization, not P&L.** Three months of paper says almost
+nothing about a Sharpe — confirming a true Sharpe of 2 at two sigma takes about
+eleven months. What it settles in weeks: realized slippage against the 0.5bp
+assumption, fill behaviour, funding actually paid, universe churn, stale symbols,
+API failures, partial fills, and reconciliation.
+
+Written down before the run started, so they cannot be rationalised later:
+
+- Expected live Sharpe **1.0–1.3** (backtest 2.0–2.2)
+- Kill: drawdown **> 25%**, realized costs **> 1.5×** modelled, or rolling 60-day
+  IC **< 0**
+
+---
+
+## 6. Intervene
+
+All four controls write an audited row to `control_events` and take a name and a
+reason:
+
+```bash
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
+  halt   --reason "..." --by magnus     # stop executing; planning continues
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
+  pause  --reason "..." --by magnus     # risk-reducing orders only
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
+  resume --reason "..." --by magnus
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
+  flatten --reason "..." --by magnus --confirm    # cancel resting, close at market
+```
+
+`halt` and `flatten` are different tools: halt stops new execution and leaves the
+book alone; flatten closes it and works even while halted.
+
+Suspend the schedule entirely:
+
+```bash
+kubectl patch cronjob aitrader-paper-cycle -n trader -p '{"spec":{"suspend":true}}'
+```
+
+### The gates that will stop a run, and what each means
+
+| refusal | meaning |
+|---|---|
+| `bot "X" is registered but disabled` | fail-closed identity registry; `identity enable` deliberately |
+| `plan ... is N minutes old` | the plan sat too long — build a new one |
+| `decision lag ... past the limit` | the decision is far behind the fill; paper can override with `--accept-decision-lag`, live cannot |
+| `is in Dry mode, not live` | the plan was not stamped `--for-execution` |
+| `the venue reports a fill we never authorised` | reconciliation failure — **investigate before doing anything**; §7 |
+| `model trained through D cannot score D` | leakage guard. Never relax it |
+
+---
+
+## 7. First principles worth not relearning
+
+**Reconciliation disagreements are never auto-corrected.** The ledger is an
+independent record of what we authorised, written before orders go out. If the
+venue reports a fill the ledger does not know, the run stops. It could be another
+process, a stale order, a compromised key — or a lost ledger. Those look
+identical from inside. Check the account, then `bot adopt --accept-unknown-fills`
+records *your judgement* against *your name*.
+
+**The leakage guard is the reason any of these numbers can be believed.** A
+recorded +875% (Sharpe 2.70) turned out to be a one-character bug: the funding
+features summed *forward* from each decision date over realised rates. Flip the
+window to trailing, change nothing else, and the same code returns +134.9% at
+Sharpe 1.05. That leak is reproducible on purpose behind
+`--leaky-funding-diagnostic`, which prints a warning that everything downstream
+of it is fiction — it exists so the Rust port could be proven equivalent to the
+Python harness, and for no other reason.
+`docs/research/harness/README.md` has the full account.
+
+**Bootstrapping a fresh database** (only ever needed once per environment):
+
+```bash
+kubectl exec -n storage postgres-0 -- createdb -U postgres ai_trader
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json identity migrate
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json identity register
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json identity enable
+kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
+  resume --reason "..." --by magnus
+```
+
+A new PVC also needs the bar store seeded, or the first cycle spends hours
+rebuilding history it could have copied:
+
+```bash
+tar czf /tmp/seed.tgz -C data bars funding universe
+kubectl cp /tmp/seed.tgz trader/$POD:/data/seed.tgz -c feed
+kubectl exec -n trader $POD -c feed -- sh -c 'cd /data && tar xzf seed.tgz && rm seed.tgz'
+```
+
+---
+
+## 8. Environment gotchas, paid for once
+
+- **`docker build` has no DNS here** — use `--network=host`.
+- **The in-cluster registry cannot serve fresh pushes.** Spegel owns the nodes'
+  wildcard registry config and resolves from its cache, so containerd answers
+  `not found` for an image the registry is serving happily over its NodePort.
+  Build in CI to ghcr instead.
+- **`${SECRET_POSTGRES_PASSWORD}` does not exist** in `cluster-secrets`, despite
+  appearing in other apps' manifests (unsubstituted there too). Use a sops
+  secret, and add `decryption:` to the app's `ks.yaml` — child Kustomizations do
+  not inherit it.
+- **Docker's default OCI image index is unpullable by this containerd.** Build
+  with `--provenance=false` if you ever push locally.
+- **The api binds loopback** unless `KUBERNETES_SERVICE_HOST` is present, in
+  which case it binds wide. Detected, never configured — a flag is a thing that
+  gets set.
