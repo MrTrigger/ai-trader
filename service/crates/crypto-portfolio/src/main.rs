@@ -914,6 +914,7 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         hold_hours,
         funding_window,
         args.iter().any(|a| a == "--include-unlisted-training"),
+        flag_i64(args, "--step-hours").unwrap_or(24),
     )?;
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut out = std::io::BufWriter::new(file);
@@ -971,6 +972,7 @@ fn cmd_backtest(args: &[String]) -> Result<(), String> {
         initial_cash,
         slippage,
         funding_window,
+        flag_i64(args, "--step-hours"),
     )?;
     let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     bytes.push(b'\n');

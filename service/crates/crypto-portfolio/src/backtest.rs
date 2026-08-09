@@ -185,9 +185,10 @@ pub fn replay(
     initial_cash: Decimal,
     slippage_multiple: Decimal,
     funding_window: features_crypto::FundingWindow,
+    step_hours: Option<i64>,
 ) -> Result<BacktestResult, String> {
     let prepared = prepare(cfg, root, cfg.signal == "ml_ranker", funding_window)?;
-    replay_prepared(
+    replay_prepared_stepped(
         cfg,
         start,
         end,
@@ -195,6 +196,7 @@ pub fn replay(
         initial_cash,
         slippage_multiple,
         &prepared,
+        step_hours,
     )
 }
 
@@ -206,6 +208,28 @@ pub fn replay_prepared(
     initial_cash: Decimal,
     slippage_multiple: Decimal,
     prepared: &Prepared,
+) -> Result<BacktestResult, String> {
+    replay_prepared_stepped(
+        cfg,
+        start,
+        end,
+        root,
+        initial_cash,
+        slippage_multiple,
+        prepared,
+        None,
+    )
+}
+
+pub fn replay_prepared_stepped(
+    cfg: &Config,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    root: &Path,
+    initial_cash: Decimal,
+    slippage_multiple: Decimal,
+    prepared: &Prepared,
+    step_hours_override: Option<i64>,
 ) -> Result<BacktestResult, String> {
     if start > end {
         return Err(format!(
@@ -222,7 +246,13 @@ pub fn replay_prepared(
         return Err("prepared replay data has no hourly features for ml_ranker".into());
     }
 
-    let cadence = Duration::seconds(cfg.interval_s * cfg.rebalance_every.max(1) as i64);
+    let cadence = match step_hours_override {
+        // The evaluation grid, decoupled from the bar interval: a 12h grid
+        // decides twice a day on the same daily features plus fresher hourly
+        // ones. None keeps the config cadence exactly as before.
+        Some(h) => Duration::hours(h),
+        None => Duration::seconds(cfg.interval_s * cfg.rebalance_every.max(1) as i64),
+    };
     let fills = SimFill::new(cfg, slippage_multiple);
     let mut portfolio = Portfolio {
         cash: initial_cash,

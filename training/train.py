@@ -53,7 +53,7 @@ def load_matrix(path: Path, through: date, reward: str = "return"):
         byday = defaultdict(list)
         for row in rows:
             if row.get("vol"):
-                byday[row["date"]].append(row)
+                byday[(row["date"], row.get("slot", 0))].append(row)
         kept = []
         for day_rows in byday.values():
             mean = sum(r["raw_ret"] / r["vol"] for r in day_rows) / len(day_rows)
@@ -118,7 +118,7 @@ def main() -> None:
         from collections import defaultdict
         byday = defaultdict(list)
         for i, row in enumerate(rows):
-            byday[row["date"]].append(i)
+            byday[(row["date"], row.get("slot", 0))].append(i)
         for ixs in byday.values():
             order = sorted(ixs, key=lambda i: y[i])
             n = max(1, len(order) - 1)

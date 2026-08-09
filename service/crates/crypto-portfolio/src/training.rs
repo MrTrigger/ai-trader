@@ -3,13 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{Timelike, DateTime, Duration, NaiveDate, Utc};
 
 use crate::{config::Config, store, universe};
 
 #[derive(Debug, serde::Serialize)]
 pub struct TrainingRow {
     pub date: NaiveDate,
+    /// Hour-of-day of the decision stamp. 0 for the daily grid; the per-date
+    /// demeaning and ranking in the trainer must group by (date, slot) or a
+    /// sub-daily grid folds two cross-sections into one.
+    pub slot: u32,
     pub asset: String,
     /// Demeaned forward return - the reward the model has always been fit on.
     pub target: f64,
@@ -38,7 +42,11 @@ pub fn build(
     hold_hours: i64,
     funding_window: features_crypto::FundingWindow,
     include_unlisted: bool,
+    step_hours: i64,
 ) -> Result<TrainingMatrix, String> {
+    if step_hours <= 0 || 24 % step_hours != 0 && step_hours % 24 != 0 {
+        return Err("step_hours must be positive and divide or multiply 24".into());
+    }
     if end < start {
         return Err("training end precedes start".into());
     }
@@ -95,18 +103,19 @@ pub fn build(
         .collect();
     let feature_names: Vec<String> = raw_names.iter().map(|v| format!("x_{v}")).collect();
     let mut rows = Vec::new();
-    let mut day = start;
-    while day <= end {
-        let stamp = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let mut stamp = start.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end_stamp = end.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    while stamp <= end_stamp {
+        let day = stamp.date_naive();
         let hourly_stamp = stamp - Duration::hours(1);
         let Some(hour_rows) = hourly_by_ts.get(&hourly_stamp) else {
-            day = day.succ_opt().unwrap();
+            stamp += Duration::hours(step_hours);
             continue;
         };
         let members = match universe::load(root, stamp) {
             Ok(v) => v,
             Err(_) => {
-                day = day.succ_opt().unwrap();
+                stamp += Duration::hours(step_hours);
                 continue;
             }
         };
@@ -115,7 +124,15 @@ pub fn build(
             .filter(|m| m.eligible)
             .map(|m| m.asset)
             .collect();
-        let daily_stamp = stamp - Duration::seconds(cfg.interval_s);
+        // The newest daily bar whose close precedes the stamp: for a 00:00
+        // decision that is yesterday's bar exactly as before; for an intraday
+        // slot it is the same bar, now up to step_hours stale - the hourly
+        // block carries the freshness.
+        let daily_stamp = (stamp - Duration::hours(24))
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
         let entry = stamp + Duration::hours(lag_hours);
         let exit = entry + Duration::hours(hold_hours);
         let mut block = Vec::new();
@@ -156,6 +173,7 @@ pub fn build(
             for ((asset, target, vol, _), values) in block.into_iter().zip(normalised) {
                 rows.push(TrainingRow {
                     date: day,
+                    slot: stamp.time().hour(),
                     asset,
                     target: target - mean_target,
                     raw_ret: target,
@@ -164,7 +182,7 @@ pub fn build(
                 });
             }
         }
-        day = day.succ_opt().unwrap();
+        stamp += Duration::hours(step_hours);
     }
     if rows.is_empty() {
         return Err(format!("no usable training rows between {start} and {end}"));
