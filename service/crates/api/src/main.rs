@@ -55,6 +55,22 @@ use rust_decimal::Decimal;
 
 /// Never configurable. See the module docs.
 const BIND: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// Loopback, except inside a pod - where loopback serves nobody.
+///
+/// The no-flag rule stands: nothing here can be set. Inside Kubernetes the
+/// pod's network namespace is the isolation boundary and the gateway in front
+/// of the Service is the front door, so binding wide is not weakening the
+/// laptop rule, it is the same rule expressed in that environment. Detected,
+/// not configured: KUBERNETES_SERVICE_HOST is injected by the kubelet and not
+/// something an operator "sets".
+fn bind_addr() -> Ipv4Addr {
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        BIND
+    }
+}
 const DEFAULT_PORT: u16 = 7434;
 
 const MAX_REQUEST_LINE: u64 = 8 * 1024;
@@ -142,7 +158,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let listener = match TcpListener::bind(SocketAddrV4::new(BIND, cfg.port)) {
+    let listener = match TcpListener::bind(SocketAddrV4::new(bind_addr(), cfg.port)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("api: cannot bind 127.0.0.1:{}: {e}", cfg.port);
