@@ -3,8 +3,15 @@ on:
   push:
     branches: [main]
     paths:
+      # Everything the image is built FROM. The frontend was missing here even
+      # though the Dockerfile bakes it in, so a UI commit pushed, built
+      # nothing, and left the cluster on the old page while every step
+      # reported success.
       - "service/**"
+      - "frontend/**"
+      - "training/**"
       - "config/default.toml"
+      - "data/models/**"
       - "deploy/**"
       - ".github/workflows/image.yaml"
   workflow_dispatch: {}
