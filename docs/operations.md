@@ -119,24 +119,55 @@ is a deliberate, separate act.
 ## 4. Ship a change
 
 The image is built by GitHub Actions on every push touching `service/`,
-`config/default.toml` or `deploy/`, and pushed to
-`ghcr.io/mrtrigger/aitrader-paper:latest`.
+`config/default.toml` or `deploy/`, tagged both `:latest` and `:<commit-sha>`.
+
+**The cluster only ever runs a SHA tag.** Never `:latest` — spegel mirrors the
+registry and serves from node cache, so a mutable tag is whatever that node
+last happened to see. A `rollout restart` against `:latest` can silently
+re-run the old image while reporting success, which cost two debugging rounds
+of arguing with a pod that was confidently running week-old code. An immutable
+tag also makes the deployed version a fact in git rather than a question.
 
 ```bash
 # 1. change code, and prove it
 cd service && cargo test --release && cargo fmt --all
 
-# 2. push - CI builds the image (~5 min)
+# 2. push, and wait for THAT COMMIT to build (~5 min)
 git push
-gh run watch -R MrTrigger/ai-trader
-
-# 3. roll the cluster onto it
-export KUBECONFIG=~/dev/magnus/triggerlab/kubeconfig
-kubectl rollout restart deployment/aitrader-paper -n trader
-kubectl rollout status  deployment/aitrader-paper -n trader
+SHA=$(git rev-parse HEAD)
+gh run list -R MrTrigger/ai-trader --workflow paper-image --limit 5 \
+  --json headSha,status,conclusion -q ".[] | select(.headSha==\"$SHA\")"
 ```
 
-CronJobs pick up the new image on their next run; nothing to restart.
+Watch for the right SHA, not the newest run: `--limit 1` returns whatever
+finished last, which right after a push is still the *previous* build. Waiting
+on that exits immediately and deploys the old image.
+
+```bash
+# 3. pin the cluster to it (in the triggerlab repo)
+cd ~/dev/magnus/triggerlab
+sed -i "s|aitrader-paper:.*|aitrader-paper:$SHA|" \
+  kubernetes/apps/trader/aitrader-paper/app/{deployment,cronjob}.yaml
+git commit -am "aitrader-paper: $SHA" && git push
+
+# 4. let Flux take it (or force it)
+export KUBECONFIG=~/dev/magnus/triggerlab/kubeconfig
+kubectl annotate gitrepository flux-system -n flux-system \
+  reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite
+kubectl annotate kustomization aitrader-paper -n trader \
+  reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite
+kubectl rollout status deployment/aitrader-paper -n trader
+```
+
+Confirm what is actually running rather than trusting the rollout:
+
+```bash
+kubectl get deploy -n trader aitrader-paper \
+  -o jsonpath='{.spec.template.spec.containers[1].image}'
+kubectl logs -n trader deploy/aitrader-paper -c api --tail=5   # the startup banner
+```
+
+CronJobs pick up the pinned image on their next run; nothing to restart.
 
 **Manifest changes** live in the `triggerlab` repo and go through Flux:
 
@@ -300,6 +331,12 @@ kubectl exec -n trader $POD -c feed -- sh -c 'cd /data && tar xzf seed.tgz && rm
   not inherit it.
 - **Docker's default OCI image index is unpullable by this containerd.** Build
   with `--provenance=false` if you ever push locally.
+- **`:latest` is a lie on these nodes.** Spegel serves it from cache, so a
+  rollout can succeed while running old code. Pin the SHA; verify the running
+  image and the startup banner afterwards.
+- **`gh run list --limit 1` right after a push** returns the previous run, not
+  yours. Select on the commit SHA or you will deploy the thing you just
+  replaced.
 - **The api binds loopback** unless `KUBERNETES_SERVICE_HOST` is present, in
   which case it binds wide. Detected, never configured — a flag is a thing that
   gets set.
