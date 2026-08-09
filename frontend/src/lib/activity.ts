@@ -33,6 +33,7 @@ import type { FeedHealth } from "../api/types";
 export type Activity = {
   key:
     | "disabled"
+    | "unset"
     | "stopped"
     | "stopping"
     | "stop-not-applied"
@@ -87,6 +88,15 @@ export function activity(a: {
 }): Activity {
   if (a.enabled === false) {
     return { key: "disabled", label: "disabled", long: "disabled", tone: "quiet" };
+  }
+  // No control word at all. The canonical contract says unknown reads as
+  // halted — fail closed — and this derivation had no case for it, so it fell
+  // through every branch below to the most optimistic answer there is: a green
+  // RUNNING pill. The first bot ever to be in this state was a freshly
+  // registered one in the cluster, which had never run and never been told to,
+  // and the page announced it as running with "no heartbeat" beside it.
+  if (a.control == null) {
+    return { key: "unset", label: "not started", long: "not started", tone: "quiet" };
   }
   // Control outranks everything the bot reports about itself: the operator
   // has said what should happen, and a bot that has not caught up yet must

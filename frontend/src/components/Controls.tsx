@@ -22,6 +22,58 @@ import { ago } from "../lib/format";
  * Start out of stopped, Resume out of halted — because those are
  * different promises about what happens to the book.
  */
+/**
+ * Which verbs this bot is offered, and what the first one is called.
+ *
+ * A pure function because it is the part that keeps being wrong, and being
+ * wrong here is not cosmetic: it decides whether an operator can reach the
+ * book. It has been wrong twice — Start and Stop both live on an already
+ * stopped bot, and then Stop withheld from a stale one that might still hold
+ * positions — so the table in `controls.test.ts` is the specification and this
+ * is only its implementation.
+ */
+export function verbs({
+  control,
+  staleSeconds,
+  flat,
+}: {
+  control?: string | null;
+  staleSeconds?: number | null;
+  flat: boolean;
+}) {
+  // Nothing has published in two minutes: whatever we write, no process is
+  // going to act on it. Saying so at the moment of pressing is the whole
+  // point — a promise about "the next cycle" is a lie when there is no next
+  // cycle, and this bot's book stays open until something runs it.
+  //
+  // No heartbeat AT ALL is the strongest form of that, not the absence of
+  // evidence: a bot that has never published has certainly never run. Reading
+  // null as "reachable" is why a freshly deployed bot offered Stop and skipped
+  // the notice that nothing would act on it.
+  const neverRan = staleSeconds == null;
+  const unreachable = neverRan || staleSeconds > 120;
+  const stopped = control === "stopped";
+  const running = control === "running";
+  // "Resume" is a promise about a book that is still there. Only a halt leaves
+  // one, so it is the only word for coming back out of one; a bot that was
+  // stopped, or has never been told anything at all, is being STARTED.
+  const startVerb = control === "halted" ? "Resume" : "Start";
+
+  // Each verb is offered exactly when pressing it would change something.
+  // Both Start and Stop were enabled on an already-stopped bot, which asks
+  // the operator to guess what a second Stop would do: nothing.
+  const canStart = !running;
+  const canHalt = running;
+  // A bot nothing has EVER run, and nothing has ever been asked of: there is
+  // no book to close and no instruction to withdraw, so Stop would record a
+  // word about a process that has never existed. Deliberately narrower than
+  // "unreachable": requiring a live process instead cost the operator of a
+  // stale bot their only way to say "be flat when you next run".
+  const untouched = neverRan && control == null;
+  const canStop = !untouched && (!stopped || (!flat && !unreachable));
+  return { neverRan, unreachable, running, stopped, startVerb, canStart, canHalt, canStop };
+}
+
 export function Controls({
   botId,
   control,
@@ -45,23 +97,11 @@ export function Controls({
   note?: string;
   onDone: () => void;
 }) {
-  // Nothing has published in two minutes: whatever we write, no process is
-  // going to act on it. Saying so at the moment of pressing is the whole
-  // point — a promise about "the next cycle" is a lie when there is no next
-  // cycle, and this bot's book stays open until something runs it.
-  const unreachable = staleSeconds != null && staleSeconds > 120;
-  const stopped = control === "stopped";
-  const running = control === "running";
-  const startVerb = stopped ? "Start" : "Resume";
-
-  // Each verb is offered exactly when pressing it would change something.
-  // Both Start and Stop were enabled on an already-stopped bot, which asks
-  // the operator to guess what a second Stop would do: nothing. The one
-  // exception is a book that may still be open on a bot we can actually
-  // reach — flattening is never the thing to withhold.
-  const canStart = !running;
-  const canHalt = running;
-  const canStop = !stopped || (!flat && !unreachable);
+  const { neverRan, unreachable, startVerb, canStart, canHalt, canStop } = verbs({
+    control,
+    staleSeconds,
+    flat,
+  });
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ text: string; bad?: boolean } | null>(null);
 
@@ -69,7 +109,7 @@ export function Controls({
     if (verb === "stop" && !window.confirm(
       `Stop ${botId}?\n\nEverything open is closed at market, now. Halt instead to stop opening new positions and let the book wind down on its own exits.` +
       (unreachable
-        ? `\n\nWARNING: nothing has run this bot in ${ago(staleSeconds)}. The stop is recorded, but no process is listening — the book stays open until something runs it.`
+        ? `\n\nWARNING: ${neverRan ? "nothing has ever run this bot" : `nothing has run this bot in ${ago(staleSeconds)}`}. The stop is recorded, but no process is listening — the book stays open until something runs it.`
         : ""),
     )) return;
     setBusy(verb);
@@ -85,7 +125,9 @@ export function Controls({
       setMsg({
         text:
           unreachable
-            ? `Recorded. Nothing has run this bot in ${ago(staleSeconds)}, so nothing will act on it yet.`
+            ? neverRan
+              ? "Recorded. Nothing has ever run this bot, so nothing will act on it yet."
+              : `Recorded. Nothing has run this bot in ${ago(staleSeconds)}, so nothing will act on it yet.`
             : verb === "resume"
               ? `${startVerb === "Start" ? "Started" : "Resumed"}.`
               : verb === "halt"
@@ -131,8 +173,11 @@ export function Controls({
           they have already dismissed. */}
       {unreachable && (
         <p className="mt-2 text-[12px] leading-relaxed text-alarm">
-          Nothing has run this bot in {ago(staleSeconds)}. Controls are recorded, but no process is
-          listening — none of these take effect until something runs it.
+          {neverRan
+            ? "Nothing has ever run this bot."
+            : `Nothing has run this bot in ${ago(staleSeconds)}.`}{" "}
+          Controls are recorded, but no process is listening — none of these take effect until
+          something runs it.
         </p>
       )}
       {msg && (

@@ -141,7 +141,13 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
             <>
               <Card
                 title="Book"
-                aside={`${det.instrument ?? ""} · ${det.sizing?.mode ?? "?"} × ${det.sizing?.units ?? "?"}`}
+                // A bot that has never published has no instrument and no
+                // sizing, and "· ? × ?" is a worse answer than no answer.
+                aside={
+                  det.instrument
+                    ? `${det.instrument} · ${det.sizing?.mode ?? "?"} × ${det.sizing?.units ?? "?"}`
+                    : undefined
+                }
               >
                 <div className="flex flex-wrap items-end justify-between gap-6">
                   <div>
@@ -253,7 +259,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
         </div>
 
         <div className="space-y-5">
-          <Card title="Controls" aside={ctl?.state ?? "trading"}>
+          <Card title="Controls" aside={ctl?.state ?? "never set"}>
             <Controls
               botId={id}
               control={ctl?.state}

@@ -8,12 +8,13 @@ import { activity, type Activity } from "./activity";
  * should have to change this file on purpose.
  */
 const cases: [string, Parameters<typeof activity>[0], Activity["key"], Activity["tone"]][] = [
-  ["bars arriving", { enabled: true, feed: { healthy: true, market_open: true } }, "working", "go"],
-  ["market closed", { enabled: true, feed: { healthy: true, market_open: false } }, "idle", "consequence"],
-  ["feed unhealthy", { enabled: true, feed: { healthy: false, market_open: true } }, "failure", "alarm"],
+  ["bars arriving", { enabled: true, control: "running", feed: { healthy: true, market_open: true } }, "working", "go"],
+  ["market closed", { enabled: true, control: "running", feed: { healthy: true, market_open: false } }, "idle", "consequence"],
+  ["feed unhealthy", { enabled: true, control: "running", feed: { healthy: false, market_open: true } }, "failure", "alarm"],
   ["halted by operator", { enabled: true, control: "halted" }, "halted", "quiet"],
   ["stopped by operator", { enabled: true, control: "stopped" }, "stopped", "quiet"],
   ["disabled in registry", { enabled: false }, "disabled", "quiet"],
+  ["registered, never told anything", { enabled: true }, "unset", "quiet"],
 ];
 
 for (const [name, input, key, tone] of cases) {
@@ -27,7 +28,9 @@ for (const [name, input, key, tone] of cases) {
 test("a failing feed outranks a closed market", () => {
   // Both are true during a weekend outage. The operator needs the fault,
   // not the reassurance — and the old card showed the reassurance.
-  expect(activity({ enabled: true, feed: { healthy: false, market_open: false } }).key).toBe("failure");
+  expect(
+    activity({ enabled: true, control: "running", feed: { healthy: false, market_open: false } }).key,
+  ).toBe("failure");
 });
 
 test("the control word outranks a failing feed", () => {
@@ -72,6 +75,26 @@ test("an unapplied Halt is also reported", () => {
 
 test("a bot with no feed is never called idle", () => {
   // Crypto is 24/7 and reports no market, so absent feed health there is
-  // no quiet period to claim.
-  expect(activity({ enabled: true }).key).toBe("working");
+  // no quiet period to claim. The control word is part of the premise: this
+  // case used to be written `activity({ enabled: true })`, which asserted
+  // that a bot NOBODY HAS TOLD ANYTHING is green and working — the bug
+  // below, pinned as if it were the requirement.
+  expect(activity({ enabled: true, control: "running" }).key).toBe("working");
+});
+
+test("no control word is not 'running'", () => {
+  // A registered bot that has never been told anything: the state every
+  // freshly deployed one is in. Unknown reads as halted in the control
+  // contract — fail closed — but this derivation had no case for it, so a
+  // bot in the cluster with no control row and no heartbeat wore a green
+  // RUNNING pill.
+  for (const control of [null, undefined]) {
+    const a = activity({ enabled: true, control });
+    expect(a.key).toBe("unset");
+    expect(a.label).toBe("not started");
+    expect(a.tone).toBe("quiet");
+  }
+  // And it outranks a feed opinion: nothing is running, so there is nothing
+  // for a feed to be healthy or unhealthy about.
+  expect(activity({ enabled: true, feed: { healthy: false } as never }).key).toBe("unset");
 });

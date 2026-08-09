@@ -527,17 +527,18 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             .collect::<Vec<_>>(),
     });
     let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
+    // The operator's control word comes from the DB for EVERY branch below.
+    // The never-published branch used to read a `controls.json` that exists
+    // only on a laptop, so a freshly deployed bot reported no control word at
+    // all — and the page, having nothing to contradict, drew a green RUNNING
+    // pill over a bot with no heartbeat.
+    let controls: Value = control
+        .as_ref()
+        .map(|c| serde_json::from_str(&c.payload).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
 
     if let Some(srow) = status {
         let state: Value = serde_json::from_str(&srow.payload).unwrap_or(Value::Null);
-        // The operator's control word travels with BOTH contracts. It was
-        // only on the runner branch, so the futures page had no `controls`
-        // at all: its pill fell through to the feed rules and drew
-        // RUNNING·IDLE over a bot whose operator had just pressed Stop —
-        // with the toast promising the close and nothing else moving.
-        let controls: Value = control
-            .map(|c| serde_json::from_str(&c.payload).unwrap_or(Value::Null))
-            .unwrap_or(Value::Null);
         if dialect_of(&state) == "botstate" {
             // Chronological, like the journal file the shape came from.
             let fills: Vec<Value> = fills
@@ -580,9 +581,39 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         }));
     }
 
-    // Dev fallback: no status row yet — read the registered state_dir.
+    // Nothing published yet. That is not a broken bot, it is a bot that has
+    // never run — the state every freshly deployed one starts in, and the
+    // state this branch got wrong in three ways at once: it inferred the
+    // contract from files (so a futures book rendered as a runner, complete
+    // with an empty run history it will never have), it dropped `broker` (so
+    // the route chain read "unbound" while the registry held the binding), and
+    // it looked for the control word on disk. The registry knows all three.
+    //
+    // `cadence` is the honest discriminator: `cron` is a scheduled runner,
+    // everything else (`bar_close`, `stream`) is a resident book.
+    let contract = if bot.cadence == "cron" {
+        "runner"
+    } else {
+        "botstate"
+    };
+    let never_ran = json!({
+        "contract": contract,
+        "source": "registry",
+        "display_name": bot.display_name,
+        "cadence": bot.cadence,
+        "asset_class": bot.asset_class,
+        "decision_core": bot.decision_core,
+        "enabled": bot.enabled,
+        "launch": bot.launch,
+        "broker": broker,
+        "controls": controls,
+        "runs": [],
+        "fills": [],
+    });
+    // Dev fallback: a laptop bot whose state is still in files. A pod has no
+    // files at all, so this can only ever ADD to what the registry said.
     let Some(dir) = bot.state_dir.as_deref() else {
-        return Ok(json!({ "contract": "none" }));
+        return Ok(never_ran);
     };
     let dir = repo_root.join(dir);
     let botstate = dir.join("botstate");
@@ -605,15 +636,12 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             "decision_core": bot.decision_core,
             "enabled": bot.enabled,
             "launch": bot.launch,
+            "broker": broker,
+            "controls": controls,
             "state": state,
             "fills": fills[tail..],
         }));
     }
-    // runner contract: controls + recent runs
-    let controls: Value = std::fs::read_to_string(dir.join("controls.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null);
     let mut runs: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir.join("runs")) {
         let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -627,16 +655,10 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             }
         }
     }
-    Ok(json!({
-        "contract": "runner",
-        "display_name": bot.display_name,
-        "cadence": bot.cadence,
-        "asset_class": bot.asset_class,
-        "enabled": bot.enabled,
-            "launch": bot.launch,
-        "controls": controls,
-        "runs": runs,
-    }))
+    // Files only ever fill in what the registry could not know: the runs.
+    let mut out = never_ran;
+    out["runs"] = json!(runs);
+    Ok(out)
 }
 
 /// GET /api/fleet/overview — everything the fleet landing page draws, in one
