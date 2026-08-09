@@ -21,6 +21,15 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# A committed-but-unpushed HEAD is the same failure wearing a clean shirt: the
+# tree looks fine, CI never sees the commit, and the wait below times out
+# blaming a path filter. Push it rather than explaining it.
+if ! git ls-remote --exit-code origin "$SHA" >/dev/null 2>&1 &&
+   [ -n "$(git log --oneline @{u}..HEAD 2>/dev/null)" ]; then
+  say "pushing ${SHA:0:7}"
+  git push -q
+fi
+
 say "waiting for the image for ${SHA:0:7}"
 for _ in $(seq 1 80); do
   read -r status conclusion <<<"$(gh run list -R MrTrigger/ai-trader --workflow paper-image \
@@ -59,9 +68,13 @@ sleep 10
 kubectl rollout status deployment/aitrader-paper -n trader --timeout=600s
 
 # Verify what is RUNNING, not what was asked for. The whole point.
+#
+# Selected by NAME, not by index: containers[1] was the api until the pod grew
+# an IB Gateway sidecar, and an index that silently points at a different
+# container verifies the wrong thing while reporting success.
 running=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
   --field-selector=status.phase=Running \
-  -o jsonpath='{.items[0].spec.containers[1].image}')
+  -o jsonpath='{.items[0].spec.containers[?(@.name=="api")].image}')
 if [ "$running" != "ghcr.io/mrtrigger/aitrader-paper:$SHA" ]; then
   echo "deploy: pod is running $running, expected :$SHA" >&2
   exit 1
