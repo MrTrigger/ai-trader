@@ -22,35 +22,43 @@ say() { echo "[$(date -u +%H:%M:%SZ)] futures: $*"; }
 # up as a bot with no contract.
 mkdir -p "$(dirname "$BARS")" "${FUTURES_STATE_DIR:-/data/futures/state}"
 
-# The Gateway is a sidecar, so it is starting at the same time as everything
-# else and takes a minute or two to log in. Exiting immediately would work —
-# the supervisor relaunches — but it would fill the log with failures that are
-# not failures. Wait, then say so if it never came.
-for i in $(seq 1 60); do
-  if (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null; then
-    say "gateway answering on $HOST:$PORT after ${i}0s"
-    break
-  fi
-  if [ "$i" = 60 ]; then
-    say "no IB Gateway on $HOST:$PORT after 10 minutes — giving up so this is visible as a failure"
-    exit 1
-  fi
+# A cheap first gate: is anything listening at all. This is NOT a readiness
+# check and must not be mistaken for one — socat accepts on the relay port from
+# the moment the container starts, long before IB Gateway behind it has logged
+# in, and a client that connects then gets an immediate EOF. Measured in the
+# pod: the port was open and `ib-check` still answered "connection rejected:
+# early eof".
+for i in $(seq 1 12); do
+  (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null && break
+  say "nothing listening on $HOST:$PORT yet"
   sleep 10
 done
 
-# The noise band needs 14 completed sessions before it reads at all, so the
-# warmup is not optional and a short cache is the same as no cache. backfill
-# seeds when there is nothing and extends when there is; both need the Gateway,
-# which is why this is here and not in an initContainer that would run before
-# the sidecar exists.
-for attempt in 1 2 3; do
+# The real gate is a completed IB handshake that returns data, and the honest
+# way to test that is to ask for the thing we actually need. The noise band
+# needs 14 completed sessions before it reads at all, so the warmup is not
+# optional and a short cache is the same as no cache: backfill seeds when there
+# is nothing and extends when there is.
+#
+# The Gateway is a sidecar, starting alongside everything else, and IBC's login
+# takes a minute or two — longer if IB is slow, forever if the credentials are
+# wrong. So retry patiently and then FAIL, rather than exiting straight into the
+# supervisor's arms: a bot relaunching every minute against a Gateway that will
+# never log in buries the one line that says why.
+ok=""
+for attempt in $(seq 1 20); do
   if $BOT backfill --bars "$BARS" --days "$WARMUP_DAYS"; then
+    ok=1
     break
   fi
-  say "backfill attempt $attempt failed"
-  [ "$attempt" = 3 ] && { say "warmup bars unavailable — refusing to trade on a short history"; exit 1; }
-  sleep 20
+  say "no warmup bars yet (attempt $attempt/20) — is the Gateway logged in?"
+  sleep 30
 done
+if [ -z "$ok" ]; then
+  say "10 minutes without warmup bars. Check TWS_USERID/TWS_PASSWORD and the"
+  say "ib-gateway container's log; refusing to trade on a short history."
+  exit 1
+fi
 
 # --live is a deployment decision, not a code one: it arms order flow (still
 # subject to IB_ALLOW_ORDERS and, for a live account, IB_ALLOW_LIVE). Shadow is

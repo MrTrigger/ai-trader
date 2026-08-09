@@ -209,6 +209,10 @@ pub fn list(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
                 "decision_core": b.decision_core,
                 "enabled": b.enabled,
                 "state_dir": b.state_dir,
+                // Null means nothing can start this bot, which is the honest
+                // answer to "why is Start disabled" and was previously only
+                // inferable from a stale heartbeat.
+                "launch": b.launch,
                 "status": status,
             })
         })
@@ -549,6 +553,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
                 "asset_class": bot.asset_class,
                 "decision_core": bot.decision_core,
                 "enabled": bot.enabled,
+            "launch": bot.launch,
                 "heartbeat_age_seconds": srow.heartbeat_age_seconds,
                 "broker": broker,
                 "controls": controls,
@@ -567,6 +572,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             "cadence": bot.cadence,
             "asset_class": bot.asset_class,
             "enabled": bot.enabled,
+            "launch": bot.launch,
             "heartbeat_age_seconds": srow.heartbeat_age_seconds,
             "broker": broker,
             "controls": controls,
@@ -598,6 +604,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             "asset_class": bot.asset_class,
             "decision_core": bot.decision_core,
             "enabled": bot.enabled,
+            "launch": bot.launch,
             "state": state,
             "fills": fills[tail..],
         }));
@@ -626,6 +633,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         "cadence": bot.cadence,
         "asset_class": bot.asset_class,
         "enabled": bot.enabled,
+            "launch": bot.launch,
         "controls": controls,
         "runs": runs,
     }))
