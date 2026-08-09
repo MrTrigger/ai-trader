@@ -191,7 +191,9 @@ pub fn known_assets(root: &Path) -> Result<Vec<String>, String> {
             // of it lives at enumerate time.
             (!asset.is_empty()
                 && asset.len() <= 20
-                && asset.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+                && asset
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
             .then_some(asset)
         })
         .collect::<Vec<_>>();

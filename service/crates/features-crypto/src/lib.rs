@@ -646,9 +646,9 @@ pub fn daily(
             let amihud_30 = if i + 1 >= 30 {
                 let terms: Option<Vec<f64>> = (i + 1 - 30..=i)
                     .map(|j| {
-                        returns[j].zip(bars[j].quote_volume).and_then(|(r, qv)| {
-                            (qv > 0.0).then(|| r.abs() / qv)
-                        })
+                        returns[j]
+                            .zip(bars[j].quote_volume)
+                            .and_then(|(r, qv)| (qv > 0.0).then(|| r.abs() / qv))
                     })
                     .collect();
                 terms.and_then(|t| finite(t.iter().sum::<f64>() / t.len() as f64))
@@ -1161,10 +1161,24 @@ mod tests {
     fn daily_features_are_prefix_invariant() {
         let mut input = bars(86_400, 200, "BTC", 1.0);
         input.extend(bars(86_400, 200, "ETH", 20.0));
-        let full = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
+        let full = daily(
+            &input,
+            Some("BTC"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FundingWindow::Trailing,
+        )
+        .unwrap();
         let cutoff = input.iter().map(|b| b.ts_utc).min().unwrap() + TimeDelta::days(159);
         let prefix_bars: Vec<_> = input.into_iter().filter(|b| b.ts_utc <= cutoff).collect();
-        let prefix = daily(&prefix_bars, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
+        let prefix = daily(
+            &prefix_bars,
+            Some("BTC"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FundingWindow::Trailing,
+        )
+        .unwrap();
         let expected: Vec<_> = full.into_iter().filter(|r| r.ts_utc <= cutoff).collect();
         assert_eq!(prefix, expected);
     }
@@ -1195,7 +1209,14 @@ mod tests {
     #[test]
     fn beta_of_benchmark_is_one() {
         let input = bars(86_400, 200, "BTC", 1.0);
-        let out = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
+        let out = daily(
+            &input,
+            Some("BTC"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FundingWindow::Trailing,
+        )
+        .unwrap();
         assert!((out.last().unwrap().beta_bench.unwrap() - 1.0).abs() < 1e-12);
     }
 
@@ -1234,7 +1255,14 @@ mod tests {
         // deterministic `bars` series above. This fixture keeps
         // the old validated semantics without keeping a second implementation.
         let input = bars(86_400, 200, "BTC", 1.0);
-        let out = daily(&input, Some("BTC"), &BTreeMap::new(), &BTreeMap::new(), FundingWindow::Trailing).unwrap();
+        let out = daily(
+            &input,
+            Some("BTC"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FundingWindow::Trailing,
+        )
+        .unwrap();
         let r = out.last().unwrap();
         close(r.ret_1, 0.009771636483385665);
         close(r.ret_7, -0.008905970393982998);

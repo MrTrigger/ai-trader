@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use arrow_array::{Array, Float64Array, LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray};
+use arrow_array::{
+    Array, Float64Array, LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+};
 use chrono::DateTime;
 use features_crypto::FundingTable;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

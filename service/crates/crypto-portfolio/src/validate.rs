@@ -183,7 +183,12 @@ pub fn sweep_axis(
     if configs.iter().any(|(_, cfg)| cfg.signal != first.signal) {
         return Err("a validation sweep may not change the signal axis".into());
     }
-    let prepared = backtest::prepare(first, root, first.signal == "ml_ranker", features_crypto::FundingWindow::Trailing)?;
+    let prepared = backtest::prepare(
+        first,
+        root,
+        first.signal == "ml_ranker",
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let mut points = Vec::new();
     for (value, config) in configs {
         let result = backtest::replay_prepared(

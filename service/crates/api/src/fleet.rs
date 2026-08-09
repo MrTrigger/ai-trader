@@ -310,14 +310,6 @@ pub fn set_state(bot_id: &str, state: &str, reason: &str, by: &str) -> Result<Va
 /// gap between spawn and first publish, where a double-click would
 /// otherwise launch twins.
 pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
-    use std::sync::Mutex;
-    /// The last child spawned per press. Deduping by wall-clock window kept
-    /// refusing legitimate relaunches (Stop exits the process, so
-    /// Stop-then-Start inside the window found "a launch in flight" that
-    /// was already a corpse). The pid answers the actual question: is the
-    /// previous launch still a live process?
-    static LAST_CHILD: Mutex<Option<(String, u32)>> = Mutex::new(None);
-
     let id = bot_id.to_string();
     let (bot, status) = with_registry(move |reg| {
         Box::pin(async move {
@@ -341,7 +333,10 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         // (a resident halt says "operator") — and that outranks the clock.
         .map(|s| {
             let doc: Value = serde_json::from_str(&s.payload).unwrap_or(Value::Null);
-            let reason = doc.get("state_reason").and_then(|r| r.as_str()).unwrap_or("");
+            let reason = doc
+                .get("state_reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
             let exited = doc.get("state").and_then(|v| v.as_str()) == Some("halted")
                 && matches!(reason, "operator-stop" | "feed-stall" | "feed-closed");
             s.heartbeat_age_seconds < 90 && !exited
@@ -350,16 +345,19 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     if alive {
         return Ok(json!({ "spawned": false, "why": "a process is already publishing" }));
     }
-    {
-        let last = LAST_CHILD.lock().expect("spawn dedupe");
-        if let Some((last_id, pid)) = last.as_ref() {
-            let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
-            if last_id == bot_id && alive {
-                return Ok(json!({ "spawned": false, "why": "the previous launch is still running" }));
-            }
+    if let Some(pid) = children().lock().expect("spawn dedupe").get(bot_id) {
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return Ok(json!({ "spawned": false, "why": "the previous launch is still running" }));
         }
     }
     let log = repo_root.join(format!("var/{}.launch.log", bot_id.replace('/', "_")));
+    // On a laptop `var/` is always there; on a fresh PVC it is not, and a Start
+    // that failed because a directory was missing reported "cannot open" and
+    // nothing else.
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot make {}: {e}", parent.display()))?;
+    }
     let logfile = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -375,7 +373,10 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         .spawn()
         .map_err(|e| format!("launch failed: {e}"))?;
     let pid = child.id();
-    *LAST_CHILD.lock().expect("spawn dedupe") = Some((bot_id.to_string(), pid));
+    children()
+        .lock()
+        .expect("spawn dedupe")
+        .insert(bot_id.to_string(), pid);
     // Reap on exit; an unwaited child lingers as a zombie under the api.
     // (Reaping also flips the /proc liveness the dedupe reads.)
     std::thread::spawn(move || {
@@ -383,6 +384,96 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         let _ = child.wait();
     });
     Ok(json!({ "spawned": true, "pid": pid, "launch": launch, "log": log.display().to_string() }))
+}
+
+/// The most recent child pid per bot.
+///
+/// It was one slot for the whole api, which was right while the only spawn was
+/// an operator pressing Start on one bot and wrong the moment a supervisor
+/// walked the fleet: bot B's launch overwrote bot A's pid, and A's next tick
+/// read "nothing of mine is running" and launched a twin.
+fn children() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u32>> {
+    static CHILDREN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+    > = std::sync::OnceLock::new();
+    CHILDREN.get_or_init(Default::default)
+}
+
+/// How often the supervisor asks whether the fleet matches its control words.
+const SUPERVISE_TICK_S: u64 = 30;
+/// The floor between two launches of the same bot. A bot that dies on boot
+/// would otherwise be relaunched every tick, and the useful signal — the same
+/// failure, over and over — would arrive buried in its own volume.
+const RELAUNCH_BACKOFF_S: u64 = 60;
+
+/// Keep the fleet matching its control words: every bot whose control says
+/// `running`, which has a launch command and no live process, gets one.
+///
+/// The control state machine says `running` means "there should be a process",
+/// but only a Start press ever created one. So a pod restart, an OOM kill, or a
+/// crash left a bot that the database and the dashboard both called running
+/// with nothing running — the exact lie the status work existed to remove. This
+/// closes it in the api because the api is the only thing in the pod that can
+/// spawn: one process per bot, supervised, no scheduler involved.
+///
+/// Deliberately not a restart-loop breaker. A bot that cannot start will be
+/// tried again every minute forever, because the alternative — giving up — is
+/// indistinguishable on the dashboard from a bot nobody asked to run, and IB
+/// outages are exactly the transient this must survive unattended.
+pub fn supervise(repo_root: PathBuf) {
+    std::thread::spawn(move || {
+        let mut last_launch: std::collections::BTreeMap<String, std::time::Instant> =
+            Default::default();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(SUPERVISE_TICK_S));
+            let wanted = match with_registry(|reg| {
+                Box::pin(async move {
+                    let mut wanted = Vec::new();
+                    for bot in reg.list_bots().await? {
+                        if bot.launch.is_none() {
+                            continue;
+                        }
+                        // No control row reads as halted, never as running:
+                        // fail closed. Nothing is started that was not asked
+                        // for in writing.
+                        if reg.current_control(&bot.bot_id).await?.map(|c| c.state)
+                            == Some("running".to_string())
+                        {
+                            wanted.push(bot.bot_id);
+                        }
+                    }
+                    Ok(wanted)
+                })
+            }) {
+                Ok(w) => w,
+                // The registry being unreachable is not a reason to act. It is
+                // a reason to say so and ask again in thirty seconds.
+                Err(e) => {
+                    eprintln!("  supervisor: cannot read the fleet ({e})");
+                    continue;
+                }
+            };
+            for bot_id in wanted {
+                if last_launch
+                    .get(&bot_id)
+                    .is_some_and(|t| t.elapsed().as_secs() < RELAUNCH_BACKOFF_S)
+                {
+                    continue;
+                }
+                match maybe_spawn(&repo_root, &bot_id) {
+                    Ok(v) if v["spawned"] == json!(true) => {
+                        last_launch.insert(bot_id.clone(), std::time::Instant::now());
+                        eprintln!(
+                            "  supervisor: {bot_id} says running and nothing was — launched pid {}",
+                            v["pid"]
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("  supervisor: cannot launch {bot_id} ({e})"),
+                }
+            }
+        }
+    });
 }
 
 /// GET /api/bots/{id}/state — the per-bot detail document the dashboard's

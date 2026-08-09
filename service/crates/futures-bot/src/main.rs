@@ -48,11 +48,22 @@ usage: futures-bot <command>
       Fetch recent 5-minute bars from IB historical data and append the
       ones newer than the file's last bar. Closes the gap between the
       lab's stored history and now, so today's noise bands are computed
-      from actual recent sessions.
+      from actual recent sessions. With no file — or one whose last bar
+      predates the window, which could only be extended across a gap —
+      it writes the window instead: IB is the seed as well as the tail.
 
   rithmic-check [--live]
       Rithmic readiness probe: connect + login all plants, positions read,
       history bars. Needs the RITHMIC_* credentials (.env section 8).
+
+  register [--bot-id ID] [--state-dir DIR] [--launch CMD] [--account ID]
+           [--ib-account NUMBER] [--enable]
+      Write this bot's identity into the records DB: the IB account it
+      trades, the trade binding, the bots row, and the launch command the
+      api spawns for Start. Idempotent — safe on every pod start. --launch
+      is deployment-specific (a repo path on a laptop, /usr/local/bin in
+      the image), so it comes from whoever deploys rather than from a
+      migration. Enabling stays a separate act unless --enable is given.
 
   run --bars <warmup jsonl> [--live] [--bot-id ID] [--venue ib|rithmic]
       The live loop: IB 5s bars -> 5min -> the SAME stack replay parity
@@ -81,6 +92,7 @@ fn main() -> ExitCode {
         Some("ib-check") => block_on_async(ib_check(&get)),
         Some("rithmic-check") => block_on_async(rithmic_check(&get)),
         Some("backfill") => block_on_async(backfill(&get)),
+        Some("register") => block_on_async(register(&args, &get)),
         Some("run") => block_on_async(run_live(&get)),
         _ => {
             println!("{USAGE}");
@@ -464,6 +476,89 @@ async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     }
 }
 
+/// Put this bot's identity in the database, idempotently.
+///
+/// Registration used to be hand-written SQL against the laptop's Postgres,
+/// which meant a second environment had a schema and no rows: the fleet page
+/// listed one bot, and the futures bot could not be started because nothing
+/// knew it existed. This is that SQL, in the binary that owns the contract, so
+/// a fresh database is one command from being deployable.
+async fn register(args: &[String], get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let bot_id = get("--bot-id").unwrap_or_else(|| "futures-noise".into());
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| "register requires DATABASE_URL (the identity registry)")?;
+    let reg = records::Registry::connect(&url)
+        .await
+        .map_err(|e| format!("records db unreachable ({e}) — fail closed"))?;
+    // The schema comes first: on a fresh database there is nothing to insert
+    // into, and a deployment that has to remember to migrate separately is a
+    // deployment that will forget.
+    reg.migrate().await.map_err(|e| e.to_string())?;
+
+    // The account, then the binding, then the bot. The IB account NUMBER is
+    // credentials-adjacent and lives in the environment; only the slug and the
+    // credential reference are recorded.
+    let account = get("--account").unwrap_or_else(|| "ib-paper".into());
+    let ib_account = get("--ib-account")
+        .or_else(|| std::env::var("IB_PAPER_ACCOUNT").ok())
+        .filter(|a| !a.is_empty());
+    let kind = if account.ends_with("-live") {
+        "live"
+    } else {
+        "paper"
+    };
+    let credential_ref = if kind == "live" {
+        "IB_LIVE"
+    } else {
+        "IB_PAPER"
+    };
+    reg.register_account(
+        &account,
+        "ib",
+        kind,
+        credential_ref,
+        "USD",
+        ib_account
+            .as_deref()
+            .map(|a| format!("IB {kind} account {a}"))
+            .as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    println!("account {account} ({kind}, credentials {credential_ref})");
+
+    reg.register_bot(
+        &bot_id,
+        "NQ noise-area four-sleeve book",
+        "bar_close(CME,5m)",
+        "futures",
+        "service/crates/noise-book + features-cme (Rust, gated on \
+         bots/futures/parity-fixture.json)",
+        get("--state-dir").as_deref(),
+        get("--launch").as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    reg.set_trade_binding(&bot_id, &account)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("bot {bot_id} registered, trading {account}");
+
+    if flag("--enable") {
+        reg.set_enabled(&bot_id, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!("{bot_id} enabled");
+    } else {
+        let bot = reg.bot(&bot_id).await.map_err(|e| e.to_string())?;
+        if !bot.map(|b| b.enabled).unwrap_or(false) {
+            println!("{bot_id} is DISABLED — enable it deliberately (--enable)");
+        }
+    }
+    Ok(())
+}
+
 async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let live = get("--live").is_some() || std::env::args().any(|a| a == "--live");
     let mode = if live { "live" } else { "shadow" };
@@ -758,7 +853,11 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 // Start; a halt stays resident because winding an open
                 // position down still requires evaluating bars.
                 if control.flatten {
-                    let _ = rec.log_line(&bot_id, "info", "stopped by operator — process exiting; Start relaunches");
+                    let _ = rec.log_line(
+                        &bot_id,
+                        "info",
+                        "stopped by operator — process exiting; Start relaunches",
+                    );
                     eprintln!("stopped by operator — process exiting");
                     return Ok(());
                 }
@@ -868,13 +967,43 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
 
     let path = get("--bars").ok_or("--bars is required")?;
     let days: i32 = get("--days").map(|d| d.parse().unwrap_or(5)).unwrap_or(5);
-    let existing = read_bars(&path)?;
-    let last = existing
-        .last()
-        .map(|b| b.ts_utc)
-        .ok_or("bars file is empty")?;
 
-    let cfg = ib::IbConfig::from_env(false)?;
+    // What "backfill" means depends on what is already there, and on a fresh
+    // deployment the answer is "nothing": the bar cache is a cache, gitignored
+    // on the laptop and absent on a new PVC, and the lab's Python exporter that
+    // fills it does not exist in the image. So IB is also the SEED, not only
+    // the tail — the same request either way.
+    //
+    // The stale case is the one that has to be got right rather than guessed:
+    // appending to a cache whose last bar predates the window leaves a HOLE,
+    // and a noise band computed across a hole is a number with no meaning. A
+    // cache we cannot extend continuously is a cache we replace.
+    let existing = if std::path::Path::new(&path).exists() {
+        read_bars(&path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let window_start = chrono::Utc::now() - chrono::Duration::days(days as i64);
+    let last = match existing.last().map(|b| b.ts_utc) {
+        None => {
+            println!("no bar cache at {path} — seeding {days} days from IB");
+            None
+        }
+        Some(last) if last < window_start => {
+            println!(
+                "bar cache ends at {last}, before the {days}-day window opens at {window_start} — \
+                 re-seeding rather than leaving a gap"
+            );
+            None
+        }
+        Some(last) => Some(last),
+    };
+
+    let mut cfg = ib::IbConfig::from_env(false)?;
+    // Not the trading loop's id. `futures-live.sh` runs this and then execs the
+    // loop, and IB can hold a just-released client id reserved: sharing 9 would
+    // make the bot's own warmup step the thing that kept it from starting.
+    cfg.client_id = 7;
     let venue = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
     eprintln!("{}", venue.describe());
     let data = venue
@@ -895,7 +1024,7 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         };
         let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(dt.unix_timestamp(), 0)
             .ok_or("bar timestamp out of range")?;
-        if ts <= last {
+        if last.is_some_and(|l| ts <= l) {
             continue;
         }
         fresh.push(RawBar {
@@ -909,11 +1038,26 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     }
     fresh.sort_by_key(|b| b.ts_utc);
     if fresh.is_empty() {
+        let Some(last) = last else {
+            return Err(format!(
+                "IB returned no 5-minute bars for the last {days} days, and there is no cache at \
+                 {path} to fall back on — the warmup would be empty"
+            ));
+        };
         println!("nothing to append: file already ends at {last} and IB returned no newer bars");
         return Ok(());
     }
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let seeding = last.is_none();
     let mut f = std::fs::OpenOptions::new()
-        .append(true)
+        .create(true)
+        .append(!seeding)
+        // Seeding REPLACES: the file either did not exist or held bars too old
+        // to continue from, and both cases want exactly what IB just returned.
+        .write(true)
+        .truncate(seeding)
         .open(&path)
         .map_err(|e| format!("{path}: {e}"))?;
     for b in &fresh {
@@ -925,7 +1069,8 @@ async fn backfill(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         writeln!(f, "{row}").map_err(|e| e.to_string())?;
     }
     println!(
-        "appended {} bars ({} -> {})",
+        "{} {} bars ({} -> {})",
+        if seeding { "seeded" } else { "appended" },
         fresh.len(),
         fresh.first().expect("nonempty").ts_utc,
         fresh.last().expect("nonempty").ts_utc
@@ -987,17 +1132,26 @@ async fn feed_task(
                     // of the task here would leave the process alive with no
                     // feed at all, so drop through to polling instead.
                     health.lock().expect("feed health").source = "poll".into();
-                    say("warn", "realtime stream ended — falling back to polling".into());
+                    say(
+                        "warn",
+                        "realtime stream ended — falling back to polling".into(),
+                    );
                 }
                 _ => {
                     health.lock().expect("feed health").source = "poll".into();
-                    say("info", "no realtime subscription — polling historical bars".into());
+                    say(
+                        "info",
+                        "no realtime subscription — polling historical bars".into(),
+                    );
                 }
             }
         }
         Err(e) => {
             health.lock().expect("feed health").source = "poll".into();
-            say("warn", format!("realtime refused ({e}) — polling historical bars"));
+            say(
+                "warn",
+                format!("realtime refused ({e}) — polling historical bars"),
+            );
         }
     }
 
@@ -1078,7 +1232,10 @@ async fn feed_task(
                     n
                 };
                 if recovered > 0 {
-                    say("info", format!("feed recovered after {recovered} failed poll(s)"));
+                    say(
+                        "info",
+                        format!("feed recovered after {recovered} failed poll(s)"),
+                    );
                 }
                 let now = chrono::Utc::now();
                 for b in &data.bars {

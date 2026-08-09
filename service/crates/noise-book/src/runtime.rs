@@ -106,7 +106,10 @@ impl Book {
             if self.halted.is_none() {
                 self.halted = Some("operator".into());
             }
-        } else if matches!(self.halted.as_deref(), Some("operator") | Some("operator-stop")) {
+        } else if matches!(
+            self.halted.as_deref(),
+            Some("operator") | Some("operator-stop")
+        ) {
             // An operator halt is operator-resumable. Rail halts (kill
             // criterion, reconcile mismatch, feed stall, refused orders)
             // stay latched: they mean something is WRONG, and clearing them
@@ -507,10 +510,17 @@ mod control_tests {
         Control::default()
     }
     fn halt() -> Control {
-        Control { halt: true, ..Default::default() }
+        Control {
+            halt: true,
+            ..Default::default()
+        }
     }
     fn stop() -> Control {
-        Control { halt: true, flatten: true, ..Default::default() }
+        Control {
+            halt: true,
+            flatten: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -543,7 +553,11 @@ mod control_tests {
             let mut b = book();
             b.halted = Some(reason.into());
             b.apply_control(&running());
-            assert_eq!(b.halted.as_deref(), Some(reason), "{reason} must stay latched");
+            assert_eq!(
+                b.halted.as_deref(),
+                Some(reason),
+                "{reason} must stay latched"
+            );
         }
     }
 
@@ -645,7 +659,11 @@ mod halt_semantics_tests {
             }
         }
         fn open_positions(&self) -> usize {
-            self.book.sleeves.iter().filter(|s| s.position.is_some()).count()
+            self.book
+                .sleeves
+                .iter()
+                .filter(|s| s.position.is_some())
+                .count()
         }
     }
 
@@ -665,10 +683,21 @@ mod halt_semantics_tests {
             d.feed(&all[i]);
             i += 1;
         }
-        assert!(d.open_positions() > 0, "never opened a position — test is vacuous");
-        let fills_at_halt = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+        assert!(
+            d.open_positions() > 0,
+            "never opened a position — test is vacuous"
+        );
+        let fills_at_halt = d
+            .book
+            .sleeve_totals()
+            .values()
+            .map(|(n, _)| *n)
+            .sum::<usize>();
 
-        d.book.apply_control(&Control { halt: true, ..Default::default() });
+        d.book.apply_control(&Control {
+            halt: true,
+            ..Default::default()
+        });
 
         // A week of further bars. Everything held must wind down.
         let end = (i + 2016).min(all.len());
@@ -681,7 +710,12 @@ mod halt_semantics_tests {
             0,
             "a halted book held its position through a week of bars — exits never ran"
         );
-        let fills_after = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+        let fills_after = d
+            .book
+            .sleeve_totals()
+            .values()
+            .map(|(n, _)| *n)
+            .sum::<usize>();
         assert!(fills_after > fills_at_halt, "the wind-down booked no fills");
     }
 
@@ -694,7 +728,10 @@ mod halt_semantics_tests {
         for b in &all[..12_000] {
             d.feed(b);
         }
-        d.book.apply_control(&Control { halt: true, ..Default::default() });
+        d.book.apply_control(&Control {
+            halt: true,
+            ..Default::default()
+        });
 
         // Let anything already open wind down first.
         let mut i = 12_000;
@@ -704,14 +741,23 @@ mod halt_semantics_tests {
         }
         assert_eq!(d.open_positions(), 0, "never wound down");
 
-        let fills_flat = d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>();
+        let fills_flat = d
+            .book
+            .sleeve_totals()
+            .values()
+            .map(|(n, _)| *n)
+            .sum::<usize>();
         let end = (i + 4032).min(all.len());
         for b in &all[i..end] {
             d.feed(b);
         }
         assert_eq!(d.open_positions(), 0, "a halted book opened a new position");
         assert_eq!(
-            d.book.sleeve_totals().values().map(|(n, _)| *n).sum::<usize>(),
+            d.book
+                .sleeve_totals()
+                .values()
+                .map(|(n, _)| *n)
+                .sum::<usize>(),
             fills_flat,
             "a halted book booked a new fill"
         );

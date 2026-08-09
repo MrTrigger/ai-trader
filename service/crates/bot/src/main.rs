@@ -1067,6 +1067,11 @@ async fn cmd_identity(cfg: &BotConfig, rest: &[String]) -> Result<(), String> {
                 "crypto",
                 "crypto-portfolio (Rust decide)",
                 Some(&cfg.state_dir.display().to_string()),
+                // This bot is driven by a schedule, not by a resident process:
+                // nothing supervises it, so it has no launch command. Recording
+                // one would put a Start button in front of an operator that
+                // cannot start anything.
+                None,
             )
             .await
             .map_err(|e| e.to_string())?;

@@ -25,6 +25,8 @@ pub enum RecordsError {
     UnknownBot(String),
     #[error("bot {0:?} is registered but disabled — enable it before running (fail closed)")]
     DisabledBot(String),
+    #[error("refused: {0}")]
+    Refused(String),
     #[error(
         "bot {bot_id:?} still owns operational records ({held}). Deregistering would orphan \
          history somebody may need to audit. Disable it instead, or clear those rows first if \
@@ -233,6 +235,12 @@ impl Registry {
 
     /// Operator convenience: register (or update) a bot row. Registration
     /// never enables — enabling is a separate, deliberate act.
+    ///
+    /// `launch` is the shell command that starts one process for this bot, and
+    /// it is deployment-specific: on a laptop it is a repo path, in the image
+    /// it is an absolute one. So it arrives here from whoever is registering
+    /// rather than from a migration, and a `None` keeps whatever is recorded.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_bot(
         &self,
         bot_id: &str,
@@ -241,6 +249,7 @@ impl Registry {
         asset_class: &str,
         decision_core: &str,
         state_dir: Option<&str>,
+        launch: Option<&str>,
     ) -> Result<(), RecordsError> {
         // state_dir is how anything finds this bot's files before it has ever
         // run and written a status row. Left null, the fleet view falls all the
@@ -249,10 +258,11 @@ impl Registry {
         // freshly deployed bot looked like until this was recorded.
         sqlx::query(
             "INSERT INTO bots (bot_id, display_name, cadence, asset_class, decision_core, \
-             state_dir) VALUES ($1, $2, $3, $4, $5, $6) \
+             state_dir, launch) VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (bot_id) DO UPDATE SET display_name = $2, cadence = $3, \
              asset_class = $4, decision_core = $5, \
-             state_dir = COALESCE(EXCLUDED.state_dir, bots.state_dir)",
+             state_dir = COALESCE(EXCLUDED.state_dir, bots.state_dir), \
+             launch = COALESCE(EXCLUDED.launch, bots.launch)",
         )
         .bind(bot_id)
         .bind(display_name)
@@ -260,6 +270,48 @@ impl Registry {
         .bind(asset_class)
         .bind(decision_core)
         .bind(state_dir)
+        .bind(launch)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Register (or update) an account at a venue that already exists.
+    ///
+    /// The venues are reference data and arrive by migration; the accounts on
+    /// them are per-environment, because which paper account you hold is not a
+    /// property of the code. They were hand-written SQL until a second
+    /// environment needed the same rows and there was nothing to run.
+    ///
+    /// `credential_ref` names the `.env` block that holds the secrets — the
+    /// reference travels in the database, the secret never does.
+    pub async fn register_account(
+        &self,
+        account_id: &str,
+        venue_id: &str,
+        kind: &str,
+        credential_ref: &str,
+        quote_currency: &str,
+        notes: Option<&str>,
+    ) -> Result<(), RecordsError> {
+        if kind != "paper" && kind != "live" {
+            return Err(RecordsError::Refused(format!(
+                "account kind {kind:?} is neither paper nor live"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO accounts (account_id, venue_id, kind, credential_ref, quote_currency, \
+             notes) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (account_id) DO UPDATE SET venue_id = $2, kind = $3, \
+             credential_ref = $4, quote_currency = $5, \
+             notes = COALESCE(EXCLUDED.notes, accounts.notes)",
+        )
+        .bind(account_id)
+        .bind(venue_id)
+        .bind(kind)
+        .bind(credential_ref)
+        .bind(quote_currency)
+        .bind(notes)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -650,7 +702,10 @@ impl Registry {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
     }
 
     pub async fn put_snapshot(

@@ -40,7 +40,12 @@ pub fn run(
     baseline_signal: &str,
     baseline_constructor: &str,
 ) -> Result<GateResult, String> {
-    let prepared = backtest::prepare(cfg, root, cfg.signal == "ml_ranker" || baseline_signal == "ml_ranker", features_crypto::FundingWindow::Trailing)?;
+    let prepared = backtest::prepare(
+        cfg,
+        root,
+        cfg.signal == "ml_ranker" || baseline_signal == "ml_ranker",
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let candidate =
         backtest::replay_prepared(cfg, start, end, root, initial_cash, Decimal::ONE, &prepared)?;
     let stressed = backtest::replay_prepared(

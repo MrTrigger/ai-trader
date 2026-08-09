@@ -92,6 +92,11 @@ impl IbConfig {
         Ok(Self {
             host,
             port,
+            // The trading loop's id. Every other purpose that connects to the
+            // same Gateway must take a different one: IB refuses a duplicate,
+            // and it can hold a just-disconnected id reserved for a while, so
+            // two phases of one deployment sharing an id fail intermittently
+            // and only under load. 8 is the ib-check probe, 7 is backfill.
             client_id: 9,
             account,
             symbol: std::env::var("IB_SYMBOL").unwrap_or_else(|_| "MNQ".into()),

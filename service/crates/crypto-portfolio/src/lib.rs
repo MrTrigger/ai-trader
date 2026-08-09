@@ -636,8 +636,10 @@ fn construct(signals: &[Signal], cfg: &Config) -> Result<Construction, String> {
                     for (side, sign) in [(longs, Decimal::ONE), (shorts, -Decimal::ONE)] {
                         let total: Decimal = side.iter().map(|(s, vol)| s.conviction / *vol).sum();
                         for (s, vol) in side {
-                            weights
-                                .insert(s.asset.clone(), sign * half * (s.conviction / vol) / total);
+                            weights.insert(
+                                s.asset.clone(),
+                                sign * half * (s.conviction / vol) / total,
+                            );
                         }
                     }
                     let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
@@ -1065,7 +1067,11 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
     // decision date let exactly that day through — one leaked date per fold,
     // which the Python side (comparing `frame["ts_utc"].max()`, the last closed
     // bar) always refused. Match the stricter side.
-    let newest_feature_date = input.as_of.date_naive().pred_opt().ok_or("date underflow")?;
+    let newest_feature_date = input
+        .as_of
+        .date_naive()
+        .pred_opt()
+        .ok_or("date underflow")?;
     let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg)?;
     let construction = construct(&generated.values, cfg)?;
     let betas: BTreeMap<_, _> = latest

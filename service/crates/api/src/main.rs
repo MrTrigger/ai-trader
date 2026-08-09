@@ -87,9 +87,14 @@ const USAGE: &str = "\
 usage: api [--state-dir <dir> --initial-cash <amount>]
            [--bot <path> --bot-config <file>]
            [--port N] [--expectation <file>] [--quote-currency USD]
+           [--no-supervise]
 
 Serves the operations dashboard on http://127.0.0.1:7434 until you stop it.
 Loopback only - nothing outside this machine can reach it.
+
+Bots are its children: every registered bot whose control says `running` and
+whose `launch` command is recorded is kept running, and relaunched if it
+exits. --no-supervise turns that off for a bot you are driving by hand.
 
 With no arguments at all this is the FLEET CONTROL PLANE: it serves every
 registered bot from the records DB (DATABASE_URL) and wraps no bot of its
@@ -112,6 +117,9 @@ struct Config {
     expectation: Option<PathBuf>,
     cadence_hours: i64,
     port: u16,
+    /// Do not keep bots whose control says `running` alive. For driving a bot
+    /// from your own terminal without this process launching a second one.
+    no_supervise: bool,
 }
 
 /// Read `KEY=value` lines into the environment without overwriting anything
@@ -172,13 +180,36 @@ fn main() -> ExitCode {
     }
     println!("  http://{}:{}", bind_addr(), cfg.port);
     println!("  loopback only - not reachable from the network. ctrl-c to stop.");
-    match cfg.static_dir.as_ref().filter(|d| d.join("index.html").exists()) {
+    match cfg
+        .static_dir
+        .as_ref()
+        .filter(|d| d.join("index.html").exists())
+    {
         Some(d) => println!("  ui: {} (built frontend)", d.display()),
         None => println!("  ui: legacy embedded page — run `bun run build` in frontend/"),
     }
     match std::env::var("DATABASE_URL") {
         Ok(_) => println!("  fleet: identity registry configured"),
         Err(_) => println!("  fleet: no DATABASE_URL, so the fleet view is unavailable"),
+    }
+    // Supervision is the api's job because the api is the process that can
+    // spawn: bots run as its children, so a bot whose control says running and
+    // whose process died is something only this loop can put right. Opt out
+    // with --no-supervise when you want to drive a bot from your own shell and
+    // not have it relaunched underneath you.
+    if std::env::var("DATABASE_URL").is_ok() && !cfg.no_supervise {
+        match std::env::current_dir() {
+            Ok(root) => {
+                println!(
+                    "  supervisor: keeping running bots alive from {}",
+                    root.display()
+                );
+                fleet::supervise(root);
+            }
+            Err(e) => eprintln!("  supervisor: no working directory ({e}) — not supervising"),
+        }
+    } else if cfg.no_supervise {
+        println!("  supervisor: off (--no-supervise) — nothing relaunches a bot that exits");
     }
     match cfg.bot.as_ref().map(|b| (b.binary.as_ref(), &b.config)) {
         Some((Some(binary), config)) => println!(
@@ -233,7 +264,11 @@ fn parse(args: &[String]) -> Result<Config, String> {
     // launched before `bun run build` served the legacy page forever, with
     // no hint why — the operator sees an old UI and reasonably concludes
     // the change never landed.
-    let static_dir = Some(get("--static-dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("frontend/dist")));
+    let static_dir = Some(
+        get("--static-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("frontend/dist")),
+    );
     let state_dir = get("--state-dir").map(PathBuf::from);
     let initial_cash: Decimal = match get("--initial-cash") {
         Some(c) => c
@@ -264,6 +299,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
             .and_then(|c| c.parse().ok())
             .unwrap_or(24),
         port,
+        no_supervise: args.iter().any(|a| a == "--no-supervise"),
     })
 }
 
@@ -433,9 +469,14 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                         // the bot process rather than idling it, so Start
                         // must be able to bring one back.
                         if state == "running" {
-                            match fleet::maybe_spawn(&std::env::current_dir().unwrap_or_default(), &id) {
+                            match fleet::maybe_spawn(
+                                &std::env::current_dir().unwrap_or_default(),
+                                &id,
+                            ) {
                                 Ok(sp) => v["spawn"] = sp,
-                                Err(e) => v["spawn"] = serde_json::json!({ "spawned": false, "error": e }),
+                                Err(e) => {
+                                    v["spawn"] = serde_json::json!({ "spawned": false, "error": e })
+                                }
                             }
                         }
                         json(&mut stream, 200, &serde_json::to_vec(&v).unwrap())
@@ -606,7 +647,11 @@ fn json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Re
 /// same document — the app resolves it client-side — so a refresh or a
 /// pasted link lands where it should instead of 404ing.
 fn serve_index(stream: &mut TcpStream, cfg: &Config, head_only: bool) -> std::io::Result<()> {
-    match cfg.static_dir.as_ref().map(|d| std::fs::read(d.join("index.html"))) {
+    match cfg
+        .static_dir
+        .as_ref()
+        .map(|d| std::fs::read(d.join("index.html")))
+    {
         Some(Ok(body)) => respond(stream, 200, "text/html; charset=utf-8", &body, head_only),
         // No fallback page any more. An api with no bundle says so, with
         // the command that fixes it — which is more useful than serving a

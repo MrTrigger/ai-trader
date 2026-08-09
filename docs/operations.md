@@ -12,7 +12,21 @@ Everything below is the whole loop: change code, ship it, watch it, intervene.
 
 ---
 
+Two bots, and they are driven differently on purpose:
+
+| | `crypto-portfolio` | `futures-noise` |
+|---|---|---|
+| decides | once a day, on the daily bar | every 5-minute bar close |
+| driven by | a CronJob running `cycle.sh` | a resident process, supervised by the api |
+| venue | Hyperliquid (paper book) | IB Gateway (paper account, armed) |
+| controls | CLI, audited by kubeconfig | the dashboard's Start/Halt/Stop |
+
+---
+
 ## 1. The daily cycle, and why it is a script
+
+This section is the **crypto** bot. The futures bot has no cycle — it is a loop
+that never stops between bars, §3.
 
 One decision-and-execution cycle is four commands, in `deploy/cycle.sh` on the
 cluster and `bin/cycle.sh` on the laptop:
@@ -44,11 +58,19 @@ cargo build --release -p crypto-portfolio -p bot -p api   # in service/
 # a full cycle against the local paper book
 bin/cycle.sh var/live/bot.json
 
-# the dashboard (loopback, no flag to change that)
+# the dashboard (loopback, no flag to change that). It supervises: any bot whose
+# control says running and whose `launch` is recorded is kept alive. Add
+# --no-supervise when you want to run one from your own terminal instead.
 ./service/target/release/api --state-dir var/live/state \
   --initial-cash 100000 --quote-currency USDC \
   --bot ./service/target/release/bot --bot-config var/live/bot.json
 ```
+
+The futures bot on the laptop is `bots/futures/run.sh` — `live` to arm, `shadow`
+for simulated fills, `parity` for the gate. Its warmup bars come from the
+journal's parquet store through Python; in the image there is no Python, so the
+Gateway's own history is the source. Same binary, same strategy, one plumbing
+difference. `bots/futures/README.md` has the rest.
 
 ### Research: walk-forward is the only measurement that counts
 
@@ -86,33 +108,99 @@ live evidence. `docs/phase-1-findings.md` records what was tried and rejected.
 
 ## 3. Cluster: what is deployed
 
+Both bots live in one pod, against the cluster's Postgres. `/data` is a cache;
+nothing durable is file-resident.
+
 | piece | what it is |
 |---|---|
-| `CronJob aitrader-paper-cycle` | the decision cycle, 00:05 UTC daily |
-| `Deployment aitrader-paper` | two sidecars: the Hyperliquid marks feed, and the dashboard |
-| `PVC aitrader-paper-data` | bars, universe snapshots, funding, paper venue state (10Gi, `local-path`, pinned to `talos-2`) |
-| `Secret aitrader-paper-secret` | `DATABASE_URL` only — sops-encrypted in git |
+| `CronJob aitrader-paper-cycle` | the crypto decision cycle, 00:05 UTC daily |
+| `Deployment aitrader-paper` | `ib-gateway` (sidecar), `feed`, `api` — and `futures-bot` as a child of `api` |
+| `PVC aitrader-paper-data` | bars, universe snapshots, funding, paper venue state, the futures bar cache, IB Gateway settings (10Gi, `local-path`, pinned to `talos-2`) |
+| `Secret aitrader-paper-secret` | `DATABASE_URL`, `TWS_USERID`, `TWS_PASSWORD`, `IB_PAPER_ACCOUNT` — sops-encrypted in git |
 | Postgres `ai_trader` | identity registry, controls, runs, fills, ledger, paper book |
 
 - Dashboard: **https://trader.wallintech.eu** (also a homepage tile)
 - The manifests live in `triggerlab`, at
   `kubernetes/apps/trader/aitrader-paper/`
 
-### The dashboard on the cluster is a lens, not a hand
+### The futures bot is a process, not a container
 
-It runs **without `--bot`**, so its control endpoints refuse. Interventions go
-through `kubectl exec` (§6), where they are authenticated by your kubeconfig and
-audited by the cluster. Ingress is restricted by NetworkPolicy to the gateway and
-the homepage monitor.
+`futures-noise` runs as a child of the `api` container, launched by the command
+recorded in `bots.launch` (`/usr/local/bin/futures-live.sh`). That is not a
+packaging convenience, it is what makes the control states mean anything:
 
-The laptop instance keeps its hands — it is loopback-only and drives a throwaway
-book.
+- **Stop ENDS the process.** A container that exits is a container the kubelet
+  restarts, so a stopped bot in its own container would come straight back —
+  crash-looping on the operator's own instruction. With the api as its parent,
+  stopped means stopped and burns no CPU.
+- **Start launches one**, and the api **supervises**: every 30s it checks each
+  bot whose control says `running`, and relaunches any that is not publishing
+  (90s without a heartbeat, or a final document saying it exited). A SIGKILLed
+  bot is back inside two minutes without anybody watching.
+- A control word with no row reads as **halted**, never running. Registration
+  enables a bot; it never starts one.
 
-### No venue credentials anywhere in this stack
+`--no-supervise` turns that off, for when you are driving a bot from your own
+terminal and do not want a second one appearing underneath you.
 
-Paper needs public market data and the account address. There is no
-`HL_AGENT_PRIVATE_KEY` in the image, the manifests, or the cluster. Going live
-is a deliberate, separate act.
+### IB Gateway runs in the pod
+
+The futures bot needs a Gateway and a Gateway needs a desktop, so
+`ghcr.io/gnzsnz/ib-gateway` (IBC + Xvfb + socat) runs as a **native sidecar** —
+an init container with `restartPolicy: Always`, which is what makes it start
+before the other init containers and stay up. Containers in a pod share a
+network namespace, so the bot reaches it at `127.0.0.1:4004` (socat's relay of
+the Gateway's loopback-only 4002). Nothing outside the pod can: the
+NetworkPolicy admits 7434 and nothing else, and the IB API is an unauthenticated
+raw socket.
+
+**One session per IBKR username.** IB allows a single Gateway login per user, and
+`EXISTING_SESSION_DETECTED_ACTION=primary` means this pod takes it. Starting the
+cluster Gateway therefore **kicks out the Gateway on your laptop**, and the bot
+attached to it goes blind. Run one or the other, or get a second paper user.
+
+The Gateway restarts itself at 21:15 UTC (`AUTO_RESTART_TIME`), because IB
+expires the session daily. That is inside CME's 16:00–17:00 CT maintenance
+break, so there are no bars to miss — and the bot's stall watchdog does not
+count silence while the market is closed. It has **no readiness probe on
+purpose**: pod readiness gates the Service, and a dashboard that vanishes
+exactly when the broker link does could not report the one thing you would want
+to know.
+
+### The warmup bars come from IB, not from the lab
+
+The noise band needs 14 completed sessions before it reads at all, and the
+laptop fills that from the journal's parquet store through Python — which is not
+in the image. So `futures-live.sh` waits for the Gateway and then runs
+`futures-bot backfill --days 45`, which **seeds** when there is no cache and
+extends when there is. A cache whose last bar predates the window is replaced
+rather than appended to: a noise band computed across a hole is a number with no
+meaning.
+
+### What the dashboard can do, and to which bot
+
+The crypto half is still a **lens**: that api runs without `--bot`, so its
+single-bot controls refuse, and its cycle belongs to the CronJob. Interventions
+go through `kubectl exec` (§6), authenticated by your kubeconfig.
+
+The futures half is a **hand**. Start, Halt and Stop on the bot page write
+`control_events` and reach a real process — Halt is a graceful stop (no new
+entries, open positions still close when the strategy says so), Stop exits the
+process. The NetworkPolicy, restricting ingress to the gateway and the homepage
+monitor, is what decides who can press them.
+
+### Which credentials are in this stack, and which are not
+
+There is no `HL_AGENT_PRIVATE_KEY` in the image, the manifests, or the cluster:
+crypto paper needs public market data and an address, and going live is a
+deliberate, separate act.
+
+The futures side does hold credentials, because a broker session cannot be
+opened without them: the IBKR **paper** username and password, in sops. Order
+flow is armed against the paper account (`IB_ALLOW_ORDERS=yes`,
+`IB_ALLOW_LIVE=no`, bound to `ib-paper`); reaching live capital would take both
+a flag flip and a binding change. `FUTURES_LIVE=no` drops the bot to shadow —
+simulated fills, published, nothing sent — as a one-line change.
 
 ---
 
@@ -205,9 +293,10 @@ names disagree with its own, and refuses to score any date at or before
 ```bash
 export KUBECONFIG=~/dev/magnus/triggerlab/kubeconfig
 kubectl get pods,cronjob,job -n trader | grep aitrader
-kubectl logs -n trader deploy/aitrader-paper -c feed --tail=20     # marks feed
-kubectl logs -n trader deploy/aitrader-paper -c api  --tail=20     # dashboard
-kubectl logs -n trader job/<the-cycle-job> | tail -40              # a cycle
+kubectl logs -n trader deploy/aitrader-paper -c feed --tail=20        # marks feed
+kubectl logs -n trader deploy/aitrader-paper -c api  --tail=20        # dashboard + supervisor
+kubectl logs -n trader deploy/aitrader-paper -c ib-gateway --tail=40  # IBC login, restarts
+kubectl logs -n trader job/<the-cycle-job> | tail -40                 # a cycle
 
 POD=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
         --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
@@ -222,6 +311,24 @@ Run a cycle by hand (the CronJob's own definition, so it cannot drift):
 ```bash
 kubectl create job -n trader cycle-manual --from=cronjob/aitrader-paper-cycle
 ```
+
+### Watching the futures bot
+
+```bash
+# is there a process, and whose child is it
+kubectl exec -n trader $POD -c api -- ps -o pid,ppid,etime,cmd -C futures-bot
+
+# what it printed: the wait for the Gateway, the backfill, the loop
+kubectl exec -n trader $POD -c api -- tail -40 /data/var/futures-noise.launch.log
+
+# is the Gateway answering at all
+kubectl exec -n trader $POD -c api -- futures-bot ib-check
+```
+
+`ib-check` connects on client id 8 and the loop uses 9, so the probe is safe
+while the bot runs. `backfill` uses 7 for the same reason: IB refuses a duplicate
+id and can hold a just-released one reserved, so two phases of one deployment
+sharing an id fails intermittently and only under load.
 
 ### What Phase 2 is actually grading
 
@@ -262,6 +369,26 @@ Suspend the schedule entirely:
 
 ```bash
 kubectl patch cronjob aitrader-paper-cycle -n trader -p '{"spec":{"suspend":true}}'
+```
+
+### Intervening on the futures bot
+
+Use the dashboard: **Start**, **Halt**, **Stop** on the bot page. They write the
+same audited `control_events` rows, and unlike the crypto controls they reach a
+process that acts within a second (Postgres `NOTIFY`, not a poll).
+
+| you press | what happens |
+|---|---|
+| **Halt** | graceful stop: no new entries, open positions still close when the strategy exits them |
+| **Stop** | flat and gone: the book closes, the process exits, and the supervisor leaves it alone |
+| **Start** | a fresh process, publishing in ~7s |
+
+If the ingress is what is broken rather than the bot, go straight at the api —
+same endpoints, authenticated by your kubeconfig:
+
+```bash
+kubectl port-forward -n trader $POD 7434:7434 &
+curl -X POST localhost:7434/api/bots/futures-noise/halt   # or /stop, /resume
 ```
 
 ### The gates that will stop a run, and what each means
@@ -307,7 +434,14 @@ kubectl exec -n trader $POD -c feed -- bot --config /app/bot.json \
   resume --reason "..." --by magnus
 ```
 
-A new PVC also needs the bar store seeded, or the first cycle spends hours
+The futures bot needs none of that. Its identity is written on every pod start
+by the `register-futures` init container — account, trade binding, `state_dir`,
+`launch`, enabled, idempotent — which migrates the schema first, so a fresh
+database is deployable with nothing run by hand. It is registered and enabled
+and **not started**: the control word decides that, and no control row reads as
+halted. Press Start once.
+
+A new PVC needs the *crypto* bar store seeded, or the first cycle spends hours
 rebuilding history it could have copied:
 
 ```bash
@@ -315,6 +449,22 @@ tar czf /tmp/seed.tgz -C data bars funding universe
 kubectl cp /tmp/seed.tgz trader/$POD:/data/seed.tgz -c feed
 kubectl exec -n trader $POD -c feed -- sh -c 'cd /data && tar xzf seed.tgz && rm seed.tgz'
 ```
+
+The futures bar cache is not seeded by hand — `futures-live.sh` fetches 45 days
+from the Gateway on first launch.
+
+**A fresh IB paper account** needs `IB_PAPER_ACCOUNT` in the sops secret, plus
+the Gateway's own login:
+
+```bash
+cd ~/dev/magnus/triggerlab
+sops kubernetes/apps/trader/aitrader-paper/app/secret.sops.yaml   # TWS_USERID, TWS_PASSWORD
+```
+
+Both start as `REPLACE_ME`, and IBC fails the login loudly rather than quietly
+running without a broker. Which account the Gateway happens to hold is never
+inferred: a mismatch with `IB_PAPER_ACCOUNT` is a refusal, because that is how a
+paper bot meets a live account.
 
 ---
 
@@ -340,3 +490,14 @@ kubectl exec -n trader $POD -c feed -- sh -c 'cd /data && tar xzf seed.tgz && rm
 - **The api binds loopback** unless `KUBERNETES_SERVICE_HOST` is present, in
   which case it binds wide. Detected, never configured — a flag is a thing that
   gets set.
+- **`containers[1]` was the api** until the pod grew a Gateway. `bin/deploy.sh`
+  now selects it by name; an index that quietly points at a different container
+  verifies the wrong image and reports success.
+- **`pgrep -f futures-bot` matches its own shell.** The command line containing
+  the pattern is itself a process, so a check for "is the bot running" answers
+  yes when nothing is. `pgrep -x futures-bot` asks about the executable.
+- **IB allows one Gateway session per username.** Bringing up the cluster
+  Gateway logs the laptop's out from under whatever is attached to it.
+- **A sidecar with a readiness probe gates the Service.** The Gateway restarts
+  nightly; probing it would take the dashboard down with it, exactly when you
+  would want to look at the dashboard.

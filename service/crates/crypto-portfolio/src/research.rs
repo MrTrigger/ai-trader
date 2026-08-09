@@ -128,7 +128,12 @@ pub fn build(
     if bars.is_empty() {
         return Err("daily store is empty".into());
     }
-    let prepared = backtest::prepare(config, root, false, features_crypto::FundingWindow::Trailing)?;
+    let prepared = backtest::prepare(
+        config,
+        root,
+        false,
+        features_crypto::FundingWindow::Trailing,
+    )?;
     let specifications = [
         ("momentum", "xs_momentum", "conviction_tilt"),
         ("gc_breakout", "gc_breakout", "conviction_tilt"),

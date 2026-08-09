@@ -519,13 +519,21 @@ mod tests {
         assert_eq!(a, b, "live drive_bar diverged from the replay loop");
         // A test that compares two empty books proves nothing.
         let fills: usize = a.values().map(|(n, _)| *n).sum();
-        assert!(fills > 0, "synthetic week produced no fills — test is vacuous");
+        assert!(
+            fills > 0,
+            "synthetic week produced no fills — test is vacuous"
+        );
 
         for (sa, sb) in book_a.sleeves.iter().zip(book_b.sleeves.iter()) {
             let pos = |s: &noise_book::runtime::SleeveState| {
                 s.position.as_ref().map(|p| (p.direction, p.contracts))
             };
-            assert_eq!(pos(sa), pos(sb), "{} ended on a different position", sa.cfg.key);
+            assert_eq!(
+                pos(sa),
+                pos(sb),
+                "{} ended on a different position",
+                sa.cfg.key
+            );
         }
     }
 

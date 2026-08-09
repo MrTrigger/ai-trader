@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use chrono::{Timelike, DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 
 use crate::{config::Config, store, universe};
 
@@ -167,7 +167,10 @@ pub fn build(
             block.push((asset.to_owned(), p1 / p0 - 1.0, vol, values));
         }
         if block.len() >= 12 {
-            let raw = block.iter().map(|(_, _, _, v)| v.clone()).collect::<Vec<_>>();
+            let raw = block
+                .iter()
+                .map(|(_, _, _, v)| v.clone())
+                .collect::<Vec<_>>();
             let normalised = features_crypto::rank_normalise(&raw)?;
             let mean_target = block.iter().map(|(_, y, _, _)| y).sum::<f64>() / block.len() as f64;
             for ((asset, target, vol, _), values) in block.into_iter().zip(normalised) {
