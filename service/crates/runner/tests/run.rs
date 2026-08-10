@@ -1110,6 +1110,56 @@ async fn the_closing_book_prices_the_names_this_run_opened() {
     assert!(dec(&eth.qty).is_sign_negative(), "the ETH leg is a short");
 }
 
+/// A record written before runs kept a closing book can be repaired once.
+///
+/// The quantities come from the venue as it stands, so the repair is only
+/// sound while nothing has traded since. It refuses anything but the newest
+/// run rather than marking an old record with a book that has moved.
+#[tokio::test]
+async fn a_run_recorded_without_a_closing_book_can_be_marked_once() {
+    let dir = tmpdir("mark-recorded");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let plan = plan_decided_at_written_at("2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z");
+
+    // A run of that plan, then its book_after wiped: the shape of every record
+    // written before the runner kept one.
+    let rec = runner(&venue, &clock, &store, &ledger, controls.clone(), Schedule::default())
+        .run(&plan)
+        .await
+        .expect("the run completes");
+    assert!(!rec.book_after.is_empty(), "the run itself marks its book");
+    let mut stripped = rec.clone();
+    stripped.book_after = Vec::new();
+    store.record(&stripped).unwrap();
+    assert!(store.recent(1).unwrap()[0].book_after.is_empty());
+
+    let r = runner(&venue, &clock, &store, &ledger, controls.clone(), Schedule::default());
+    let marked = r.mark_recorded(&plan).await.expect("marks");
+    assert_eq!(marked.as_deref(), Some(rec.run_id.as_str()));
+    let after = store.recent(1).unwrap();
+    assert_eq!(
+        after[0].book_after.len(),
+        rec.book_after.len(),
+        "the repair reproduces what the run would have written"
+    );
+
+    // Idempotent: a second pass has nothing to do.
+    assert_eq!(r.mark_recorded(&plan).await.expect("second pass"), None);
+
+    // And a plan whose run is not the newest is refused, not applied.
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    v["run_id"] = serde_json::json!("11111111-1111-4111-8111-111111111111");
+    let other = plan::Plan::parse(&v.to_string()).unwrap();
+    assert!(
+        r.mark_recorded(&other).await.is_err(),
+        "repairing an older run would mark it with a book that has since moved"
+    );
+}
+
 // --- settlement --------------------------------------------------------------
 
 /// Build a finished run with a priced closing book.

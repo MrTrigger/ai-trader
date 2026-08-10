@@ -73,6 +73,8 @@ commands:
   history [--limit N]                recent runs, newest first
   positions                          what the venue says we hold
   settle                             attribute the period each past run opened
+  mark-book --plan FILE              write the closing book onto the newest run
+                                     if it was recorded without one
   markets                            the assets this venue lists (stdout)
   book                               cash and positions, planner format (stdout)
   reconcile                          our record against the venue's; changes nothing
@@ -151,6 +153,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
         "positions" => block_on(cmd_positions(&cfg)),
         "settle" => cmd_settle(&cfg),
+        "mark-book" => cmd_mark_book(&cfg, PathBuf::from(flags.need("--plan")?)),
         "markets" => block_on(cmd_markets(&cfg)),
         "book" => block_on(cmd_book(&cfg)),
         "reconcile" => block_on(cmd_reconcile(&cfg)),
@@ -690,6 +693,64 @@ async fn settle_inner(cfg: &BotConfig, st: &Stores, controls: ControlStore) -> R
     match settled.len() {
         0 => println!("nothing to settle: every closed period already has a result"),
         n => println!("settled {n} period(s): {}", settled.join(", ")),
+    }
+    Ok(())
+}
+
+/// Repair a run recorded before runs kept a closing book.
+///
+/// One-shot, guarded, and idempotent: it refuses any run but the newest,
+/// because the quantities come from the venue as it stands and a later run
+/// would have moved them. The prices come from the plan, so the repaired
+/// record is marked at the decision, not at the repair.
+fn cmd_mark_book(cfg: &BotConfig, plan_path: PathBuf) -> Result<(), String> {
+    // Same runtime-drop discipline as `settle`: the stores own a blocking
+    // Records handle, and dropping its runtime inside an async frame panics.
+    let st = open_stores(cfg)?;
+    let (st, out) = block_on(mark_book_with(cfg, st, plan_path));
+    drop(st);
+    out
+}
+
+async fn mark_book_with(
+    cfg: &BotConfig,
+    mut st: Stores,
+    plan_path: PathBuf,
+) -> (Stores, Result<(), String>) {
+    let controls = std::mem::replace(
+        &mut st.controls,
+        ControlStore::File(cfg.state_dir.join("controls.json")),
+    );
+    let out = mark_book_inner(cfg, &st, controls, plan_path).await;
+    (st, out)
+}
+
+async fn mark_book_inner(
+    cfg: &BotConfig,
+    st: &Stores,
+    controls: ControlStore,
+    plan_path: PathBuf,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(&plan_path)
+        .map_err(|e| format!("cannot read plan {}: {e}", plan_path.display()))?;
+    let plan = plan::Plan::parse(&text).map_err(|e| e.to_string())?;
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
+    let clock = SystemClock;
+    let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
+        venue: &venue,
+        clock: &clock,
+        store: &st.store,
+        ledger: &st.ledger,
+        controls,
+        schedule: cfg.schedule,
+        max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag: false,
+    };
+    match runner.mark_recorded(&plan).await.map_err(|e| e.to_string())? {
+        Some(id) => println!("marked the closing book on run {id}"),
+        None => println!("nothing to mark: the newest run already has a closing book"),
     }
     Ok(())
 }

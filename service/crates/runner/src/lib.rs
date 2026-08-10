@@ -105,6 +105,9 @@ pub enum RunnerError {
         max_minutes: i64,
     },
 
+    #[error("{0}")]
+    Refused(String),
+
     #[error("execution: {0}")]
     Execution(#[from] ExecError),
 
@@ -1194,6 +1197,43 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             }
         }
         Ok(book)
+    }
+
+    /// Write the closing book onto a finished run that was recorded without one.
+    ///
+    /// Records written before runs kept a closing book have nothing to settle
+    /// against and nothing to show, and the gap does not heal on its own — the
+    /// prices that run decided on are gone the moment the next plan is written.
+    ///
+    /// Only the NEWEST run can be repaired, and only from its own plan. The
+    /// quantities come from the venue as it stands, which is that run's book
+    /// exactly as long as nothing has traded since; a later run invalidates
+    /// that and the repair is refused rather than guessed. The prices come from
+    /// the plan, so a record repaired hours later is marked at the moment the
+    /// decision was made, not at the moment of the repair.
+    pub async fn mark_recorded(&self, plan: &Plan) -> Result<Option<String>, RunnerError> {
+        let runs = self.store.recent(2)?;
+        let Some(newest) = runs.first() else {
+            return Ok(None);
+        };
+        if newest.run_id != plan.run_id.to_string() {
+            return Err(RunnerError::Refused(format!(
+                "plan {} is not the newest run ({}); repairing an older run would \
+                 mark it with a book that has since moved",
+                plan.run_id, newest.run_id
+            )));
+        }
+        if !newest.book_after.is_empty() {
+            return Ok(None);
+        }
+        let book = self.mark_book(plan).await?;
+        if book.is_empty() {
+            return Ok(None);
+        }
+        let mut amended = newest.clone();
+        amended.book_after = book;
+        self.store.record(&amended)?;
+        Ok(Some(amended.run_id))
     }
 
     /// Attribute the period a past run opened, once it has closed.
