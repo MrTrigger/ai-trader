@@ -257,24 +257,9 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
                   <Stat k="NAV" v={`${money(run.result.nav_start ?? 0)} → ${money(run.result.nav_end ?? 0)}`} />
                 </div>
               </div>
-              {(run.result.contributors ?? []).length > 0 && (
-                <div className="mt-3">
-                  <p className="eyebrow mb-1.5">
-                    Movers <span className="text-faint">· mark to mark, biggest first</span>
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(run.result.contributors ?? []).slice(0, 12).map((c) => (
-                      <span
-                        key={c.asset}
-                        title={`${c.qty} @ ${c.mark_start} → ${c.mark_end}`}
-                        className={`num rounded border border-line2 px-1.5 py-0.5 text-[11px] ${tone(c.pnl)}`}
-                      >
-                        <span className="text-ink">{c.asset}</span> {signed(c.pnl)}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {/* Per-name attribution lives in the book table below, against the
+                  position that earned it — a separate chip strip said the same
+                  numbers twice and neither copy showed the size behind them. */}
               {Math.abs(num(run.result.unattributed)) > 0.005 && (
                 <p className="mt-2 text-[11px] text-faint">
                   {signed(run.result.unattributed ?? 0)} unattributed — fees, and anything opened or
