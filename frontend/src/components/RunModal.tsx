@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { AssetName } from "./AssetName";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
 type Order = {
@@ -75,11 +76,14 @@ export type Run = {
 export function RunModal({
   run,
   before,
+  venue,
   onClose,
 }: {
   run: Run;
   /** The run immediately before this one, where there is one. */
   before?: Run;
+  /** Which venue this bot trades on, so a symbol can link to its chart. */
+  venue?: string;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -353,7 +357,9 @@ export function RunModal({
                   <tbody className="num">
                     {rows.map((r) => (
                       <tr key={r.asset} className="border-b border-line/40">
-                        <td className="py-1.5 font-display text-ink">{r.asset}</td>
+                        <td className="py-1.5 align-top">
+                          <AssetName asset={r.asset} venue={venue} />
+                        </td>
                         <td>
                           <span className={`rounded px-1.5 py-0.5 text-[10px] ${CHANGE[r.change].cls}`}>
                             {CHANGE[r.change].label}

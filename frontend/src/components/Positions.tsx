@@ -1,3 +1,4 @@
+import { AssetName } from "./AssetName";
 import { money, num, signed, tone } from "../lib/format";
 
 export type Position = {
@@ -26,7 +27,7 @@ export type Position = {
  * The price columns say "entry price" and "current price" rather than "entry"
  * and "mark". Mark is what the desk calls it; it is not what it is.
  */
-export function Positions({ positions }: { positions: Position[] }) {
+export function Positions({ positions, venue }: { positions: Position[]; venue?: string }) {
   if (positions.length === 0) {
     return <p className="text-[12px] text-faint">Flat — nothing open.</p>;
   }
@@ -79,7 +80,9 @@ export function Positions({ positions }: { positions: Position[] }) {
                     const pct = (Math.abs(w) / widest) * 100;
                     return (
                       <tr key={p.asset} className="border-b border-line/40">
-                        <td className="py-1.5 font-display text-ink">{p.asset}</td>
+                        <td className="py-1.5">
+                          <AssetName asset={p.asset} venue={venue} />
+                        </td>
                         <td className="pr-3 text-right text-dim">{compact(p.qty)}</td>
                         <td className="pr-3 text-right text-dim">{price(p.avg_price)}</td>
                         <td className="pr-3 text-right">{price(p.mark)}</td>

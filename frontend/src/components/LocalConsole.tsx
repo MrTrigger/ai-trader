@@ -38,7 +38,7 @@ type Local = {
  * futures bot's name — the worst kind of wrong, because every number on it was
  * real.
  */
-export function LocalConsole({ botId }: { botId?: string }) {
+export function LocalConsole({ botId, venue }: { botId?: string; venue?: string }) {
   const q = useQuery({
     queryKey: ["local"],
     queryFn: async () => {
@@ -94,7 +94,7 @@ export function LocalConsole({ botId }: { botId?: string }) {
         </div>
 
         <div className="mt-5 border-t border-line pt-4">
-          <Positions positions={positions} />
+          <Positions positions={positions} venue={venue} />
         </div>
 
         <div className="mt-4 flex flex-wrap gap-x-6 gap-y-1 border-t border-line pt-3 text-[11px] text-faint">

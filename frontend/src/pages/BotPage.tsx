@@ -35,6 +35,9 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const [openRun, setOpenRun] = useState<{ run: Run; before?: Run } | null>(null);
   const st = d.state ?? {};
   const det = st.detail ?? {};
+  // The venue actually bound for trading, so a symbol links to ITS chart and
+  // not to whichever exchange happens to list the same ticker.
+  const venueId = d.broker?.venue_id ?? undefined;
   const sleeves = Object.entries(det.sleeves ?? {});
   const feed = det.feed;
   const ctl = d.controls as { state?: string; set_at?: string } | null;
@@ -250,7 +253,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
             </>
           ) : (
             <>
-            <LocalConsole botId={id} />
+            <LocalConsole botId={id} venue={venueId} />
             <Card title="Run history" aside={`${(d.runs ?? []).length} recorded`}>
               {(d.runs ?? []).length === 0 ? (
                 <p className="text-[12px] text-faint">Nothing has run yet.</p>
@@ -342,7 +345,12 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
 
       {logs && <LogModal botId={id} onClose={() => setLogs(false)} />}
       {openRun && (
-        <RunModal run={openRun.run} before={openRun.before} onClose={() => setOpenRun(null)} />
+        <RunModal
+          run={openRun.run}
+          before={openRun.before}
+          venue={venueId}
+          onClose={() => setOpenRun(null)}
+        />
       )}
 
       {settings && (
