@@ -47,7 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use executor::{Controls, ExecError, ExecutionRecord};
-use plan::{Order, Plan};
+use plan::{Order, OrderReason, Plan};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -1136,12 +1136,32 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
     /// A position we cannot price is left out rather than marked at zero: its
     /// absence lands in `unattributed`, which is honest, where a zero would
     /// invent a loss.
+    ///
+    /// `current` alone prices only what the run INHERITED, so a book taken from
+    /// flat would come back empty and every name this run opened would be
+    /// missing from its own closing book. An Entry buys the whole target from
+    /// zero, so its order quantity carries the same relation to the target
+    /// weight and prices the new name off the same numbers.
     async fn mark_book(&self, plan: &Plan) -> Result<Vec<BookMark>, RunnerError> {
         let nav = plan.nav.total;
         let mut marks: BTreeMap<&str, Decimal> = BTreeMap::new();
+        if !nav.is_zero() {
+            let target: BTreeMap<&str, Decimal> =
+                plan.targets.iter().map(|t| (t.asset.as_str(), t.weight)).collect();
+            for o in &plan.orders {
+                if o.reason != OrderReason::Entry || o.qty.is_zero() {
+                    continue;
+                }
+                if let Some(w) = target.get(o.asset.as_str()) {
+                    marks.insert(o.asset.as_str(), (w.abs() * nav / o.qty).abs());
+                }
+            }
+        }
+        // Inherited names last: their price comes from the book the planner
+        // actually read, which beats one inferred from an order size.
         for c in &plan.current {
             if !c.qty.is_zero() && !nav.is_zero() {
-                marks.insert(c.asset.as_str(), c.weight * nav / c.qty);
+                marks.insert(c.asset.as_str(), (c.weight * nav / c.qty).abs());
             }
         }
         let positions = read_with_retry(|| self.venue.get_positions()).await?;

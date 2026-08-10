@@ -1065,6 +1065,51 @@ async fn an_off_grid_quantity_is_rounded_before_it_is_authorised() {
     assert!(report.agrees, "our record and the venue must agree");
 }
 
+/// A name this run OPENED belongs in the book this run left.
+///
+/// The closing marks are recovered from the plan, and the plan's `current` is
+/// the book the run inherited — so pricing from `current` alone drops every new
+/// position, and a book built from flat comes back empty. Which is exactly the
+/// case that matters: the run that opens a name is the one whose period we most
+/// want attributed. An entry buys the whole target, so its order size prices it.
+#[tokio::test]
+async fn the_closing_book_prices_the_names_this_run_opened() {
+    let dir = tmpdir("mark-entries");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    // The fixture's ETH leg is an entry: nothing held, target -25% of NAV,
+    // 13.42209814 units sold. 0.25 * 100000 / 13.42209814 = 1862.60.
+    let plan = plan_decided_at_written_at("2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z");
+
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("the run completes");
+
+    assert_eq!(rec.outcome, "executed");
+    let eth = rec
+        .book_after
+        .iter()
+        .find(|b| b.asset == "ETH")
+        .expect("the name this run opened must be in the book it left");
+    let mark = dec(&eth.mark);
+    assert!(
+        (mark - dec("1862.60")).abs() < dec("0.01"),
+        "an entry prices off its own order size, got {mark}"
+    );
+    assert!(dec(&eth.qty).is_sign_negative(), "the ETH leg is a short");
+}
+
 // --- settlement --------------------------------------------------------------
 
 /// Build a finished run with a priced closing book.

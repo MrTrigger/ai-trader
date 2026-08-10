@@ -26,6 +26,8 @@ type Slice = {
   };
 };
 
+type BookMark = { asset: string; qty: string; mark: string };
+
 export type Run = {
   run_id?: string;
   plan_id?: string;
@@ -44,6 +46,7 @@ export type Run = {
   control_state?: string;
   risk_checks?: { name: string; limit: string; value: string; passed: boolean; detail?: string | null }[];
   slices?: Slice[];
+  book_after?: BookMark[];
   result?: {
     settled_at?: string;
     hours?: number;
@@ -109,6 +112,77 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
     { key: "Exit", label: "Closed", hint: "positions this run ended" },
   ].map((g) => ({ ...g, rows: merged.filter((m) => (m.o.reason ?? "") === g.key) }));
   const untouched = groups.every((g) => g.rows.length === 0);
+
+  // What this run did to each name, from the reason the executor stamped on
+  // the order. A position in the closing book with no order was simply carried.
+  const intent = new Map<string, string>();
+  for (const m of merged) if (m.o.asset) intent.set(m.o.asset, m.o.reason ?? "");
+  const changeOf = (asset: string): keyof typeof CHANGE => {
+    switch (intent.get(asset)) {
+      case "Entry":
+        return "new";
+      case "Increase":
+        return "added";
+      case "Reduce":
+        return "trimmed";
+      case "Exit":
+        return "closed";
+      default:
+        return "held";
+    }
+  };
+
+  const nav = num(run.nav);
+  const settled = !!run.result;
+  const endMark = new Map<string, { mark: number; pnl: number }>();
+  for (const c of run.result?.contributors ?? []) {
+    endMark.set(c.asset, { mark: num(c.mark_end), pnl: num(c.pnl) });
+  }
+
+  type Row = {
+    asset: string;
+    change: keyof typeof CHANGE;
+    qty: number;
+    mark: number;
+    notional: number;
+    markEnd: number | null;
+    pnl: number | null;
+  };
+  // Runs recorded before the closing book was kept have nothing to list but
+  // their exits, and a four-row table under "the book this run left" would
+  // read as a four-name book. Say which it is.
+  const noBook = (run.book_after ?? []).length === 0;
+  const rows: Row[] = (run.book_after ?? []).map((b) => {
+    const qty = num(b.qty);
+    const mark = num(b.mark);
+    const close = endMark.get(b.asset);
+    return {
+      asset: b.asset,
+      change: changeOf(b.asset),
+      qty,
+      mark,
+      notional: qty * mark,
+      markEnd: close?.mark ?? null,
+      pnl: close?.pnl ?? null,
+    };
+  });
+  // Positions this run ENDED are not in the closing book, and leaving them out
+  // would make a run that flattened five names look like it did nothing to
+  // them. Listed with a zero closing size, which is what happened.
+  for (const m of merged) {
+    if ((m.o.reason ?? "") !== "Exit" || !m.o.asset) continue;
+    if (rows.some((r) => r.asset === m.o.asset)) continue;
+    rows.push({
+      asset: m.o.asset,
+      change: "closed",
+      qty: 0,
+      mark: 0,
+      notional: 0,
+      markEnd: null,
+      pnl: null,
+    });
+  }
+  rows.sort((a, b) => Math.abs(b.notional) - Math.abs(a.notional));
 
   const failedChecks = (run.risk_checks ?? []).filter((c) => !c.passed);
 
@@ -216,43 +290,64 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
           )}
 
           <div>
-            <p className="eyebrow mb-2">What changed</p>
-            {untouched ? (
+            <p className="eyebrow mb-2">
+              The book this run left{" "}
+              <span className="text-faint">
+                {noBook
+                  ? "· closing book not recorded — only what changed"
+                  : `· ${rows.length} names, marked when it finished`}
+              </span>
+            </p>
+            {rows.length === 0 ? (
               <p className="text-[12px] text-faint">
-                No orders. The book already matched the target — every drift was zero.
+                {untouched
+                  ? "No orders — the book already matched the target."
+                  : "No closing book was recorded for this run."}
               </p>
             ) : (
-              <div className="space-y-3">
-                {groups
-                  .filter((g) => g.rows.length > 0)
-                  .map((g) => (
-                    <div key={g.key}>
-                      <div className="mb-1 flex items-baseline gap-2">
-                        <span className="text-[11.5px] text-ink">{g.label}</span>
-                        <span className="text-[11px] text-faint">
-                          {g.rows.length} · {g.hint}
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {g.rows.map((m, i) => (
-                          <span
-                            key={i}
-                            title={
-                              `${m.o.side} ${m.qty} ${m.o.asset}` +
-                              (m.parts > 1 ? ` over ${m.parts} slices` : "") +
-                              (m.o.error ? ` — ${m.o.error}` : "")
-                            }
-                            className={`num rounded border px-1.5 py-0.5 text-[11px] ${
-                              m.o.error ? "border-alarm/50 text-alarm" : "border-line2 text-dim"
-                            }`}
-                          >
-                            <span className="text-ink">{m.o.asset}</span>{" "}
-                            {String(m.o.side ?? "").toLowerCase()} {compact(m.qty)}
+              <div className="-mx-1 overflow-x-auto px-1">
+                <table className="w-full min-w-[620px] text-[12px]">
+                  <thead>
+                    <tr className="text-[10px] uppercase tracking-[0.1em] text-faint">
+                      <th className="pb-1 text-left font-normal">Asset</th>
+                      <th className="pb-1 text-left font-normal">Change</th>
+                      <th className="pb-1 text-right font-normal">Qty</th>
+                      <th className="pb-1 text-right font-normal">Mark</th>
+                      {settled && <th className="pb-1 text-right font-normal">Close</th>}
+                      <th className="pb-1 text-right font-normal">Notional</th>
+                      <th className="pb-1 text-right font-normal">Weight</th>
+                      {settled && <th className="pb-1 text-right font-normal">P&L</th>}
+                    </tr>
+                  </thead>
+                  <tbody className="num">
+                    {rows.map((r) => (
+                      <tr key={r.asset} className="border-b border-line/40">
+                        <td className="py-1.5 font-display text-ink">{r.asset}</td>
+                        <td>
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] ${CHANGE[r.change].cls}`}>
+                            {CHANGE[r.change].label}
                           </span>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
+                        </td>
+                        <td className="pr-3 text-right text-dim">{compact(r.qty)}</td>
+                        <td className="pr-3 text-right">{price(r.mark)}</td>
+                        {settled && (
+                          <td className="pr-3 text-right text-dim">
+                            {r.markEnd == null ? "—" : price(r.markEnd)}
+                          </td>
+                        )}
+                        <td className="pr-3 text-right">{money(Math.abs(r.notional), 0)}</td>
+                        <td className="pr-3 text-right text-dim">
+                          {nav ? `${((r.notional / nav) * 100).toFixed(1)}%` : "—"}
+                        </td>
+                        {settled && (
+                          <td className={`text-right ${tone(r.pnl)}`}>
+                            {r.pnl == null ? "—" : signed(r.pnl)}
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
@@ -325,6 +420,16 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
   );
 }
 
+/** Green for risk added, red for risk removed - the direction of the book, not
+ *  of the order. A "buy" that closes a short is a reduction. */
+const CHANGE = {
+  new: { label: "NEW", cls: "bg-go/15 text-go" },
+  added: { label: "ADDED", cls: "bg-go/10 text-go/90" },
+  trimmed: { label: "TRIMMED", cls: "bg-consequence/10 text-consequence" },
+  closed: { label: "CLOSED", cls: "bg-alarm/10 text-alarm" },
+  held: { label: "held", cls: "text-faint" },
+} as const;
+
 function Stat({ k, v }: { k: string; v: string }) {
   return (
     <div>
@@ -346,6 +451,15 @@ const compact = (v: unknown) => {
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   if (n >= 1) return String(Math.round(n * 100) / 100);
   return n.toPrecision(3);
+};
+
+/** A $4,351 mark and a $0.0000071 mark need different decimals to say anything. */
+const price = (v: unknown) => {
+  const n = num(v);
+  if (n >= 1000) return money(n, 0);
+  if (n >= 1) return money(n, 2);
+  if (n >= 0.01) return money(n, 4);
+  return `$${n.toPrecision(3)}`;
 };
 
 /** Risk values arrive with 28 decimals; three is all a reader can use. */
