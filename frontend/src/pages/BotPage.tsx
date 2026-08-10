@@ -29,7 +29,10 @@ function summarise(r: Record<string, unknown>): string {
 export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefresh: () => void }) {
   const [settings, setSettings] = useState(false);
   const [logs, setLogs] = useState(false);
-  const [openRun, setOpenRun] = useState<Run | null>(null);
+  // The run AND the one before it: a book row can only say "trimmed from" if
+  // something knows what it was trimmed from. `runs` is newest first, so the
+  // previous run is the next index.
+  const [openRun, setOpenRun] = useState<{ run: Run; before?: Run } | null>(null);
   const st = d.state ?? {};
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
@@ -260,7 +263,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
                       <button
                         key={i}
                         type="button"
-                        onClick={() => setOpenRun(r as Run)}
+                        onClick={() => setOpenRun({ run: r as Run, before: (d.runs ?? [])[i + 1] as Run | undefined })}
                         className="flex w-full items-baseline gap-3 border-b border-line/50 pb-2 text-left text-[12px] hover:bg-line/25 focus:bg-line/25 focus:outline-none"
                         title="what this run decided, and what let it"
                       >
@@ -338,7 +341,9 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
       </div>
 
       {logs && <LogModal botId={id} onClose={() => setLogs(false)} />}
-      {openRun && <RunModal run={openRun} onClose={() => setOpenRun(null)} />}
+      {openRun && (
+        <RunModal run={openRun.run} before={openRun.before} onClose={() => setOpenRun(null)} />
+      )}
 
       {settings && (
         <SettingsModal

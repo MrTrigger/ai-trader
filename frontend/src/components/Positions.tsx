@@ -22,6 +22,9 @@ export type Position = {
  *
  * Weight is drawn as a bar from a centre line: sign is position, magnitude is
  * length, so concentration is visible without reading a single number.
+ *
+ * The price columns say "entry price" and "current price" rather than "entry"
+ * and "mark". Mark is what the desk calls it; it is not what it is.
  */
 export function Positions({ positions }: { positions: Position[] }) {
   if (positions.length === 0) {
@@ -60,9 +63,9 @@ export function Positions({ positions }: { positions: Position[] }) {
                 <tr className="text-[10px] uppercase tracking-[0.1em] text-faint">
                   <th className="pb-1 text-left font-normal">Asset</th>
                   <th className="pb-1 text-right font-normal">Qty</th>
-                  <th className="pb-1 text-right font-normal">Entry</th>
-                  <th className="pb-1 text-right font-normal">Mark</th>
-                  <th className="pb-1 text-right font-normal">Notional</th>
+                  <th className="pb-1 text-right font-normal">Entry price</th>
+                  <th className="pb-1 text-right font-normal">Current price</th>
+                  <th className="pb-1 text-right font-normal">Size</th>
                   <th className="pb-1 pl-3 text-right font-normal">Weight</th>
                   <th className="pb-1 text-right font-normal">Unrealised</th>
                 </tr>

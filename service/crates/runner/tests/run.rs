@@ -1127,17 +1127,31 @@ async fn a_run_recorded_without_a_closing_book_can_be_marked_once() {
 
     // A run of that plan, then its book_after wiped: the shape of every record
     // written before the runner kept one.
-    let rec = runner(&venue, &clock, &store, &ledger, controls.clone(), Schedule::default())
-        .run(&plan)
-        .await
-        .expect("the run completes");
+    let rec = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls.clone(),
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("the run completes");
     assert!(!rec.book_after.is_empty(), "the run itself marks its book");
     let mut stripped = rec.clone();
     stripped.book_after = Vec::new();
     store.record(&stripped).unwrap();
     assert!(store.recent(1).unwrap()[0].book_after.is_empty());
 
-    let r = runner(&venue, &clock, &store, &ledger, controls.clone(), Schedule::default());
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls.clone(),
+        Schedule::default(),
+    );
     let marked = r.mark_recorded(&plan).await.expect("marks");
     assert_eq!(marked.as_deref(), Some(rec.run_id.as_str()));
     let after = store.recent(1).unwrap();
@@ -1181,6 +1195,7 @@ fn settled_fixture(run_id: &str, at: &str, nav: &str, book: &[(&str, &str, &str)
             asset: (*a).into(),
             qty: (*q).into(),
             mark: (*m).into(),
+            entry: None,
         })
         .collect();
     r
@@ -1322,11 +1337,18 @@ async fn a_position_closed_by_the_next_run_still_gets_its_last_day() {
         .find(|c| c.asset == "ETH")
         .expect("the name Tuesday sold still earned Monday's period");
     assert_eq!(eth.pnl, "-10.00", "5 units, 20 -> 18");
-    assert_eq!(res.unattributed, "-10.00", "unchanged: 80 realised, 90 marked");
+    assert_eq!(
+        res.unattributed, "-10.00",
+        "unchanged: 80 realised, 90 marked"
+    );
     // And the zero row is a price, not a holding, so it is not a contributor
     // of Tuesday's own.
     assert!(
-        runs.iter().find(|r| r.run_id == "tue").unwrap().result.is_none(),
+        runs.iter()
+            .find(|r| r.run_id == "tue")
+            .unwrap()
+            .result
+            .is_none(),
         "tuesday's period is still open"
     );
 }

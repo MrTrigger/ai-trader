@@ -493,6 +493,12 @@ pub struct BookMark {
     pub asset: String,
     pub qty: String,
     pub mark: String,
+    /// Volume-weighted price the open quantity was bought or sold at, as the
+    /// venue reported it when the run finished. `mark` says what the position
+    /// was worth; without this there is nothing to say whether it was working.
+    /// Absent on records written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 /// The realised outcome of the period a run opened.
@@ -1149,8 +1155,11 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         let nav = plan.nav.total;
         let mut marks: BTreeMap<&str, Decimal> = BTreeMap::new();
         if !nav.is_zero() {
-            let target: BTreeMap<&str, Decimal> =
-                plan.targets.iter().map(|t| (t.asset.as_str(), t.weight)).collect();
+            let target: BTreeMap<&str, Decimal> = plan
+                .targets
+                .iter()
+                .map(|t| (t.asset.as_str(), t.weight))
+                .collect();
             for o in &plan.orders {
                 if o.reason != OrderReason::Entry || o.qty.is_zero() {
                     continue;
@@ -1176,6 +1185,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                     asset: p.asset.to_string(),
                     qty: p.qty.to_string(),
                     mark: m.to_string(),
+                    entry: Some(p.avg_price.to_string()),
                 })
             })
             .collect();
@@ -1193,6 +1203,9 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                     asset: c.asset.clone(),
                     qty: "0".into(),
                     mark: m.to_string(),
+                    // Nothing is held, so there is no open quantity to have an
+                    // entry price for. The row exists to carry the price.
+                    entry: None,
                 });
             }
         }
@@ -1223,7 +1236,12 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                 plan.run_id, newest.run_id
             )));
         }
-        if !newest.book_after.is_empty() {
+        // A book with no entry prices is as repairable as no book at all: the
+        // record was written by a version that did not keep them, and the same
+        // plan and the same untouched positions can still supply them.
+        let priced = !newest.book_after.is_empty()
+            && newest.book_after.iter().any(|b| b.entry.is_some());
+        if priced {
             return Ok(None);
         }
         let book = self.mark_book(plan).await?;

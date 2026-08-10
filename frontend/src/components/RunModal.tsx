@@ -26,7 +26,7 @@ type Slice = {
   };
 };
 
-type BookMark = { asset: string; qty: string; mark: string };
+type BookMark = { asset: string; qty: string; mark: string; entry?: string | null };
 
 export type Run = {
   run_id?: string;
@@ -72,7 +72,16 @@ export type Run = {
  * three names and closed one is a different animal from one that trimmed
  * twenty, and the two look identical as a list of fills.
  */
-export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
+export function RunModal({
+  run,
+  before,
+  onClose,
+}: {
+  run: Run;
+  /** The run immediately before this one, where there is one. */
+  before?: Run;
+  onClose: () => void;
+}) {
   useEffect(() => {
     const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     document.addEventListener("keydown", esc);
@@ -139,14 +148,37 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
     endMark.set(c.asset, { mark: num(c.mark_end), pnl: num(c.pnl) });
   }
 
+  // What the run before this one left, so a held or trimmed name can say what
+  // it was held or trimmed FROM. A weight of -10% means one thing after a trim
+  // from -14% and the opposite after a build from -6%, and the row alone
+  // cannot tell those apart.
+  const beforeNav = num(before?.nav);
+  const wasOf = new Map<string, { qty: number; weight: number | null; pnl: number | null }>();
+  for (const b of before?.book_after ?? []) {
+    const qty = num(b.qty);
+    const notional = qty * num(b.mark);
+    wasOf.set(b.asset, {
+      qty,
+      weight: beforeNav ? (notional / beforeNav) * 100 : null,
+      pnl: null,
+    });
+  }
+  for (const c of before?.result?.contributors ?? []) {
+    const w = wasOf.get(c.asset);
+    if (w) w.pnl = num(c.pnl);
+  }
+
   type Row = {
     asset: string;
     change: keyof typeof CHANGE;
     qty: number;
+    entry: number | null;
     mark: number;
     notional: number;
+    weight: number | null;
     markEnd: number | null;
     pnl: number | null;
+    was: { qty: number; weight: number | null; pnl: number | null } | null;
   };
   // Runs recorded before the closing book was kept have nothing to list but
   // their exits, and a four-row table under "the book this run left" would
@@ -155,15 +187,22 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
   const rows: Row[] = (run.book_after ?? []).map((b) => {
     const qty = num(b.qty);
     const mark = num(b.mark);
+    const notional = qty * mark;
     const close = endMark.get(b.asset);
+    const change = changeOf(b.asset);
     return {
       asset: b.asset,
-      change: changeOf(b.asset),
+      change,
       qty,
+      entry: b.entry == null ? null : num(b.entry),
       mark,
-      notional: qty * mark,
+      notional,
+      weight: nav ? (notional / nav) * 100 : null,
       markEnd: close?.mark ?? null,
       pnl: close?.pnl ?? null,
+      // Only where it answers something. A name this run opened was not held
+      // before, so "from nothing" is noise on every new row.
+      was: change === "held" || change === "trimmed" ? (wasOf.get(b.asset) ?? null) : null,
     };
   });
   // Positions this run ENDED are not in the closing book, and leaving them out
@@ -176,13 +215,20 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
       asset: m.o.asset,
       change: "closed",
       qty: 0,
+      entry: null,
       mark: 0,
       notional: 0,
+      weight: 0,
       markEnd: null,
       pnl: null,
+      was: wasOf.get(m.o.asset) ?? null,
     });
   }
-  rows.sort((a, b) => Math.abs(b.notional) - Math.abs(a.notional));
+  // By weight, which is the order the book is actually read in: what the run
+  // is most exposed to, first. Notional and weight rank the same when there is
+  // one NAV, but weight is the column on screen and a table should be sorted
+  // by something the reader can see.
+  rows.sort((a, b) => Math.abs(b.weight ?? 0) - Math.abs(a.weight ?? 0));
 
   const failedChecks = (run.risk_checks ?? []).filter((c) => !c.passed);
 
@@ -291,16 +337,16 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
               </p>
             ) : (
               <div className="-mx-1 overflow-x-auto px-1">
-                <table className="w-full min-w-[620px] text-[12px]">
+                <table className="w-full min-w-[740px] text-[12px]">
                   <thead>
                     <tr className="text-[10px] uppercase tracking-[0.1em] text-faint">
                       <th className="pb-1 text-left font-normal">Asset</th>
                       <th className="pb-1 text-left font-normal">Change</th>
                       <th className="pb-1 text-right font-normal">Qty</th>
-                      <th className="pb-1 text-right font-normal">Mark</th>
-                      {settled && <th className="pb-1 text-right font-normal">Close</th>}
-                      <th className="pb-1 text-right font-normal">Notional</th>
                       <th className="pb-1 text-right font-normal">Weight</th>
+                      <th className="pb-1 text-right font-normal">Entry price</th>
+                      <th className="pb-1 text-right font-normal">Current price</th>
+                      {settled && <th className="pb-1 text-right font-normal">Close price</th>}
                       {settled && <th className="pb-1 text-right font-normal">P&L</th>}
                     </tr>
                   </thead>
@@ -313,20 +359,36 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
                             {CHANGE[r.change].label}
                           </span>
                         </td>
-                        <td className="pr-3 text-right text-dim">{compact(r.qty)}</td>
-                        <td className="pr-3 text-right">{price(r.mark)}</td>
+                        <td className="pr-3 text-right align-top text-dim">
+                          {compact(r.qty)}
+                          <Was show={r.was != null && r.was.qty !== r.qty} text={r.was ? compact(r.was.qty) : ""} />
+                        </td>
+                        <td className="pr-3 text-right align-top text-dim">
+                          {r.weight == null ? "—" : `${r.weight.toFixed(1)}%`}
+                          <Was
+                            show={
+                              r.was?.weight != null &&
+                              r.was.weight.toFixed(1) !== (r.weight ?? 0).toFixed(1)
+                            }
+                            text={r.was?.weight == null ? "" : `${r.was.weight.toFixed(1)}%`}
+                          />
+                        </td>
+                        <td className="pr-3 text-right align-top text-dim">
+                          {r.entry == null ? "—" : price(r.entry)}
+                        </td>
+                        <td className="pr-3 text-right align-top">{price(r.mark)}</td>
                         {settled && (
-                          <td className="pr-3 text-right text-dim">
+                          <td className="pr-3 text-right align-top text-dim">
                             {r.markEnd == null ? "—" : price(r.markEnd)}
                           </td>
                         )}
-                        <td className="pr-3 text-right">{money(Math.abs(r.notional), 0)}</td>
-                        <td className="pr-3 text-right text-dim">
-                          {nav ? `${((r.notional / nav) * 100).toFixed(1)}%` : "—"}
-                        </td>
                         {settled && (
-                          <td className={`text-right ${tone(r.pnl)}`}>
+                          <td className={`text-right align-top ${tone(r.pnl)}`}>
                             {r.pnl == null ? "—" : signed(r.pnl)}
+                            <Was
+                              show={r.was?.pnl != null}
+                              text={r.was?.pnl == null ? "" : signed(r.was.pnl)}
+                            />
                           </td>
                         )}
                       </tr>
@@ -452,3 +514,16 @@ const short = (v: unknown) => {
   const n = num(v);
   return Number.isInteger(n) ? String(n) : n.toFixed(3);
 };
+
+/**
+ * The value this cell had at the run before, under the value it has now.
+ *
+ * A trimmed name at -10% could have come down from -14% or been built up from
+ * -6%, and the row on its own cannot tell those apart. Rendered only where
+ * there is a previous value and it differs — a "from" line repeating the
+ * number above it is noise in every row of the table.
+ */
+function Was({ show, text }: { show: boolean | undefined; text: string }) {
+  if (!show || !text) return null;
+  return <div className="text-[10px] leading-tight text-faint">was {text}</div>;
+}
