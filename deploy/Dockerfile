@@ -28,6 +28,7 @@ COPY deploy/bot.cluster.json /app/bot.json
 COPY deploy/cycle.sh /usr/local/bin/cycle.sh
 COPY deploy/bootstrap-cycle.sh /usr/local/bin/bootstrap-cycle.sh
 COPY deploy/futures-live.sh /usr/local/bin/futures-live.sh
+COPY deploy/ib-gateway-on-demand.sh /usr/local/bin/ib-gateway-on-demand.sh
 COPY data/models/ranker-rank-1.json /app/ranker-rank-1.json
 COPY --from=frontend /src/frontend/dist /app/frontend/dist
 # The cluster config is the repo config with the model path pinned to the
@@ -35,7 +36,8 @@ COPY --from=frontend /src/frontend/dist /app/frontend/dist
 # and the previous `python3 ... || sed ...` quietly fell through to the sed on
 # every build while pretending the Python mattered.
 RUN sed -i 's|^model_path = .*|model_path = "/app/ranker-rank-1.json"|' /app/config.toml \
- && grep -q '^model_path = "/app/ranker-rank-1.json"$' /app/config.toml
+ && grep -q '^model_path = "/app/ranker-rank-1.json"$' /app/config.toml \
+ && chmod +x /usr/local/bin/ib-gateway-on-demand.sh
 # No interpreter in the runtime, by rule: Python belongs to training, and the
 # deployed image runs compiled binaries and POSIX sh. Asserted at build time
 # rather than trusted, because the last violation was a bootstrap script that

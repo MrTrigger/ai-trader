@@ -114,7 +114,7 @@ nothing durable is file-resident.
 | piece | what it is |
 |---|---|
 | `CronJob aitrader-paper-cycle` | the crypto decision cycle, 00:05 UTC daily |
-| `Deployment aitrader-paper` | `ib-gateway` (sidecar), `feed`, `api` — and `futures-bot` as a child of `api` |
+| `Deployment aitrader-paper` | on-demand `ib-gateway` controller (sidecar), `feed`, `api` — and `futures-bot` as a child of `api` |
 | `PVC aitrader-paper-data` | bars, universe snapshots, funding, paper venue state, the futures bar cache, IB Gateway settings (10Gi, `local-path`, pinned to `talos-2`) |
 | `Secret aitrader-paper-secret` | `DATABASE_URL`, `TWS_USERID`, `TWS_PASSWORD`, `IB_PAPER_ACCOUNT` — sops-encrypted in git |
 | Postgres `ai_trader` | identity registry, controls, runs, fills, ledger, paper book |
@@ -143,29 +143,39 @@ packaging convenience, it is what makes the control states mean anything:
 `--no-supervise` turns that off, for when you are driving a bot from your own
 terminal and do not want a second one appearing underneath you.
 
-### IB Gateway runs in the pod
+### IB Gateway runs on demand in the pod
 
-The futures bot needs a Gateway and a Gateway needs a desktop, so
-`ghcr.io/gnzsnz/ib-gateway` (IBC + Xvfb + socat) runs as a **native sidecar** —
-an init container with `restartPolicy: Always`, which is what makes it start
-before the other init containers and stay up. Containers in a pod share a
-network namespace, so the bot reaches it at `127.0.0.1:4004` (socat's relay of
-the Gateway's loopback-only 4002). Nothing outside the pod can: the
-NetworkPolicy admits 7434 and nothing else, and the IB API is an unauthenticated
-raw socket.
+The futures bot needs a Gateway and a Gateway needs a desktop, so the pod has a
+**native sidecar** — an init container with `restartPolicy: Always`. The
+sidecar's resident process is only a small demand controller. The expensive and
+exclusive part (`ghcr.io/gnzsnz/ib-gateway`: IBC + Gateway + Xvfb + socat) is
+started only while at least one supervised bot process whose trade binding uses
+the `ib` protocol holds a lease. The last process releasing its lease shuts the
+Gateway down after 45 seconds. `Halt` retains the lease because the process is
+still managing its book; `Stop` releases it only after the process has flattened
+and exited. Separate lease files make the rule work unchanged when more than one
+IB-backed bot exists.
+
+Containers in a pod share a network namespace, so an active bot reaches the
+Gateway at `127.0.0.1:4004` (socat's relay of the Gateway's loopback-only 4002).
+Nothing outside the pod can: the NetworkPolicy admits 7434 and nothing else,
+and the IB API is an unauthenticated raw socket. With no IB-backed bot active,
+there is no Java process, API listener, or IB login in the cluster.
 
 **One session per IBKR username.** IB allows a single Gateway login per user, and
-`EXISTING_SESSION_DETECTED_ACTION=primary` means this pod takes it. Starting the
-cluster Gateway therefore **kicks out the Gateway on your laptop**, and the bot
-attached to it goes blind. Run one or the other, or get a second paper user.
+`EXISTING_SESSION_DETECTED_ACTION=primary` means an active cluster Gateway takes
+it. Starting an IB-backed cluster bot can therefore **kick out the Gateway on
+your laptop**, and the bot attached to it goes blind. Stopping the last
+IB-backed cluster bot releases that session automatically; running both still
+requires a second paper user.
 
-The Gateway restarts itself at 21:15 UTC (`AUTO_RESTART_TIME`), because IB
-expires the session daily. That is inside CME's 16:00–17:00 CT maintenance
-break, so there are no bars to miss — and the bot's stall watchdog does not
-count silence while the market is closed. It has **no readiness probe on
-purpose**: pod readiness gates the Service, and a dashboard that vanishes
-exactly when the broker link does could not report the one thing you would want
-to know.
+While demanded, the Gateway restarts itself at 21:15 UTC
+(`AUTO_RESTART_TIME`), because IB expires the session daily. That is inside
+CME's 16:00–17:00 CT maintenance break, so there are no bars to miss — and the
+bot's stall watchdog does not count silence while the market is closed. The
+demand controller has **no Gateway readiness probe on purpose**: pod readiness
+gates the Service, and a dashboard that vanishes exactly when the broker link
+does could not report the one thing you would want to know.
 
 ### The warmup bars come from IB, not from the lab
 

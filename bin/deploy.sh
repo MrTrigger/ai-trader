@@ -75,16 +75,16 @@ sleep 20
 kubectl annotate kustomization aitrader-paper -n trader \
   reconcile.fluxcd.io/requestedAt="$(date +%s)" --overwrite >/dev/null
 sleep 10
-# Longer than the init chain it is waiting on: ib-gateway plus a bootstrap
-# cycle that can be a full 7-minute data pull. A timeout shorter than the thing
-# it waits for reports failure on a healthy rollout.
+# Longer than the init chain it is waiting on: the Gateway demand controller
+# plus a bootstrap cycle that can be a full 7-minute data pull. A timeout
+# shorter than the thing it waits for reports failure on a healthy rollout.
 kubectl rollout status deployment/aitrader-paper -n trader --timeout=1200s
 
 # Verify what is RUNNING, not what was asked for. The whole point.
 #
 # Selected by NAME, not by index: containers[1] was the api until the pod grew
-# an IB Gateway sidecar, and an index that silently points at a different
-# container verifies the wrong thing while reporting success.
+# an IB Gateway controller sidecar, and an index that silently points at a
+# different container verifies the wrong thing while reporting success.
 #
 # Pods being deleted are skipped. A terminating pod keeps phase Running until
 # its grace period expires, so the old one can still be first in the list a

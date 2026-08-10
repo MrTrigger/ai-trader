@@ -15,6 +15,7 @@
 //! halted. No credentials are involved anywhere in this process.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 
@@ -315,11 +316,16 @@ pub fn set_state(bot_id: &str, state: &str, reason: &str, by: &str) -> Result<Va
 /// otherwise launch twins.
 pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     let id = bot_id.to_string();
-    let (bot, status) = with_registry(move |reg| {
+    let (bot, status, needs_ib_gateway) = with_registry(move |reg| {
         Box::pin(async move {
             let bot = reg.bot(&id).await?;
             let status = reg.get_status(&id).await?;
-            Ok((bot, status))
+            let needs_ib_gateway = reg
+                .bindings(&id)
+                .await?
+                .into_iter()
+                .any(|b| b.scope == "trade" && b.protocol == "ib");
+            Ok((bot, status, needs_ib_gateway))
         })
     })?;
     let Some(bot) = bot else {
@@ -367,6 +373,15 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         .append(true)
         .open(&log)
         .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    // Acquire before spawning: an IB bot's launch script deliberately waits
+    // for the Gateway, and the sidecar starts it only after seeing this lease.
+    // A unique file per process makes overlapping exits safe when the fleet
+    // eventually contains more than one IB-backed bot.
+    let gateway_lease = if needs_ib_gateway {
+        acquire_gateway_lease(bot_id)?
+    } else {
+        None
+    };
     let child = std::process::Command::new("sh")
         .arg("-c")
         .arg(launch)
@@ -374,8 +389,14 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         .stdin(std::process::Stdio::null())
         .stdout(logfile.try_clone().map_err(|e| e.to_string())?)
         .stderr(logfile)
-        .spawn()
-        .map_err(|e| format!("launch failed: {e}"))?;
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            release_gateway_lease(gateway_lease.as_deref());
+            return Err(format!("launch failed: {e}"));
+        }
+    };
     let pid = child.id();
     children()
         .lock()
@@ -386,8 +407,85 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     std::thread::spawn(move || {
         let mut child = child;
         let _ = child.wait();
+        release_gateway_lease(gateway_lease.as_deref());
     });
     Ok(json!({ "spawned": true, "pid": pid, "launch": launch, "log": log.display().to_string() }))
+}
+
+const IB_GATEWAY_DEMAND_DIR: &str = "IB_GATEWAY_DEMAND_DIR";
+static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn lease_stem(bot_id: &str) -> String {
+    bot_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Tell the native sidecar that one supervised process needs an IB session.
+/// No environment variable means laptop/dev mode, where Gateway lifecycle is
+/// owned by the operator and this deliberately does nothing.
+fn acquire_gateway_lease(bot_id: &str) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = std::env::var_os(IB_GATEWAY_DEMAND_DIR).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "cannot create IB Gateway demand directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    let seq = LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{}-{}-{seq}.lease",
+        lease_stem(bot_id),
+        std::process::id()
+    ));
+    std::fs::write(&path, format!("bot_id={bot_id}\n"))
+        .map_err(|e| format!("cannot acquire IB Gateway lease {}: {e}", path.display()))?;
+    Ok(Some(path))
+}
+
+fn release_gateway_lease(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "  supervisor: cannot release IB Gateway lease {} ({e})",
+                path.display()
+            );
+        }
+    }
+}
+
+/// An api container restart kills all of its bot children, but the pod-level
+/// emptyDir survives that one container restart. Remove their now-ownerless
+/// leases before supervision recreates the requested processes.
+pub fn reset_gateway_leases() {
+    let Some(dir) = std::env::var_os(IB_GATEWAY_DEMAND_DIR).map(PathBuf::from) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "  supervisor: cannot prepare IB Gateway demand directory {} ({e})",
+            dir.display()
+        );
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        if path.extension().and_then(|x| x.to_str()) == Some("lease") {
+            release_gateway_lease(Some(&path));
+        }
+    }
 }
 
 /// The most recent child pid per bot.
@@ -887,6 +985,18 @@ pub fn logs(bot_id: &str, limit: i64) -> Result<Value, String> {
             .map(|(at, level, line)| json!({ "at": at, "level": level, "line": line }))
             .collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod gateway_lease_tests {
+    use super::lease_stem;
+
+    #[test]
+    fn lease_names_cannot_escape_the_demand_directory() {
+        assert_eq!(lease_stem("futures-noise"), "futures-noise");
+        assert_eq!(lease_stem("stocks/../../other"), "stocks_______other");
+        assert_eq!(lease_stem("omx stockholm"), "omx_stockholm");
+    }
 }
 
 /// POST /api/bots/{id}/venue — point the bot's trade scope at another

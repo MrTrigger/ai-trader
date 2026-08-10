@@ -6,8 +6,8 @@
 # The laptop equivalent is `bots/futures/run.sh live`. They differ in exactly
 # one thing and it is not the strategy: where the warmup bars come from. On the
 # laptop the lab's parquet store exports them through Python; here there is no
-# Python and no parquet, so IB's own history is the source — which is why the
-# Gateway runs in this pod and why this script waits for it.
+# Python and no parquet, so IB's own history is the source — which is why this
+# process's IB lease starts the pod's Gateway and why this script waits for it.
 set -uo pipefail
 BOT=/usr/local/bin/futures-bot
 BARS=${FUTURES_BARS:-/data/futures/bars.jsonl}
@@ -40,11 +40,11 @@ done
 # optional and a short cache is the same as no cache: backfill seeds when there
 # is nothing and extends when there is.
 #
-# The Gateway is a sidecar, starting alongside everything else, and IBC's login
-# takes a minute or two — longer if IB is slow, forever if the credentials are
-# wrong. So retry patiently and then FAIL, rather than exiting straight into the
-# supervisor's arms: a bot relaunching every minute against a Gateway that will
-# never log in buries the one line that says why.
+# The Gateway's demand controller sees this process's lease immediately, but
+# IBC's login takes a minute or two — longer if IB is slow, forever if the
+# credentials are wrong. So retry patiently and then FAIL, rather than exiting
+# into the supervisor's arms: a bot relaunching every minute against a Gateway
+# that will never log in buries the one line that says why.
 ok=""
 for attempt in $(seq 1 20); do
   if $BOT backfill --bars "$BARS" --days "$WARMUP_DAYS"; then

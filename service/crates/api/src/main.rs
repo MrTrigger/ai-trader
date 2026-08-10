@@ -198,6 +198,10 @@ fn main() -> ExitCode {
     // with --no-supervise when you want to drive a bot from your own shell and
     // not have it relaunched underneath you.
     if std::env::var("DATABASE_URL").is_ok() && !cfg.no_supervise {
+        // Bot children die with this container. Their per-process IB Gateway
+        // leases live in a pod emptyDir, so clear any orphaned files before the
+        // supervisor recreates only the processes still requested by control.
+        fleet::reset_gateway_leases();
         match std::env::current_dir() {
             Ok(root) => {
                 println!(
