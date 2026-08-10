@@ -85,11 +85,24 @@ kubectl rollout status deployment/aitrader-paper -n trader --timeout=1200s
 # Selected by NAME, not by index: containers[1] was the api until the pod grew
 # an IB Gateway sidecar, and an index that silently points at a different
 # container verifies the wrong thing while reporting success.
-running=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
-  --field-selector=status.phase=Running \
-  -o jsonpath='{.items[0].spec.containers[?(@.name=="api")].image}')
-if [ "$running" != "ghcr.io/mrtrigger/aitrader-paper:$SHA" ]; then
-  echo "deploy: pod is running $running, expected :$SHA" >&2
+#
+# Pods being deleted are skipped. A terminating pod keeps phase Running until
+# its grace period expires, so the old one can still be first in the list a
+# second after the rollout reports done - and reading it accuses a good deploy
+# of shipping the previous commit. Retried, because the replacement is not
+# necessarily listed the instant the rollout returns.
+want="ghcr.io/mrtrigger/aitrader-paper:$SHA"
+for _ in $(seq 1 20); do
+  running=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{range .spec.containers}}{{if eq .name "api"}}{{.image}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}')
+  # Every live pod must be on it, not merely one of them.
+  if [ -n "$running" ] && [ "$(echo "$running" | sort -u)" = "$want" ]; then
+    break
+  fi
+  sleep 5
+done
+if [ "$(echo "$running" | sort -u)" != "$want" ]; then
+  echo "deploy: pod is running ${running:-nothing}, expected :$SHA" >&2
   exit 1
 fi
 say "running ${SHA:0:7} - https://trader.wallintech.eu"
