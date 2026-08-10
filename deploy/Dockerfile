@@ -24,15 +24,30 @@ COPY --from=build /src/service/target/release/crypto-portfolio /usr/local/bin/cr
 COPY --from=build /src/service/target/release/api /usr/local/bin/api
 COPY --from=build /src/service/target/release/futures-bot /usr/local/bin/futures-bot
 COPY config/default.toml /app/config.toml
-COPY deploy/config-patch.py /app/config-patch.py
 COPY deploy/bot.cluster.json /app/bot.json
 COPY deploy/cycle.sh /usr/local/bin/cycle.sh
 COPY deploy/bootstrap-cycle.sh /usr/local/bin/bootstrap-cycle.sh
 COPY deploy/futures-live.sh /usr/local/bin/futures-live.sh
 COPY data/models/ranker-rank-1.json /app/ranker-rank-1.json
 COPY --from=frontend /src/frontend/dist /app/frontend/dist
-# the cluster config is the repo config with the model path pinned to the image
-RUN python3 /app/config-patch.py || sed -i 's|^model_path = .*|model_path = "/app/ranker-rank-1.json"|' /app/config.toml
+# The cluster config is the repo config with the model path pinned to the
+# image. sed, not an interpreter: there is no Python in the runtime by rule,
+# and the previous `python3 ... || sed ...` quietly fell through to the sed on
+# every build while pretending the Python mattered.
+RUN sed -i 's|^model_path = .*|model_path = "/app/ranker-rank-1.json"|' /app/config.toml \
+ && grep -q '^model_path = "/app/ranker-rank-1.json"$' /app/config.toml
+# No interpreter in the runtime, by rule: Python belongs to training, and the
+# deployed image runs compiled binaries and POSIX sh. Asserted at build time
+# rather than trusted, because the last violation was a bootstrap script that
+# shelled out to python3, swallowed the "command not found", and read the
+# silence as "this bot has never run" - which restarted a live book's cycle on
+# every pod restart.
+RUN for i in python python3 ruby node; do \
+      if command -v "$i" >/dev/null 2>&1; then \
+        echo "runtime image must not contain $i - see deploy/Dockerfile" >&2; exit 1; \
+      fi; \
+    done
+
 RUN useradd -u 1000 -m trader
 USER 1000
 WORKDIR /data
