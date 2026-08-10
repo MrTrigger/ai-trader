@@ -1165,7 +1165,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             }
         }
         let positions = read_with_retry(|| self.venue.get_positions()).await?;
-        Ok(positions
+        let mut book: Vec<BookMark> = positions
             .iter()
             .filter(|p| !p.qty.is_zero())
             .filter_map(|p| {
@@ -1175,7 +1175,25 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                     mark: m.to_string(),
                 })
             })
-            .collect())
+            .collect();
+        // A name this run CLOSED is carried at zero rather than dropped. It is
+        // not part of the book going forward, but the run before this one held
+        // it, and settling that period needs a closing price for it. Dropping
+        // it sent a full day of its P&L to `unattributed` for no better reason
+        // than that the position no longer exists.
+        for c in &plan.current {
+            if c.qty.is_zero() || book.iter().any(|b| b.asset == c.asset) {
+                continue;
+            }
+            if let Some(m) = marks.get(c.asset.as_str()) {
+                book.push(BookMark {
+                    asset: c.asset.clone(),
+                    qty: "0".into(),
+                    mark: m.to_string(),
+                });
+            }
+        }
+        Ok(book)
     }
 
     /// Attribute the period a past run opened, once it has closed.
@@ -1220,6 +1238,11 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                 else {
                     continue;
                 };
+                // Zero-quantity rows are prices this run left behind for the
+                // PREVIOUS period to settle against, not positions it held.
+                if qty.is_zero() {
+                    continue;
+                }
                 // Prefer the closing run's own mark for the asset; fall back to
                 // the current one for the still-open period.
                 let Some(end) = closer

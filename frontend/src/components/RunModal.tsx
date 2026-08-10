@@ -280,7 +280,7 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
               <span className="text-faint">
                 {noBook
                   ? "· closing book not recorded — only what changed"
-                  : `· ${rows.length} names, marked when it finished`}
+                  : `· ${rows.filter((r) => r.qty !== 0).length} names, marked when it finished`}
               </span>
             </p>
             {rows.length === 0 ? (

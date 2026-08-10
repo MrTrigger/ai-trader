@@ -1212,6 +1212,75 @@ async fn settle_attributes_a_closed_period_and_leaves_the_open_one_alone() {
     assert_eq!(res.unattributed, "-10.00");
 }
 
+/// The last day of a position it closed still belongs to the run that held it.
+///
+/// A name the closing run exits is not in the book that run leaves, so there
+/// was no end mark for it and its whole final period fell into `unattributed`
+/// — the strategy's exits, the decisions most worth judging, were the ones it
+/// could say least about. `mark_book` now carries a closed name at zero
+/// quantity purely to leave its price behind.
+#[tokio::test]
+async fn a_position_closed_by_the_next_run_still_gets_its_last_day() {
+    let dir = tmpdir("settle-exit");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-03T00:00:00Z");
+
+    store
+        .record(&settled_fixture(
+            "mon",
+            "2026-08-01T00:00:00Z",
+            "1100",
+            &[("BTC", "10", "100"), ("ETH", "5", "20")],
+        ))
+        .unwrap();
+    // Tuesday sold the ETH. It is carried at zero, marked 18 — the price the
+    // decision was made on, which is exactly Monday's closing price for it.
+    store
+        .record(&settled_fixture(
+            "tue",
+            "2026-08-02T00:00:00Z",
+            "1180",
+            &[("BTC", "10", "110"), ("ETH", "0", "18")],
+        ))
+        .unwrap();
+
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        running_controls(&dir),
+        Schedule::default(),
+    )
+    .settle(t("2026-08-03T00:00:00Z"), 10)
+    .await
+    .expect("settles");
+
+    let runs = store.recent(10).unwrap();
+    let res = runs
+        .iter()
+        .find(|r| r.run_id == "mon")
+        .unwrap()
+        .result
+        .as_ref()
+        .expect("monday is settled");
+    let eth = res
+        .contributors
+        .iter()
+        .find(|c| c.asset == "ETH")
+        .expect("the name Tuesday sold still earned Monday's period");
+    assert_eq!(eth.pnl, "-10.00", "5 units, 20 -> 18");
+    assert_eq!(res.unattributed, "-10.00", "unchanged: 80 realised, 90 marked");
+    // And the zero row is a price, not a holding, so it is not a contributor
+    // of Tuesday's own.
+    assert!(
+        runs.iter().find(|r| r.run_id == "tue").unwrap().result.is_none(),
+        "tuesday's period is still open"
+    );
+}
+
 /// Running it twice must not double-count, so a missed day can be picked up by
 /// the day after without corrupting the days that were already settled.
 #[tokio::test]
