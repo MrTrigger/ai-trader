@@ -8,13 +8,28 @@ import { RouteChain } from "../components/RouteChain";
 import { SettingsModal } from "../components/SettingsModal";
 import { FeedStatus } from "../components/FeedStatus";
 import { LogModal } from "../components/LogModal";
+import { RunModal, type Run } from "../components/RunModal";
 import { LocalConsole } from "../components/LocalConsole";
 import { money, num, signed, stamp, tone } from "../lib/format";
 import { activity } from "../lib/activity";
 
+/** What a run did, in the space of a table row. */
+function summarise(r: Record<string, unknown>): string {
+  const sub = Number(r.orders_submitted ?? 0);
+  const planned = Number(r.orders_planned ?? 0);
+  if (planned === 0 && sub === 0) return "no orders — the book already matched the target";
+  const bits = [`${sub} order${sub === 1 ? "" : "s"}`];
+  const skipped = Number(r.orders_skipped ?? 0);
+  if (skipped) bits.push(`${skipped} skipped`);
+  const slices = Number(r.slices_planned ?? 0);
+  if (slices > 1) bits.push(`${r.slices_completed}/${slices} slices`);
+  return bits.join(" · ");
+}
+
 export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefresh: () => void }) {
   const [settings, setSettings] = useState(false);
   const [logs, setLogs] = useState(false);
+  const [openRun, setOpenRun] = useState<Run | null>(null);
   const st = d.state ?? {};
   const det = st.detail ?? {};
   const sleeves = Object.entries(det.sleeves ?? {});
@@ -242,13 +257,22 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
                     const rr = r as Record<string, unknown>;
                     const bad = String(rr.outcome) !== "executed";
                     return (
-                      <div key={i} className="flex gap-3 border-b border-line/50 pb-2 text-[12px]">
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setOpenRun(r as Run)}
+                        className="flex w-full items-baseline gap-3 border-b border-line/50 pb-2 text-left text-[12px] hover:bg-line/25 focus:bg-line/25 focus:outline-none"
+                        title="what this run decided, and what let it"
+                      >
                         <span className="num shrink-0 text-faint">{stamp(rr.recorded_at as string).slice(5, 16)}</span>
                         <span className={`shrink-0 font-display text-[11px] uppercase ${bad ? "text-consequence" : "text-go"}`}>
                           {String(rr.outcome)}
                         </span>
-                        <span className="text-dim">{(rr.detail as string) ?? ""}</span>
-                      </div>
+                        <span className="min-w-0 flex-1 truncate text-dim">
+                          {(rr.detail as string) ?? summarise(rr)}
+                        </span>
+                        <span className="shrink-0 text-[11px] text-faint">detail →</span>
+                      </button>
                     );
                   })}
                 </div>
@@ -302,6 +326,7 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
       </div>
 
       {logs && <LogModal botId={id} onClose={() => setLogs(false)} />}
+      {openRun && <RunModal run={openRun} onClose={() => setOpenRun(null)} />}
 
       {settings && (
         <SettingsModal
