@@ -72,6 +72,7 @@ commands:
   status                             health, controls and the last run
   history [--limit N]                recent runs, newest first
   positions                          what the venue says we hold
+  settle                             attribute the period each past run opened
   markets                            the assets this venue lists (stdout)
   book                               cash and positions, planner format (stdout)
   reconcile                          our record against the venue's; changes nothing
@@ -149,6 +150,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "status" => cmd_status(&cfg),
         "history" => cmd_history(&cfg, flags.get("--limit").and_then(|s| s.parse().ok())),
         "positions" => block_on(cmd_positions(&cfg)),
+        "settle" => cmd_settle(&cfg),
         "markets" => block_on(cmd_markets(&cfg)),
         "book" => block_on(cmd_book(&cfg)),
         "reconcile" => block_on(cmd_reconcile(&cfg)),
@@ -641,6 +643,57 @@ async fn cmd_book(cfg: &BotConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Go back and write down what each finished period actually earned.
+///
+/// A run records a decision; the result of that decision does not exist yet
+/// when it finishes, because the period it opens closes when the next run
+/// starts. This is the pass that returns and fills it in - safe to call at any
+/// time, idempotent, and it never touches a period that is still open.
+fn cmd_settle(cfg: &BotConfig) -> Result<(), String> {
+    // The stores own a blocking Records handle, which owns a tokio runtime, and
+    // dropping a runtime inside an async context panics. Opened and dropped
+    // here in the sync frame; only the work between is awaited.
+    let st = open_stores(cfg)?;
+    let (st, out) = block_on(settle_with(cfg, st));
+    drop(st);
+    out
+}
+
+async fn settle_with(cfg: &BotConfig, mut st: Stores) -> (Stores, Result<(), String>) {
+    let controls = std::mem::replace(
+        &mut st.controls,
+        ControlStore::File(cfg.state_dir.join("controls.json")),
+    );
+    let out = settle_inner(cfg, &st, controls).await;
+    (st, out)
+}
+
+async fn settle_inner(cfg: &BotConfig, st: &Stores, controls: ControlStore) -> Result<(), String> {
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
+    let clock = SystemClock;
+    let runner = Runner {
+        bot_id: cfg.bot_id.clone(),
+        venue: &venue,
+        clock: &clock,
+        store: &st.store,
+        ledger: &st.ledger,
+        controls,
+        schedule: cfg.schedule,
+        max_plan_age_minutes: cfg.max_plan_age_minutes,
+        max_decision_lag_minutes: cfg.max_decision_lag_minutes,
+        accept_decision_lag: false,
+    };
+    let settled = runner
+        .settle(time::OffsetDateTime::now_utc(), 60)
+        .await
+        .map_err(|e| e.to_string())?;
+    match settled.len() {
+        0 => println!("nothing to settle: every closed period already has a result"),
+        n => println!("settled {n} period(s): {}", settled.join(", ")),
+    }
+    Ok(())
+}
+
 async fn cmd_positions(cfg: &BotConfig) -> Result<(), String> {
     let st = open_stores(cfg)?;
     let venue = open_venue(cfg, st.rec.as_deref()).await?;
@@ -953,6 +1006,8 @@ async fn cmd_mode_set(
         control_state: controls.state().into(),
         risk_checks: Vec::new(),
         slices: Vec::new(),
+        book_after: Vec::new(),
+        result: None,
     };
     store.record(&record).map_err(|e| e.to_string())?;
     println!("{}", serde_json::to_string_pretty(&record).unwrap());

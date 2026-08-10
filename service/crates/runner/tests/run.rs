@@ -1065,6 +1065,153 @@ async fn an_off_grid_quantity_is_rounded_before_it_is_authorised() {
     assert!(report.agrees, "our record and the venue must agree");
 }
 
+// --- settlement --------------------------------------------------------------
+
+/// Build a finished run with a priced closing book.
+fn settled_fixture(run_id: &str, at: &str, nav: &str, book: &[(&str, &str, &str)]) -> RunRecord {
+    let mut r = RunRecord::refused(
+        &standard_plan("2026-08-01T00:00:00Z"),
+        "fixture".into(),
+        &ControlFile::default(),
+        t(at),
+    );
+    r.run_id = run_id.into();
+    r.recorded_at = at.replace('Z', "+00:00").replace("+00:00", "Z");
+    r.outcome = "executed".into();
+    r.detail = None;
+    r.nav = Some(nav.into());
+    r.book_after = book
+        .iter()
+        .map(|(a, q, m)| runner::BookMark {
+            asset: (*a).into(),
+            qty: (*q).into(),
+            mark: (*m).into(),
+        })
+        .collect();
+    r
+}
+
+/// A period's result is the NAV it handed on, attributed to what moved.
+///
+/// The decision half of a run record is worthless for judging the strategy: it
+/// says what was chosen, never what that choice earned. This is the pass that
+/// goes back once the period has closed.
+#[tokio::test]
+async fn settle_attributes_a_closed_period_and_leaves_the_open_one_alone() {
+    let dir = tmpdir("settle");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-03T00:00:00Z");
+
+    // Monday: 10 BTC at 100, 5 ETH at 20 => the book that Tuesday inherits.
+    store
+        .record(&settled_fixture(
+            "mon",
+            "2026-08-01T00:00:00Z",
+            "1100",
+            &[("BTC", "10", "100"), ("ETH", "5", "20")],
+        ))
+        .unwrap();
+    // Tuesday: BTC 100 -> 110 (+100), ETH 20 -> 18 (-10). NAV 1100 -> 1180,
+    // so 80 of the 90 is attributable and 10 is not - fees, or something
+    // traded inside the period rather than held across it.
+    store
+        .record(&settled_fixture(
+            "tue",
+            "2026-08-02T00:00:00Z",
+            "1180",
+            &[("BTC", "10", "110"), ("ETH", "5", "18")],
+        ))
+        .unwrap();
+
+    let settled = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        running_controls(&dir),
+        Schedule::default(),
+    )
+    .settle(t("2026-08-03T00:00:00Z"), 10)
+    .await
+    .expect("settles");
+
+    // Monday closed when Tuesday ran. Tuesday's own period is still open and
+    // must be left alone: reporting a part-period would make every fresh run
+    // look like a win or a loss at random.
+    assert_eq!(settled, vec!["mon".to_string()], "only the closed period");
+
+    let runs = store.recent(10).unwrap();
+    let mon = runs.iter().find(|r| r.run_id == "mon").unwrap();
+    let tue = runs.iter().find(|r| r.run_id == "tue").unwrap();
+    assert!(tue.result.is_none(), "the open period is not settled");
+
+    let res = mon.result.as_ref().expect("monday is settled");
+    assert_eq!(res.pnl, "80.00", "1180 - 1100");
+    assert_eq!(res.nav_start, "1100.00");
+    assert_eq!(res.nav_end, "1180.00");
+    assert!(
+        (res.return_pct - 80.0 / 1100.0).abs() < 1e-9,
+        "{}",
+        res.return_pct
+    );
+    assert_eq!(res.closed_by_run_id.as_deref(), Some("tue"));
+
+    // Biggest absolute mover first, and both signs carried honestly.
+    let names: Vec<&str> = res.contributors.iter().map(|c| c.asset.as_str()).collect();
+    assert_eq!(names, vec!["BTC", "ETH"]);
+    assert_eq!(res.contributors[0].pnl, "100.00");
+    assert_eq!(res.contributors[1].pnl, "-10.00");
+    // 80 realised against 90 of mark movement: the gap is stated, not spread.
+    assert_eq!(res.unattributed, "-10.00");
+}
+
+/// Running it twice must not double-count, so a missed day can be picked up by
+/// the day after without corrupting the days that were already settled.
+#[tokio::test]
+async fn settle_is_idempotent() {
+    let dir = tmpdir("settle-idem");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-03T00:00:00Z");
+    store
+        .record(&settled_fixture(
+            "a",
+            "2026-08-01T00:00:00Z",
+            "1000",
+            &[("BTC", "1", "100")],
+        ))
+        .unwrap();
+    store
+        .record(&settled_fixture(
+            "b",
+            "2026-08-02T00:00:00Z",
+            "1010",
+            &[("BTC", "1", "110")],
+        ))
+        .unwrap();
+
+    let r = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        running_controls(&dir),
+        Schedule::default(),
+    );
+    assert_eq!(
+        r.settle(t("2026-08-03T00:00:00Z"), 10).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        r.settle(t("2026-08-03T00:00:00Z"), 10).await.unwrap().len(),
+        0,
+        "a settled period is never settled again"
+    );
+}
+
 // --- freshness, history, health --------------------------------------------
 
 #[test]

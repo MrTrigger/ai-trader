@@ -14,6 +14,14 @@ say() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
 exec 9>"$STATE/cycle.lock"
 flock -n 9 || { say "a cycle is already running; leaving it alone"; exit 0; }
 
+# Before anything moves: write down what the period that just ended earned.
+# It has to happen here rather than at the end of the previous run, because the
+# answer does not exist until the period closes - and this is the moment it
+# does. Never fatal: a missing result is a gap in the record, not a reason to
+# skip a day's trading.
+say "settle"
+$BOT --config $BOTCFG settle || say "settle failed; continuing - the next cycle will pick it up"
+
 say "pull"
 $CP data-pull --config $CFG --data-root $DATA --days 8
 

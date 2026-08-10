@@ -42,6 +42,7 @@ mod ledger;
 
 pub use ledger::{Entry, Ledger, Reconciliation};
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,16 @@ where
         attempts: READ_ATTEMPTS,
         last,
     })
+}
+
+/// Money, to the cent. Decimal arithmetic keeps 28 places and no reader wants
+/// them on a P&L line.
+fn q2(v: Decimal) -> String {
+    // rescale as well as round: round_dp leaves 80 as "80", and a P&L column
+    // where some rows have cents and some do not is a column nobody can scan.
+    let mut v = v.round_dp(2);
+    v.rescale(2);
+    v.to_string()
 }
 
 fn stamp(t: OffsetDateTime) -> String {
@@ -457,6 +468,58 @@ pub struct RunRecord {
     /// *which* slice failed is the first diagnostic question, and a merged
     /// summary cannot answer it.
     pub slices: Vec<serde_json::Value>,
+    /// The book this run left behind, marked at the time it finished.
+    ///
+    /// A decision is only half the record. Without the closing book there is no
+    /// way to say later what the positions this run chose went on to earn, and
+    /// "why did it do that" is a much less useful question than "was it right".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub book_after: Vec<BookMark>,
+    /// What the period that followed this run actually returned.
+    ///
+    /// Written by a later pass, not by the run itself, because the answer does
+    /// not exist yet when the run finishes - the period it opens closes when
+    /// the next one starts. See `settle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
+}
+
+/// One holding, priced. Enough to attribute the period without a price history.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BookMark {
+    pub asset: String,
+    pub qty: String,
+    pub mark: String,
+}
+
+/// The realised outcome of the period a run opened.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunResult {
+    /// When this was computed - always after the fact.
+    pub settled_at: String,
+    /// The run whose execution ended this period.
+    pub closed_by_run_id: Option<String>,
+    pub hours: f64,
+    pub nav_start: String,
+    pub nav_end: String,
+    pub pnl: String,
+    /// Fraction, not percent: -0.0123 is -1.23%.
+    pub return_pct: f64,
+    /// Per-asset mark-to-mark over the period, biggest absolute mover first.
+    /// Positions opened or closed mid-period are attributed only for the part
+    /// of the book that was actually held at both ends, and the remainder falls
+    /// into `unattributed` rather than being silently spread around.
+    pub contributors: Vec<Contribution>,
+    pub unattributed: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Contribution {
+    pub asset: String,
+    pub qty: String,
+    pub mark_start: String,
+    pub mark_end: String,
+    pub pnl: String,
 }
 
 impl RunRecord {
@@ -491,6 +554,8 @@ impl RunRecord {
             control_state: controls.state().into(),
             risk_checks: plan.risk_report.checks.clone(),
             slices: Vec::new(),
+            book_after: Vec::new(),
+            result: None,
         }
     }
 }
@@ -936,6 +1001,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             control_state: controls.state().into(),
             risk_checks: plan.risk_report.checks.clone(),
             slices: Vec::new(),
+            book_after: Vec::new(),
+            result: None,
         };
 
         // The venue's lot grid, read once. Slicing divides each quantity, so
@@ -1052,8 +1119,146 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         }
 
         record.recorded_at = stamp(self.clock.now());
+        // The book this run leaves behind, priced now. Recorded with the run so
+        // the period it opens can be attributed later without a price history.
+        record.book_after = self.mark_book(plan).await.unwrap_or_default();
         self.store.record(&record)?;
         Ok(record)
+    }
+
+    /// Every open position with its mark at the moment the run finished.
+    ///
+    /// The runner has no price source - the PLANNER prices the book - so the
+    /// marks are recovered from the plan, where `weight = qty * price / nav`
+    /// makes `price = weight * nav / qty`. Same prices the decision was made
+    /// on, which is the right basis for judging it.
+    ///
+    /// A position we cannot price is left out rather than marked at zero: its
+    /// absence lands in `unattributed`, which is honest, where a zero would
+    /// invent a loss.
+    async fn mark_book(&self, plan: &Plan) -> Result<Vec<BookMark>, RunnerError> {
+        let nav = plan.nav.total;
+        let mut marks: BTreeMap<&str, Decimal> = BTreeMap::new();
+        for c in &plan.current {
+            if !c.qty.is_zero() && !nav.is_zero() {
+                marks.insert(c.asset.as_str(), c.weight * nav / c.qty);
+            }
+        }
+        let positions = read_with_retry(|| self.venue.get_positions()).await?;
+        Ok(positions
+            .iter()
+            .filter(|p| !p.qty.is_zero())
+            .filter_map(|p| {
+                marks.get(p.asset.as_str()).map(|m| BookMark {
+                    asset: p.asset.to_string(),
+                    qty: p.qty.to_string(),
+                    mark: m.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Attribute the period a past run opened, once it has closed.
+    ///
+    /// Called at the top of the next cycle, before it trades: the book still
+    /// holds the previous run's positions and the marks have moved, which is
+    /// precisely the measurement. Returns the runs it settled.
+    ///
+    /// Idempotent. A run already carrying a result is skipped, so running this
+    /// twice does not double-count and a missed day is picked up by the day
+    /// after.
+    pub async fn settle(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<String>, RunnerError> {
+        let runs = self.store.recent(limit.max(2))?;
+        let mut settled = Vec::new();
+        // `recent` is newest first, so a run's period is closed by the one
+        // BEFORE it in this list.
+        for (i, run) in runs.iter().enumerate() {
+            if run.result.is_some() || run.book_after.is_empty() {
+                continue;
+            }
+            let closer = i.checked_sub(1).and_then(|j| runs.get(j));
+            let Some(nav_start) = run.nav.as_ref().and_then(|n| n.parse::<Decimal>().ok()) else {
+                continue;
+            };
+            // Only a CLOSED period can be settled. The newest run's period is
+            // still running, and reporting a part-day as if it were the result
+            // would make every fresh run look like a loss or a win at random.
+            let Some(closer) = closer else { continue };
+            let Some(nav_end) = closer.nav.as_ref().and_then(|n| n.parse::<Decimal>().ok()) else {
+                continue;
+            };
+            let (closed_by, end_at) = (Some(closer.run_id.clone()), closer.recorded_at.clone());
+
+            let mut contributors = Vec::new();
+            let mut attributed = Decimal::ZERO;
+            for h in &run.book_after {
+                let (Ok(qty), Ok(start)) = (h.qty.parse::<Decimal>(), h.mark.parse::<Decimal>())
+                else {
+                    continue;
+                };
+                // Prefer the closing run's own mark for the asset; fall back to
+                // the current one for the still-open period.
+                let Some(end) = closer
+                    .book_after
+                    .iter()
+                    .find(|b| b.asset == h.asset)
+                    .and_then(|b| b.mark.parse::<Decimal>().ok())
+                else {
+                    continue;
+                };
+                let pnl = qty * (end - start);
+                attributed += pnl;
+                contributors.push(Contribution {
+                    asset: h.asset.clone(),
+                    qty: h.qty.clone(),
+                    mark_start: h.mark.clone(),
+                    mark_end: end.to_string(),
+                    pnl: q2(pnl),
+                });
+            }
+            contributors.sort_by(|a, b| {
+                let (x, y) = (
+                    a.pnl.parse::<Decimal>().unwrap_or_default().abs(),
+                    b.pnl.parse::<Decimal>().unwrap_or_default().abs(),
+                );
+                y.cmp(&x)
+            });
+
+            let pnl = nav_end - nav_start;
+            let hours = (OffsetDateTime::parse(&end_at, &Rfc3339)
+                .ok()
+                .zip(OffsetDateTime::parse(&run.recorded_at, &Rfc3339).ok())
+                .map(|(e, s)| (e - s).whole_minutes() as f64 / 60.0))
+            .unwrap_or(0.0);
+
+            let mut amended = run.clone();
+            amended.result = Some(RunResult {
+                settled_at: stamp(now),
+                closed_by_run_id: closed_by,
+                hours,
+                nav_start: q2(nav_start),
+                nav_end: q2(nav_end),
+                pnl: q2(pnl),
+                return_pct: if nav_start.is_zero() {
+                    0.0
+                } else {
+                    (pnl / nav_start).to_string().parse().unwrap_or(0.0)
+                },
+                contributors,
+                // Fees, funding, and anything opened or closed inside the
+                // period. Named rather than folded into the movers, because a
+                // large residual means the attribution is not telling the whole
+                // story and the reader should know that.
+                unattributed: q2(pnl - attributed),
+            });
+            self.store.record(&amended)?;
+            settled.push(amended.run_id.clone());
+        }
+        Ok(settled)
     }
 
     /// Compare our ledger against the venue, and report rather than act.
@@ -1180,6 +1385,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
                 "adopted": written,
                 "acknowledged": acknowledged,
             })],
+            book_after: Vec::new(),
+            result: None,
         };
         self.store.record(&record)?;
         Ok(record)
@@ -1271,6 +1478,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
             control_state: controls.state().into(),
             risk_checks: Vec::new(),
             slices: Vec::new(),
+            book_after: Vec::new(),
+            result: None,
         };
 
         let mut outcomes = Vec::new();

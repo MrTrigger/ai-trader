@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { money, num, stamp } from "../lib/format";
+import { money, num, signed, stamp, tone } from "../lib/format";
 
 type Order = {
   asset?: string;
@@ -44,6 +44,16 @@ export type Run = {
   control_state?: string;
   risk_checks?: { name: string; limit: string; value: string; passed: boolean; detail?: string | null }[];
   slices?: Slice[];
+  result?: {
+    settled_at?: string;
+    hours?: number;
+    nav_start?: string;
+    nav_end?: string;
+    pnl?: string;
+    return_pct?: number;
+    unattributed?: string;
+    contributors?: { asset: string; qty: string; mark_start: string; mark_end: string; pnl: string }[];
+  } | null;
 };
 
 /**
@@ -153,6 +163,57 @@ export function RunModal({ run, onClose }: { run: Run; onClose: () => void }) {
               v={`${run.orders_submitted ?? 0} over ${run.slices_completed ?? 0}/${run.slices_planned ?? 0} slices`}
             />
           </div>
+
+          {run.result ? (
+            <div className="rounded border border-line2 p-3">
+              <div className="flex flex-wrap items-baseline justify-between gap-3">
+                <div>
+                  <p className="eyebrow mb-1">
+                    What it earned{" "}
+                    <span className="text-faint">
+                      · the {fmtHours(run.result.hours)} this run's book was held
+                    </span>
+                  </p>
+                  <p className={`num text-[22px] leading-none ${tone(run.result.pnl)}`}>
+                    {signed(run.result.pnl ?? 0)}
+                  </p>
+                </div>
+                <div className="flex gap-6 text-right">
+                  <Stat k="Return" v={`${((run.result.return_pct ?? 0) * 100).toFixed(2)}%`} />
+                  <Stat k="NAV" v={`${money(run.result.nav_start ?? 0)} → ${money(run.result.nav_end ?? 0)}`} />
+                </div>
+              </div>
+              {(run.result.contributors ?? []).length > 0 && (
+                <div className="mt-3">
+                  <p className="eyebrow mb-1.5">
+                    Movers <span className="text-faint">· mark to mark, biggest first</span>
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(run.result.contributors ?? []).slice(0, 12).map((c) => (
+                      <span
+                        key={c.asset}
+                        title={`${c.qty} @ ${c.mark_start} → ${c.mark_end}`}
+                        className={`num rounded border border-line2 px-1.5 py-0.5 text-[11px] ${tone(c.pnl)}`}
+                      >
+                        <span className="text-ink">{c.asset}</span> {signed(c.pnl)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {Math.abs(num(run.result.unattributed)) > 0.005 && (
+                <p className="mt-2 text-[11px] text-faint">
+                  {signed(run.result.unattributed ?? 0)} unattributed — fees, and anything opened or
+                  closed inside the period rather than held across it.
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="rounded border border-line2 p-3 text-[11.5px] text-faint">
+              Not settled yet. The period this run opened closes when the next one runs; the result
+              is written then.
+            </p>
+          )}
 
           <div>
             <p className="eyebrow mb-2">What changed</p>
@@ -272,6 +333,10 @@ function Stat({ k, v }: { k: string; v: string }) {
     </div>
   );
 }
+
+/** "18h" reads; "18.0000001 hours" does not. */
+const fmtHours = (h?: number) =>
+  h == null ? "period" : h < 1.5 ? `${Math.round(h * 60)} min` : `${h.toFixed(1)}h`;
 
 const pct = (v: unknown) => (v == null ? "—" : `${(num(v) * 100).toFixed(1)}%`);
 

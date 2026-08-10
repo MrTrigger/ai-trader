@@ -271,6 +271,18 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
                         <span className="min-w-0 flex-1 truncate text-dim">
                           {(rr.detail as string) ?? summarise(rr)}
                         </span>
+                        {(() => {
+                          const res = rr.result as { pnl?: string; return_pct?: number } | undefined;
+                          if (!res) return <span className="shrink-0 text-[11px] text-faint">unsettled</span>;
+                          return (
+                            <span className={`num shrink-0 text-[11.5px] ${tone(res.pnl)}`}>
+                              {signed(res.pnl ?? 0)}
+                              <span className="ml-1 text-faint">
+                                {((res.return_pct ?? 0) * 100).toFixed(2)}%
+                              </span>
+                            </span>
+                          );
+                        })()}
                         <span className="shrink-0 text-[11px] text-faint">detail →</span>
                       </button>
                     );
