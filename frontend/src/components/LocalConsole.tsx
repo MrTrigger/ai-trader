@@ -86,7 +86,11 @@ export function LocalConsole({ botId }: { botId?: string }) {
         </div>
 
         <div className="mt-5 border-t border-line pt-4">
-          <NavChart runs={runs} initialCash={num(b.nav) - num(b.total_pnl)} />
+          <NavChart
+            runs={runs}
+            initialCash={num(b.nav) - num(b.total_pnl)}
+            now={num(b.nav)}
+          />
         </div>
 
         <div className="mt-5 border-t border-line pt-4">
