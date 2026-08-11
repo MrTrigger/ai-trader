@@ -209,9 +209,37 @@ export function RunModal({
       was: change === "held" || change === "trimmed" ? (wasOf.get(b.asset) ?? null) : null,
     };
   });
-  // Positions this run ENDED are not in the closing book, and leaving them out
-  // would make a run that flattened five names look like it did nothing to
-  // them. Listed with a zero closing size, which is what happened.
+  // What this run REMOVED: held before, gone now. Taken from the two books
+  // rather than from Exit orders, because a name can leave the book without
+  // this run's record naming an exit — and "what did it drop" is the first
+  // question asked of a rebalance, so it must not depend on which of two
+  // sources happens to have the answer.
+  const held = new Set(rows.filter((r) => r.qty !== 0).map((r) => r.asset));
+  for (const [asset, was] of wasOf) {
+    if (was.qty === 0 || held.has(asset)) continue;
+    const existing = rows.find((r) => r.asset === asset);
+    if (existing) {
+      existing.change = "closed";
+      existing.was = was;
+      continue;
+    }
+    rows.push({
+      asset,
+      change: "closed",
+      qty: 0,
+      entry: null,
+      // A name absent from the closing book has no mark of its own there; the
+      // last price it was carried at is the honest one to show.
+      mark: 0,
+      notional: 0,
+      weight: 0,
+      markEnd: null,
+      pnl: null,
+      was,
+    });
+  }
+  // An exit this run submitted, for a book old enough to have no previous
+  // record to difference against.
   for (const m of merged) {
     if ((m.o.reason ?? "") !== "Exit" || !m.o.asset) continue;
     if (rows.some((r) => r.asset === m.o.asset)) continue;
@@ -228,11 +256,25 @@ export function RunModal({
       was: wasOf.get(m.o.asset) ?? null,
     });
   }
-  // By weight, which is the order the book is actually read in: what the run
-  // is most exposed to, first. Notional and weight rank the same when there is
-  // one NAV, but weight is the column on screen and a table should be sorted
-  // by something the reader can see.
-  rows.sort((a, b) => Math.abs(b.weight ?? 0) - Math.abs(a.weight ?? 0));
+  // Signed, so the book reads top to bottom as longest to shortest and the two
+  // sides are two blocks rather than interleaved by size. Names this run
+  // removed sit below both, ordered by the weight they used to carry: they are
+  // not part of the book, and sorting them into the middle at zero would put
+  // them exactly where the sign changes.
+  rows.sort((a, b) => {
+    const closed = (r: Row) => (r.change === "closed" && r.qty === 0 ? 1 : 0);
+    if (closed(a) !== closed(b)) return closed(a) - closed(b);
+    if (closed(a)) return Math.abs(b.was?.weight ?? 0) - Math.abs(a.was?.weight ?? 0);
+    return (b.weight ?? 0) - (a.weight ?? 0);
+  });
+
+  // The book the run actually left, which is not the book it aimed at. The
+  // recorded gross and net are the PLAN's — target weights, checked by the
+  // risk layer before anything traded. A turnover budget that defers weight
+  // lands somewhere else, and nothing on this page used to say where.
+  const longPct = rows.reduce((a, r) => a + Math.max(r.weight ?? 0, 0), 0);
+  const shortPct = rows.reduce((a, r) => a + Math.max(-(r.weight ?? 0), 0), 0);
+  const sided = longPct > 0 && shortPct > 0;
 
   const failedChecks = (run.risk_checks ?? []).filter((c) => !c.passed);
 
@@ -274,17 +316,33 @@ export function RunModal({
             </p>
           )}
 
-          <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-5">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-6">
             <Stat k="NAV" v={money(run.nav ?? 0)} />
-            <Stat k="Gross" v={pct(run.gross_exposure)} />
-            <Stat k="Net" v={pct(run.net_exposure)} />
+            <Stat
+              k="Gross"
+              v={`${(longPct + shortPct).toFixed(1)}%`}
+              sub={`target ${pct(run.gross_exposure)}`}
+            />
+            <Stat
+              k="Net"
+              v={`${(longPct - shortPct).toFixed(1)}%`}
+              sub={`target ${pct(run.net_exposure)}`}
+              alarm={Math.abs(longPct - shortPct) > 5}
+            />
+            <Stat
+              k="Long / short"
+              v={`${longPct.toFixed(1)}% / ${shortPct.toFixed(1)}%`}
+              sub={sided ? `${(longPct / shortPct).toFixed(2)}\u00d7` : undefined}
+              alarm={sided && (longPct / shortPct < 0.8 || longPct / shortPct > 1.25)}
+            />
             <Stat
               k="Positions moved"
               v={String(merged.length)}
             />
             <Stat
               k="Orders"
-              v={`${run.orders_submitted ?? 0} over ${run.slices_completed ?? 0}/${run.slices_planned ?? 0} slices`}
+              v={String(run.orders_submitted ?? 0)}
+              sub={`${run.slices_completed ?? 0}/${run.slices_planned ?? 0} slices`}
             />
           </div>
 
@@ -483,11 +541,23 @@ const CHANGE = {
   held: { label: "held", cls: "text-faint" },
 } as const;
 
-function Stat({ k, v }: { k: string; v: string }) {
+function Stat({
+  k,
+  v,
+  sub,
+  alarm = false,
+}: {
+  k: string;
+  v: string;
+  /** What it was supposed to be, where that differs from what it is. */
+  sub?: string;
+  alarm?: boolean;
+}) {
   return (
     <div>
       <p className="eyebrow">{k}</p>
-      <p className="num mt-1 text-[13px]">{v}</p>
+      <p className={`num mt-1 text-[13px] ${alarm ? "text-consequence" : ""}`}>{v}</p>
+      {sub && <p className="num text-[10.5px] leading-tight text-faint">{sub}</p>}
     </div>
   );
 }
