@@ -393,6 +393,14 @@ impl venue::MarketData for PaperUpstream {
     async fn mark(&self, asset: &str) -> Result<rust_decimal::Decimal, venue::VenueError> {
         self.prices.mark_price(asset).await
     }
+    /// Forwarded to the exchange like `markets`, and for the same reason: the
+    /// paper book invents fills, never market data. Written out rather than
+    /// inherited because this type implements `MarketData` by hand, so it
+    /// silently took the trait's "unsupported" default and reported that the
+    /// exchange has no order book.
+    async fn order_book(&self, asset: &str) -> Result<venue::OrderBook, venue::VenueError> {
+        self.venue.get_order_book(asset).await
+    }
 }
 
 /// THE venue registry: the one sanctioned place a live venue's name may be

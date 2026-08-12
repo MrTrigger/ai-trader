@@ -745,3 +745,58 @@ async fn a_restored_venue_keeps_resting_orders_waiting() {
     h.clock.advance(Duration::minutes(1));
     assert_eq!(back.get_fills(None).await.unwrap().len(), 1);
 }
+
+/// The paper book invents fills; it must never invent market data.
+///
+/// `MarketData::order_book` carries an "unsupported" default so a venue with
+/// no depth blocks nobody. The cost of that default is that any upstream
+/// implementing the trait by hand silently inherits it — which is exactly what
+/// shipped: `bot book-capture` reported "this venue does not support order
+/// book" for every name, against an exchange that publishes full depth.
+#[tokio::test]
+async fn the_paper_venue_forwards_the_market_s_book() {
+    use venue::{BookLevel, MarketData, OrderBook, Side};
+
+    struct Upstream;
+    #[async_trait::async_trait]
+    impl MarketData for Upstream {
+        async fn markets(&self) -> Result<Vec<Market>, venue::VenueError> {
+            Ok(markets())
+        }
+        async fn mark(&self, _asset: &str) -> Result<Decimal, venue::VenueError> {
+            Ok(dec("100"))
+        }
+        async fn order_book(&self, _asset: &str) -> Result<OrderBook, venue::VenueError> {
+            Ok(OrderBook {
+                bids: vec![BookLevel {
+                    price: dec("99"),
+                    qty: dec("10"),
+                }],
+                asks: vec![BookLevel {
+                    price: dec("101"),
+                    qty: dec("10"),
+                }],
+            })
+        }
+    }
+
+    let clock = Arc::new(ManualClock::new(
+        OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap(),
+    ));
+    let venue = PaperVenue::new(PaperConfig::default(), Upstream, clock);
+    let book = venue
+        .get_order_book("BTC")
+        .await
+        .expect("the paper venue forwards the market's book");
+
+    assert_eq!(book.best_bid(), Some(dec("99")));
+    assert_eq!(book.best_ask(), Some(dec("101")));
+    // 2 wide on a mid of 100 is 200bp.
+    assert_eq!(book.spread_bps(), Some(dec("200")));
+    // One level of $1,010 on the ask; a $505 buy takes half of it at 101,
+    // which is 100bp above the mid.
+    assert_eq!(book.cross_bps(dec("505"), Side::Buy), Some(dec("100")));
+    // And more than the level holds cannot be filled at all, which is an
+    // answer rather than an error.
+    assert_eq!(book.cross_bps(dec("5000"), Side::Buy), None);
+}
