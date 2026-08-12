@@ -55,7 +55,9 @@ fn main() -> Result<(), String> {
         let mut rng: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
         for b in bars.iter().filter(|b| b.ts_utc >= cutoff) {
             let q = b.quote_volume.unwrap_or(b.volume * b.close);
-            if !(q > 0.0) || !(b.open > 0.0) || !(b.close > 0.0) {
+            // NaN fails every comparison, which is the intent: an unpriced bar
+            // is skipped rather than folded in as a zero.
+            if q.is_nan() || q <= 0.0 || b.open <= 0.0 || b.close <= 0.0 {
                 continue;
             }
             let h = chrono::Timelike::hour(&b.ts_utc);
