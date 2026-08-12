@@ -34,6 +34,20 @@ fn parse_date(text: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|e| format!("bad date {text:?}: {e}"))
 }
 
+/// Resolve one `--assets` token to its store key and Binance UM symbol.
+///
+/// The two derivations must read the input at different points: HL's `k`
+/// prefix (kPEPE, kBONK, ...) means "thousandths" and `binance_um_symbol`
+/// only recognises it in its original lowercase-`k` form - uppercasing
+/// first turns `kPEPE` into `KPEPE`, silently missing the 1000-prefix
+/// mapping and (wrongly) treating the coin as unlisted. But `Bar::validate`
+/// requires the canonical uppercase asset, so the store key `KPEPE` is what
+/// every partition and file name use. So: symbol lookup from the original
+/// case, store key uppercased.
+fn resolve_asset(input: &str) -> (String, Option<String>) {
+    (input.to_uppercase(), binance_um_symbol(input))
+}
+
 /// (year, month) pairs from `start`'s month through the month containing the
 /// instant just before `end` - the same exclusive-end-boundary convention as
 /// `crypto_portfolio::binance_archive::months`, so `--end 2026-08-01` does
@@ -58,11 +72,13 @@ fn months(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(i32, u32)> {
 
 async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
+    // Kept in original case: resolve_asset needs the un-uppercased token to
+    // recognise HL's lowercase-`k` 1000-prefix coins (kPEPE, kBONK, ...).
     let assets = need(args, "--assets")?
         .split(',')
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(str::to_uppercase)
+        .map(str::to_string)
         .collect::<Vec<_>>();
     if assets.is_empty() {
         return Err("no assets given".into());
@@ -82,17 +98,18 @@ async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
     let months = months(start, end);
     let mut total = 0usize;
     for asset in &assets {
-        let Some(symbol) = binance_um_symbol(asset) else {
-            println!("{asset}: skipped (not listed on Binance UM)");
+        let (store_asset, symbol) = resolve_asset(asset);
+        let Some(symbol) = symbol else {
+            println!("{store_asset}: skipped (not listed on Binance UM)");
             continue;
         };
         for &(year, month) in &months {
             let label = format!("{year:04}-{month:02}");
             match fetch_um_month(&client, &symbol, year, month).await? {
-                None => println!("{asset} {label}: skipped (404: not listed)"),
+                None => println!("{store_asset} {label}: skipped (404: not listed)"),
                 Some(bytes) => {
-                    let bars = parse_um_klines_zip(&bytes, asset, start, end)?;
-                    println!("{asset} {label}: {} bars", bars.len());
+                    let bars = parse_um_klines_zip(&bytes, &store_asset, start, end)?;
+                    println!("{store_asset} {label}: {} bars", bars.len());
                     if !bars.is_empty() {
                         total += bars.len();
                         store::write(&root, &bars)?;
@@ -133,5 +150,30 @@ fn main() -> ExitCode {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_asset_reads_the_k_prefix_before_uppercasing_the_store_key() {
+        assert_eq!(
+            resolve_asset("kPEPE"),
+            ("KPEPE".to_string(), Some("1000PEPEUSDT".to_string()))
+        );
+        assert_eq!(
+            resolve_asset("BTC"),
+            ("BTC".to_string(), Some("BTCUSDT".to_string()))
+        );
+        assert_eq!(resolve_asset("HYPE").1, None);
+        // Capital-K tickers (KAITO, KAVA, ...) are real HL coins, not the
+        // 1000-prefix shorthand - a case-insensitive `k` match would corrupt
+        // them into a nonexistent "1000AITOUSDT" symbol.
+        assert_eq!(
+            resolve_asset("KAITO").1,
+            Some("KAITOUSDT".to_string())
+        );
     }
 }
