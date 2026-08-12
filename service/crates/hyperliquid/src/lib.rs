@@ -206,6 +206,33 @@ impl Hyperliquid {
         ack_from_status(first, &order.client_order_id)
     }
 
+    /// Cancel a resting order by the id *we* chose, with no oid lookup.
+    ///
+    /// A cancel refused because the order is already gone comes back as
+    /// [`VenueError::Rejected`]; for the scalper's cancel-then-reprice loop
+    /// that usually means "it filled while you decided", and the fills feed
+    /// settles which.
+    pub async fn cancel_by_cloid(
+        &self,
+        asset: &str,
+        client_order_id: &str,
+    ) -> Result<(), VenueError> {
+        let index = self.asset_index(asset).await?;
+        let res = self.exchange(cancel_by_cloid_action(index, client_order_id)).await?;
+        if res.status != "ok" {
+            return Err(VenueError::Unreachable(format!(
+                "cancel refused: venue returned status {}",
+                res.status
+            )));
+        }
+        let data = res
+            .response
+            .as_ref()
+            .and_then(|r| r.data.as_ref())
+            .ok_or_else(|| VenueError::Unreachable("no data in the venue's response".into()))?;
+        cancel_outcome(&data.statuses)
+    }
+
     fn agent_or_refuse(&self) -> Result<&Agent, VenueError> {
         self.agent.as_ref().ok_or_else(|| {
             VenueError::Unreachable(
@@ -276,6 +303,24 @@ fn client() -> Result<reqwest::Client, VenueError> {
         .user_agent("ai-trader/0.1")
         .build()
         .map_err(|e| VenueError::Unreachable(e.to_string()))
+}
+
+fn cancel_by_cloid_action(index: u32, client_order_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cancelByCloid",
+        "cancels": [{"asset": index, "cloid": cloid(client_order_id)}],
+    })
+}
+
+/// Cancel statuses are the string `"success"` or `{"error": ...}` — a shape
+/// `ExchangeResponse::statuses()` was not built for, so they are read here.
+fn cancel_outcome(statuses: &[serde_json::Value]) -> Result<(), VenueError> {
+    for s in statuses {
+        if let Some(msg) = s.get("error").and_then(|v| v.as_str()) {
+            return Err(VenueError::Rejected { message: msg.to_string() });
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -657,5 +702,21 @@ mod tests {
         assert_eq!(Tif::Gtc.as_str(), "Gtc");
         assert_eq!(Tif::Ioc.as_str(), "Ioc");
         assert_eq!(Tif::Alo.as_str(), "Alo");
+    }
+
+    #[test]
+    fn the_cancel_by_cloid_action_names_the_asset_and_the_hashed_id() {
+        let a = cancel_by_cloid_action(7, "my-id");
+        assert_eq!(a["type"], "cancelByCloid");
+        assert_eq!(a["cancels"][0]["asset"], 7);
+        assert_eq!(a["cancels"][0]["cloid"], serde_json::json!(cloid("my-id")));
+    }
+
+    #[test]
+    fn a_successful_cancel_is_ok_and_a_refused_one_says_why() {
+        assert!(cancel_outcome(&[serde_json::json!("success")]).is_ok());
+        let e = cancel_outcome(&[serde_json::json!({"error": "Order was never placed, already canceled, or filled."})])
+            .unwrap_err();
+        assert!(matches!(&e, VenueError::Rejected { message } if message.contains("already canceled")));
     }
 }
