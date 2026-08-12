@@ -180,7 +180,13 @@ async fn run(
         if connected_at.elapsed() > cfg.backoff_cap {
             backoff = cfg.backoff_start; // it held for a while; start fresh
         }
-        tokio::time::sleep(backoff).await;
+        // A venue that's simply unreachable never touches `tx`, so without
+        // racing the sleep against the receiver closing, a dropped receiver
+        // would never be noticed and this loop would retry forever.
+        tokio::select! {
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(cfg.backoff_cap);
     }
 }
@@ -197,13 +203,25 @@ async fn connect_and_stream(
     cfg: WsConfig,
     tx: &tokio::sync::mpsc::Sender<WsMessage>,
 ) -> SessionEnd {
-    let Ok((mut socket, _)) = tokio_tungstenite::connect_async(url).await else {
-        return SessionEnd::ConnectFailed;
+    // Race the connect attempt itself against the receiver closing, so a
+    // hung or slow handshake against an unreachable venue doesn't stop this
+    // task from noticing the consumer is gone.
+    let mut socket = tokio::select! {
+        _ = tx.closed() => return SessionEnd::ReceiverDropped,
+        res = tokio_tungstenite::connect_async(url) => match res {
+            Ok((socket, _)) => socket,
+            Err(_) => return SessionEnd::ConnectFailed,
+        },
     };
     for sub in subs {
         let msg = serde_json::json!({"method": "subscribe", "subscription": sub.to_json()});
+        // This send happens strictly before `Connected` is ever emitted, so
+        // a failure here is a connection that was never established from the
+        // consumer's point of view — ConnectFailed, not ConnectionLost.
+        // Reporting ConnectionLost here would emit Disconnected for a
+        // session that never emitted Connected, violating the contract.
         if socket.send(Message::Text(msg.to_string())).await.is_err() {
-            return SessionEnd::ConnectionLost;
+            return SessionEnd::ConnectFailed;
         }
     }
     if tx.send(WsMessage::Connected).await.is_err() {
@@ -313,5 +331,30 @@ mod tests {
             parse_frame(r#"{"channel":"notifications","data":{}}"#).unwrap(),
             WsEvent::Other(c) if c == "notifications"
         ));
+    }
+
+    /// `run` is private, so this test lives here rather than in the
+    /// integration test file. A venue that's unreachable (nothing listens on
+    /// this port, so every connect attempt fails fast and the task falls
+    /// into its backoff sleep) never sends anything on `tx` — the only way
+    /// the task can notice the receiver was dropped is by racing the
+    /// connect attempt and the backoff sleep against `tx.closed()`, per the
+    /// "task exits when the receiver is dropped" contract.
+    #[tokio::test]
+    async fn the_task_exits_once_the_receiver_is_dropped_even_while_the_venue_is_unreachable() {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let cfg = WsConfig {
+            ping_interval: std::time::Duration::from_secs(30),
+            backoff_start: std::time::Duration::from_millis(20),
+            backoff_cap: std::time::Duration::from_millis(50),
+        };
+        let handle = tokio::spawn(run("ws://127.0.0.1:1".to_string(), vec![], cfg, tx));
+
+        drop(rx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("run() must exit promptly once the receiver is dropped, even with the venue unreachable")
+            .expect("the run() task must not panic");
     }
 }

@@ -64,3 +64,55 @@ async fn the_client_reconnects_and_resubscribes() {
     assert_eq!(first[0]["subscription"]["coin"], "BTC");
     assert_eq!(first[0]["subscription"]["interval"], "1m");
 }
+
+/// `Disconnected` is only valid for a session that reached `Connected` first
+/// (per the module's contract). A session whose subscribe send fails —
+/// which can happen if the server completes the WS handshake and then drops
+/// the connection immediately, before the client's subscribe frame lands —
+/// must end silently (`ConnectFailed`), never by emitting `Disconnected`.
+///
+/// The race is inherent (whether the subscribe send observes the drop
+/// depends on OS buffering timing), so this drives a few connect cycles
+/// against a server that always drops right after the handshake and checks
+/// the one invariant that must hold regardless of how the race resolves:
+/// the very first message a consumer ever receives, if any, is `Connected`
+/// — never `Disconnected`.
+#[tokio::test]
+async fn the_first_message_a_consumer_receives_is_never_disconnected() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let cfg = WsConfig {
+        ping_interval: std::time::Duration::from_secs(30),
+        backoff_start: std::time::Duration::from_millis(20),
+        backoff_cap: std::time::Duration::from_millis(50),
+    };
+    let subs = vec![Subscription::Bbo { coin: "BTC".into() }];
+    let mut rx = ws::spawn(url, subs, cfg);
+
+    let server = tokio::spawn(async move {
+        // Accept a handful of connections, completing the WS handshake each
+        // time and then dropping the socket immediately without reading
+        // anything the client sends — the shape that can race the
+        // subscribe send against the connection closing.
+        for _ in 0..5 {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok(socket) = tokio_tungstenite::accept_async(stream).await else { continue };
+            drop(socket);
+        }
+    });
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+    match first {
+        Ok(msg) => assert!(
+            !matches!(msg, Some(WsMessage::Disconnected)),
+            "the first message must never be Disconnected, got {msg:?}"
+        ),
+        Err(_) => {} // nothing arrived within the window: also consistent with the contract
+    }
+
+    // The client may well have gotten what it needed in a single cycle,
+    // leaving the mock server blocked in `listener.accept().await` for the
+    // connections that never came — awaiting it here would hang the test.
+    drop(rx);
+    server.abort();
+}
