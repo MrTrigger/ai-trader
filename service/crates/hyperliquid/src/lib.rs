@@ -35,7 +35,9 @@
 mod info;
 mod sign;
 
-pub use info::{ApprovedAgent, Candle, Info, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET};
+pub use info::{
+    ApprovedAgent, Candle, Info, L2Book, L2Level, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET,
+};
 pub use sign::{Agent, SignError};
 
 use async_trait::async_trait;

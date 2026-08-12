@@ -372,11 +372,20 @@ impl Info {
         .await
     }
 
+    /// The resting book, both sides, deepest form the venue will give us.
+    ///
+    /// Depth is the only way to price a trade we have not made: the cost of
+    /// crossing a given size is a property of the book, and it is observable
+    /// without sending anything. What it cannot show is our own impact — the
+    /// book's reaction to being hit — which needs real fills.
+    pub async fn l2_book(&self, coin: &str) -> Result<L2Book, VenueError> {
+        self.post(serde_json::json!({"type": "l2Book", "coin": coin}))
+            .await
+    }
+
     /// Best bid and ask, for measuring the spread we are actually paying.
     pub async fn top_of_book(&self, coin: &str) -> Result<(Decimal, Decimal), VenueError> {
-        let b: L2Book = self
-            .post(serde_json::json!({"type": "l2Book", "coin": coin}))
-            .await?;
+        let b = self.l2_book(coin).await?;
         let px = |side: usize| -> Option<Decimal> { b.levels.get(side)?.first()?.px.parse().ok() };
         match (px(0), px(1)) {
             (Some(bid), Some(ask)) => Ok((bid, ask)),
