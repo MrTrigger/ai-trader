@@ -125,6 +125,9 @@ pub struct Prepared {
     daily: Vec<DailyRow>,
     hourly: Option<Vec<HourlyRow>>,
     opens: BTreeMap<DateTime<Utc>, BTreeMap<String, Decimal>>,
+    /// Realised daily funding, kept so the replay can charge it rather than
+    /// only feed it to the features.
+    funding: features_crypto::FundingTable,
 }
 
 pub fn prepare(
@@ -141,11 +144,12 @@ pub fn prepare(
         return Err("daily store is empty".into());
     }
     let listings = store::funding_listings(root)?;
+    let funding = crate::funding::load(root)?;
     let daily = features_crypto::daily(
         &daily_bars,
         cfg.benchmark.as_deref(),
         &listings,
-        &crate::funding::load(root)?,
+        &funding,
         funding_window,
     )?;
     let hourly = if require_hourly {
@@ -174,6 +178,7 @@ pub fn prepare(
         daily,
         hourly,
         opens,
+        funding,
     })
 }
 
@@ -261,6 +266,10 @@ pub fn replay_prepared_stepped(
     let mut steps = Vec::new();
     let mut disclosures = Vec::new();
     let mut gate_failures = 0usize;
+    // The last date whose funding has been charged. None until the first step,
+    // because a book that does not exist yet cannot have been funded.
+    let mut last_priced: Option<DateTime<Utc>> = None;
+    let mut funding_total = Decimal::ZERO;
     let mut as_of = start;
     while as_of <= end {
         let members = match universe::load(root, as_of) {
@@ -305,6 +314,16 @@ pub fn replay_prepared_stepped(
             }
         };
         let prices = prepared.opens.get(&as_of).cloned().unwrap_or_default();
+        // Funding for the period that just ENDED, on the book that was held
+        // through it, before this step's orders change anything. The direction
+        // matters more than it looks: summing the days ahead of the position
+        // instead of behind it is the one-character error that turned a
+        // +134.9% backtest into +760.7%, so the window is closed on both ends
+        // and excludes today.
+        let carry = funding_carry(&portfolio, &prices, &prepared.funding, last_priced, as_of);
+        portfolio.cash += carry;
+        funding_total += carry;
+        last_priced = Some(as_of);
         let (next, filled) = apply(&decision.plan.orders, &portfolio, &prices, &fills, as_of);
         portfolio = next;
         let nav = mark(&portfolio, &prices);
@@ -335,6 +354,16 @@ pub fn replay_prepared_stepped(
             ),
         );
     }
+    if prepared.funding.is_empty() {
+        disclosures
+            .push("no funding data in the store, so this replay carries no funding P&L".into());
+    } else {
+        disclosures.push(format!(
+            "funding carried on held positions: {} over the window (Binance USD-M rates \
+             standing in for Hyperliquid's, as the plan discloses)",
+            format!("{:.2}", funding_total)
+        ));
+    }
     disclosures.extend(standing_disclosures(cfg, &steps, slippage_multiple));
     Ok(BacktestResult {
         metrics: metrics(&steps),
@@ -342,6 +371,52 @@ pub fn replay_prepared_stepped(
         disclosures,
         slippage_multiple,
     })
+}
+
+/// What the book paid or earned in funding over `(since, until]`.
+///
+/// A perpetual charges longs and pays shorts when the rate is positive, so the
+/// P&L on a position is `-qty * price * rate`: the sign falls out of the
+/// quantity and needs no special case for shorts.
+///
+/// The window excludes `until` itself. Funding for a day is only knowable once
+/// that day has happened, and charging it to a book being priced at that day's
+/// open is how a backtest earns money it could not have earned. The recovered
+/// harness summed the window forward by one day and turned +134.9% into
+/// +760.7%; this is the same arithmetic pointed the other way, and the test
+/// beside it exists to keep it pointed there.
+fn funding_carry(
+    book: &Portfolio,
+    prices: &BTreeMap<String, Decimal>,
+    table: &features_crypto::FundingTable,
+    since: Option<DateTime<Utc>>,
+    until: DateTime<Utc>,
+) -> Decimal {
+    let Some(since) = since else {
+        return Decimal::ZERO;
+    };
+    let mut total = Decimal::ZERO;
+    for position in &book.positions {
+        if position.qty.is_zero() {
+            continue;
+        }
+        let Some(price) = prices.get(&position.asset) else {
+            continue;
+        };
+        let Some(days) = table.get(&position.asset) else {
+            continue;
+        };
+        for (day, rate) in days.range(since.date_naive()..until.date_naive()) {
+            // range() is half-open, so `since` is included and `until` is not.
+            // The day of `since` is the first full day the book was held.
+            let _ = day;
+            let Some(rate) = decimal(*rate).ok() else {
+                continue;
+            };
+            total -= position.qty * price * rate;
+        }
+    }
+    total
 }
 
 fn apply(
@@ -564,6 +639,101 @@ fn canonical(asset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+        use chrono::NaiveDate;
+
+    fn book(asset: &str, qty: i64) -> Portfolio {
+        Portfolio {
+            cash: Decimal::from(100_000),
+            positions: vec![crate::Position {
+                asset: asset.into(),
+                qty: Decimal::from(qty),
+            }],
+        }
+    }
+
+    fn rates(days: &[(&str, f64)]) -> features_crypto::FundingTable {
+        let mut inner = BTreeMap::new();
+        for (d, r) in days {
+            inner.insert(NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap(), *r);
+        }
+        BTreeMap::from([("BTC".to_string(), inner)])
+    }
+
+    fn at(d: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&format!("{d}T00:00:00Z"))
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// A long pays funding when the rate is positive; a short is paid.
+    #[test]
+    fn funding_charges_the_long_and_pays_the_short() {
+        let prices = BTreeMap::from([("BTC".to_string(), Decimal::from(100))]);
+        let table = rates(&[("2026-01-01", 0.001)]);
+        let long = funding_carry(&book("BTC", 10), &prices, &table, Some(at("2026-01-01")), at("2026-01-02"));
+        let short = funding_carry(&book("BTC", -10), &prices, &table, Some(at("2026-01-01")), at("2026-01-02"));
+        // 10 units at 100 is 1000 of notional; 0.1% of it is 1.
+        assert_eq!(long, Decimal::from(-1));
+        assert_eq!(short, Decimal::from(1));
+    }
+
+    /// The +875% bug, in one assertion.
+    ///
+    /// The recovered harness summed the funding window FORWARD - `day +
+    /// timedelta` where it needed `day -` - so a position was charged rates
+    /// from days it had not lived through. That single character took a
+    /// +134.9% backtest to +760.7%. The window here is half-open and must
+    /// never reach the day being priced.
+    #[test]
+    fn funding_never_reaches_a_day_the_book_has_not_lived_through() {
+        let prices = BTreeMap::from([("BTC".to_string(), Decimal::from(100))]);
+        // A colossal rate on the day we are pricing at, and nothing before it.
+        let table = rates(&[("2026-01-02", 1.0)]);
+        let carry = funding_carry(
+            &book("BTC", 10),
+            &prices,
+            &table,
+            Some(at("2026-01-01")),
+            at("2026-01-02"),
+        );
+        assert_eq!(
+            carry,
+            Decimal::ZERO,
+            "the 2nd's rate belongs to the period ENDING on the 3rd, not the one \
+             ending on the 2nd"
+        );
+    }
+
+    #[test]
+    fn a_book_with_no_history_yet_is_charged_nothing() {
+        let prices = BTreeMap::from([("BTC".to_string(), Decimal::from(100))]);
+        let table = rates(&[("2026-01-01", 0.001)]);
+        // First step of a replay: nothing was held before it.
+        assert_eq!(
+            funding_carry(&book("BTC", 10), &prices, &table, None, at("2026-01-02")),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn every_day_the_book_was_held_is_charged_exactly_once() {
+        let prices = BTreeMap::from([("BTC".to_string(), Decimal::from(100))]);
+        let table = rates(&[
+            ("2026-01-01", 0.001),
+            ("2026-01-02", 0.001),
+            ("2026-01-03", 0.001),
+        ]);
+        // Held from the 1st to the 4th: three days, the 4th not yet knowable.
+        let carry = funding_carry(
+            &book("BTC", 10),
+            &prices,
+            &table,
+            Some(at("2026-01-01")),
+            at("2026-01-04"),
+        );
+        assert_eq!(carry, Decimal::from(-3));
+    }
 
     fn step(day: i64, nav: i64) -> Step {
         Step {

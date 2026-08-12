@@ -1016,6 +1016,8 @@ fn cmd_gate(args: &[String]) -> Result<(), String> {
         initial_cash,
         "liquidity_top",
         "equal_weight",
+        get(args, "--retrained").as_deref().map(Path::new),
+        get(args, "--retrained-2x").as_deref().map(Path::new),
     )?;
     let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
