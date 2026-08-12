@@ -10,6 +10,7 @@ name = "api"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 records = { path = "../records" }
 tokio = { version = "1", features = ["rt"] }
 venue.workspace = true
