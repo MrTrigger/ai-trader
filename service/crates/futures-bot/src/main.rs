@@ -1271,6 +1271,7 @@ async fn feed_task(
                         format!("first realtime bar stamped {:?}", first.date),
                     );
                     let mut last_emit = std::time::Instant::now();
+                    let mut errors: u64 = 0;
                     let why = loop {
                         let next = tokio::time::timeout(
                             std::time::Duration::from_secs(REALTIME_SILENCE_S),
@@ -1280,13 +1281,30 @@ async fn feed_task(
                         match next {
                             Ok(None) => break "realtime stream ended",
                             Ok(Some(item)) => {
-                                let Ok(b) = item else { continue };
-                                if let Some(done) = push(&b, &mut agg) {
-                                    last_emit = std::time::Instant::now();
-                                    if tx.send(done).await.is_err() {
-                                        return;
+                                match item {
+                                    Ok(b) => {
+                                        if let Some(done) = push(&b, &mut agg) {
+                                            last_emit = std::time::Instant::now();
+                                            if tx.send(done).await.is_err() {
+                                                return;
+                                            }
+                                        }
                                     }
-                                } else if last_emit.elapsed().as_secs() > REALTIME_NO_BAR_S
+                                    // An erroring subscription still counts as
+                                    // "printing", so it must not skip the
+                                    // deadline below — `continue` here would
+                                    // spin past both guards forever, which is
+                                    // the same blindness by a third route. Say
+                                    // it once: an error nobody records is an
+                                    // error nobody can diagnose.
+                                    Err(e) => {
+                                        if errors == 0 {
+                                            say("warn", format!("realtime stream error: {e}"));
+                                        }
+                                        errors += 1;
+                                    }
+                                }
+                                if last_emit.elapsed().as_secs() > REALTIME_NO_BAR_S
                                     && live::market_should_be_open(chrono::Utc::now())
                                 {
                                     // Printing, but never completing a bar.
