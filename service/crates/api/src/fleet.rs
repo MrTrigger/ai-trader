@@ -17,6 +17,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use serde_json::{json, Value};
 
 /// Blocking bridge over the async registry: the dashboard is a localhost
@@ -160,6 +163,10 @@ fn status_from_rows(
         };
         out["kill_switch"] = halted;
         out["control_state"] = json!(c.state);
+        // When it was set. Without it the fleet card cannot tell a Start that
+        // was picked up from one that nothing has answered, so every card with
+        // a `running` control was green regardless of what was happening.
+        out["control_set_at"] = json!(c.at);
     }
     if let Some(r) = last_run {
         out["last_run"] = json!({
@@ -168,6 +175,33 @@ fn status_from_rows(
         });
     }
     Some(out)
+}
+
+/// A bot's status for a list view: its published document if it has one, the
+/// file fallback otherwise — and in BOTH cases the operator's control word.
+///
+/// The merge lives here because forgetting it is silent and this is the third
+/// place it was forgotten. `status_from_rows` returns `None` for a bot that has
+/// never published, and the fallback knows only about files, so a bot that had
+/// been told to run and wasn't showed on the fleet page as one nobody had asked
+/// anything of — grey "not started" — while its own page said "not running" in
+/// red. Same fact, two answers, because only one path carried the control row.
+fn status_or_fallback(
+    repo_root: &Path,
+    bot: &records::BotRow,
+    status: Option<&records::StatusRow>,
+    control: Option<&records::ControlRow>,
+    last_run: Option<&Value>,
+) -> Value {
+    let mut out = status_from_rows(status, control, last_run)
+        .unwrap_or_else(|| status_for(repo_root, bot.state_dir.as_deref()));
+    if let Some(c) = control {
+        if out.get("control_state").is_none() {
+            out["control_state"] = json!(c.state);
+            out["control_set_at"] = json!(c.at);
+        }
+    }
+    out
 }
 
 /// GET /api/bots
@@ -194,8 +228,13 @@ pub fn list(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
     let rows: Vec<Value> = data
         .into_iter()
         .map(|(b, status, control, last_run)| {
-            let status = status_from_rows(status.as_ref(), control.as_ref(), last_run.as_ref())
-                .unwrap_or_else(|| status_for(repo_root, b.state_dir.as_deref()));
+            let status = status_or_fallback(
+                repo_root,
+                &b,
+                status.as_ref(),
+                control.as_ref(),
+                last_run.as_ref(),
+            );
             let is_local = b
                 .state_dir
                 .as_deref()
@@ -219,23 +258,6 @@ pub fn list(repo_root: &Path, local_state_dir: &Path) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "available": true, "bots": rows }))
-}
-
-/// POST /api/bots/{id}/halt|resume — one control path for every bot.
-///
-/// Appends a `control_events` row whose payload merges over the current
-/// one, so per-sleeve switches and other bot-specific keys survive a
-/// halt/resume cycle. Both dialects are written (`halt` for the futures
-/// contract, `kill_switch` for the runner's ControlFile) — each bot reads
-/// its own key from the same row.
-pub fn set_halt(
-    _repo_root: &Path,
-    bot_id: &str,
-    halt: bool,
-    reason: &str,
-    by: &str,
-) -> Result<Value, String> {
-    set_state(bot_id, if halt { "halted" } else { "running" }, reason, by)
 }
 
 /// Write a control state. Three of them, because "stop the bot" is two
@@ -316,16 +338,22 @@ pub fn set_state(bot_id: &str, state: &str, reason: &str, by: &str) -> Result<Va
 /// otherwise launch twins.
 pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     let id = bot_id.to_string();
-    let (bot, status, needs_ib_gateway) = with_registry(move |reg| {
+    let (bot, status, ib_account_kind) = with_registry(move |reg| {
         Box::pin(async move {
             let bot = reg.bot(&id).await?;
             let status = reg.get_status(&id).await?;
-            let needs_ib_gateway = reg
+            // Not just WHETHER this bot needs a Gateway, but WHICH MONEY it is
+            // bound to. One IBKR username holds the paper account and another
+            // holds the live one, so a Gateway serving the wrong one cannot be
+            // fixed by the bot afterwards — it is a different login. The
+            // binding is the only place that answer exists.
+            let ib_account_kind = reg
                 .bindings(&id)
                 .await?
                 .into_iter()
-                .any(|b| b.scope == "trade" && b.protocol == "ib");
-            Ok((bot, status, needs_ib_gateway))
+                .find(|b| b.scope == "trade" && b.protocol == "ib")
+                .map(|b| b.account_kind);
+            Ok((bot, status, ib_account_kind))
         })
     })?;
     let Some(bot) = bot else {
@@ -334,29 +362,12 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     let Some(launch) = bot.launch.as_deref() else {
         return Ok(json!({ "spawned": false, "why": "no launch command registered" }));
     };
-    let alive = status
-        // A healthy bot publishes every 60s; missing a cycle and a half
-        // means nothing is attached. But freshness alone lies right after
-        // a Stop: the process publishes its final state and EXITS, so a
-        // seconds-old heartbeat can belong to a corpse. The final document
-        // says so — exit paths publish reasons no resident process carries
-        // (a resident halt says "operator") — and that outranks the clock.
-        .map(|s| {
-            let doc: Value = serde_json::from_str(&s.payload).unwrap_or(Value::Null);
-            let reason = doc
-                .get("state_reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
-            let exited = doc.get("state").and_then(|v| v.as_str()) == Some("halted")
-                && matches!(reason, "operator-stop" | "feed-stall" | "feed-closed");
-            s.heartbeat_age_seconds < 90 && !exited
-        })
-        .unwrap_or(false);
+    let alive = status.as_ref().is_some_and(status_is_live);
     if alive {
         return Ok(json!({ "spawned": false, "why": "a process is already publishing" }));
     }
-    if let Some(pid) = children().lock().expect("spawn dedupe").get(bot_id) {
-        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+    if let Some(child) = children().lock().expect("spawn dedupe").get(bot_id) {
+        if std::path::Path::new(&format!("/proc/{}", child.pid)).exists() {
             return Ok(json!({ "spawned": false, "why": "the previous launch is still running" }));
         }
     }
@@ -377,19 +388,25 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     // for the Gateway, and the sidecar starts it only after seeing this lease.
     // A unique file per process makes overlapping exits safe when the fleet
     // eventually contains more than one IB-backed bot.
-    let gateway_lease = if needs_ib_gateway {
-        acquire_gateway_lease(bot_id)?
-    } else {
-        None
+    let gateway_lease = match ib_account_kind.as_deref() {
+        Some(kind) => acquire_gateway_lease(bot_id, kind)?,
+        None => None,
     };
-    let child = std::process::Command::new("sh")
+    let mut command = std::process::Command::new("sh");
+    command
         .arg("-c")
         .arg(launch)
         .current_dir(repo_root)
         .stdin(std::process::Stdio::null())
         .stdout(logfile.try_clone().map_err(|e| e.to_string())?)
-        .stderr(logfile)
-        .spawn();
+        .stderr(logfile);
+    // One process group per launch lets Stop tear down a launcher that is
+    // blocked before the bot's heartbeat/control loop (for example, IB
+    // warmup). Killing only the shell would orphan its current backfill or
+    // sleep child and keep the Gateway lease logically ambiguous.
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn();
     let child = match child {
         Ok(child) => child,
         Err(e) => {
@@ -398,18 +415,109 @@ pub fn maybe_spawn(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         }
     };
     let pid = child.id();
-    children()
-        .lock()
-        .expect("spawn dedupe")
-        .insert(bot_id.to_string(), pid);
+    let status_at_spawn = status.map(|status| status.heartbeat_at);
+    children().lock().expect("spawn dedupe").insert(
+        bot_id.to_string(),
+        SupervisedChild {
+            pid,
+            status_at_spawn,
+        },
+    );
     // Reap on exit; an unwaited child lingers as a zombie under the api.
     // (Reaping also flips the /proc liveness the dedupe reads.)
+    let child_bot_id = bot_id.to_string();
     std::thread::spawn(move || {
         let mut child = child;
         let _ = child.wait();
         release_gateway_lease(gateway_lease.as_deref());
+        let mut children = children().lock().expect("spawn dedupe");
+        if children
+            .get(&child_bot_id)
+            .is_some_and(|child| child.pid == pid)
+        {
+            children.remove(&child_bot_id);
+        }
     });
     Ok(json!({ "spawned": true, "pid": pid, "launch": launch, "log": log.display().to_string() }))
+}
+
+/// A healthy resident publishes every 60 seconds. Freshness alone lies right
+/// after Stop because the bot publishes its final halted document and exits;
+/// those terminal reasons therefore outrank the clock.
+fn status_is_live(status: &records::StatusRow) -> bool {
+    status_document_is_live(status.heartbeat_age_seconds, &status.payload)
+}
+
+fn status_document_is_live(heartbeat_age_seconds: i64, payload: &str) -> bool {
+    let doc: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    if !doc.is_object() {
+        return false;
+    }
+    let reason = doc
+        .get("state_reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let exited = doc.get("state").and_then(|v| v.as_str()) == Some("halted")
+        && matches!(reason, "operator-stop" | "feed-stall" | "feed-closed");
+    heartbeat_age_seconds < 90 && !exited
+}
+
+/// Stop a supervised launch only when no live bot is publishing.
+///
+/// A running bot must consume `stopped`, flatten, publish its terminal state,
+/// and exit itself. A launcher stuck before that loop cannot do any of those
+/// things; terminating its process group is both safe and necessary to release
+/// its IB Gateway demand lease.
+pub fn terminate_silent_launch(bot_id: &str) -> Result<Value, String> {
+    let id = bot_id.to_string();
+    let status = with_registry(move |reg| Box::pin(async move { reg.get_status(&id).await }))?;
+    let child = children()
+        .lock()
+        .expect("spawn dedupe")
+        .get(bot_id)
+        .cloned();
+    let Some(child) = child else {
+        return Ok(json!({ "terminated": false, "why": "no supervised launch" }));
+    };
+    if published_since_launch(child.status_at_spawn.as_deref(), status.as_ref()) {
+        return Ok(json!({
+            "terminated": false,
+            "why": "this launch has published; the bot must flatten and exit itself"
+        }));
+    }
+    let pid = child.pid;
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        children().lock().expect("spawn dedupe").remove(bot_id);
+        return Ok(json!({ "terminated": false, "why": "launch already exited" }));
+    }
+
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(pid).map_err(|_| format!("invalid child pid {pid}"))?;
+        // SAFETY: `pid` came from a child we spawned into its own process
+        // group. A negative PID targets exactly that group, not the API.
+        let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("cannot terminate launch group {pid}: {error}"));
+            }
+        }
+        Ok(json!({ "terminated": true, "pid": pid, "signal": "SIGTERM" }))
+    }
+
+    #[cfg(not(unix))]
+    Ok(json!({
+        "terminated": false,
+        "why": "launch-group termination is only supported on unix"
+    }))
+}
+
+fn published_since_launch(
+    status_at_spawn: Option<&str>,
+    current: Option<&records::StatusRow>,
+) -> bool {
+    current.is_some_and(|status| Some(status.heartbeat_at.as_str()) != status_at_spawn)
 }
 
 const IB_GATEWAY_DEMAND_DIR: &str = "IB_GATEWAY_DEMAND_DIR";
@@ -431,7 +539,7 @@ fn lease_stem(bot_id: &str) -> String {
 /// Tell the native sidecar that one supervised process needs an IB session.
 /// No environment variable means laptop/dev mode, where Gateway lifecycle is
 /// owned by the operator and this deliberately does nothing.
-fn acquire_gateway_lease(bot_id: &str) -> Result<Option<PathBuf>, String> {
+fn acquire_gateway_lease(bot_id: &str, account_kind: &str) -> Result<Option<PathBuf>, String> {
     let Some(dir) = std::env::var_os(IB_GATEWAY_DEMAND_DIR).map(PathBuf::from) else {
         return Ok(None);
     };
@@ -447,8 +555,16 @@ fn acquire_gateway_lease(bot_id: &str) -> Result<Option<PathBuf>, String> {
         lease_stem(bot_id),
         std::process::id()
     ));
-    std::fs::write(&path, format!("bot_id={bot_id}\n"))
-        .map_err(|e| format!("cannot acquire IB Gateway lease {}: {e}", path.display()))?;
+    // The lease says which money it needs, because the sidecar cannot know:
+    // paper and live are different IBKR logins, and starting the wrong one
+    // produces a Gateway the bot will refuse to trade through (it checks the
+    // account it was given against the ones the Gateway holds) after a
+    // ten-minute wait that looks exactly like a credential problem.
+    std::fs::write(
+        &path,
+        format!("bot_id={bot_id}\naccount_kind={account_kind}\n"),
+    )
+    .map_err(|e| format!("cannot acquire IB Gateway lease {}: {e}", path.display()))?;
     Ok(Some(path))
 }
 
@@ -494,9 +610,17 @@ pub fn reset_gateway_leases() {
 /// an operator pressing Start on one bot and wrong the moment a supervisor
 /// walked the fleet: bot B's launch overwrote bot A's pid, and A's next tick
 /// read "nothing of mine is running" and launched a twin.
-fn children() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u32>> {
+#[derive(Debug, Clone)]
+struct SupervisedChild {
+    pid: u32,
+    /// Heartbeat that preceded this launch. A different value proves this
+    /// child reached the bot loop and therefore owns safe flattening.
+    status_at_spawn: Option<String>,
+}
+
+fn children() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, SupervisedChild>> {
     static CHILDREN: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+        std::sync::Mutex<std::collections::BTreeMap<String, SupervisedChild>>,
     > = std::sync::OnceLock::new();
     CHILDREN.get_or_init(Default::default)
 }
@@ -870,8 +994,13 @@ pub fn overview(repo_root: &Path, local_state_dir: &Path) -> Result<Value, Strin
             }));
         }
 
-        let st = status_from_rows(status.as_ref(), control.as_ref(), runs.first())
-            .unwrap_or_else(|| status_for(repo_root, b.state_dir.as_deref()));
+        let st = status_or_fallback(
+            repo_root,
+            &b,
+            status.as_ref(),
+            control.as_ref(),
+            runs.first(),
+        );
         let is_local = b
             .state_dir
             .as_deref()
@@ -988,14 +1117,55 @@ pub fn logs(bot_id: &str, limit: i64) -> Result<Value, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod gateway_lease_tests {
-    use super::lease_stem;
+    use super::{lease_stem, published_since_launch, status_document_is_live};
+    use records::StatusRow;
 
     #[test]
     fn lease_names_cannot_escape_the_demand_directory() {
         assert_eq!(lease_stem("futures-noise"), "futures-noise");
         assert_eq!(lease_stem("stocks/../../other"), "stocks_______other");
         assert_eq!(lease_stem("omx stockholm"), "omx_stockholm");
+    }
+
+    #[test]
+    fn stale_or_terminal_status_does_not_protect_a_stuck_launcher() {
+        assert!(!status_document_is_live(90, r#"{"state":"running"}"#));
+        assert!(!status_document_is_live(
+            1,
+            r#"{"state":"halted","state_reason":"operator-stop"}"#
+        ));
+        assert!(!status_document_is_live(1, "not json"));
+    }
+
+    #[test]
+    fn fresh_resident_status_is_allowed_to_flatten_itself() {
+        assert!(status_document_is_live(89, r#"{"state":"running"}"#));
+        assert!(status_document_is_live(
+            1,
+            r#"{"state":"halted","state_reason":"operator"}"#
+        ));
+    }
+
+    #[test]
+    fn only_a_heartbeat_from_this_launch_protects_the_process_group() {
+        let current = StatusRow {
+            bot_id: "futures-noise".into(),
+            heartbeat_at: "2026-08-12 07:00:01+00".into(),
+            heartbeat_age_seconds: 1,
+            payload: r#"{"state":"running"}"#.into(),
+        };
+        assert!(!published_since_launch(
+            Some("2026-08-12 07:00:01+00"),
+            Some(&current)
+        ));
+        assert!(published_since_launch(
+            Some("2026-08-12 07:00:00+00"),
+            Some(&current)
+        ));
+        assert!(published_since_launch(None, Some(&current)));
+        assert!(!published_since_launch(None, None));
     }
 }
 

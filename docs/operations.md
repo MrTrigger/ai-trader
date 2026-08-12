@@ -156,6 +156,43 @@ still managing its book; `Stop` releases it only after the process has flattened
 and exited. Separate lease files make the rule work unchanged when more than one
 IB-backed bot exists.
 
+### The lease says which money, because the login depends on it
+
+Paper and live are not a flag on one IB session — they are **different IBKR
+usernames holding different accounts**. So the lease carries the leasing bot's
+bound `account_kind`, and the controller exports the matching credential pair
+(`IB_PAPER_USERNAME`/`IB_PAPER_PASSWORD` or the `IB_LIVE_*` pair) plus
+`TRADING_MODE` before starting the session. Change a bot's binding and the next
+launch brings up a Gateway logged into the other account; if one is already up
+for the other kind, the controller stops it and switches.
+
+Both credential pairs are in the sops secret, and that is deliberately not the
+same thing as permission to use them:
+
+| gate | what it stops |
+|---|---|
+| `IB_ALLOW_LIVE_GATEWAY` (sidecar, `no`) | opening a real-money **broker session** at all |
+| `IB_ALLOW_LIVE` (bot, `no`) | placing orders on a live account |
+| the trade binding (`ib-paper`) | which account the bot even asks for |
+
+Binding a bot to the live account is one click on the dashboard's venue picker.
+Opening a live session is a manifest change, reviewed in git. The controller
+refuses a live lease while the gate is shut and says so, rather than starting a
+paper Gateway that the live-bound bot would then refuse ten minutes later —
+which looks exactly like a bad password.
+
+A Gateway holding the wrong account is not a soft failure either way: the bot
+asks the Gateway which accounts it holds and refuses if its own is not among
+them.
+
+The API also owns the launcher's process group. If `Stop` arrives while an IB
+readiness/backfill script is still waiting and no heartbeat from that launch
+has ever been published, the API terminates that group and its reaper releases
+the lease. Once a launch has published, it is never killed by this shortcut:
+the bot must consume `stopped`, flatten, publish its terminal state, and exit.
+This distinction prevents both a pre-loop launcher from pinning Gateway open
+and a stale heartbeat from turning Stop into an unsafe hard kill.
+
 Containers in a pod share a network namespace, so an active bot reaches the
 Gateway at `127.0.0.1:4004` (socat's relay of the Gateway's loopback-only 4002).
 Nothing outside the pod can: the NetworkPolicy admits 7434 and nothing else,
