@@ -1,10 +1,14 @@
 mod binance_um;
+mod books;
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, Datelike, Utc};
 use crypto_portfolio::store;
+use hyperliquid::{Info, MAINNET};
 
 use binance_um::{binance_um_symbol, fetch_um_month, parse_um_klines_zip};
 
@@ -15,6 +19,14 @@ usage: scalper-data <command>
       Bulk-load Binance USDT-perp (UM futures) monthly 1m kline archives into
       the shared Parquet bar store (interval_s=60). Assets with no UM listing
       are skipped with a warning rather than silently substituted with spot.
+
+  record-books --data-root <dir> --seconds N --interval N [--assets A,B | --top N]
+      Poll Hyperliquid L2 books at --interval seconds for --seconds total and
+      append one JSON line per snapshot per coin to
+      {data-root}/books/{YYYY-MM-DD}.jsonl (UTC day, flushed every round).
+      --top N picks the N largest markets by day_volume_usd() instead of a
+      fixed --assets list. A coin's fetch or book error is a warning, not a
+      reason to stop the run.
 ";
 
 fn get(args: &[String], name: &str) -> Option<String> {
@@ -122,6 +134,111 @@ async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// How many levels of each side we keep per snapshot. Not exposed on the
+/// CLI: the cost-summary consumer (Task 4) walks at most a handful of
+/// levels to price a cross, and 20 is generous headroom for that without
+/// writing the whole book.
+const BOOK_DEPTH: usize = 20;
+
+async fn cmd_record_books(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let seconds: u64 = need(args, "--seconds")?
+        .parse()
+        .map_err(|e| format!("bad --seconds: {e}"))?;
+    let interval: u64 = need(args, "--interval")?
+        .parse()
+        .map_err(|e| format!("bad --interval: {e}"))?;
+    if interval == 0 {
+        return Err("--interval must be > 0".into());
+    }
+
+    let info = Info::new(MAINNET).map_err(|e| e.to_string())?;
+
+    let coins = match (get(args, "--assets"), get(args, "--top")) {
+        (Some(list), _) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        (None, Some(n)) => {
+            let n: usize = n.parse().map_err(|e| format!("bad --top: {e}"))?;
+            let mut ctxs = info.asset_ctxs().await.map_err(|e| e.to_string())?;
+            // asset_ctxs() reports every market the venue lists, delisted
+            // ones included (see its doc comment) - a delisted market has no
+            // real trading and no volume, so filtering on positive volume is
+            // the cheap stand-in for a delisted check without a second
+            // round trip to raw `meta()` for the flag itself.
+            ctxs.retain(|(_, ctx)| ctx.day_volume_usd().unwrap_or(0.0) > 0.0);
+            ctxs.sort_by(|a, b| {
+                b.1.day_volume_usd()
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.1.day_volume_usd().unwrap_or(0.0))
+            });
+            ctxs.into_iter().take(n).map(|(name, _)| name).collect()
+        }
+        (None, None) => return Err("need --assets A,B,C or --top N".into()),
+    };
+    if coins.is_empty() {
+        return Err("no assets to record".into());
+    }
+
+    for coin in &coins {
+        if binance_um_symbol(coin).is_none() {
+            println!("{coin}: no Binance UM coverage (fine for book recording, matters once this is paired with bar history)");
+        }
+    }
+
+    let books_dir = root.join("books");
+    std::fs::create_dir_all(&books_dir).map_err(|e| e.to_string())?;
+
+    let rounds = (seconds / interval).max(1);
+    println!(
+        "recording {} coin(s) every {interval}s for {seconds}s ({rounds} rounds)",
+        coins.len()
+    );
+
+    for round in 0..rounds {
+        // Recomputed every round rather than once up front: a run that
+        // straddles UTC midnight should roll onto the next day's file, not
+        // keep appending to yesterday's.
+        let day = Utc::now().format("%Y-%m-%d");
+        let path = books_dir.join(format!("{day}.jsonl"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+
+        for coin in &coins {
+            let book = match info.l2_book(coin).await {
+                Ok(book) => book,
+                Err(e) => {
+                    eprintln!("{coin}: {e}");
+                    continue;
+                }
+            };
+            let ts_ms = Utc::now().timestamp_millis();
+            match books::snapshot_from_book(coin, ts_ms, &book, BOOK_DEPTH) {
+                Ok(snapshot) => {
+                    let line = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+                    if let Err(e) = writeln!(file, "{line}") {
+                        eprintln!("{coin}: write failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        file.flush().map_err(|e| format!("{}: {e}", path.display()))?;
+
+        if round + 1 < rounds {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    }
+    println!("done");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -137,6 +254,19 @@ fn main() -> ExitCode {
                 }
             };
             runtime.block_on(cmd_pull_binance_perp(&args[1..]))
+        }
+        Some("record-books") => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(cmd_record_books(&args[1..]))
         }
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
