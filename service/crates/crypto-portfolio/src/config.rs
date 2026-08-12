@@ -7,6 +7,10 @@ use toml::Value;
 
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
+    /// Fraction of one hour's volume a single position may represent. The cap
+    /// is the LOWER of this and `max_position`, so a thin name is limited by
+    /// the market and a liquid one by the mandate.
+    pub participation_limit: Decimal,
     pub max_gross_exposure: Decimal,
     pub max_position: Decimal,
     pub max_position_count: usize,
@@ -19,6 +23,10 @@ pub struct RiskLimits {
 #[derive(Debug, Clone)]
 pub struct CostModel {
     pub commission_bps: Decimal,
+    /// The fallback spread, charged to any name the liquidity profile has not
+    /// measured. One number for every asset is right for the liquid majority
+    /// and an order of magnitude out on the tail, which is what the profile
+    /// exists to correct.
     pub spread_bps: Decimal,
     pub impact_coefficient: Decimal,
     pub adv_lookback_days: usize,
@@ -40,6 +48,16 @@ pub struct Config {
     pub universe: Vec<String>,
     pub benchmark: Option<String>,
     pub min_dollar_volume: Decimal,
+    /// How many slices the executor will split each order into. The cost model
+    /// needs it because impact meets one slice against one hour, not the whole
+    /// order against a day — see `estimate`. It is the runner that decides the
+    /// schedule; this is the planner's belief about it, and a mismatch makes
+    /// the estimate wrong in a knowable direction rather than a mysterious one.
+    pub execution_slices: usize,
+    /// Where the measured liquidity profile lives, if there is one. Absent
+    /// means the flat spread and the daily-volume impact term, which is the
+    /// behaviour that shipped.
+    pub liquidity_profile: Option<std::path::PathBuf>,
     pub min_volatility: Decimal,
     pub min_history_bars: u32,
     pub rebalance_cost_multiple: Decimal,
@@ -129,6 +147,15 @@ impl Config {
         let limits = RiskLimits {
             max_gross_exposure: dec(l, "max_gross_exposure")?,
             max_position: dec(l, "max_position")?,
+            // Spec 8: the second half of a position's cap. 5% of an hour's
+            // volume is the workable limit; 2% strands more capital than the
+            // impact it avoids. Zero disables the cap entirely, which is the
+            // behaviour that shipped.
+            participation_limit: l
+                .get("participation_limit")
+                .map(|_| dec(l, "participation_limit"))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO),
             max_position_count: usize_value(l, "max_position_count")?,
             min_position_notional: dec(l, "min_position_notional")?,
             max_net_exposure: opt_dec(l, "max_net_exposure")?,
@@ -167,6 +194,15 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned),
             min_dollar_volume: dec(p, "min_dollar_volume")?,
+            execution_slices: p
+                .get("execution_slices")
+                .map(|_| usize_value(p, "execution_slices"))
+                .transpose()?
+                .unwrap_or(1),
+            liquidity_profile: p
+                .get("liquidity_profile")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from),
             min_volatility: dec(p, "min_volatility")?,
             min_history_bars: u32::try_from(usize_value(p, "min_history_bars")?)
                 .map_err(|e| e.to_string())?,

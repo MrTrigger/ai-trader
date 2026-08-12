@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use crypto_portfolio::config::Config;
+use crypto_portfolio::liquidity;
 use crypto_portfolio::{
     binance::Binance, decide, store, universe as universe_mod, write_plan, DecisionInput,
     DecisionResult, Portfolio,
@@ -28,6 +29,13 @@ usage: crypto-portfolio <command>
                 [--end <RFC3339>] [--step-days N] [--top N]
                 [--tradeable <json>] [--overwrite]
       Record a point-in-time liquidity-ranked universe using Rust store logic.
+
+  liquidity-profile --config F --data-root D --out F [--hours 1,2] [--days 180]
+                    [--spreads F]
+      Median quote volume per name in the hours the bot trades, from the bar
+      store, optionally merged with spreads measured off the live book by
+      `hyperliquid --example book_capture --out-spreads`. This is the artefact
+      that replaces the flat spread and the daily-volume impact denominator.
 
   universe-record --config <toml> --data-root <dir> --as-of <RFC3339>
                   [--overwrite]
@@ -1184,6 +1192,92 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the measured liquidity artefact the cost model reads.
+///
+/// Volume comes from the bar store, taken as the median over the hours the bot
+/// actually sends orders in — that is the liquidity a slice meets, and it is
+/// what the participation cap is a fraction of. Spread cannot come from bars
+/// at all (OHLCV has no bid or ask), so it is merged in from a live book
+/// capture when one has been run, and simply left absent otherwise. Absent is
+/// safe: the caller falls back to the flat model rather than assuming a name
+/// is free to trade.
+fn cmd_liquidity_profile(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let out = PathBuf::from(need(args, "--out")?);
+    let days: i64 = get(args, "--days")
+        .map(|v| v.parse().map_err(|e| format!("--days: {e}")))
+        .transpose()?
+        .unwrap_or(180);
+    let hours: Vec<u32> = get(args, "--hours")
+        .unwrap_or_else(|| "1,2".into())
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u32>().map_err(|e| format!("--hours: {e}")))
+        .collect::<Result<_, String>>()?;
+    if hours.is_empty() {
+        return Err("--hours must name at least one hour".into());
+    }
+
+    let assets = store::known_assets(&root)?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let mut profile = liquidity::Profile {
+        measured_at: chrono::Utc::now().to_rfc3339(),
+        hours: hours.clone(),
+        assets: Default::default(),
+    };
+    for asset in &assets {
+        let Ok(bars) = store::read_asset(&root, 3600, asset) else {
+            continue;
+        };
+        let mut vols: Vec<f64> = bars
+            .iter()
+            .filter(|b| b.ts_utc >= cutoff)
+            .filter(|b| hours.contains(&chrono::Timelike::hour(&b.ts_utc)))
+            .filter_map(|b| b.quote_volume.or(Some(b.volume * b.close)))
+            .filter(|v| *v > 0.0)
+            .collect();
+        // A handful of bars is not a median. Better no number than a number
+        // built from a week of a name's first month of listing.
+        if vols.len() < 30 {
+            continue;
+        }
+        vols.sort_by(f64::total_cmp);
+        let median = vols[vols.len() / 2];
+        profile.assets.insert(
+            asset.clone(),
+            liquidity::AssetLiquidity {
+                hourly_quote_volume: rust_decimal::Decimal::from_f64_retain(median)
+                    .map(|v| v.round_dp(2)),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Spreads, if a book capture has left any. Merged rather than replacing,
+    // because the two measurements come from different places and neither is
+    // a substitute for the other.
+    let mut with_spread = 0usize;
+    if let Some(path) = get(args, "--spreads") {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        let measured: std::collections::BTreeMap<String, (f64, u32)> =
+            serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        for (asset, (bps, samples)) in measured {
+            let entry = profile.assets.entry(asset).or_default();
+            entry.spread_bps = rust_decimal::Decimal::from_f64_retain(bps).map(|v| v.round_dp(3));
+            entry.spread_samples = samples;
+            with_spread += 1;
+        }
+    }
+
+    profile.write(&out)?;
+    println!(
+        "{} names with hourly volume, {with_spread} with a measured spread -> {}",
+        profile.assets.len(),
+        out.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -1191,6 +1285,7 @@ fn main() -> ExitCode {
         Some("plan-verify") => cmd_plan_verify(&args[1..]),
         Some("features") => cmd_features(&args[1..]),
         Some("universe-rank") => cmd_universe_rank(&args[1..]),
+        Some("liquidity-profile") => cmd_liquidity_profile(&args[1..]),
         Some("universe-record") => cmd_universe_record(&args[1..]),
         Some("universe-list") => cmd_universe_list(&args[1..]),
         Some("data-pull") => cmd_data_pull(&args[1..]),

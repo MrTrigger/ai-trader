@@ -79,6 +79,29 @@ benchmark = "BTC"
 # headroom, which is what a screen should be.
 min_dollar_volume = "5000000"
 
+# --- measured liquidity -------------------------------------------------------
+# All three settings below are OFF, and turning any of them on changes what the
+# planner does. Nothing here has been through a walk-forward yet.
+#
+# `liquidity_profile` points at the artefact written by `liquidity-profile`:
+# median quote volume per name in the hours this bot trades, and spreads
+# measured off the live book by `hyperliquid --example book_capture`. Supplying
+# it swaps the flat spread for a per-asset one where one was measured, and moves
+# the impact denominator from a whole day's volume to one slice-hour's.
+#
+# That second change is not a rescaling. A day holds 24 hours and impact goes as
+# the square root of participation, so the same coefficient produces roughly 3.5x
+# the impact estimate. `impact_coefficient` was ASSUMED against the daily
+# denominator and has to be refitted against the hourly one before this is
+# trusted - see the note on it in [costs].
+#
+# liquidity_profile = "data/liquidity/profile.json"
+#
+# What the planner believes about the runner's slicing, because impact meets one
+# slice against one hour. The runner currently sends two. Only consulted when a
+# profile is present.
+# execution_slices = 2
+
 # Below this annualised realised volatility an asset is a peg, not a position.
 # Behavioural rather than a maintained name list - a new stablecoin should not
 # need a config change to be recognised, and nothing genuinely risky in crypto
@@ -115,6 +138,20 @@ turnover_budget = "0.50"
 # see turnover_budget above.
 max_gross_exposure = "1.00"
 max_position = "0.25"
+
+# The other half of spec 8's position cap: a position may be at most this
+# fraction of one hour's volume, and the binding cap is the LOWER of this and
+# `max_position`. Without it a thin name is limited only by the mandate, so at
+# six times today's NAV the planner would keep asking for a $20k position in a
+# name whose hour trades $200k and simply pay for it.
+#
+# Requires `liquidity_profile`; a name with no measured volume keeps the mandate
+# cap rather than being assumed illiquid. Whatever a capped name cannot hold
+# spills down the SAME side of the book, and anything that will not fit anywhere
+# is disclosed on the plan rather than silently dropped.
+#
+# Off. 0.05 is the value spec 8 argues for.
+# participation_limit = "0.05"
 # Raised from 12 in Phase 2, on measurement rather than convenience. The limit
 # exists to keep the book auditable by a human, and 12 was set for a
 # concentrated long-only book. The learned ranker is long/short and its name

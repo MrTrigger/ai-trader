@@ -12,6 +12,7 @@ pub mod funding;
 pub mod gate;
 pub mod ic;
 pub mod inspect;
+pub mod liquidity;
 pub mod model;
 pub mod report;
 pub mod research;
@@ -510,7 +511,12 @@ struct Construction {
     notes: Vec<String>,
 }
 
-fn construct(signals: &[Signal], cfg: &Config) -> Result<Construction, String> {
+fn construct(
+    signals: &[Signal],
+    cfg: &Config,
+    nav: Decimal,
+    profile: Option<&liquidity::Profile>,
+) -> Result<Construction, String> {
     let mut weights = BTreeMap::new();
     let mut notes = Vec::new();
     if signals.is_empty() {
@@ -663,11 +669,123 @@ fn construct(signals: &[Signal], cfg: &Config) -> Result<Construction, String> {
         }
         other => return Err(format!("unknown constructor {other:?}")),
     }
+    notes.extend(cap_by_participation(&mut weights, cfg, nav, profile));
     Ok(Construction {
         weights,
         constructor: cfg.constructor.clone(),
         notes,
     })
+}
+
+/// Hold no more of a name than its market will carry, and put what will not
+/// fit somewhere it will.
+///
+/// Spec 8: a position's cap is the lower of `max_position` and
+/// `participation_limit * hourly_volume / NAV`. The first is a mandate, the
+/// second is the market, and until now only the mandate was enforced — so at
+/// six times today's NAV the planner would have kept asking for a $20k
+/// position in a name whose hour trades $200k, and simply paid.
+///
+/// The remainder spills down the same side of the book, proportional to the
+/// headroom each name has left, and iterates because filling one name can push
+/// it into its own cap. What cannot be placed is left unspent and disclosed:
+/// idle capital is a smaller error than an unfillable order, and a silent
+/// shortfall is a larger one than either.
+///
+/// Same side only. Spilling a capped long into the shorts would answer "this
+/// name is too thin" by changing the book's net exposure, which is not an
+/// answer to that question.
+fn cap_by_participation(
+    weights: &mut BTreeMap<String, Decimal>,
+    cfg: &Config,
+    nav: Decimal,
+    profile: Option<&liquidity::Profile>,
+) -> Vec<String> {
+    let limit = cfg.limits.participation_limit;
+    if limit <= Decimal::ZERO || nav <= Decimal::ZERO {
+        return Vec::new();
+    }
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    // A name with no measured volume keeps the mandate cap. Assuming it is
+    // illiquid would drop names for want of a measurement.
+    let cap_of = |asset: &str| -> Decimal {
+        match profile.hourly_volume(asset) {
+            Some(v) if v > Decimal::ZERO => (limit * v / nav).min(cfg.limits.max_position),
+            _ => cfg.limits.max_position,
+        }
+    };
+
+    let mut notes = Vec::new();
+    let mut capped: Vec<String> = Vec::new();
+    for sign in [Decimal::ONE, -Decimal::ONE] {
+        let side: Vec<String> = weights
+            .iter()
+            .filter(|(_, w)| !w.is_zero() && w.is_sign_positive() == sign.is_sign_positive())
+            .map(|(a, _)| a.clone())
+            .collect();
+        if side.is_empty() {
+            continue;
+        }
+        let mut spill = Decimal::ZERO;
+        for asset in &side {
+            let cap = cap_of(asset);
+            let w = weights[asset];
+            if w.abs() > cap {
+                spill += w.abs() - cap;
+                weights.insert(asset.clone(), sign * cap);
+                capped.push(asset.clone());
+            }
+        }
+        // Place the remainder where there is room. Proportional to headroom so
+        // the shape of the book survives; iterated because each pass can fill
+        // a name to its own cap.
+        for _ in 0..8 {
+            if spill <= Decimal::ZERO {
+                break;
+            }
+            let room: Vec<(String, Decimal)> = side
+                .iter()
+                .filter_map(|a| {
+                    let r = cap_of(a) - weights[a].abs();
+                    (r > Decimal::ZERO).then(|| (a.clone(), r))
+                })
+                .collect();
+            let total: Decimal = room.iter().map(|(_, r)| *r).sum();
+            if total <= Decimal::ZERO {
+                break;
+            }
+            let placing = spill.min(total);
+            for (asset, r) in &room {
+                let add = placing * *r / total;
+                let w = weights[asset];
+                weights.insert(asset.clone(), w + sign * add);
+            }
+            spill -= placing;
+        }
+        if spill > Decimal::ZERO {
+            notes.push(format!(
+                "participation cap leaves {} of {} weight unplaced: the whole side is at its \
+                 liquidity limit",
+                q(spill, 4),
+                if sign.is_sign_positive() {
+                    "long"
+                } else {
+                    "short"
+                }
+            ));
+        }
+    }
+    if !capped.is_empty() {
+        capped.sort();
+        notes.push(format!(
+            "participation cap binds on {}: {}",
+            capped.len(),
+            capped.join(", ")
+        ));
+    }
+    notes
 }
 
 fn risk(
@@ -797,20 +915,55 @@ struct Estimate {
     total: Decimal,
 }
 
+/// What one order costs, and against which liquidity.
+///
+/// Two things the flat model got wrong, both fixed here, both inert until a
+/// [`liquidity::Profile`] supplies the measurement:
+///
+/// **The spread is per asset.** One constant for every name is defensible for
+/// the liquid majority and badly wrong for the tail — measured, KAITO's spread
+/// runs 10 to 30 times the flat 0.50bp the model charges it.
+///
+/// **Impact meets one hour's liquidity, not a day's.** An order is sliced, and
+/// each slice crosses against the volume available in the hour it is sent. So
+/// the denominator is the hour's volume and the numerator is one slice, which
+/// is where the spec's `1/√N` comes from: dividing the order by N divides
+/// participation by N, and impact goes as its square root.
+///
+/// Falling back to daily ADV when no profile exists is not a rescaling of the
+/// same number — a day holds 24 hours and the square root of that is nearly
+/// five. The impact coefficient was assumed against the daily denominator, so
+/// the two paths are not interchangeable and a profile must not be introduced
+/// without re-running the walk-forward behind it.
+struct Liquidity {
+    /// Volume in one slice-hour, when measured.
+    hourly: Option<Decimal>,
+    /// Average daily volume — the old denominator, and the fallback.
+    adv: Option<Decimal>,
+    /// Measured full spread in bps, when measured.
+    spread_bps: Option<Decimal>,
+    /// How many slices the order is split into.
+    slices: Decimal,
+}
+
 fn estimate(
     asset: &str,
     notional: Decimal,
-    adv: Option<Decimal>,
+    liq: &Liquidity,
     vol: Option<Decimal>,
     model: &CostModel,
 ) -> Estimate {
+    // One slice against one hour, or the whole order against a day. Never a
+    // slice against a day, which would flatter every thin name.
+    let (denominator, numerator) = match liq.hourly.filter(|v| *v > Decimal::ZERO) {
+        Some(hourly) => (Some(hourly), notional / liq.slices.max(Decimal::ONE)),
+        None => (liq.adv.filter(|v| *v > Decimal::ZERO), notional),
+    };
     let impact = if notional <= Decimal::ZERO {
         Decimal::ZERO
-    } else if let (Some(adv), Some(vol)) = (
-        adv.filter(|v| *v > Decimal::ZERO),
-        vol.filter(|v| *v > Decimal::ZERO),
-    ) {
-        let participation = (notional / adv)
+    } else if let (Some(denominator), Some(vol)) = (denominator, vol.filter(|v| *v > Decimal::ZERO))
+    {
+        let participation = (numerator / denominator)
             .to_string()
             .parse::<f64>()
             .unwrap_or(f64::INFINITY)
@@ -819,12 +972,13 @@ fn estimate(
     } else {
         BPS
     };
+    let spread = liq.spread_bps.unwrap_or(model.spread_bps);
     Estimate {
         asset: asset.into(),
         notional,
-        spread: model.spread_bps,
+        spread,
         impact,
-        total: model.spread_bps + model.commission_bps + impact,
+        total: spread + model.commission_bps + impact,
     }
 }
 
@@ -840,15 +994,27 @@ fn reason(current: Decimal, target: Decimal) -> OrderReason {
     }
 }
 
+/// Everything `diff` needs to know about the market, as opposed to the book.
+struct Market<'a> {
+    prices: &'a BTreeMap<String, Decimal>,
+    adv: &'a BTreeMap<String, Option<Decimal>>,
+    vol: &'a BTreeMap<String, Option<Decimal>>,
+    profile: Option<&'a liquidity::Profile>,
+}
+
 fn diff(
     weights: &BTreeMap<String, Decimal>,
     current: &BTreeMap<String, Decimal>,
-    prices: &BTreeMap<String, Decimal>,
-    adv: &BTreeMap<String, Option<Decimal>>,
-    vol: &BTreeMap<String, Option<Decimal>>,
+    market: &Market<'_>,
     nav: Decimal,
     cfg: &Config,
 ) -> (Vec<Order>, Vec<Estimate>, Vec<String>, Decimal, Decimal) {
+    let Market {
+        prices,
+        adv,
+        vol,
+        profile,
+    } = *market;
     let assets: BTreeSet<_> = weights.keys().chain(current.keys()).cloned().collect();
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
@@ -867,7 +1033,12 @@ fn diff(
         let estimate = estimate(
             &asset,
             notional.abs(),
-            adv.get(&asset).copied().flatten(),
+            &Liquidity {
+                hourly: profile.and_then(|p| p.hourly_volume(&asset)),
+                adv: adv.get(&asset).copied().flatten(),
+                spread_bps: profile.and_then(|p| p.spread(&asset)),
+                slices: Decimal::from(cfg.execution_slices.max(1) as u64),
+            },
             vol.get(&asset).copied().flatten(),
             &cfg.costs,
         );
@@ -1073,7 +1244,13 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         .pred_opt()
         .ok_or("date underflow")?;
     let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg)?;
-    let construction = construct(&generated.values, cfg)?;
+    // Measured tradeability, if anyone has measured it. Absent is the shipped
+    // behaviour: one flat spread, impact against daily volume, no cap.
+    let profile = match cfg.liquidity_profile.as_deref() {
+        Some(path) => Some(liquidity::Profile::load(path)?),
+        None => None,
+    };
+    let construction = construct(&generated.values, cfg, nav, profile.as_ref())?;
     let betas: BTreeMap<_, _> = latest
         .iter()
         .map(|(a, r)| Ok((a.clone(), r.beta_bench.map(d).transpose()?.map(|v| q(v, 6)))))
@@ -1098,9 +1275,12 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         diff(
             &construction.weights,
             &current,
-            &prices,
-            &adv,
-            &vol,
+            &Market {
+                prices: &prices,
+                adv: &adv,
+                vol: &vol,
+                profile: profile.as_ref(),
+            },
             nav,
             cfg,
         )
@@ -1115,6 +1295,18 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
     };
 
     let mut warnings = generated.warnings;
+    // A cap that quietly reshapes the book belongs on the artefact, not in a
+    // log line. `TurnoverCapped` is the nearest existing kind and reads the
+    // same way: the plan wanted more than it was allowed to do.
+    for note in &construction.notes {
+        if note.starts_with("participation cap") {
+            warnings.push(Warning {
+                kind: WarningKind::TurnoverCapped,
+                message: note.clone(),
+            });
+        }
+    }
+
     warnings.push(warning(
         WarningKind::UnenforcedRule,
         "no risk model: covariance does not inform construction",
@@ -1379,6 +1571,234 @@ mod tests {
         cfg
     }
 
+    /// A profile with one thin name, sized so the cap bites exactly once.
+    fn thin_profile(asset: &str, hourly: i64) -> liquidity::Profile {
+        let mut p = liquidity::Profile {
+            measured_at: "2026-08-12T00:00:00Z".into(),
+            hours: vec![1, 2],
+            ..Default::default()
+        };
+        p.assets.insert(
+            asset.into(),
+            liquidity::AssetLiquidity {
+                hourly_quote_volume: Some(Decimal::from(hourly)),
+                ..Default::default()
+            },
+        );
+        p
+    }
+
+    #[test]
+    fn a_measured_spread_replaces_the_flat_one_only_where_it_was_measured() {
+        let cfg = config();
+        let flat = cfg.costs.spread_bps;
+        let mut profile = liquidity::Profile::default();
+        profile.assets.insert(
+            "KAITO".into(),
+            liquidity::AssetLiquidity {
+                spread_bps: Some(Decimal::from(15)),
+                ..Default::default()
+            },
+        );
+        let liq = |asset: &str| Liquidity {
+            hourly: None,
+            adv: Some(Decimal::from(100_000_000)),
+            spread_bps: profile.spread(asset),
+            slices: Decimal::ONE,
+        };
+        let thin = estimate(
+            "KAITO",
+            Decimal::from(9_000),
+            &liq("KAITO"),
+            None,
+            &cfg.costs,
+        );
+        let fat = estimate("BTC", Decimal::from(9_000), &liq("BTC"), None, &cfg.costs);
+        assert_eq!(
+            thin.spread,
+            Decimal::from(15),
+            "measured wins where it exists"
+        );
+        assert_eq!(
+            fat.spread, flat,
+            "and a name never sampled keeps the flat one"
+        );
+    }
+
+    /// Impact meets ONE slice against ONE hour. The old model met the whole
+    /// order against a whole day, which flatters a thin name by the square
+    /// root of twenty-four.
+    #[test]
+    fn impact_prices_a_slice_against_an_hour_not_an_order_against_a_day() {
+        let cfg = config();
+        let vol = Some(Decimal::new(5, 2));
+        let notional = Decimal::from(9_000);
+        let daily = estimate(
+            "KAITO",
+            notional,
+            &Liquidity {
+                hourly: None,
+                adv: Some(Decimal::from(4_800_000)),
+                spread_bps: None,
+                slices: Decimal::from(2),
+            },
+            vol,
+            &cfg.costs,
+        );
+        // The same name, same day's volume, but priced against the hour it is
+        // actually sent in — one twenty-fourth of it — in two slices.
+        let hourly = estimate(
+            "KAITO",
+            notional,
+            &Liquidity {
+                hourly: Some(Decimal::from(200_000)),
+                adv: Some(Decimal::from(4_800_000)),
+                spread_bps: None,
+                slices: Decimal::from(2),
+            },
+            vol,
+            &cfg.costs,
+        );
+        assert!(
+            hourly.impact > daily.impact,
+            "an hour holds less than a day: {} should exceed {}",
+            hourly.impact,
+            daily.impact
+        );
+        // sqrt((9000/2)/200000) / sqrt(9000/4800000) = sqrt(0.0225/0.001875)
+        // = sqrt(12) = 3.46.
+        let ratio = (hourly.impact / daily.impact).round_dp(2);
+        assert_eq!(ratio, Decimal::new(346, 2), "got {ratio}");
+    }
+
+    #[test]
+    fn slicing_an_order_reduces_its_impact_by_the_root_of_the_slice_count() {
+        let cfg = config();
+        let vol = Some(Decimal::new(5, 2));
+        let one = |slices: i64| {
+            estimate(
+                "KAITO",
+                Decimal::from(9_000),
+                &Liquidity {
+                    hourly: Some(Decimal::from(200_000)),
+                    adv: None,
+                    spread_bps: None,
+                    slices: Decimal::from(slices),
+                },
+                vol,
+                &cfg.costs,
+            )
+            .impact
+        };
+        // Spec 8: N slices divide the order by N against the same per-hour
+        // liquidity, so impact falls as 1/root-N.
+        let ratio = (one(1) / one(4)).round_dp(2);
+        assert_eq!(ratio, Decimal::from(2), "got {ratio}");
+    }
+
+    #[test]
+    fn a_thin_name_is_capped_and_the_remainder_goes_to_its_own_side() {
+        let mut cfg = config();
+        cfg.limits.participation_limit = Decimal::new(5, 2); // 5% of the hour
+        let nav = Decimal::from(600_000);
+        // 5% of $200k is $10k, which at a $600k book is a 1.67% weight.
+        let profile = thin_profile("KAITO", 200_000);
+        let mut weights = BTreeMap::from([
+            ("KAITO".to_string(), Decimal::new(10, 2)),
+            ("BTC".to_string(), Decimal::new(10, 2)),
+            ("ETH".to_string(), Decimal::new(10, 2)),
+        ]);
+        let before: Decimal = weights.values().sum();
+        let notes = cap_by_participation(&mut weights, &cfg, nav, Some(&profile));
+
+        let cap = Decimal::new(5, 2) * Decimal::from(200_000) / nav;
+        assert_eq!(weights["KAITO"].round_dp(6), cap.round_dp(6));
+        assert!(
+            notes.iter().any(|n| n.contains("KAITO")),
+            "the cap must be disclosed, got {notes:?}"
+        );
+        // Nothing is lost: the gross the constructor asked for is still there,
+        // moved to names with room rather than dropped.
+        let after: Decimal = weights.values().sum();
+        assert_eq!(
+            after.round_dp(6),
+            before.round_dp(6),
+            "spill must preserve the side's gross"
+        );
+        assert!(weights["BTC"] > Decimal::new(10, 2), "BTC absorbed some");
+        assert!(weights["ETH"] > Decimal::new(10, 2), "ETH absorbed some");
+    }
+
+    #[test]
+    fn a_capped_long_never_spills_into_the_shorts() {
+        let mut cfg = config();
+        cfg.limits.participation_limit = Decimal::new(5, 2);
+        let nav = Decimal::from(600_000);
+        let profile = thin_profile("KAITO", 200_000);
+        let mut weights = BTreeMap::from([
+            ("KAITO".to_string(), Decimal::new(10, 2)),
+            ("BTC".to_string(), Decimal::new(10, 2)),
+            ("WLD".to_string(), Decimal::new(-10, 2)),
+        ]);
+        cap_by_participation(&mut weights, &cfg, nav, Some(&profile));
+        assert_eq!(
+            weights["WLD"],
+            Decimal::new(-10, 2),
+            "answering 'this long is too thin' by changing net exposure is not an answer"
+        );
+    }
+
+    #[test]
+    fn with_no_profile_or_no_limit_the_book_is_left_exactly_as_it_was() {
+        let mut cfg = config();
+        let nav = Decimal::from(600_000);
+        let profile = thin_profile("KAITO", 200_000);
+        let original = BTreeMap::from([
+            ("KAITO".to_string(), Decimal::new(10, 2)),
+            ("BTC".to_string(), Decimal::new(10, 2)),
+        ]);
+
+        // No limit configured: the shipped behaviour.
+        cfg.limits.participation_limit = Decimal::ZERO;
+        let mut w = original.clone();
+        assert!(cap_by_participation(&mut w, &cfg, nav, Some(&profile)).is_empty());
+        assert_eq!(w, original);
+
+        // Limit configured but nothing measured: a name we have not looked at
+        // must not be treated as illiquid.
+        cfg.limits.participation_limit = Decimal::new(5, 2);
+        let mut w = original.clone();
+        assert!(cap_by_participation(&mut w, &cfg, nav, None).is_empty());
+        assert_eq!(w, original);
+    }
+
+    #[test]
+    fn a_side_that_is_entirely_capped_says_so_rather_than_overfilling() {
+        let mut cfg = config();
+        cfg.limits.participation_limit = Decimal::new(5, 2);
+        let nav = Decimal::from(600_000);
+        let mut profile = thin_profile("KAITO", 200_000);
+        profile.assets.insert(
+            "PUMP".into(),
+            liquidity::AssetLiquidity {
+                hourly_quote_volume: Some(Decimal::from(200_000)),
+                ..Default::default()
+            },
+        );
+        let mut weights = BTreeMap::from([
+            ("KAITO".to_string(), Decimal::new(20, 2)),
+            ("PUMP".to_string(), Decimal::new(20, 2)),
+        ]);
+        let notes = cap_by_participation(&mut weights, &cfg, nav, Some(&profile));
+        let cap = Decimal::new(5, 2) * Decimal::from(200_000) / nav;
+        assert_eq!(weights["KAITO"].round_dp(6), cap.round_dp(6));
+        assert_eq!(weights["PUMP"].round_dp(6), cap.round_dp(6));
+        assert!(
+            notes.iter().any(|n| n.contains("unplaced")),
+            "idle capital must be stated, not silently absorbed: {notes:?}"
+        );
+    }
+
     #[test]
     fn turnover_budget_selects_largest_drift_before_reason_ordering() {
         let mut cfg = config();
@@ -1413,9 +1833,12 @@ mod tests {
         let (orders, _, skipped, used, dropped) = diff(
             &weights,
             &current,
-            &prices,
-            &adv,
-            &vol,
+            &Market {
+                prices: &prices,
+                adv: &adv,
+                vol: &vol,
+                profile: None,
+            },
             Decimal::from(100_000),
             &cfg,
         );
@@ -1536,7 +1959,7 @@ mod tests {
                 volatility: Some(Decimal::new(2, 1)),
             },
         ];
-        let out = construct(&signals, &cfg).unwrap();
+        let out = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
         assert_eq!(out.weights.len(), 4);
         assert_eq!(
             out.weights.values().map(|w| w.abs()).max(),

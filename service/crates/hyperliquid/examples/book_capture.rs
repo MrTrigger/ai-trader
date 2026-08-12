@@ -139,6 +139,29 @@ async fn main() -> Result<(), String> {
         eprintln!("raw snapshots -> {path}");
     }
 
+    // The measurement the cost model consumes: median spread and how many
+    // observations stand behind it, so a one-sample name can be told from a
+    // measured one. `crypto-portfolio liquidity-profile --spreads` merges it.
+    if let Some(path) = get("--out-spreads") {
+        let mut obj = String::from("{");
+        for (i, (asset, obs)) in spread_bps.iter().enumerate() {
+            if obs.is_empty() {
+                continue;
+            }
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(&format!(
+                "\n  \"{asset}\": [{:.4}, {}]",
+                median(obs),
+                obs.len()
+            ));
+        }
+        obj.push_str("\n}\n");
+        std::fs::write(&path, obj).map_err(|e| e.to_string())?;
+        eprintln!("measured spreads -> {path}");
+    }
+
     println!(
         "\n{:<8}{:>10}{:>12}{:>10}{:>12}{:>14}{:>8}",
         "ASSET", "ORDER $", "SPREAD bp", "med", "CROSS bp", "TOP LVL $", "n"
