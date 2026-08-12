@@ -1,6 +1,7 @@
 mod binance_um;
 mod books;
 mod costs;
+mod universe;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -15,6 +16,7 @@ use hyperliquid::{Info, MAINNET};
 use binance_um::{binance_um_symbol, fetch_um_month, parse_um_klines_zip};
 use books::BookSnapshot;
 use costs::{summarize, CostSummary};
+use universe::select_candidates;
 
 const USAGE: &str = "\
 usage: scalper-data <command>
@@ -39,6 +41,11 @@ usage: scalper-data <command>
       summary to {data-root}/costs/summary-{start}-{end}.json and prints a
       table sorted by spread. A missing day file is skipped with a note, not
       a fatal error.
+
+  universe --data-root <dir> --top N [--exclude A,B,...]
+      List the top N candidates by day volume from Hyperliquid, excluding any
+      in --exclude. Writes {data-root}/scalper-universe.json and prints a table
+      with a NO-BINANCE marker on unmapped coins.
 ";
 
 fn get(args: &[String], name: &str) -> Option<String> {
@@ -350,6 +357,52 @@ fn print_cost_table(summary: &BTreeMap<String, CostSummary>) {
     }
 }
 
+async fn cmd_universe(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let top: usize = need(args, "--top")?
+        .parse()
+        .map_err(|e| format!("bad --top: {e}"))?;
+
+    let exclude: Vec<String> = get(args, "--exclude")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let info = Info::new(MAINNET).map_err(|e| e.to_string())?;
+    let pairs = info.asset_ctxs().await.map_err(|e| e.to_string())?;
+
+    let candidates = select_candidates(&pairs, top, &exclude);
+
+    // Write JSON
+    let universe_dir = root.clone();
+    std::fs::create_dir_all(&universe_dir).map_err(|e| e.to_string())?;
+    let out_path = universe_dir.join("scalper-universe.json");
+    let json = serde_json::to_string_pretty(&candidates).map_err(|e| e.to_string())?;
+    std::fs::write(&out_path, &json).map_err(|e| format!("{}: {e}", out_path.display()))?;
+
+    // Print table
+    println!(
+        "{:<12} {:>15}  {}",
+        "coin", "day_volume_usd", "binance_um"
+    );
+    for candidate in &candidates {
+        let binance_marker = candidate
+            .binance_um
+            .as_deref()
+            .unwrap_or("NO-BINANCE");
+        println!(
+            "{:<12} {:>15.0}  {}",
+            candidate.coin, candidate.day_volume_usd, binance_marker
+        );
+    }
+
+    println!("wrote {}", out_path.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -378,6 +431,19 @@ fn main() -> ExitCode {
                 }
             };
             runtime.block_on(cmd_record_books(&args[1..]))
+        }
+        Some("universe") => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(cmd_universe(&args[1..]))
         }
         Some("summarize-costs") => cmd_summarize_costs(&args[1..]),
         Some("-h" | "--help") | None => {
