@@ -113,6 +113,23 @@ fn mean(v: &[f64]) -> f64 {
 /// baseline has not earned the complexity it costs.
 pub const BASELINE_SHARPE_MARGIN: f64 = 0.4;
 
+/// Where the honest folds live. Both come from `bin/walk-forward.sh`: one
+/// model per fold, trained only on data strictly before its own test block.
+/// The thing the candidate has to beat: a strategy with no model to leak.
+#[derive(Debug)]
+pub struct Baseline<'a> {
+    pub signal: &'a str,
+    pub constructor: &'a str,
+}
+
+#[derive(Debug, Default)]
+pub struct Evidence<'a> {
+    /// Required when the candidate is a trained model.
+    pub retrained: Option<&'a Path>,
+    /// The same folds replayed at twice the modelled slippage.
+    pub stressed: Option<&'a Path>,
+}
+
 /// Slack for binary representation only. A margin of 1.4 - 1.0 is 0.39999...
 /// in f64, and failing a gate on the sixteenth decimal place is an arithmetic
 /// artefact, not a verdict about a strategy. Far too small to admit anything
@@ -148,16 +165,12 @@ pub fn run(
     end: DateTime<Utc>,
     root: &Path,
     initial_cash: Decimal,
-    baseline_signal: &str,
-    baseline_constructor: &str,
-    // Directory of `fold-*.json` from `bin/walk-forward.sh`. Required when the
-    // candidate is a trained model.
-    retrained_dir: Option<&Path>,
-    // The same folds replayed at twice the modelled slippage.
-    stressed_dir: Option<&Path>,
+    baseline: &Baseline<'_>,
+    evidence: &Evidence<'_>,
 ) -> Result<GateResult, String> {
-    let retrained = retrained_dir.map(RetrainedFolds::load).transpose()?;
-    let stressed_folds = stressed_dir.map(RetrainedFolds::load).transpose()?;
+    let (baseline_signal, baseline_constructor) = (baseline.signal, baseline.constructor);
+    let retrained = evidence.retrained.map(RetrainedFolds::load).transpose()?;
+    let stressed_folds = evidence.stressed.map(RetrainedFolds::load).transpose()?;
     // Fail closed. Slicing one fit of a model trained across the whole window
     // and calling the pieces "out of sample" is how a gate passes something it
     // should have stopped; the number would be honest-looking and leaked.

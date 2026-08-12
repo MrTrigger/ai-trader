@@ -1008,16 +1008,22 @@ fn cmd_gate(args: &[String]) -> Result<(), String> {
     let end = parse_as_of(&need(args, "--end")?)?;
     let initial_cash = rust_decimal::Decimal::from_str(&need(args, "--initial-cash")?)
         .map_err(|error| format!("bad --initial-cash: {error}"))?;
+    let retrained = get(args, "--retrained");
+    let stressed = get(args, "--retrained-2x");
     let result = crypto_portfolio::gate::run(
         &cfg,
         start,
         end,
         &root,
         initial_cash,
-        "liquidity_top",
-        "equal_weight",
-        get(args, "--retrained").as_deref().map(Path::new),
-        get(args, "--retrained-2x").as_deref().map(Path::new),
+        &crypto_portfolio::gate::Baseline {
+            signal: "liquidity_top",
+            constructor: "equal_weight",
+        },
+        &crypto_portfolio::gate::Evidence {
+            retrained: retrained.as_deref().map(Path::new),
+            stressed: stressed.as_deref().map(Path::new),
+        },
     )?;
     let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
