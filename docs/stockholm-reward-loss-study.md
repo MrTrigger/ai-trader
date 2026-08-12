@@ -640,3 +640,77 @@ date and retains revision limitations explicitly. No dataset or model has been
 produced because `EODHD_API_TOKEN` is not configured. This gate, plus inactive
 price history and historical borrow availability, remains blocking evidence;
 the corrected 1.41 development Sharpe is not a paper/live promotion result.
+
+## 2026-08-13 residual-factor and global-direction audit
+
+The membership-ordering audit found one second-order leak in the richer
+contract: pre-admission issuers had been removed before final cross-sectional
+ranks and labels, but could still contribute to the trailing market and sector
+factor returns used by residual features. `features-stockholm` now applies the
+same effective admission date before those factor returns are calculated. A
+prefix test compares the restricted result with a reference history that never
+contains the future-listed issuer.
+
+After that correction, the unchanged v11 absolute-return/L2 control produced
++97.1% at Sharpe 1.21 and -11.1% maximum drawdown over the four development
+folds; doubled spread and impact produced +64.7% at Sharpe 0.96 and -17.0%
+drawdown. All four base folds were profitable, but their Sharpes were 1.66,
+0.93, 3.76, and 0.38. The all-20-phase recent diagnostic lost 6.7% at Sharpe
+-0.89 while phase-averaged OMXSGI gained 12.1% at Sharpe 2.38. The correction
+improves the historical estimate but does not repair the regime failure.
+
+The next declared hypothesis addressed a concrete representation defect. All
+v11 stock alpha inputs are cross-sectionally normalized, so they retain stock
+ordering but intentionally discard the common market level. A direct absolute
+stock model can then express market direction mainly through its intercept.
+Feature contract `fs-rust-stockholm-16` added 1/5/21/63/126-session returns,
+20/60-session volatility, and 126-session drawdown for ES, NQ, ZN, and GC as
+known at the 17:30 Stockholm cash close. The shared `cme-data` reader converts
+UTC timestamps with historical CET/CEST, admits only completed bars, and
+stitches the NQ-to-MNQ archive migration at its final overlap without creating
+a return jump. Equity entry remains the following session open.
+
+The v16 direct-stock arm failed the predeclared first-fold stop:
+
+| first fold, 2022-09-01–2023-05-17 | return | Sharpe | max drawdown | mean net | rank IC |
+|---|---:|---:|---:|---:|---:|
+| corrected v11 control | +39.0% | 1.66 | -11.1% | +67.8% | +0.0129 |
+| v16 close-time global risk | +13.3% | 0.75 | -21.3% | -75.6% | **+0.0621** |
+| v16 at 2x spread/impact | +9.7% | 0.60 | -21.5% | -75.6% | — |
+| OMXSGI | +18.6% | 1.18 | -6.9% | +100% | — |
+
+The new inputs improved overall cross-sectional ordering but made every
+prediction-decile mean negative in a market that rose. This is the failure the
+two-layer design was intended to prevent: one mistaken common forecast
+overwhelmed useful relative ordering. The arm was rejected after fold one; no
+remaining fold or hyperparameter variation was run.
+
+The same information was therefore tested in the structurally correct place,
+an independent direction matrix. Version
+`fs-rust-stockholm-direction-3` combines official OMXSGI/size/sector EOD
+features with the same close-time ES, NQ/MNQ, ZN, and GC values. The unchanged
+shallow direction tree was trained only through 2022-08-03 and tested on the
+same first fold. It returned -1.3% at Sharpe -0.40, with 22.2% directional
+accuracy and forecast correlation -0.037; the fixed trend control returned
+-3.3% at Sharpe -0.67, while OMXSGI returned +18.6% at Sharpe 1.18. This arm
+also failed its first-fold stop and was not composed with the stock ranker.
+
+The NQ comparison explains why copying its mechanics cannot manufacture the
+missing result. The deployed futures strategy is a deterministic, intraday
+noise-area mechanism evaluated on 5-minute bars across sixteen years, flat at
+the end of each session, with thousands of individual trades and a mechanism
+that is gross-positive in 14 of 16 years. It is not a daily supervised market
+direction model. Its own research ledger reports the four-sleeve modern-era
+book at approximately Sharpe **1.0**, not 2.0, with a -$70.3k maximum drawdown;
+its attractive CAGR comes from the capital/sizing dial and the level of NQ,
+not a Sharpe above the Stockholm gate. Stockholm's challenge is different:
+only roughly 250 non-overlapping 20-session market outcomes exist in ten years,
+while hundreds of same-date stock rows do not create hundreds of independent
+market-direction observations.
+
+No licensed quarterly-fundamental or inactive-price dataset can currently be
+collected because `EODHD_API_TOKEN` is still absent. Historical borrow fees are
+archived, but IB does not provide historical locate quantity. Those remain real
+data omissions, not model settings. Until new data or genuinely new forward
+time exists, additional reward/loss/horizon searches on the exposed folds
+would optimize the backtest rather than establish Sharpe 2.0.

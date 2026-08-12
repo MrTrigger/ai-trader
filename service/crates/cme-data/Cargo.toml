@@ -6,7 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 arrow-array = "56"
+chrono = "0.4"
+chrono-tz = "0.10"
 parquet = { version = "56", features = ["arrow"] }
 serde = { workspace = true }
 time = { workspace = true }
-

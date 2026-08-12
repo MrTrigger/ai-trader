@@ -100,7 +100,7 @@ usage: stockholm-portfolio <command>
   training-matrix --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                   --out <jsonl> [--horizon-sessions 5] [--min-adv-sek 1000000]
                   [--skv-listing-history <json>]
-                  [--feature-set baseline|baseline-global-risk|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-quarterly-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text|residual-pdmr-microstructure-borrow-news-report-attachments]
+                  [--feature-set baseline|baseline-global-risk|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-quarterly-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-global-risk|residual-pdmr-microstructure-borrow-news-report-text|residual-pdmr-microstructure-borrow-news-report-attachments]
                   [--fi-net-shorts <json>] [--fi-pdmr <json>]
                   [--nasdaq-reports <json>] [--esef-annual <json>]
                   [--eodhd-fundamentals <json>]
@@ -114,13 +114,18 @@ usage: stockholm-portfolio <command>
       Emit final Rust-owned features, missing flags, labels, and sample weights
       for Nasdaq Stockholm Large, Mid, and Small Cap only. When supplied,
       effective authority admission dates are enforced before cross-sectional
-      ranks and labels are finalized.
+      ranks and labels are finalized. The global-risk feature set consumes
+      ES/NQ/ZN/GC bars completed by the 17:30 Stockholm close and enters only
+      at the following session's open.
 
   direction-training-matrix --index-dir <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                             --out <jsonl> [--horizon-sessions 20]
                             [--cme-bars-root <dir>]
+                            [--stockholm-close-cme-bars-root <dir>]
       Emit causal Rust-owned market-direction features and executable OMXSGI
       SOD-to-SOD absolute-return labels from official Nasdaq index histories.
+      The Stockholm-close option adds ES/NQ/ZN/GC context known by 17:30 local
+      time and is mutually exclusive with the prior-UTC-day ES option.
 
   filter-main-membership --matrix <jsonl> --universe <json>
                          --skv-listing-history <json> --out <jsonl>
@@ -726,6 +731,34 @@ fn collect_eodhd_fundamentals(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn load_stockholm_close_global_risk(
+    root: &Path,
+) -> Result<Vec<features_stockholm::GlobalRiskSeries>, String> {
+    features_stockholm::STOCKHOLM_CLOSE_GLOBAL_RISK_SYMBOLS
+        .iter()
+        .map(|symbol| {
+            let series = if *symbol == "NQ" {
+                let nq = cme_data::load_daily_closes_at_stockholm_close(root, "NQ", 300)?;
+                let mnq = cme_data::load_daily_closes_at_stockholm_close(root, "MNQ", 300)?;
+                cme_data::stitch_daily_close_aliases("NQ", &[nq, mnq])?
+            } else {
+                cme_data::load_daily_closes_at_stockholm_close(root, symbol, 300)?
+            };
+            Ok(features_stockholm::GlobalRiskSeries {
+                symbol: series.symbol,
+                observations: series
+                    .observations
+                    .into_iter()
+                    .map(|bar| features_stockholm::GlobalRiskBar {
+                        date: bar.date,
+                        close: bar.close,
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 fn matrix(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let (source, histories) = equity_data::load_stockholm(&root)?;
@@ -1167,6 +1200,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
         "residual-pdmr-microstructure-borrow-news" => {
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
         }
+        "residual-pdmr-microstructure-borrow-news-global-risk" => {
+            features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
+        }
         "residual-pdmr-microstructure-borrow-news-report-text" => {
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
         }
@@ -1175,9 +1211,15 @@ fn matrix(args: &[String]) -> Result<(), String> {
         }
         other => return Err(format!("unknown Stockholm feature set {other:?}")),
     };
-    let global_risk_dataset = get(args, "--cme-bars-root")
-        .map(|path| cme_data::load_daily_closes(Path::new(&path), "ES", 300))
-        .transpose()?;
+    let cme_bars_root = get(args, "--cme-bars-root").map(PathBuf::from);
+    let global_risk_dataset = if feature_set == features_stockholm::FeatureSet::BaselineGlobalRisk {
+        cme_bars_root
+            .as_ref()
+            .map(|path| cme_data::load_daily_closes(path, "ES", 300))
+            .transpose()?
+    } else {
+        None
+    };
     if feature_set == features_stockholm::FeatureSet::BaselineGlobalRisk
         && global_risk_dataset.is_none()
     {
@@ -1196,6 +1238,16 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let stockholm_close_global_risk = if feature_set
+        == features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
+    {
+        let root = cme_bars_root.as_ref().ok_or(
+            "--cme-bars-root is required for residual-pdmr-microstructure-borrow-news-global-risk features",
+        )?;
+        load_stockholm_close_global_risk(root)?
+    } else {
+        Vec::new()
+    };
     let public_short_dataset = get(args, "--fi-net-shorts")
         .map(|path| equity_data::load_fi_net_shorts(Path::new(&path)))
         .transpose()?;
@@ -1229,6 +1281,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructure
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && pdmr_dataset.is_none()
@@ -1318,6 +1371,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
         features_stockholm::FeatureSet::ResidualPdmrMicrostructure
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && market_history_dataset.is_none()
@@ -1355,6 +1409,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
         feature_set,
         features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && borrow_fee_root.is_none()
@@ -1367,6 +1422,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
     if matches!(
         feature_set,
         features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && all_company_news_dataset.is_none()
@@ -1430,6 +1486,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
             &company_news_events,
             &report_text_events,
             &global_risk,
+            &stockholm_close_global_risk,
             &eligible_from,
         )?;
     let path = PathBuf::from(need(args, "--out")?);
@@ -1477,6 +1534,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
             }
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews => {
                 features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION
+            }
+            features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsGlobalRisk => {
+                features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION
             }
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
                 features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION
@@ -1673,36 +1733,85 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 borrow_fees.len()
             )
         }),
-        global_risk_source: global_risk_dataset.as_ref().map(|series| {
-            format!(
-                "archived CME {} {}-second Parquet bars in {}",
-                series.symbol,
-                series.interval_seconds,
-                series.source_root.display()
+        global_risk_source: global_risk_dataset
+            .as_ref()
+            .map(|series| {
+                format!(
+                    "archived CME {} {}-second Parquet bars in {}",
+                    series.symbol,
+                    series.interval_seconds,
+                    series.source_root.display()
+                )
+            })
+            .or_else(|| {
+                (!stockholm_close_global_risk.is_empty()).then(|| {
+                    format!(
+                        "archived CME ES,NQ/MNQ,ZN,GC 300-second Parquet bars in {}",
+                        cme_bars_root
+                            .as_ref()
+                            .expect("Stockholm-close series require a CME root")
+                            .display()
+                    )
+                })
+            }),
+        global_risk_asof_policy: if global_risk_dataset.is_some() {
+            Some(
+                "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
+                    .into(),
             )
-        }),
-        global_risk_asof_policy: global_risk_dataset.as_ref().map(|_| {
-            "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
-                .into()
-        }),
-        global_risk_coverage: global_risk_dataset.as_ref().map(|series| {
-            format!(
-                "{} source rows in {} partitions produce {} daily observations, {} through {}",
-                series.source_rows,
-                series.source_files,
-                series.observations.len(),
-                series
-                    .observations
-                    .first()
-                    .map(|bar| bar.date.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                series
-                    .observations
-                    .last()
-                    .map(|bar| bar.date.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+        } else if !stockholm_close_global_risk.is_empty() {
+            Some(
+                "Rust uses the last CME bar completed by 17:30 Europe/Stockholm on the decision date; archived timestamps identify bar opens, timezone conversion follows historical CET/CEST, and equity entry is no earlier than the next session"
+                    .into(),
             )
-        }),
+        } else {
+            None
+        },
+        global_risk_coverage: global_risk_dataset
+            .as_ref()
+            .map(|series| {
+                format!(
+                    "{} source rows in {} partitions produce {} daily observations, {} through {}",
+                    series.source_rows,
+                    series.source_files,
+                    series.observations.len(),
+                    series
+                        .observations
+                        .first()
+                        .map(|bar| bar.date.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    series
+                        .observations
+                        .last()
+                        .map(|bar| bar.date.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                )
+            })
+            .or_else(|| {
+                (!stockholm_close_global_risk.is_empty()).then(|| {
+                    stockholm_close_global_risk
+                        .iter()
+                        .map(|series| {
+                            format!(
+                                "{}: {} observations, {} through {}",
+                                series.symbol,
+                                series.observations.len(),
+                                series
+                                    .observations
+                                    .first()
+                                    .map(|bar| bar.date.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                series
+                                    .observations
+                                    .last()
+                                    .map(|bar| bar.date.to_string())
+                                    .unwrap_or_else(|| "unknown".into())
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            }),
         membership_source: membership_history_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
@@ -1885,8 +1994,17 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
                 .collect(),
         });
     }
-    let global_risk_dataset = get(args, "--cme-bars-root")
-        .map(|path| cme_data::load_daily_closes(Path::new(&path), "ES", 300))
+    let global_risk_root = get(args, "--cme-bars-root").map(PathBuf::from);
+    let stockholm_close_global_risk_root =
+        get(args, "--stockholm-close-cme-bars-root").map(PathBuf::from);
+    if global_risk_root.is_some() && stockholm_close_global_risk_root.is_some() {
+        return Err(
+            "--cme-bars-root and --stockholm-close-cme-bars-root are mutually exclusive".into(),
+        );
+    }
+    let global_risk_dataset = global_risk_root
+        .as_ref()
+        .map(|path| cme_data::load_daily_closes(path, "ES", 300))
         .transpose()?;
     let global_risk = global_risk_dataset
         .as_ref()
@@ -1901,13 +2019,30 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let matrix = features_stockholm::direction_training_matrix_with_global_risk(
-        &inputs,
-        date(args, "--start")?,
-        date(args, "--end")?,
-        horizon,
-        &global_risk,
-    )?;
+    let stockholm_close_global_risk = stockholm_close_global_risk_root
+        .as_ref()
+        .map(|root| load_stockholm_close_global_risk(root))
+        .transpose()?
+        .unwrap_or_default();
+    let start = date(args, "--start")?;
+    let end = date(args, "--end")?;
+    let matrix = if stockholm_close_global_risk.is_empty() {
+        features_stockholm::direction_training_matrix_with_global_risk(
+            &inputs,
+            start,
+            end,
+            horizon,
+            &global_risk,
+        )?
+    } else {
+        features_stockholm::direction_training_matrix_with_stockholm_close_global_risk(
+            &inputs,
+            start,
+            end,
+            horizon,
+            &stockholm_close_global_risk,
+        )?
+    };
     let path = PathBuf::from(need(args, "--out")?);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1916,7 +2051,9 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
     let mut output = std::io::BufWriter::new(file);
     let manifest = DirectionMatrixManifest {
         kind: "stockholm_direction_training_manifest".into(),
-        feature_set_version: if global_risk_dataset.is_some() {
+        feature_set_version: if !stockholm_close_global_risk.is_empty() {
+            features_stockholm::DIRECTION_STOCKHOLM_CLOSE_GLOBAL_RISK_FEATURE_SET_VERSION
+        } else if global_risk_dataset.is_some() {
             features_stockholm::DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION
         } else {
             features_stockholm::DIRECTION_FEATURE_SET_VERSION
@@ -1933,36 +2070,82 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
         label_policy:
             "OMXSGI next-session official SOD value to official SOD value after the declared holding horizon"
                 .into(),
-        global_risk_source: global_risk_dataset.as_ref().map(|series| {
-            format!(
-                "archived CME {} {}-second Parquet bars in {}",
-                series.symbol,
-                series.interval_seconds,
-                series.source_root.display()
+        global_risk_source: global_risk_dataset
+            .as_ref()
+            .map(|series| {
+                format!(
+                    "archived CME {} {}-second Parquet bars in {}",
+                    series.symbol,
+                    series.interval_seconds,
+                    series.source_root.display()
+                )
+            })
+            .or_else(|| {
+                stockholm_close_global_risk_root.as_ref().map(|root| {
+                    format!(
+                        "archived CME ES,NQ/MNQ,ZN,GC 300-second Parquet bars in {}",
+                        root.display()
+                    )
+                })
+            }),
+        global_risk_asof_policy: if global_risk_dataset.is_some() {
+            Some(
+                "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
+                    .into(),
             )
-        }),
-        global_risk_asof_policy: global_risk_dataset.as_ref().map(|_| {
-            "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
-                .into()
-        }),
-        global_risk_coverage: global_risk_dataset.as_ref().map(|series| {
-            format!(
-                "{} source rows in {} partitions produce {} daily observations, {} through {}",
-                series.source_rows,
-                series.source_files,
-                series.observations.len(),
-                series
-                    .observations
-                    .first()
-                    .map(|bar| bar.date.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                series
-                    .observations
-                    .last()
-                    .map(|bar| bar.date.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+        } else if !stockholm_close_global_risk.is_empty() {
+            Some(
+                "Rust uses the last CME bar completed by 17:30 Europe/Stockholm on the decision date; archived timestamps identify bar opens, timezone conversion follows historical CET/CEST, and the OMXSGI label enters at the next session SOD"
+                    .into(),
             )
-        }),
+        } else {
+            None
+        },
+        global_risk_coverage: global_risk_dataset
+            .as_ref()
+            .map(|series| {
+                format!(
+                    "{} source rows in {} partitions produce {} daily observations, {} through {}",
+                    series.source_rows,
+                    series.source_files,
+                    series.observations.len(),
+                    series
+                        .observations
+                        .first()
+                        .map(|bar| bar.date.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    series
+                        .observations
+                        .last()
+                        .map(|bar| bar.date.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                )
+            })
+            .or_else(|| {
+                (!stockholm_close_global_risk.is_empty()).then(|| {
+                    stockholm_close_global_risk
+                        .iter()
+                        .map(|series| {
+                            format!(
+                                "{}: {} observations, {} through {}",
+                                series.symbol,
+                                series.observations.len(),
+                                series
+                                    .observations
+                                    .first()
+                                    .map(|bar| bar.date.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                series
+                                    .observations
+                                    .last()
+                                    .map(|bar| bar.date.to_string())
+                                    .unwrap_or_else(|| "unknown".into())
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            }),
     };
     serde_json::to_writer(&mut output, &manifest).map_err(|error| error.to_string())?;
     output.write_all(b"\n").map_err(|error| error.to_string())?;

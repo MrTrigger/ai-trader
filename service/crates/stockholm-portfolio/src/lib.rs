@@ -401,6 +401,9 @@ impl DirectionModel {
             features_stockholm::DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION => {
                 features_stockholm::direction_global_risk_model_feature_names()
             }
+            features_stockholm::DIRECTION_STOCKHOLM_CLOSE_GLOBAL_RISK_FEATURE_SET_VERSION => {
+                features_stockholm::direction_stockholm_close_global_risk_model_feature_names()
+            }
             _ => return Err("unsupported direction model feature-set version".into()),
         };
         if model.features != expected {
@@ -513,6 +516,9 @@ fn expected_features(version: &str) -> Result<Vec<String>, String> {
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION => {
             Ok(features_stockholm::pdmr_microstructure_borrow_news_model_feature_names())
         }
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION => Ok(
+            features_stockholm::pdmr_microstructure_borrow_news_global_risk_model_feature_names(),
+        ),
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Ok(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
@@ -3100,9 +3106,9 @@ fn benchmark_comparison_from_returns(
     let periods_per_year = 252.0 / cadence as f64;
     let active_mean = mean(&active);
     let tracking_error = population_std(&active) * periods_per_year.sqrt();
-    let covariance = population_covariance(&portfolio_returns, &benchmark_returns);
-    let portfolio_std = population_std(&portfolio_returns);
-    let benchmark_std = population_std(&benchmark_returns);
+    let covariance = population_covariance(portfolio_returns, benchmark_returns);
+    let portfolio_std = population_std(portfolio_returns);
+    let benchmark_std = population_std(benchmark_returns);
     let benchmark_variance = benchmark_std.powi(2);
     Ok(BenchmarkComparison {
         symbol: history.symbol.clone(),
@@ -3478,6 +3484,17 @@ mod tests {
             )
             .unwrap(),
             features_stockholm::pdmr_microstructure_borrow_news_model_feature_names()
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_the_complete_stockholm_close_global_risk_contract() {
+        assert_eq!(
+            expected_features(
+                features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION,
+            )
+            .unwrap(),
+            features_stockholm::pdmr_microstructure_borrow_news_global_risk_model_feature_names()
         );
     }
 

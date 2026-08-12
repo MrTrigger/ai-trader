@@ -21,6 +21,7 @@ MODEL_VERSION = "stockholm-direction-model-1"
 FEATURE_SET_VERSIONS = {
     "fs-rust-stockholm-direction-1",
     "fs-rust-stockholm-direction-2",
+    "fs-rust-stockholm-direction-3",
 }
 PARAMS = {
     "learning_rate": 0.025,
