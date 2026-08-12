@@ -503,6 +503,30 @@ all 180 selected position-periods had observed spread. Remaining fits were
 not run because no aggregate can repair the already-failed all-fold stability
 requirement without turning the exercise into closed-fold selection.
 
+## Official report-attachment data gate
+
+Nasdaq report metadata exposes 41,077 unique PDF attachments. An initial
+parallel in-process decoder was unsafe: malformed and unusually large PDFs
+could expand memory across several workers and terminate the WSL environment.
+That implementation was removed. Downloads are now a separate bounded phase;
+decoding is sequential, with every PDF handled by an isolated subprocess under
+a 512 MiB address-space limit and a 120-second timeout. A `--cached-only` mode
+performs no network requests and emits an explicitly diagnostic manifest that
+the training-matrix command rejects.
+
+The interrupted archive left 3,499 PDFs on disk. Safe cache-only recovery
+produced 3,432 texts and 67 explicit extraction failures. On those documents,
+the frozen Rust accounting parser increased deduplicated report events with at
+least one metric from 9,424 to 9,806. EBIT coverage increased by 300 events,
+dividend by 240, sales by 211, EPS by 168, operating margin by 104, and order
+intake by 36. These are data-coverage diagnostics, not model results.
+
+Feature version `fs-rust-stockholm-13` is reserved for a complete attachment
+archive. It retains v12's exact eight fields and parser: body values win, and
+same-release PDF text may only fill a body-missing field. It introduces no new
+numeric labels or parser search. No v13 matrix or model may be produced from
+the partial cache; collection is not being resumed automatically.
+
 ## Verdict
 
 No candidate approaches the required 2.0 aggregate Sharpe, the development

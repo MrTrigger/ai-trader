@@ -321,6 +321,11 @@ service/target/release/stockholm-portfolio collect-nasdaq-report-messages \
   --data-root var/stockholm/authority-data \
   --nasdaq-reports var/stockholm/authority-data/nasdaq-company-news/latest-financial-reports.json \
   --pause-ms 100 --concurrency 16
+
+service/target/release/stockholm-portfolio collect-nasdaq-report-attachments \
+  --data-root var/stockholm/authority-data \
+  --report-messages var/stockholm/authority-data/nasdaq-financial-report-messages/latest-financial-report-messages.json \
+  --pause-ms 100 --concurrency 4 --max-attachment-mb 64
 ```
 
 The completed report-text archive contains 31,611 bodies and 43,053 attachment
@@ -329,6 +334,19 @@ was rejected at its first fold (-5.4%, Sharpe -0.85); remaining folds were not
 run after the mandatory all-fold stability gate became impossible to pass.
 See the reward/loss study for measured-spread v11 attribution and the frozen
 v12 contract.
+
+The attachment collector is resumable and de-duplicates identical URLs before
+download. Download concurrency does not apply to decoding: each decoder runs
+sequentially in a separate subprocess with a 512 MiB address-space limit and a
+120-second timeout. Raw PDFs and normalized extracted text remain shared
+provider artifacts; image-only, malformed, oversized, timed-out, or
+memory-limited documents are explicit failures. Feature crates—not the
+collector—own accounting-field parsing, publication-time deduplication, and
+missingness.
+
+Use `--cached-only` to inventory and safely extract existing files without any
+network requests. Such a partial manifest is diagnostic input and is rejected
+by the attachment feature-set completeness check.
 
 The public Nasdaq chart endpoint drops inactive order books, so official
 delisting notices alone cannot supply survivorship-safe returns. With a

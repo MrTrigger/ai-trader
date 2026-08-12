@@ -45,6 +45,18 @@ usage: stockholm-portfolio <command>
       Resumably archive official financial-report HTML bodies and attachment
       metadata through the shared equity provider; no bot owns web decoding.
 
+  collect-nasdaq-report-attachments --data-root <dir> --report-messages <json>
+                                     [--pause-ms 100] [--concurrency 4]
+                                     [--max-attachment-mb 64] [--limit 0]
+                                     [--cached-only]
+      Download official report PDFs with bounded concurrency, then extract
+      sequentially in memory-limited subprocesses. Existing files are reused.
+
+  audit-nasdaq-report-attachments --report-messages <json>
+                                  --report-attachments <json>
+      Compare the fixed Rust report-metric parser's body-only coverage with
+      coverage after adding the causally associated extracted PDF text.
+
   collect-nasdaq-company-news --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                                [--pause-ms 100]
       Archive every official Nasdaq Main Market Stockholm company-news event
@@ -81,11 +93,12 @@ usage: stockholm-portfolio <command>
 
   training-matrix --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                   --out <jsonl> [--horizon-sessions 5] [--min-adv-sek 1000000]
-                  [--feature-set baseline|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text]
+                  [--feature-set baseline|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text|residual-pdmr-microstructure-borrow-news-report-attachments]
                   [--fi-net-shorts <json>] [--fi-pdmr <json>]
                   [--nasdaq-reports <json>] [--esef-annual <json>]
                   [--nasdaq-company-news <json>]
                   [--nasdaq-report-messages <json>]
+                  [--nasdaq-report-attachments <json>]
                   [--riksbank-macro <json>]
                   [--nasdaq-market-history-root <dir>]
                   [--ib-fee-history-root <dir>]
@@ -162,6 +175,12 @@ struct MatrixManifest {
     report_text_asof_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     report_text_mapping_coverage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_attachment_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_attachment_asof_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_attachment_coverage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     esef_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,6 +409,107 @@ fn collect_nasdaq_report_messages(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn collect_nasdaq_report_attachments(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let metadata_path = PathBuf::from(need(args, "--report-messages")?);
+    let metadata = equity_data::load_nasdaq_financial_report_messages(&metadata_path)?;
+    let max_attachment_mb = number(args, "--max-attachment-mb", 64_u64)?;
+    let max_attachment_bytes = max_attachment_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "--max-attachment-mb is too large".to_owned())?;
+    let collection = equity_data::collect_nasdaq_financial_report_attachments(
+        &root,
+        &metadata_path,
+        &metadata,
+        number(args, "--pause-ms", 100_u64)?,
+        number(args, "--concurrency", 4_usize)?,
+        max_attachment_bytes,
+        number(args, "--limit", 0_usize)?,
+        args.iter().any(|arg| arg == "--cached-only"),
+    )?;
+    println!(
+        "downloaded {}/{} requested Nasdaq report PDFs ({} available), extracted {} texts / {} chars from {} bytes, {} failures -> {}",
+        collection.downloaded,
+        collection.requested,
+        collection.available,
+        collection.extracted,
+        collection.text_chars,
+        collection.bytes,
+        collection.failures,
+        collection.dataset_path.display(),
+    );
+    Ok(())
+}
+
+fn extract_nasdaq_report_pdf_worker(args: &[String]) -> Result<(), String> {
+    equity_data::extract_nasdaq_financial_report_pdf(
+        Path::new(&need(args, "--input")?),
+        Path::new(&need(args, "--output")?),
+        number(args, "--max-bytes", 64_u64 * 1024 * 1024)?,
+    )?;
+    Ok(())
+}
+
+fn audit_nasdaq_report_attachments(args: &[String]) -> Result<(), String> {
+    let messages_path = PathBuf::from(need(args, "--report-messages")?);
+    let attachments_path = PathBuf::from(need(args, "--report-attachments")?);
+    let messages = equity_data::load_nasdaq_financial_report_messages(&messages_path)?;
+    let attachments = equity_data::load_nasdaq_financial_report_attachments(&attachments_path)?;
+    let mut texts_by_disclosure = std::collections::BTreeMap::<u64, Vec<String>>::new();
+    for document in &attachments.documents {
+        let Some(path) = document.extracted_text_file.as_deref() else {
+            continue;
+        };
+        let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+        for disclosure_id in &document.disclosure_ids {
+            texts_by_disclosure
+                .entry(*disclosure_id)
+                .or_default()
+                .push(text.clone());
+        }
+    }
+    let mut body_events = Vec::new();
+    let mut augmented_events = Vec::new();
+    let mut augmented_messages = 0_usize;
+    for message in &messages.messages {
+        let announcement = &message.announcement;
+        let instrument_id = equity_data::nasdaq_news_issuer_key(&announcement.company);
+        let baseline = features_stockholm::FinancialReportTextEvent {
+            instrument_id,
+            publication_date: announcement.publication_date,
+            publication_key: announcement.published.clone(),
+            language: announcement.language.clone(),
+            body_text: message.body_text.clone(),
+            extracted_metrics: None,
+        };
+        let mut augmented = baseline.clone();
+        if let Some(texts) = texts_by_disclosure.get(&announcement.disclosure_id) {
+            augmented_messages += 1;
+            augmented.extracted_metrics =
+                Some(features_stockholm::report_text_metrics_with_supplements(
+                    &augmented.body_text,
+                    texts.iter().map(String::as_str),
+                ));
+        }
+        body_events.push(baseline);
+        augmented_events.push(augmented);
+    }
+    let body = features_stockholm::report_text_metric_coverage(&body_events)?;
+    let augmented = features_stockholm::report_text_metric_coverage(&augmented_events)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "attachment_documents": attachments.documents.len(),
+            "attachment_texts": attachments.documents.iter().filter(|document| document.extracted_text_file.is_some()).count(),
+            "messages_augmented": augmented_messages,
+            "body_only": body,
+            "body_plus_attachments": augmented,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
 fn collect_nasdaq_equity_notices(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let collection = equity_data::collect_nasdaq_stockholm_equity_notices(
@@ -610,6 +730,67 @@ fn matrix(args: &[String]) -> Result<(), String> {
     let report_text_dataset = get(args, "--nasdaq-report-messages")
         .map(|path| equity_data::load_nasdaq_financial_report_messages(Path::new(&path)))
         .transpose()?;
+    let report_attachment_dataset = get(args, "--nasdaq-report-attachments")
+        .map(|path| equity_data::load_nasdaq_financial_report_attachments(Path::new(&path)))
+        .transpose()?;
+    let attachment_feature_requested = get(args, "--feature-set").as_deref()
+        == Some("residual-pdmr-microstructure-borrow-news-report-attachments");
+    if attachment_feature_requested {
+        let dataset = report_attachment_dataset.as_ref().ok_or_else(|| {
+            "--nasdaq-report-attachments is required for report-attachment features".to_owned()
+        })?;
+        if !dataset.network_downloads_enabled
+            || dataset.requested_pdf_urls != dataset.available_pdf_urls
+        {
+            return Err(format!(
+                "report-attachment archive is diagnostic/partial: network_enabled={}, requested {} of {} unique PDFs",
+                dataset.network_downloads_enabled,
+                dataset.requested_pdf_urls,
+                dataset.available_pdf_urls,
+            ));
+        }
+    }
+    let mut attachment_paths_by_disclosure = std::collections::BTreeMap::<u64, Vec<String>>::new();
+    if let Some(dataset) = &report_attachment_dataset {
+        for document in &dataset.documents {
+            let Some(path) = document.extracted_text_file.as_ref() else {
+                continue;
+            };
+            for disclosure_id in &document.disclosure_ids {
+                attachment_paths_by_disclosure
+                    .entry(*disclosure_id)
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+    }
+    let mut attachment_metrics_by_disclosure =
+        std::collections::BTreeMap::<u64, Vec<Option<f64>>>::new();
+    if attachment_feature_requested {
+        let messages = report_text_dataset.as_ref().ok_or_else(|| {
+            "--nasdaq-report-messages is required for report-attachment features".to_owned()
+        })?;
+        for message in &messages.messages {
+            let Some(paths) =
+                attachment_paths_by_disclosure.get(&message.announcement.disclosure_id)
+            else {
+                continue;
+            };
+            let texts = paths
+                .iter()
+                .map(|path| {
+                    std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            attachment_metrics_by_disclosure.insert(
+                message.announcement.disclosure_id,
+                features_stockholm::report_text_metrics_with_supplements(
+                    &message.body_text,
+                    texts.iter().map(String::as_str),
+                ),
+            );
+        }
+    }
     let mut matched_report_text = 0_usize;
     let mut matched_report_text_instruments = std::collections::BTreeSet::new();
     let report_text_events = report_text_dataset
@@ -635,6 +816,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
                                 publication_key: announcement.published.clone(),
                                 language: announcement.language.clone(),
                                 body_text: message.body_text.clone(),
+                                extracted_metrics: attachment_metrics_by_disclosure
+                                    .get(&announcement.disclosure_id)
+                                    .cloned(),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -770,6 +954,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
         "residual-pdmr-microstructure-borrow-news-report-text" => {
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
         }
+        "residual-pdmr-microstructure-borrow-news-report-attachments" => {
+            features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
+        }
         other => return Err(format!("unknown Stockholm feature set {other:?}")),
     };
     let public_short_dataset = get(args, "--fi-net-shorts")
@@ -806,6 +993,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && pdmr_dataset.is_none()
     {
         return Err("--fi-pdmr is required for residual-pdmr features".into());
@@ -881,6 +1069,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && market_history_dataset.is_none()
     {
         return Err(
@@ -917,6 +1106,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
         features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrow
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && borrow_fee_root.is_none()
     {
         return Err(
@@ -928,6 +1118,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
         feature_set,
         features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) && all_company_news_dataset.is_none()
     {
         return Err(
@@ -935,8 +1126,11 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
-    if feature_set == features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
-        && report_text_dataset.is_none()
+    if matches!(
+        feature_set,
+        features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
+    ) && report_text_dataset.is_none()
     {
         return Err("--nasdaq-report-messages is required for report-text features".into());
     }
@@ -1028,6 +1222,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
             features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
                 features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION
             }
+            features_stockholm::FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments => {
+                features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION
+            }
         }
         .into(),
         label_version: features_stockholm::label_version(horizon)?,
@@ -1106,6 +1303,30 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 dataset.messages.len(),
                 matched_report_text_instruments.len(),
                 instruments_by_issuer.values().map(Vec::len).sum::<usize>()
+            )
+        }),
+        report_attachment_source: report_attachment_dataset
+            .as_ref()
+            .map(|dataset| dataset.source.clone()),
+        report_attachment_asof_policy: report_attachment_dataset.as_ref().map(|_| {
+            "official PDF text inherits its Nasdaq message publication timestamp; fixed Rust metrics fill only body-missing fields, and values become usable only on later decision dates"
+                .into()
+        }),
+        report_attachment_coverage: report_attachment_dataset.as_ref().map(|dataset| {
+            format!(
+                "{}/{} unique PDF URLs have extracted text; {} documents carry explicit failures; network_enabled={}",
+                dataset
+                    .documents
+                    .iter()
+                    .filter(|document| document.extracted_text_file.is_some())
+                    .count(),
+                dataset.available_pdf_urls,
+                dataset
+                    .documents
+                    .iter()
+                    .filter(|document| document.failure.is_some())
+                    .count(),
+                dataset.network_downloads_enabled,
             )
         }),
         esef_source: esef_dataset.as_ref().map(|dataset| dataset.source.clone()),
@@ -1580,6 +1801,9 @@ fn main() -> ExitCode {
         Some("collect-fi-pdmr") => collect_fi_pdmr(&args[1..]),
         Some("collect-nasdaq-reports") => collect_nasdaq_reports(&args[1..]),
         Some("collect-nasdaq-report-messages") => collect_nasdaq_report_messages(&args[1..]),
+        Some("collect-nasdaq-report-attachments") => collect_nasdaq_report_attachments(&args[1..]),
+        Some("__extract-nasdaq-report-pdf") => extract_nasdaq_report_pdf_worker(&args[1..]),
+        Some("audit-nasdaq-report-attachments") => audit_nasdaq_report_attachments(&args[1..]),
         Some("collect-nasdaq-company-news") => collect_nasdaq_company_news(&args[1..]),
         Some("collect-nasdaq-equity-notices") => collect_nasdaq_equity_notices(&args[1..]),
         Some("collect-nasdaq-market-history") => collect_nasdaq_market_history(&args[1..]),

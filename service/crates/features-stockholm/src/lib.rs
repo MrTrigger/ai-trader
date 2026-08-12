@@ -25,6 +25,8 @@ pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockh
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-11";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str =
     "fs-rust-stockholm-12";
+pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION: &str =
+    "fs-rust-stockholm-13";
 pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
 pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
 pub const DIRECTION_INDEX_SYMBOLS: &[&str] = &[
@@ -1187,6 +1189,7 @@ pub enum FeatureSet {
     ResidualPdmrMicrostructureBorrow,
     ResidualPdmrMicrostructureBorrowNews,
     ResidualPdmrMicrostructureBorrowNewsReportText,
+    ResidualPdmrMicrostructureBorrowNewsReportAttachments,
 }
 
 #[derive(Debug, Clone)]
@@ -1800,6 +1803,11 @@ pub struct FinancialReportTextEvent {
     pub publication_key: String,
     pub language: String,
     pub body_text: String,
+    /// Optional finalized values in `REPORT_TEXT_FEATURE_NAMES[1..]` order.
+    /// These may only be produced by [`report_text_metrics_with_supplements`]
+    /// in this crate; the shared provider merely supplies document text.
+    #[serde(default)]
+    pub extracted_metrics: Option<Vec<Option<f64>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1836,6 +1844,26 @@ pub fn report_text_metric_coverage(
     })
 }
 
+/// Apply the fixed Rust accounting parser to an announcement body and any
+/// official same-release document texts. Body values win; documents fill only
+/// fields the body did not declare, so adding a presentation cannot silently
+/// replace a value already published in the message.
+pub fn report_text_metrics_with_supplements<'a>(
+    body_text: &str,
+    supplements: impl IntoIterator<Item = &'a str>,
+) -> Vec<Option<f64>> {
+    let mut metrics = extract_report_text_metrics(body_text);
+    for text in supplements {
+        let candidate = extract_report_text_metrics(text);
+        for (value, supplement) in metrics.iter_mut().zip(candidate) {
+            if value.is_none() {
+                *value = supplement;
+            }
+        }
+    }
+    metrics
+}
+
 #[derive(Debug, Clone)]
 struct ExtractedReportText {
     instrument_id: String,
@@ -1866,12 +1894,20 @@ impl FinancialReportTextCursor {
         }
         let mut deduplicated = BTreeMap::<(String, String), ExtractedReportText>::new();
         for event in events {
+            let metrics = if let Some(metrics) = &event.extracted_metrics {
+                if metrics.len() != REPORT_TEXT_FEATURE_NAMES.len() - 1 {
+                    return Err("report-text event has the wrong extracted metric width".into());
+                }
+                metrics.clone()
+            } else {
+                extract_report_text_metrics(&event.body_text)
+            };
             let candidate = ExtractedReportText {
                 instrument_id: event.instrument_id.clone(),
                 publication_date: event.publication_date,
                 publication_key: event.publication_key.clone(),
                 language: event.language.clone(),
-                metrics: extract_report_text_metrics(&event.body_text),
+                metrics,
             };
             let key = (
                 candidate.instrument_id.clone(),
@@ -3532,6 +3568,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
             | FeatureSet::ResidualPdmrMicrostructureBorrow
             | FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) {
         residual_features(bars, instruments)?
     } else {
@@ -3548,6 +3585,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
             | FeatureSet::ResidualPdmrMicrostructureBorrow
             | FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) {
         microstructure_features(microstructure)?
     } else {
@@ -3562,6 +3600,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
         FeatureSet::ResidualPdmrMicrostructureBorrow
             | FeatureSet::ResidualPdmrMicrostructureBorrowNews
             | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
     ) {
         borrow_fee_features(borrow_fees)?
     } else {
@@ -3656,7 +3695,8 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
         FeatureSet::ResidualPdmrMicrostructureBorrowNews => {
             pdmr_microstructure_borrow_news_model_feature_names()
         }
-        FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
+        FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+        | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments => {
             pdmr_microstructure_borrow_news_report_text_model_feature_names()
         }
     };
@@ -3694,16 +3734,18 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
     let mut company_news_cursor = (feature_set == FeatureSet::ResidualPdmrMicrostructureBorrowNews)
         .then(|| CompanyNewsCursor::new(company_news_events, bars))
         .transpose()?;
-    let mut report_text_pdmr_cursor = (feature_set
-        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+    let report_text_feature_set = matches!(
+        feature_set,
+        FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
+    );
+    let mut report_text_pdmr_cursor = report_text_feature_set
         .then(|| PdmrCursor::new(pdmr_events))
         .transpose()?;
-    let mut report_text_news_cursor = (feature_set
-        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+    let mut report_text_news_cursor = report_text_feature_set
         .then(|| CompanyNewsCursor::new(company_news_events, bars))
         .transpose()?;
-    let mut report_text_cursor = (feature_set
-        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+    let mut report_text_cursor = report_text_feature_set
         .then(|| FinancialReportTextCursor::new(report_text_events))
         .transpose()?;
     let mut rows = Vec::new();
@@ -3939,7 +3981,8 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
                     &pdmr_microstructure_borrow_news,
                 )?
             }
-            FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
+            FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments => {
                 residual_pdmr_microstructure_borrow_news_report_text_cross_section(
                     &context,
                     &residual,
@@ -4515,6 +4558,7 @@ mod tests {
             publication_key: "2024-01-10 07:00:00".into(),
             language: "en".into(),
             body_text: body.into(),
+            extracted_metrics: None,
         };
         let mut cursor = FinancialReportTextCursor::new(&[event.clone(), event]).unwrap();
         cursor.advance_before(published);
@@ -4540,6 +4584,26 @@ mod tests {
         assert!((swedish[0].unwrap() - (2018.0 / 1925.0 - 1.0)).abs() < 1e-12);
         assert!((swedish[2].unwrap() - (422.0 / 357.0 - 1.0)).abs() < 1e-12);
         assert!((swedish[3].unwrap() - 0.209).abs() < 1e-12);
+    }
+
+    #[test]
+    fn report_attachment_metrics_fill_missing_body_values_without_overwriting_them() {
+        let body = "Net sales amounted to SEK 110 (100) million.";
+        let supplement = concat!(
+            "Net sales amounted to SEK 999 (100) million. ",
+            "EBIT amounted to SEK 22 (20) million."
+        );
+        let metrics = report_text_metrics_with_supplements(body, [supplement]);
+        let sales = REPORT_TEXT_FEATURE_NAMES[1..]
+            .iter()
+            .position(|name| *name == "nasdaq_report_sales_growth")
+            .unwrap();
+        let ebit = REPORT_TEXT_FEATURE_NAMES[1..]
+            .iter()
+            .position(|name| *name == "nasdaq_report_ebit_growth")
+            .unwrap();
+        assert!((metrics[sales].unwrap() - 0.1).abs() < 1e-12);
+        assert!((metrics[ebit].unwrap() - 0.1).abs() < 1e-12);
     }
 
     #[test]

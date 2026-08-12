@@ -397,6 +397,9 @@ fn expected_features(version: &str) -> Result<Vec<String>, String> {
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Ok(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION => Ok(
+            features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
+        ),
         other => Err(format!("unsupported Stockholm feature version {other:?}")),
     }
 }
@@ -2261,6 +2264,17 @@ mod tests {
         assert_eq!(
             expected_features(
                 features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION,
+            )
+            .unwrap(),
+            features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names()
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_the_complete_report_attachment_feature_contract() {
+        assert_eq!(
+            expected_features(
+                features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION,
             )
             .unwrap(),
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names()

@@ -5,8 +5,9 @@
 //! decoding code.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -41,6 +42,12 @@ const RIKSBANK_API: &str = "https://api.riksbank.se/swea/v1";
 const RIKSBANK_API_FALLBACK: &str = "https://apimgmt-prod1365.azure-api.net/swea/v1";
 const EODHD_API: &str = "https://eodhd.com/api";
 const USER_AGENT: &str = "ai-trader-stockholm-research/0.1";
+const PDF_EXTRACTOR_ADDRESS_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+const PDF_EXTRACTOR_TIMEOUT_SECONDS: u64 = 120;
+
+fn default_true() -> bool {
+    true
+}
 
 pub const RIKSBANK_STOCKHOLM_MACRO_SERIES: &[(&str, &str, &str)] = &[
     ("SEKUSDPMI", "SEK per US dollar", "16:15 Europe/Stockholm"),
@@ -515,6 +522,51 @@ pub struct NasdaqFinancialReportMessageCollection {
     pub requested: usize,
     pub messages: usize,
     pub attachments: usize,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NasdaqFinancialReportAttachmentDocument {
+    pub url: String,
+    pub names: Vec<String>,
+    pub disclosure_ids: Vec<u64>,
+    pub byte_length: Option<u64>,
+    pub raw_file: Option<String>,
+    pub extracted_text_file: Option<String>,
+    pub extracted_text_chars: usize,
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NasdaqFinancialReportAttachmentDataset {
+    pub format_version: String,
+    pub generated_at: String,
+    pub source: String,
+    pub message_metadata_source: String,
+    pub pause_ms: u64,
+    pub concurrency: usize,
+    pub max_attachment_bytes: u64,
+    #[serde(default = "default_true")]
+    pub network_downloads_enabled: bool,
+    pub raw_cache_dir: String,
+    pub text_cache_dir: String,
+    pub available_pdf_urls: usize,
+    pub requested_pdf_urls: usize,
+    pub limitations: Vec<String>,
+    pub documents: Vec<NasdaqFinancialReportAttachmentDocument>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NasdaqFinancialReportAttachmentCollection {
+    pub dataset_path: PathBuf,
+    pub available: usize,
+    pub requested: usize,
+    pub downloaded: usize,
+    pub extracted: usize,
+    pub bytes: u64,
+    pub text_chars: usize,
     pub failures: usize,
 }
 
@@ -2315,6 +2367,248 @@ impl PublicEquityData {
         })
     }
 
+    /// Resumably archive and extract text from the PDF attachments referenced
+    /// by the official financial-report messages. Transport and PDF decoding
+    /// remain in the shared data-source crate; accounting interpretation stays
+    /// in the versioned Rust feature crate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_nasdaq_financial_report_attachments(
+        &self,
+        root: &Path,
+        message_metadata_source: &Path,
+        metadata: &NasdaqFinancialReportMessageDataset,
+        pause_ms: u64,
+        concurrency: usize,
+        max_attachment_bytes: u64,
+        limit: usize,
+        cached_only: bool,
+    ) -> Result<NasdaqFinancialReportAttachmentCollection, String> {
+        if concurrency == 0 {
+            return Err("Nasdaq report-attachment concurrency must be positive".into());
+        }
+        if max_attachment_bytes == 0 {
+            return Err("Nasdaq report-attachment byte ceiling must be positive".into());
+        }
+        let cache_dir = root.join("nasdaq-financial-report-attachments").join("raw");
+        let text_dir = root
+            .join("nasdaq-financial-report-attachments")
+            .join("text");
+        std::fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&text_dir).map_err(|error| error.to_string())?;
+
+        let mut sources = BTreeMap::<String, (BTreeSet<String>, BTreeSet<u64>)>::new();
+        for message in &metadata.messages {
+            for attachment in &message.attachments {
+                if !attachment.name.to_ascii_lowercase().ends_with(".pdf") {
+                    continue;
+                }
+                let entry = sources.entry(attachment.url.clone()).or_default();
+                entry.0.insert(attachment.name.clone());
+                entry.1.insert(message.announcement.disclosure_id);
+            }
+        }
+        let available = sources.len();
+        let mut sources = sources.into_iter().collect::<Vec<_>>();
+        if limit > 0 {
+            sources.truncate(limit);
+        }
+        let requested = sources.len();
+        if sources.is_empty() {
+            return Err("Nasdaq report-message metadata has no PDF attachments".into());
+        }
+
+        let completed = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut documents = pool.install(|| {
+            sources
+                .par_iter()
+                .map(|(url, (names, disclosure_ids))| {
+                    let key = nasdaq_attachment_cache_key(url);
+                    let raw_path = cache_dir.join(format!("{key}.pdf"));
+                    let text_path = text_dir.join(format!("{key}.txt"));
+                    let mut document = NasdaqFinancialReportAttachmentDocument {
+                        url: url.clone(),
+                        names: names.iter().cloned().collect(),
+                        disclosure_ids: disclosure_ids.iter().copied().collect(),
+                        byte_length: None,
+                        raw_file: None,
+                        extracted_text_file: None,
+                        extracted_text_chars: 0,
+                        failure: None,
+                    };
+                    let result = (|| {
+                        let cached = raw_path
+                            .exists()
+                            .then(|| read_bounded_file(&raw_path, max_attachment_bytes))
+                            .transpose()?;
+                        let bytes = if cached
+                            .as_ref()
+                            .is_some_and(|bytes| validate_pdf_bytes(bytes).is_ok())
+                        {
+                            cached.expect("validated cached bytes exist")
+                        } else if cached_only {
+                            if let Some(bytes) = cached {
+                                validate_pdf_bytes(&bytes)?;
+                            }
+                            return Err(
+                                "PDF is not present in a valid cache; network is disabled".into()
+                            );
+                        } else {
+                            let bytes = self.download_bounded_bytes_with_retries(
+                                url,
+                                max_attachment_bytes,
+                                4,
+                                2,
+                            )?;
+                            validate_pdf_bytes(&bytes)?;
+                            write_atomic_bytes(&raw_path, &bytes)?;
+                            if pause_ms > 0 {
+                                std::thread::sleep(Duration::from_millis(pause_ms));
+                            }
+                            bytes
+                        };
+                        validate_pdf_bytes(&bytes)?;
+                        document.byte_length = Some(bytes.len() as u64);
+                        document.raw_file = Some(raw_path.to_string_lossy().into_owned());
+                        if text_path.exists() {
+                            let text = std::fs::read_to_string(&text_path)
+                                .map_err(|error| format!("{}: {error}", text_path.display()))?;
+                            document.extracted_text_chars = text.chars().count();
+                            if document.extracted_text_chars == 0 {
+                                return Err("cached PDF text is empty".into());
+                            }
+                            document.extracted_text_file =
+                                Some(text_path.to_string_lossy().into_owned());
+                        }
+                        Ok::<(), String>(())
+                    })();
+                    if let Err(error) = result {
+                        document.failure = Some(error);
+                    }
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 250 == 0 || done == requested {
+                        eprintln!("Nasdaq report attachments: {done}/{requested} processed");
+                    }
+                    document
+                })
+                .collect::<Vec<_>>()
+        });
+        documents.sort_by(|a, b| a.url.cmp(&b.url));
+        let to_extract = documents
+            .iter()
+            .filter(|document| {
+                document.raw_file.is_some()
+                    && document.extracted_text_file.is_none()
+                    && document.failure.is_none()
+            })
+            .count();
+        let mut extracted = 0_usize;
+        for document in &mut documents {
+            let (Some(raw_file), None) = (
+                document.raw_file.as_deref(),
+                document.extracted_text_file.as_deref(),
+            ) else {
+                continue;
+            };
+            if document.failure.is_some() {
+                continue;
+            }
+            let text_path = text_dir.join(format!(
+                "{}.txt",
+                nasdaq_attachment_cache_key(&document.url)
+            ));
+            match run_isolated_pdf_extractor(Path::new(raw_file), &text_path, max_attachment_bytes)
+                .and_then(|()| {
+                    std::fs::read_to_string(&text_path)
+                        .map_err(|error| format!("{}: {error}", text_path.display()))
+                }) {
+                Ok(text) if !text.is_empty() => {
+                    document.extracted_text_chars = text.chars().count();
+                    document.extracted_text_file = Some(text_path.to_string_lossy().into_owned());
+                }
+                Ok(_) => document.failure = Some("PDF contains no extractable text".into()),
+                Err(error) => document.failure = Some(error),
+            }
+            extracted += 1;
+            if extracted % 50 == 0 || extracted == to_extract {
+                eprintln!(
+                    "Nasdaq report attachment extraction: {extracted}/{to_extract} isolated workers completed"
+                );
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        let dataset = NasdaqFinancialReportAttachmentDataset {
+            format_version: "nasdaq-stockholm-financial-report-attachments-1".into(),
+            generated_at: now.to_string(),
+            source: "Official Nasdaq issuer-news attachment service".into(),
+            message_metadata_source: message_metadata_source
+                .to_string_lossy()
+                .into_owned(),
+            pause_ms,
+            concurrency,
+            max_attachment_bytes,
+            network_downloads_enabled: !cached_only,
+            raw_cache_dir: cache_dir.to_string_lossy().into_owned(),
+            text_cache_dir: text_dir.to_string_lossy().into_owned(),
+            available_pdf_urls: available,
+            requested_pdf_urls: requested,
+            limitations: vec![
+                "PDF text extraction preserves issuer wording but not table geometry; accounting values require conservative field-level parsing and missingness".into(),
+                "Image-only documents are retained as explicit extraction failures; OCR is not silently substituted".into(),
+                format!("Every PDF decoder runs in its own sequential subprocess with a {} MiB address-space limit and a {} second wall-clock timeout", PDF_EXTRACTOR_ADDRESS_SPACE_BYTES / 1024 / 1024, PDF_EXTRACTOR_TIMEOUT_SECONDS),
+                "Attachment publication time is inherited from its official message; translation/correction deduplication remains a causal feature responsibility".into(),
+                "Only PDF attachments are collected in this version; spreadsheets and XBRL attachments remain metadata".into(),
+            ],
+            documents,
+        };
+        let snapshot_dir = root
+            .join("nasdaq-financial-report-attachments")
+            .join("snapshots")
+            .join(format!("{}-{}", now.date(), now.unix_timestamp()));
+        std::fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
+        let dataset_path = snapshot_dir.join("financial-report-attachments.json");
+        write_json(&dataset_path, &dataset)?;
+        write_json(
+            &root
+                .join("nasdaq-financial-report-attachments")
+                .join("latest-financial-report-attachments.json"),
+            &dataset,
+        )?;
+        Ok(NasdaqFinancialReportAttachmentCollection {
+            dataset_path,
+            available,
+            requested,
+            downloaded: dataset
+                .documents
+                .iter()
+                .filter(|document| document.raw_file.is_some())
+                .count(),
+            extracted: dataset
+                .documents
+                .iter()
+                .filter(|document| document.extracted_text_file.is_some())
+                .count(),
+            bytes: dataset
+                .documents
+                .iter()
+                .filter_map(|document| document.byte_length)
+                .sum(),
+            text_chars: dataset
+                .documents
+                .iter()
+                .map(|document| document.extracted_text_chars)
+                .sum(),
+            failures: dataset
+                .documents
+                .iter()
+                .filter(|document| document.failure.is_some())
+                .count(),
+        })
+    }
+
     /// Archive the complete official Nasdaq Stockholm Main Market company-news
     /// feed. Unlike [`Self::collect_nasdaq_financial_reports`], this does not
     /// pre-filter categories: downstream feature code can declare a stable
@@ -3550,6 +3844,60 @@ impl PublicEquityData {
         ))
     }
 
+    fn download_bounded_bytes_with_retries(
+        &self,
+        url: &str,
+        max_bytes: u64,
+        attempts: u64,
+        retry_delay_seconds: u64,
+    ) -> Result<Vec<u8>, String> {
+        let mut last_error = String::new();
+        for attempt in 1..=attempts {
+            let result = (|| {
+                let response = self
+                    .client
+                    .get(url)
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .map_err(|error| error.to_string())?;
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > max_bytes)
+                {
+                    return Err(format!(
+                        "attachment declares more than the {max_bytes}-byte ceiling"
+                    ));
+                }
+                let mut bytes = Vec::new();
+                response
+                    .take(max_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 > max_bytes {
+                    return Err(format!("attachment exceeds the {max_bytes}-byte ceiling"));
+                }
+                Ok(bytes)
+            })();
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    last_error = error;
+                    if last_error.contains("byte ceiling") {
+                        break;
+                    }
+                    if attempt < attempts {
+                        std::thread::sleep(Duration::from_secs(
+                            retry_delay_seconds.saturating_mul(attempt),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "attachment download failed after at most {attempts} attempts: {last_error}"
+        ))
+    }
+
     fn download_bytes_with_query_retries(
         &self,
         url: &str,
@@ -3653,6 +4001,29 @@ pub fn collect_nasdaq_financial_report_messages(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn collect_nasdaq_financial_report_attachments(
+    root: &Path,
+    message_metadata_source: &Path,
+    metadata: &NasdaqFinancialReportMessageDataset,
+    pause_ms: u64,
+    concurrency: usize,
+    max_attachment_bytes: u64,
+    limit: usize,
+    cached_only: bool,
+) -> Result<NasdaqFinancialReportAttachmentCollection, String> {
+    PublicEquityData::new()?.collect_nasdaq_financial_report_attachments(
+        root,
+        message_metadata_source,
+        metadata,
+        pause_ms,
+        concurrency,
+        max_attachment_bytes,
+        limit,
+        cached_only,
+    )
+}
+
 pub fn collect_nasdaq_stockholm_equity_notices(
     root: &Path,
     start: Date,
@@ -3747,6 +4118,12 @@ pub fn load_nasdaq_equity_notices(path: &Path) -> Result<NasdaqEquityNoticeDatas
 pub fn load_nasdaq_financial_report_messages(
     path: &Path,
 ) -> Result<NasdaqFinancialReportMessageDataset, String> {
+    read_json(path)
+}
+
+pub fn load_nasdaq_financial_report_attachments(
+    path: &Path,
+) -> Result<NasdaqFinancialReportAttachmentDataset, String> {
     read_json(path)
 }
 
@@ -4765,6 +5142,139 @@ fn parse_nasdaq_financial_report_message(
     })
 }
 
+fn nasdaq_attachment_cache_key(url: &str) -> String {
+    url.rsplit('/')
+        .next()
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            // Deterministic fallback for unexpected URL shapes. The current
+            // official attachment service uses opaque alphanumeric path keys.
+            let mut hash = 0xcbf29ce484222325_u64;
+            for byte in url.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            format!("url-{hash:016x}")
+        })
+}
+
+fn validate_pdf_bytes(bytes: &[u8]) -> Result<(), String> {
+    if !bytes.starts_with(b"%PDF-") {
+        return Err("attachment is not a PDF payload".into());
+    }
+    let tail = &bytes[bytes.len().saturating_sub(4096)..];
+    if !tail
+        .windows(b"%%EOF".len())
+        .any(|window| window == b"%%EOF")
+    {
+        return Err("attachment PDF is incomplete (missing terminal marker)".into());
+    }
+    Ok(())
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data");
+    let temporary = path.with_extension(format!("{extension}.tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("{}: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("{} -> {}: {error}", temporary.display(), path.display())
+    })
+}
+
+fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{} exceeds the {max_bytes}-byte ceiling",
+            path.display()
+        ));
+    }
+    std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn run_isolated_pdf_extractor(
+    input: &Path,
+    output: &Path,
+    max_attachment_bytes: u64,
+) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let status = Command::new("timeout")
+        .args([
+            "--signal=KILL",
+            &format!("{}s", PDF_EXTRACTOR_TIMEOUT_SECONDS),
+            "prlimit",
+            &format!("--as={PDF_EXTRACTOR_ADDRESS_SPACE_BYTES}"),
+            "--",
+        ])
+        .arg(executable)
+        .arg("__extract-nasdaq-report-pdf")
+        .arg("--input")
+        .arg(input)
+        .arg("--output")
+        .arg(output)
+        .arg("--max-bytes")
+        .arg(max_attachment_bytes.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to start isolated PDF extractor: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    match status.code() {
+        Some(124 | 137) => Err(format!(
+            "isolated PDF extractor exceeded its {} second or {} MiB resource limit",
+            PDF_EXTRACTOR_TIMEOUT_SECONDS,
+            PDF_EXTRACTOR_ADDRESS_SPACE_BYTES / 1024 / 1024
+        )),
+        Some(code) => Err(format!(
+            "isolated PDF extractor failed with exit code {code}"
+        )),
+        None => Err("isolated PDF extractor was terminated by a signal".into()),
+    }
+}
+
+/// Decode one already-downloaded report PDF. Production collection invokes
+/// this only in a resource-limited subprocess; keeping the decoder here makes
+/// PDF interpretation a shared data-source concern rather than bot logic.
+pub fn extract_nasdaq_financial_report_pdf(
+    input: &Path,
+    output: &Path,
+    max_attachment_bytes: u64,
+) -> Result<usize, String> {
+    let bytes = read_bounded_file(input, max_attachment_bytes)?;
+    validate_pdf_bytes(&bytes)?;
+    let extracted = pdf_extract::extract_text_from_mem(&bytes)
+        .map_err(|error| format!("PDF text extraction: {error}"))?;
+    let normalized = normalize_document_text(&extracted);
+    if normalized.is_empty() {
+        return Err("PDF contains no extractable text".into());
+    }
+    write_atomic_bytes(output, normalized.as_bytes())?;
+    Ok(normalized.chars().count())
+}
+
+fn normalize_document_text(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn identifier_tokens(value: &str) -> Vec<String> {
     value
         .split_whitespace()
@@ -5419,6 +5929,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message.body_text, "Net sales were SEK 100 million.");
+    }
+
+    #[test]
+    fn attachment_cache_keys_are_safe_and_pdf_validation_is_explicit() {
+        assert_eq!(
+            nasdaq_attachment_cache_key(
+                "https://attachment.news.eu.nasdaq.com/ad4fd6be084d7f31c4b76841d1415019b"
+            ),
+            "ad4fd6be084d7f31c4b76841d1415019b"
+        );
+        assert!(nasdaq_attachment_cache_key("https://example.test/a/b?bad=1").starts_with("url-"));
+        assert!(validate_pdf_bytes(b"%PDF-1.7\nbody\n%%EOF\n").is_ok());
+        assert!(validate_pdf_bytes(b"%PDF-1.7\ntruncated").is_err());
+        assert!(validate_pdf_bytes(b"<html>not a pdf</html>").is_err());
+        assert_eq!(
+            normalize_document_text(" Net   sales  100 \n\n EBIT  10 "),
+            "Net sales 100\nEBIT 10"
+        );
     }
 
     #[test]
