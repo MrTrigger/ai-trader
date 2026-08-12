@@ -26,6 +26,11 @@ pub enum WsEvent {
     /// A channel this module does not know. Carried, not dropped, so the
     /// consumer's logs can show what the venue started sending.
     Other(String),
+    /// A channel this module does know, but whose `data` payload failed to
+    /// deserialize into that channel's shape (a venue schema change, most
+    /// likely). Distinct from [`Other`](WsEvent::Other) so the consumer's
+    /// logs can tell "new channel" apart from "known channel, broken parse".
+    Unparseable { channel: String, raw: String },
 }
 
 /// Top of book. `bbo[0]` is the bid, `bbo[1]` the ask; a side can be empty.
@@ -83,13 +88,26 @@ struct Frame {
 }
 
 /// Parse one text frame. Unknown channels are [`WsEvent::Other`], not errors:
-/// the stream must survive the venue adding channels.
+/// the stream must survive the venue adding channels. A known channel whose
+/// `data` fails to deserialize is [`WsEvent::Unparseable`], not an error
+/// either — that failure is on the venue's payload, not on this frame being
+/// unreadable, and the stream must survive it the same way. Only a frame
+/// that isn't even valid JSON, or lacks a `channel`, fails outright.
 pub fn parse_frame(text: &str) -> Result<WsEvent, serde_json::Error> {
     let frame: Frame = serde_json::from_str(text)?;
     Ok(match frame.channel.as_str() {
-        "candle" => WsEvent::Candle(serde_json::from_value(frame.data)?),
-        "bbo" => WsEvent::Bbo(serde_json::from_value(frame.data)?),
-        "userFills" => WsEvent::UserFills(serde_json::from_value(frame.data)?),
+        "candle" => match serde_json::from_value(frame.data) {
+            Ok(c) => WsEvent::Candle(c),
+            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+        },
+        "bbo" => match serde_json::from_value(frame.data) {
+            Ok(b) => WsEvent::Bbo(b),
+            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+        },
+        "userFills" => match serde_json::from_value(frame.data) {
+            Ok(f) => WsEvent::UserFills(f),
+            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+        },
         "subscriptionResponse" => WsEvent::SubscriptionResponse,
         "pong" => WsEvent::Pong,
         other => WsEvent::Other(other.to_string()),
@@ -133,6 +151,12 @@ pub struct WsConfig {
     pub ping_interval: std::time::Duration,
     pub backoff_start: std::time::Duration,
     pub backoff_cap: std::time::Duration,
+    /// Cap on a single connect attempt (TCP + TLS + WS handshake). A hung
+    /// handshake against an unreachable-but-listening peer would otherwise
+    /// block this attempt forever, since `connect_async` has no timeout of
+    /// its own — wedging the reconnect loop with no `ConnectFailed` and no
+    /// retry. A field, not a constant, so tests can drive it short.
+    pub connect_timeout: std::time::Duration,
 }
 
 impl Default for WsConfig {
@@ -142,6 +166,8 @@ impl Default for WsConfig {
             ping_interval: std::time::Duration::from_secs(30),
             backoff_start: std::time::Duration::from_secs(1),
             backoff_cap: std::time::Duration::from_secs(60),
+            // Matches the REST client's timeout (see `client()` in lib.rs).
+            connect_timeout: std::time::Duration::from_secs(15),
         }
     }
 }
@@ -205,13 +231,18 @@ async fn connect_and_stream(
 ) -> SessionEnd {
     // Race the connect attempt itself against the receiver closing, so a
     // hung or slow handshake against an unreachable venue doesn't stop this
-    // task from noticing the consumer is gone.
+    // task from noticing the consumer is gone. The attempt is also bounded
+    // by `connect_timeout`: `connect_async` has no timeout of its own, so a
+    // peer that accepts the TCP connection but never completes TLS/WS would
+    // otherwise wedge this task forever with no `ConnectFailed` and no retry.
     let mut socket = tokio::select! {
         _ = tx.closed() => return SessionEnd::ReceiverDropped,
-        res = tokio_tungstenite::connect_async(url) => match res {
-            Ok((socket, _)) => socket,
-            Err(_) => return SessionEnd::ConnectFailed,
-        },
+        res = tokio::time::timeout(cfg.connect_timeout, tokio_tungstenite::connect_async(url)) => {
+            match res {
+                Ok(Ok((socket, _))) => socket,
+                Ok(Err(_)) | Err(_) => return SessionEnd::ConnectFailed,
+            }
+        }
     };
     for sub in subs {
         let msg = serde_json::json!({"method": "subscribe", "subscription": sub.to_json()});
@@ -232,6 +263,15 @@ async fn connect_and_stream(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // the immediate first tick; pings start one interval in
 
+    // We ping every `ping_interval`, and a live link answers a ping with a
+    // pong at least that often — so `2 * ping_interval` of total silence
+    // (no frame of any kind, not just pongs) means the link is dead even
+    // though `socket.next()` is still pending: no FIN, no RST, just gone.
+    // Without this, that half-open state is caught only by TCP's own
+    // retransmit timeout, which can take 15+ minutes.
+    let mut last_rx = tokio::time::Instant::now();
+    let stale_after = cfg.ping_interval * 2;
+
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -240,22 +280,33 @@ async fn connect_and_stream(
                     return SessionEnd::ConnectionLost;
                 }
             }
+            _ = tokio::time::sleep_until(last_rx + stale_after) => {
+                return SessionEnd::ConnectionLost;
+            }
             frame = socket.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
+                    last_rx = tokio::time::Instant::now();
                     let event = match parse_frame(&text) {
                         Ok(e) => e,
-                        Err(_) => WsEvent::Other(format!("unparseable: {text}")),
+                        // The frame itself wasn't valid JSON, or had no
+                        // `channel` field — parse_frame already routes a
+                        // known channel's broken `data` to `Unparseable`
+                        // itself, so this arm is only the outer failure.
+                        Err(_) => WsEvent::Unparseable { channel: "?".into(), raw: text },
                     };
                     if tx.send(WsMessage::Event(event)).await.is_err() {
                         return SessionEnd::ReceiverDropped;
                     }
                 }
                 Some(Ok(Message::Ping(p))) => {
+                    last_rx = tokio::time::Instant::now();
                     if socket.send(Message::Pong(p)).await.is_err() {
                         return SessionEnd::ConnectionLost;
                     }
                 }
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => {
+                    last_rx = tokio::time::Instant::now();
+                }
                 Some(Err(_)) | None => return SessionEnd::ConnectionLost,
             },
         }
@@ -333,6 +384,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_known_channel_with_an_unparseable_payload_is_distinct_from_an_unknown_channel() {
+        match parse_frame(r#"{"channel":"candle","data":{"garbage":true}}"#).unwrap() {
+            WsEvent::Unparseable { channel, .. } => assert_eq!(channel, "candle"),
+            other => panic!("expected Unparseable, got {other:?}"),
+        }
+        // An unknown channel is still `Other`, not `Unparseable` — the two
+        // must stay distinguishable in the consumer's logs.
+        assert!(matches!(
+            parse_frame(r#"{"channel":"notifications","data":{}}"#).unwrap(),
+            WsEvent::Other(c) if c == "notifications"
+        ));
+    }
+
     /// `run` is private, so this test lives here rather than in the
     /// integration test file. A venue that's unreachable (nothing listens on
     /// this port, so every connect attempt fails fast and the task falls
@@ -347,6 +412,7 @@ mod tests {
             ping_interval: std::time::Duration::from_secs(30),
             backoff_start: std::time::Duration::from_millis(20),
             backoff_cap: std::time::Duration::from_millis(50),
+            connect_timeout: std::time::Duration::from_secs(15),
         };
         let handle = tokio::spawn(run("ws://127.0.0.1:1".to_string(), vec![], cfg, tx));
 
@@ -356,5 +422,56 @@ mod tests {
             .await
             .expect("run() must exit promptly once the receiver is dropped, even with the venue unreachable")
             .expect("the run() task must not panic");
+    }
+
+    /// `connect_async` has no timeout of its own, so a peer that completes
+    /// the TCP handshake but never speaks TLS/WS would hang the connect
+    /// attempt forever without `connect_timeout` — no `ConnectFailed`, no
+    /// retry, the reconnect loop wedged. The mock server here accepts every
+    /// TCP connection and then never sends a byte, reproducing exactly that.
+    #[tokio::test]
+    async fn a_hung_handshake_times_out_instead_of_wedging_the_reconnect_loop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept every connection and hold the socket without ever writing
+        // to it — the handshake never completes, on any retry.
+        let accept_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let cfg = WsConfig {
+            ping_interval: std::time::Duration::from_secs(30),
+            backoff_start: std::time::Duration::from_millis(20),
+            backoff_cap: std::time::Duration::from_millis(50),
+            connect_timeout: std::time::Duration::from_millis(200),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let handle = tokio::spawn(run(format!("ws://{addr}"), vec![], cfg, tx));
+
+        // The handshake never completes, so nothing is ever sent on `tx` —
+        // give it comfortably longer than one connect_timeout and confirm
+        // silence, rather than a wedged-forever task masquerading as one
+        // that's merely slow.
+        let saw_nothing =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            saw_nothing.is_err(),
+            "expected no message while every handshake hangs, got {saw_nothing:?}"
+        );
+
+        // And the task must still notice the receiver going away and exit,
+        // exactly as it would mid any other retry cycle — the timeout must
+        // not have replaced one way to get stuck with another.
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("run() must exit promptly once the receiver is dropped, even mid a hung handshake retry")
+            .expect("the run() task must not panic");
+
+        accept_task.abort();
     }
 }
