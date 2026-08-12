@@ -14,7 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["time", "rt", "sync"] }
+tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # EIP-712 by hand rather than a web3 stack. Signing one well-known typed
 # structure needs a curve and a hash; pulling in a whole Ethereum client to get

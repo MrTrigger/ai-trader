@@ -5,7 +5,9 @@
 //! Gap-filling after a reconnect is the consumer's job — the client only
 //! says `Connected`, and the consumer pulls missed candles over REST.
 
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tokio_tungstenite::tungstenite::Message;
 
 /// The WS endpoint for a REST base: `https://api.hyperliquid.xyz` →
 /// `wss://api.hyperliquid.xyz/ws`.
@@ -92,6 +94,154 @@ pub fn parse_frame(text: &str) -> Result<WsEvent, serde_json::Error> {
         "pong" => WsEvent::Pong,
         other => WsEvent::Other(other.to_string()),
     })
+}
+
+/// What to ask the stream for. Serialized exactly as the venue expects.
+#[derive(Debug, Clone)]
+pub enum Subscription {
+    Candle { coin: String, interval: String },
+    Bbo { coin: String },
+    UserFills { user: String },
+}
+
+impl Subscription {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Subscription::Candle { coin, interval } => {
+                serde_json::json!({"type": "candle", "coin": coin, "interval": interval})
+            }
+            Subscription::Bbo { coin } => serde_json::json!({"type": "bbo", "coin": coin}),
+            Subscription::UserFills { user } => {
+                serde_json::json!({"type": "userFills", "user": user})
+            }
+        }
+    }
+}
+
+/// What the consumer receives. `Connected` after every successful
+/// (re)connect+subscribe — a consumer that has seen one before must treat it
+/// as "you may have missed frames" and gap-fill over REST.
+#[derive(Debug)]
+pub enum WsMessage {
+    Connected,
+    Event(WsEvent),
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WsConfig {
+    pub ping_interval: std::time::Duration,
+    pub backoff_start: std::time::Duration,
+    pub backoff_cap: std::time::Duration,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            // The venue closes sockets idle for 60s; ping at half that.
+            ping_interval: std::time::Duration::from_secs(30),
+            backoff_start: std::time::Duration::from_secs(1),
+            backoff_cap: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// Spawn the connection task. It reconnects forever (backoff doubling from
+/// `backoff_start` to `backoff_cap`, reset after a connection that lasted
+/// longer than the cap) and exits when the receiver is dropped.
+pub fn spawn(
+    url: String,
+    subs: Vec<Subscription>,
+    cfg: WsConfig,
+) -> tokio::sync::mpsc::Receiver<WsMessage> {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(run(url, subs, cfg, tx));
+    rx
+}
+
+async fn run(
+    url: String,
+    subs: Vec<Subscription>,
+    cfg: WsConfig,
+    tx: tokio::sync::mpsc::Sender<WsMessage>,
+) {
+    let mut backoff = cfg.backoff_start;
+    loop {
+        let connected_at = tokio::time::Instant::now();
+        match connect_and_stream(&url, &subs, cfg, &tx).await {
+            SessionEnd::ReceiverDropped => return,
+            SessionEnd::ConnectionLost => {
+                if tx.send(WsMessage::Disconnected).await.is_err() {
+                    return;
+                }
+            }
+            SessionEnd::ConnectFailed => {}
+        }
+        if connected_at.elapsed() > cfg.backoff_cap {
+            backoff = cfg.backoff_start; // it held for a while; start fresh
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(cfg.backoff_cap);
+    }
+}
+
+enum SessionEnd {
+    ConnectFailed,
+    ConnectionLost,
+    ReceiverDropped,
+}
+
+async fn connect_and_stream(
+    url: &str,
+    subs: &[Subscription],
+    cfg: WsConfig,
+    tx: &tokio::sync::mpsc::Sender<WsMessage>,
+) -> SessionEnd {
+    let Ok((mut socket, _)) = tokio_tungstenite::connect_async(url).await else {
+        return SessionEnd::ConnectFailed;
+    };
+    for sub in subs {
+        let msg = serde_json::json!({"method": "subscribe", "subscription": sub.to_json()});
+        if socket.send(Message::Text(msg.to_string())).await.is_err() {
+            return SessionEnd::ConnectionLost;
+        }
+    }
+    if tx.send(WsMessage::Connected).await.is_err() {
+        return SessionEnd::ReceiverDropped;
+    }
+
+    let mut ping = tokio::time::interval(cfg.ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // the immediate first tick; pings start one interval in
+
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                let p = serde_json::json!({"method": "ping"}).to_string();
+                if socket.send(Message::Text(p)).await.is_err() {
+                    return SessionEnd::ConnectionLost;
+                }
+            }
+            frame = socket.next() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    let event = match parse_frame(&text) {
+                        Ok(e) => e,
+                        Err(_) => WsEvent::Other(format!("unparseable: {text}")),
+                    };
+                    if tx.send(WsMessage::Event(event)).await.is_err() {
+                        return SessionEnd::ReceiverDropped;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    if socket.send(Message::Pong(p)).await.is_err() {
+                        return SessionEnd::ConnectionLost;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return SessionEnd::ConnectionLost,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
