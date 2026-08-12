@@ -1102,3 +1102,17 @@ Expected: PASS — baseline plus everything this plan added.
 git add crates/hyperliquid/examples/ws_watch.rs docs/superpowers/plans/2026-08-12-crypto-scalper-plan-1-venue-foundations.md
 git commit -m "Watch the live stream and write down what testnet must prove"
 ```
+
+## Testnet verification checklist (manual, needs testnet funds)
+
+Using `Hyperliquid::trading(TESTNET, account, agent_key, None, false)` from a
+scratch binary or test marked `#[ignore]`:
+
+- [ ] Alo far from the touch → resting ack; `cancel_by_cloid` on it → Ok(())
+- [ ] Alo priced through the touch → `VenueError::Rejected` and
+      `is_post_only_rejection` returns true; record the exact message wording
+      in a comment next to `is_post_only_rejection`
+- [ ] `reduce_only: true` with no position → `VenueError::Rejected` (records wording)
+- [ ] `cancel_by_cloid` for an id that never existed → `VenueError::Rejected`
+      containing "never placed"
+- [ ] Ioc limit priced mid-book → partial or no fill, never resting
