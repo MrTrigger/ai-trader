@@ -37,7 +37,7 @@ mod sign;
 pub mod ws;
 
 pub use info::{
-    ApprovedAgent, Candle, Info, L2Book, L2Level, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET,
+    ApprovedAgent, AssetCtx, Candle, Info, L2Book, L2Level, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET,
 };
 pub use sign::{Agent, SignError};
 

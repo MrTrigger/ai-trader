@@ -53,10 +53,11 @@ impl Info {
         })
     }
 
-    async fn post<T: serde::de::DeserializeOwned>(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<T, VenueError> {
+    /// The raw response body for an `/info` call, before any shape is imposed
+    /// on it. `post` is the typed convenience over this; `asset_ctxs` needs
+    /// the text itself so its parse can be a pure function tested over a
+    /// fixture rather than a live round trip.
+    async fn post_text(&self, body: serde_json::Value) -> Result<String, VenueError> {
         let url = format!("{}/info", self.base);
         let res = self
             .http
@@ -79,6 +80,15 @@ impl Info {
                 text.chars().take(200).collect::<String>()
             )));
         }
+        Ok(text)
+    }
+
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<T, VenueError> {
+        let url = format!("{}/info", self.base);
+        let text = self.post_text(body).await?;
         serde_json::from_str(&text).map_err(|e| {
             // Naming the endpoint and quoting the body matters: a shape change
             // at the venue is the most likely cause, and "expected struct" with
@@ -126,6 +136,19 @@ impl Info {
                     .map(|d| (u.name.clone(), d))
             })
             .collect())
+    }
+
+    /// Every listed market's context — volume, funding, open interest — paired
+    /// with its name.
+    ///
+    /// Unlike `meta()`, this does not filter delisted markets: it reports
+    /// what the venue reports, and a caller that cares about delisting joins
+    /// against `meta()`'s `is_delisted` itself.
+    pub async fn asset_ctxs(&self) -> Result<Vec<(String, AssetCtx)>, VenueError> {
+        let text = self
+            .post_text(serde_json::json!({"type": "metaAndAssetCtxs"}))
+            .await?;
+        parse_asset_ctxs(&text)
     }
 
     /// Markets and marks together, from one round trip.
@@ -437,6 +460,36 @@ fn perp_market(u: &Universe) -> Market {
     }
 }
 
+/// Parse a `metaAndAssetCtxs` body into `(name, context)` pairs.
+///
+/// The pure core of `Info::asset_ctxs`, split out so a fixture can drive it
+/// without a network round trip. The response is a two-element array —
+/// `[MetaResponse, Vec<AssetCtx>]` — and the venue orders both by the same
+/// asset index, so `universe[i]` and `assetCtxs[i]` describe the same market;
+/// a length mismatch means that contract changed, and this fails loudly
+/// rather than pairing the wrong name with the wrong context.
+fn parse_asset_ctxs(text: &str) -> Result<Vec<(String, AssetCtx)>, VenueError> {
+    let (meta, ctxs): (MetaResponse, Vec<AssetCtx>) = serde_json::from_str(text).map_err(|e| {
+        VenueError::Unreachable(format!(
+            "metaAndAssetCtxs: cannot read the response ({e}); body began: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+    })?;
+    if meta.universe.len() != ctxs.len() {
+        return Err(VenueError::Unreachable(format!(
+            "metaAndAssetCtxs: universe has {} entries but assetCtxs has {} — venue contract changed",
+            meta.universe.len(),
+            ctxs.len()
+        )));
+    }
+    Ok(meta
+        .universe
+        .into_iter()
+        .map(|u| u.name)
+        .zip(ctxs)
+        .collect())
+}
+
 // --- wire shapes, as captured from the live API -----------------------------
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +524,15 @@ pub struct AssetCtx {
     pub funding: Option<String>,
     #[serde(rename = "dayNtlVlm")]
     pub day_ntl_vlm: Option<String>,
+    #[serde(rename = "openInterest", default)]
+    pub open_interest: Option<String>,
+}
+
+impl AssetCtx {
+    /// The venue's 24h notional volume for this market, in USD.
+    pub fn day_volume_usd(&self) -> Option<f64> {
+        self.day_ntl_vlm.as_deref().and_then(|s| s.parse().ok())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,4 +668,24 @@ pub struct L2Level {
     pub px: String,
     pub sz: String,
     pub n: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_ctxs_pairs_names_with_contexts() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/meta_and_asset_ctxs.json"
+        ))
+        .unwrap();
+        let pairs = parse_asset_ctxs(&text).unwrap();
+        assert!(pairs.len() > 50, "mainnet lists >50 perps, got {}", pairs.len());
+        let (name, ctx) = &pairs[0];
+        assert!(!name.is_empty());
+        let vol = ctx.day_volume_usd().expect("universe leader has day volume");
+        assert!(vol > 0.0);
+    }
 }
