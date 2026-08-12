@@ -17,7 +17,7 @@
 //! `book_capture` measures directly for the present.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crypto_portfolio::store;
 
@@ -35,7 +35,9 @@ fn main() -> Result<(), String> {
     // `participation_limit * hourly_volume / NAV`. The second term is linear in
     // the volume of the hour we actually send in, so the trading hour sets how
     // large the thin tail is allowed to be — a constraint, not a price.
-    let nav: f64 = get("--nav").and_then(|v| v.parse().ok()).unwrap_or(100_000.0);
+    let nav: f64 = get("--nav")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000.0);
     let participation: f64 = get("--participation")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.05);
@@ -50,7 +52,10 @@ fn main() -> Result<(), String> {
     // hour-of-day profile over 600 delisted shells describes a market we do
     // not trade in.
     let assets = newest_eligible(&root)?;
-    eprintln!("{} eligible names, last {days} days of hourly bars", assets.len());
+    eprintln!(
+        "{} eligible names, last {days} days of hourly bars",
+        assets.len()
+    );
 
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
     // hour -> per-asset relative values
@@ -201,7 +206,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn newest_eligible(root: &PathBuf) -> Result<Vec<String>, String> {
+fn newest_eligible(root: &Path) -> Result<Vec<String>, String> {
     let dir = root.join("universe");
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -221,7 +226,7 @@ fn newest_eligible(root: &PathBuf) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn median(v: &mut Vec<f64>) -> f64 {
+fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return f64::NAN;
     }
