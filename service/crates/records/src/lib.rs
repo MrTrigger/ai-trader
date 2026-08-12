@@ -441,6 +441,56 @@ impl Registry {
         Ok(())
     }
 
+    /// Keep the decision, not just its consequence.
+    ///
+    /// Idempotent on `(bot_id, plan_id)`: a plan re-recorded is the same plan,
+    /// because `plan_id` is a content hash. `run_id` is filled in when the plan
+    /// is executed and stays null when it is refused — a refused plan is worth
+    /// keeping precisely because it was refused.
+    pub async fn record_plan(
+        &self,
+        bot_id: &str,
+        plan_id: &str,
+        run_id: Option<&str>,
+        as_of: &str,
+        created_at: &str,
+        payload_json: &str,
+    ) -> Result<(), RecordsError> {
+        sqlx::query(
+            "INSERT INTO plans (bot_id, plan_id, run_id, as_of, created_at, payload) \
+             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6::jsonb) \
+             ON CONFLICT (bot_id, plan_id) DO UPDATE SET \
+             run_id = COALESCE(EXCLUDED.run_id, plans.run_id), \
+             payload = EXCLUDED.payload",
+        )
+        .bind(bot_id)
+        .bind(plan_id)
+        .bind(run_id)
+        .bind(as_of)
+        .bind(created_at)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The plan behind one run, if it was kept. Deliberately by run rather than
+    /// by plan id: the question is always "what did THAT decision see".
+    pub async fn plan_for_run(
+        &self,
+        bot_id: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, RecordsError> {
+        let row = sqlx::query(
+            "SELECT payload::text FROM plans WHERE bot_id = $1 AND run_id = $2 LIMIT 1",
+        )
+        .bind(bot_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
     /// Most recent first, as JSON text per row.
     pub async fn recent_runs(&self, bot_id: &str, limit: i64) -> Result<Vec<String>, RecordsError> {
         let rows = sqlx::query(
@@ -600,7 +650,13 @@ impl Registry {
 
     pub async fn current_control(&self, bot_id: &str) -> Result<Option<ControlRow>, RecordsError> {
         let row = sqlx::query(
-            "SELECT state, reason, set_by, at::text, payload::text \
+            // RFC 3339, not Postgres's `2026-08-12 09:58:31.9+00`. The browser
+            // parses that one only because V8 is lenient; Safari returns NaN,
+            // and a NaN timestamp here reads as "no pending control", which is
+            // the green RUNNING lie all over again in one browser and not the
+            // other. Emit the unambiguous form and the question cannot arise.
+            "SELECT state, reason, set_by, to_char(at AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), payload::text \
              FROM control_events WHERE bot_id = $1 ORDER BY seq DESC LIMIT 1",
         )
         .bind(bot_id)
@@ -859,6 +915,33 @@ pub mod blocking {
                 self.inner
                     .record_run(bot_id, run_id, recorded_at, outcome, payload_json),
             )
+        }
+
+        pub fn record_plan(
+            &self,
+            bot_id: &str,
+            plan_id: &str,
+            run_id: Option<&str>,
+            as_of: &str,
+            created_at: &str,
+            payload_json: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(self.inner.record_plan(
+                bot_id,
+                plan_id,
+                run_id,
+                as_of,
+                created_at,
+                payload_json,
+            ))
+        }
+
+        pub fn plan_for_run(
+            &self,
+            bot_id: &str,
+            run_id: &str,
+        ) -> Result<Option<String>, RecordsError> {
+            self.wait(self.inner.plan_for_run(bot_id, run_id))
         }
 
         pub fn recent_runs(&self, bot_id: &str, limit: i64) -> Result<Vec<String>, RecordsError> {

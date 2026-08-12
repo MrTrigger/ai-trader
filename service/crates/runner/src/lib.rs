@@ -598,6 +598,49 @@ impl RunStore {
         }
     }
 
+    /// Keep the decision beside the run that acted on it.
+    ///
+    /// The plan is the only artefact that says what the model asked for —
+    /// every target weight and conviction, the model id and inputs hash, the
+    /// predicted cost, and how much weight the turnover budget deferred. It
+    /// lived in one file the next cycle overwrote, so `plan_id` on a run
+    /// pointed at something already deleted and only the newest decision could
+    /// be replayed.
+    ///
+    /// Never fatal to the run. A run that traded and then failed to file its
+    /// paperwork has still traded, and losing the record of that would be the
+    /// worse outcome by far.
+    pub fn record_plan(&self, plan: &Plan, run_id: Option<&str>) {
+        let text = match serde_json::to_string(plan) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("plan {} did not serialise: {e}", plan.plan_id);
+                return;
+            }
+        };
+        let result = match self {
+            Self::File { root } => (|| {
+                let dir = root.join("plans");
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                fs::write(dir.join(format!("{}.json", plan.plan_id)), text + "\n")
+                    .map_err(|e| e.to_string())
+            })(),
+            Self::Db { rec, bot_id } => rec
+                .record_plan(
+                    bot_id,
+                    &plan.plan_id.to_string(),
+                    run_id,
+                    &stamp(plan.as_of),
+                    &stamp(plan.created_at),
+                    &text,
+                )
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = result {
+            eprintln!("could not keep plan {}: {e}", plan.plan_id);
+        }
+    }
+
     pub fn record(&self, run: &RunRecord) -> Result<(), RunnerError> {
         match self {
             Self::File { root } => {
@@ -953,6 +996,11 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
     pub async fn run(&self, plan: &Plan) -> Result<RunRecord, RunnerError> {
         let now = self.clock.now();
         let controls = self.controls.read();
+        // Before any gate can refuse it. A plan that was turned away is the
+        // one you most want to read later — "why did nothing happen that day"
+        // has no answer without it — and the refusal paths below all return
+        // early.
+        self.store.record_plan(plan, None);
 
         if let Some(when) = self.store.executed_at(&plan.plan_id.to_string())? {
             let e = RunnerError::AlreadyExecuted {
@@ -1132,6 +1180,7 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         // the period it opens can be attributed later without a price history.
         record.book_after = self.mark_book(plan).await.unwrap_or_default();
         self.store.record(&record)?;
+        self.store.record_plan(plan, Some(&record.run_id));
         Ok(record)
     }
 
@@ -1239,8 +1288,8 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
         // A book with no entry prices is as repairable as no book at all: the
         // record was written by a version that did not keep them, and the same
         // plan and the same untouched positions can still supply them.
-        let priced = !newest.book_after.is_empty()
-            && newest.book_after.iter().any(|b| b.entry.is_some());
+        let priced =
+            !newest.book_after.is_empty() && newest.book_after.iter().any(|b| b.entry.is_some());
         if priced {
             return Ok(None);
         }

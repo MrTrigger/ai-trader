@@ -75,6 +75,7 @@ commands:
   settle                             attribute the period each past run opened
   mark-book --plan FILE              write the closing book onto the newest run
                                      if it was recorded without one
+  plan-of --run ID                   the decision behind a recorded run (stdout)
   book-capture --plan FILE           measure the spread and the cost of crossing
                [--out FILE]          each order in a plan, from the venue's
                                      resting book (read-only, changes nothing)
@@ -157,6 +158,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "positions" => block_on(cmd_positions(&cfg)),
         "settle" => cmd_settle(&cfg),
         "mark-book" => cmd_mark_book(&cfg, PathBuf::from(flags.need("--plan")?)),
+        "plan-of" => cmd_plan_of(&cfg, flags.need("--run")?),
         "book-capture" => block_on(cmd_book_capture(
             &cfg,
             PathBuf::from(flags.need("--plan")?),
@@ -767,6 +769,41 @@ async fn mark_book_inner(
     Ok(())
 }
 
+/// Print the decision a recorded run acted on.
+///
+/// The point of keeping plans: `plan_id` on a run used to name a file the next
+/// cycle had already overwritten. Now the question "what did it see, and what
+/// did it ask for" has an answer months later.
+fn cmd_plan_of(cfg: &BotConfig, run_id: String) -> Result<(), String> {
+    let st = open_stores(cfg)?;
+    let found = match &st.store {
+        runner::RunStore::Db { rec, bot_id } => {
+            rec.plan_for_run(bot_id, &run_id).map_err(|e| e.to_string())?
+        }
+        runner::RunStore::File { root } => {
+            // The file store keys plans by plan id, so find the run first.
+            let run = st
+                .store
+                .recent(500)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|r| r.run_id == run_id);
+            run.and_then(|r| r.plan_id)
+                .and_then(|id| std::fs::read_to_string(root.join("plans").join(format!("{id}.json"))).ok())
+        }
+    };
+    match found {
+        Some(text) => {
+            print!("{text}");
+            Ok(())
+        }
+        None => Err(format!(
+            "no plan kept for run {run_id}. Runs recorded before plans were kept \
+             name a plan_id whose file the next cycle overwrote."
+        )),
+    }
+}
+
 /// What the venue would charge us for this plan, right now.
 ///
 /// The cost model's spread is a constant and its impact coefficient is
@@ -801,7 +838,10 @@ async fn cmd_book_capture(
     // The executor splits each order; impact meets one slice, not the whole.
     let slices = rust_decimal::Decimal::from(cfg.schedule.slices.max(1) as u64);
 
-    println!("{:<8}{:>12}{:>11}{:>11}", "ASSET", "ORDER $", "SPREAD bp", "CROSS bp");
+    println!(
+        "{:<8}{:>12}{:>11}{:>11}",
+        "ASSET", "ORDER $", "SPREAD bp", "CROSS bp"
+    );
     let mut measured: std::collections::BTreeMap<String, (f64, u32)> = Default::default();
     for order in &plan.orders {
         let book = match venue.get_order_book(&order.asset).await {
@@ -842,11 +882,11 @@ async fn cmd_book_capture(
     if let Some(path) = out {
         // Merge rather than overwrite: each run adds one observation per name,
         // and a coefficient wants a distribution, not the latest reading.
-        let mut all: std::collections::BTreeMap<String, Vec<f64>> = match std::fs::read_to_string(&path)
-        {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => Default::default(),
-        };
+        let mut all: std::collections::BTreeMap<String, Vec<f64>> =
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+                Err(_) => Default::default(),
+            };
         for (asset, (bps, _)) in &measured {
             all.entry(asset.clone()).or_default().push(*bps);
         }

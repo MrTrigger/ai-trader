@@ -1174,6 +1174,60 @@ async fn a_run_recorded_without_a_closing_book_can_be_marked_once() {
     );
 }
 
+/// The decision survives the cycle that overwrote its file.
+///
+/// `plan_id` on a run used to point at `state/plan.json`, which the next cycle
+/// replaced. Only the newest decision could be replayed, and everything the
+/// plan alone carries — target weights, conviction, model id, inputs hash,
+/// predicted cost, deferred turnover — was gone by morning.
+#[tokio::test]
+async fn the_plan_is_kept_beside_the_run_that_executed_it() {
+    let dir = tmpdir("keep-plan");
+    let controls = running_controls(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let plan = standard_plan("2026-08-01T00:00:00Z");
+
+    runner(&venue, &clock, &store, &ledger, controls, Schedule::default())
+        .run(&plan)
+        .await
+        .expect("the run completes");
+
+    let kept = dir.join("plans").join(format!("{}.json", plan.plan_id));
+    let text = std::fs::read_to_string(&kept).expect("the plan was kept");
+    let back = plan::Plan::parse(&text).expect("and is still a valid plan");
+    assert_eq!(back.plan_id, plan.plan_id);
+    assert_eq!(back.targets.len(), plan.targets.len());
+    assert_eq!(back.provenance.inputs_hash, plan.provenance.inputs_hash);
+}
+
+/// A plan a gate turned away is the one most worth reading later: "why did
+/// nothing happen that day" has no answer without it.
+#[tokio::test]
+async fn a_refused_plan_is_kept_too() {
+    let dir = tmpdir("keep-refused");
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-01T00:30:00Z");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let plan = standard_plan("2026-08-01T00:00:00Z");
+    // An absent control file means halted, which refuses before anything runs.
+    let controls = dir.join("no-such-controls.json");
+
+    let refused = runner(&venue, &clock, &store, &ledger, controls, Schedule::default())
+        .run(&plan)
+        .await;
+    assert!(refused.is_err(), "a halted bot refuses the plan");
+    assert!(
+        dir.join("plans")
+            .join(format!("{}.json", plan.plan_id))
+            .exists(),
+        "the decision behind a refusal must outlive it"
+    );
+}
+
 // --- settlement --------------------------------------------------------------
 
 /// Build a finished run with a priced closing book.
