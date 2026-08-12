@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-common", "crates/features-cme", "crates/features-crypto", "crates/features-stockholm", "crates/equity-data", "crates/lightgbm-json", "crates/portfolio-construction", "crates/stockholm-portfolio", "crates/crypto-portfolio", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot"]
+members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-common", "crates/features-cme", "crates/features-crypto", "crates/features-stockholm", "crates/equity-data", "crates/lightgbm-json", "crates/portfolio-construction", "crates/stockholm-portfolio", "crates/crypto-portfolio", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot", "crates/scalper-data"]
 
 [workspace.package]
 version = "0.1.0"
