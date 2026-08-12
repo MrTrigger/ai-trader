@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BookSnapshot {
+    /// The client's wall clock (UTC millis) at the moment the fetch
+    /// completed - not the venue's book timestamp. Hyperliquid's L2 book
+    /// response carries no server-side capture time, so this is a
+    /// receive-side stamp only, good for ordering snapshots and rolling day
+    /// files, not for measuring venue-side latency.
     pub ts_ms: i64,
     pub coin: String,
     /// (px, sz) pairs, best-first, up to `depth` levels.

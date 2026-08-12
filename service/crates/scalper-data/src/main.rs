@@ -25,6 +25,9 @@ usage: scalper-data <command>
       Bulk-load Binance USDT-perp (UM futures) monthly 1m kline archives into
       the shared Parquet bar store (interval_s=60). Assets with no UM listing
       are skipped with a warning rather than silently substituted with spot.
+      Expects its own root (use --data-root data/perp), separate from the
+      frozen bot's daily spot store; record-books, summarize-costs, and
+      universe use the shared data/ root.
 
   record-books --data-root <dir> --seconds N --interval N [--assets A,B | --top N]
       Poll Hyperliquid L2 books at --interval seconds for --seconds total and
@@ -101,8 +104,41 @@ fn months(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(i32, u32)> {
     out
 }
 
+/// True when `root` already holds the frozen bot's daily spot store: any
+/// `bars/asset=*/interval_s=86400` partition under it. Perp minutes
+/// (interval_s=60) belong in their own root - writing them alongside the
+/// frozen bot's daily spot bars would let `pull-binance-perp` silently
+/// commingle data the frozen bot reads with data it was never tuned against.
+fn is_frozen_spot_store(root: &std::path::Path) -> bool {
+    let bars_dir = root.join("bars");
+    let Ok(entries) = std::fs::read_dir(&bars_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let is_asset_dir = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("asset="));
+        if is_asset_dir && path.join("interval_s=86400").exists() {
+            return true;
+        }
+    }
+    false
+}
+
 async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
+    if is_frozen_spot_store(&root) {
+        return Err(
+            "this data-root holds the daily spot store the frozen bot reads; perp minutes \
+             belong in their own root (use --data-root data/perp)"
+                .into(),
+        );
+    }
     // Kept in original case: resolve_asset needs the un-uppercased token to
     // recognise HL's lowercase-`k` 1000-prefix coins (kPEPE, kBONK, ...).
     let assets = need(args, "--assets")?
@@ -483,5 +519,30 @@ mod tests {
             resolve_asset("KAITO").1,
             Some("KAITOUSDT".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn pull_binance_perp_refuses_a_data_root_that_holds_the_frozen_spot_store() {
+        let root = std::env::temp_dir().join(format!("scalper-data-guard-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("bars").join("asset=BTC").join("interval_s=86400"))
+            .unwrap();
+
+        let args = vec![
+            "--data-root".to_string(),
+            root.to_string_lossy().to_string(),
+            "--assets".to_string(),
+            "BTC".to_string(),
+            "--start".to_string(),
+            "2026-01-01".to_string(),
+            "--end".to_string(),
+            "2026-01-02".to_string(),
+        ];
+        let err = cmd_pull_binance_perp(&args).await.unwrap_err();
+        assert!(
+            err.contains("spot store"),
+            "expected the guard's error to mention the spot store, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

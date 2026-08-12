@@ -241,4 +241,39 @@ mod tests {
         assert!(btc.cross_bps["5000"].is_some());
         assert!(btc.cross_bps["50000000"].is_none(), "an unabsorbable notional reads None, not 0");
     }
+
+    #[test]
+    fn even_count_median_is_none_when_the_middle_pair_splits_fillable_and_thin() {
+        // Four snapshots, same coin: two deep enough to absorb $5,000 on
+        // both sides, two too thin to absorb it on either side. Sorted by
+        // the Some-before-None convention, the two middle values (index 1
+        // and 2) are one Some and one None, so the even-count median must
+        // report None - "the middle snapshot was itself unfillable" is the
+        // fact worth keeping, not averaged away.
+        let deep = snap("BTC", 64000.0, 64001.0, 100.0);
+        let thin = snap("BTC", 64000.0, 64001.0, 0.001);
+        let snaps = vec![deep.clone(), deep, thin.clone(), thin];
+        let out = summarize(&snaps, &[5_000.0]);
+        assert!(
+            out["BTC"].cross_bps["5000"].is_none(),
+            "2 fillable + 2 thin: even-count median must be None, got {:?}",
+            out["BTC"].cross_bps["5000"]
+        );
+    }
+
+    #[test]
+    fn even_count_median_is_some_when_the_middle_pair_is_both_fillable() {
+        // Three deep snapshots and one thin one: sorted Some-before-None,
+        // the two middle values (index 1 and 2) are both Some, so the
+        // even-count median averages them into a Some.
+        let deep = snap("BTC", 64000.0, 64001.0, 100.0);
+        let thin = snap("BTC", 64000.0, 64001.0, 0.001);
+        let snaps = vec![deep.clone(), deep.clone(), deep, thin];
+        let out = summarize(&snaps, &[5_000.0]);
+        assert!(
+            out["BTC"].cross_bps["5000"].is_some(),
+            "3 fillable + 1 thin: even-count median must be Some, got {:?}",
+            out["BTC"].cross_bps["5000"]
+        );
+    }
 }
