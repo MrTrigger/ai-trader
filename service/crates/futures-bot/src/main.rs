@@ -1216,6 +1216,13 @@ async fn feed_task(
     /// missed bars — comfortably past a hiccup and far short of the 70-minute
     /// stall watchdog that would otherwise be the only thing to notice.
     const REALTIME_SILENCE_S: u64 = 120;
+    /// How long the realtime path may run without producing a COMPLETED
+    /// 5-minute bar. A stream that keeps printing is not the same as a feed
+    /// that works: the bot ran ten minutes on a stream that delivered items
+    /// the aggregator never turned into a single bucket, so the silence
+    /// timeout above never fired and the loop had nothing to decide on. Two
+    /// buckets' grace, then take the path that demonstrably works.
+    const REALTIME_NO_BAR_S: u64 = 390;
     // Narrate state CHANGES only. A log that repeats itself every 20s is
     // one nobody reads, and it buries the line that mattered.
     let say = |level: &str, line: String| {
@@ -1255,6 +1262,15 @@ async fn feed_task(
                     // stream ended — never fired, and the bot never returned to
                     // the polling path it had been using successfully an hour
                     // earlier. Silence is a failure mode, so it gets a clock.
+                    // The stamp the aggregator buckets on, said once. A stream
+                    // that prints for ten minutes without completing a single
+                    // bucket can only be doing that because this value is not
+                    // advancing, and it was not recoverable after the fact.
+                    say(
+                        "info",
+                        format!("first realtime bar stamped {:?}", first.date),
+                    );
+                    let mut last_emit = std::time::Instant::now();
                     let why = loop {
                         let next = tokio::time::timeout(
                             std::time::Duration::from_secs(REALTIME_SILENCE_S),
@@ -1266,9 +1282,15 @@ async fn feed_task(
                             Ok(Some(item)) => {
                                 let Ok(b) = item else { continue };
                                 if let Some(done) = push(&b, &mut agg) {
+                                    last_emit = std::time::Instant::now();
                                     if tx.send(done).await.is_err() {
                                         return;
                                     }
+                                } else if last_emit.elapsed().as_secs() > REALTIME_NO_BAR_S
+                                    && live::market_should_be_open(chrono::Utc::now())
+                                {
+                                    // Printing, but never completing a bar.
+                                    break "realtime stream produced no completed bars";
                                 }
                             }
                             // Out of hours a quiet stream is the market being
