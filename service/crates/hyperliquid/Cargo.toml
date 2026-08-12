@@ -14,7 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "rt", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # EIP-712 by hand rather than a web3 stack. Signing one well-known typed
 # structure needs a curve and a hash; pulling in a whole Ethereum client to get
@@ -22,6 +22,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
 rmp-serde = "1"
+# Default features kept: "connect" and "handshake" are both needed
+# (connect_async and, in tests, accept_async).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }

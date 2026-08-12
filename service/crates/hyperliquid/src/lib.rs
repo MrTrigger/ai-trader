@@ -34,6 +34,7 @@
 
 mod info;
 mod sign;
+pub mod ws;
 
 pub use info::{ApprovedAgent, Candle, Info, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET};
 pub use sign::{Agent, SignError};
