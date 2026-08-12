@@ -75,6 +75,10 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                         setAt: st.control_set_at,
                         heartbeatAgeSeconds: st.heartbeat_age_seconds,
                       }),
+                      // `halted` carries the bot's own published halt: the
+                      // reason string for a rail halt, null when it is running.
+                      publishedState: st.halted ? "halted" : undefined,
+                      stateReason: typeof st.halted === "string" ? st.halted : undefined,
                       feed: st.feed,
                     });
                     return <Pill tone={act.tone}>{act.label}</Pill>;

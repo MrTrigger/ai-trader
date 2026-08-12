@@ -139,6 +139,50 @@ test("a bot with no feed is never called idle", () => {
   expect(activity({ enabled: true, control: "running" }).key).toBe("working");
 });
 
+test("a bot that halted ITSELF says so, over any feed complaint", () => {
+  // The cluster bot latched `reconcile-mismatch: broker 0 vs model 2` and the
+  // page drew "running · failure" — the feed's opinion — with the reason
+  // nowhere on it. The operator's control word still said running, because the
+  // operator had not changed their mind; that is a different question from
+  // what the bot did. A rail halt is the most urgent thing a bot can report.
+  const a = activity({
+    enabled: true,
+    control: "running",
+    publishedState: "halted",
+    stateReason: "reconcile-mismatch: broker 0 vs model 2",
+    feed: { healthy: false, market_open: true } as never,
+  });
+  expect(a.key).toBe("self-halted");
+  expect(a.tone).toBe("alarm");
+
+  // It also outranks a merely idle market and a healthy feed.
+  expect(
+    activity({
+      enabled: true,
+      control: "running",
+      publishedState: "halted",
+      stateReason: "feed-stall",
+      feed: { healthy: true, market_open: false } as never,
+    }).key,
+  ).toBe("self-halted");
+
+  // An OPERATOR halt is not a rail halt: it arrives through the control word,
+  // stays grey, and must not be dressed up as a fault.
+  const operator = activity({
+    enabled: true,
+    control: "halted",
+    publishedState: "halted",
+    stateReason: "operator",
+  });
+  expect(operator.key).toBe("halted");
+  expect(operator.tone).toBe("quiet");
+
+  // And a running bot with a published `running` state is untouched.
+  expect(
+    activity({ enabled: true, control: "running", publishedState: "running" }).key,
+  ).toBe("working");
+});
+
 test("no control word is not 'running'", () => {
   // A registered bot that has never been told anything: the state every
   // freshly deployed one is in. Unknown reads as halted in the control

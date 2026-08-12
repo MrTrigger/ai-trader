@@ -65,6 +65,14 @@ usage: futures-bot <command>
       the image), so it comes from whoever deploys rather than from a
       migration. Enabling stays a separate act unless --enable is given.
 
+  clear-halt --by NAME --reason TEXT [--bot-id ID]
+      Clear a LATCHED rail halt (kill criterion, reconcile mismatch,
+      refused order, feed stall). Rail halts live in the snapshot and
+      survive every restart on purpose, so this is the only way out — and
+      it refuses unless the broker's position agrees with the stored
+      book. Run it with the bot STOPPED; a live process republishes its
+      snapshot and would write the halt straight back.
+
   run --bars <warmup jsonl> [--live] [--bot-id ID] [--venue ib|rithmic]
       The live loop: IB 5s bars -> 5min -> the SAME stack replay parity
       proved. Default is SHADOW (never armed, simulated fills, published
@@ -93,6 +101,7 @@ fn main() -> ExitCode {
         Some("rithmic-check") => block_on_async(rithmic_check(&get)),
         Some("backfill") => block_on_async(backfill(&get)),
         Some("register") => block_on_async(register(&args, &get)),
+        Some("clear-halt") => block_on_async(clear_halt(&get)),
         Some("run") => block_on_async(run_live(&get)),
         _ => {
             println!("{USAGE}");
@@ -572,6 +581,95 @@ async fn register(args: &[String], get: &dyn Fn(&str) -> Option<String>) -> Resu
     Ok(())
 }
 
+/// Clear a LATCHED rail halt, but only against the broker's agreement.
+///
+/// Rail halts — kill criterion, reconcile mismatch, refused order, feed stall —
+/// latch on purpose: they mean something is wrong and an operator must look.
+/// They also live in the snapshot, so `restore` reads them back and the bot
+/// comes up halted forever. There was no way out at all: Start clears only
+/// operator halts, by design, so a book that halted itself stayed down through
+/// every restart with nothing to do about it.
+///
+/// This is that way out, and it refuses to be a rubber stamp: it reads the
+/// broker and the stored book, and clears only if they agree. Papering over a
+/// real divergence is exactly what the latch exists to prevent.
+///
+/// Run it with the bot STOPPED. A live process republishes its snapshot every
+/// cycle and would write the halt straight back.
+async fn clear_halt(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    let bot_id = get("--bot-id").unwrap_or_else(|| "futures-noise".into());
+    let by = get("--by").ok_or("--by is required: clearing a rail halt is signed")?;
+    let reason =
+        get("--reason").ok_or("--reason is required: say what you found before clearing")?;
+    let url = std::env::var("DATABASE_URL").map_err(|_| "clear-halt requires DATABASE_URL")?;
+    let rec = records::blocking::Records::connect(&url).map_err(|e| e.to_string())?;
+
+    let snap_text = rec
+        .get_snapshot(&bot_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no snapshot for {bot_id} — nothing to clear"))?;
+    let mut snap: serde_json::Value =
+        serde_json::from_str(&snap_text).map_err(|e| format!("snapshot: {e}"))?;
+    let Some(halted) = snap["halted"].as_str().map(str::to_string) else {
+        println!("{bot_id} is not halted — nothing to clear");
+        return Ok(());
+    };
+
+    // What the stored book thinks it holds.
+    let sleeves = book_sleeves();
+    let mut book = Book::new(sleeves);
+    book.restore(&snap)?;
+    let model_net = live::model_net_contracts(&book);
+
+    // What the broker actually holds. Unreadable is NOT agreement.
+    let cfg = ib::IbConfig::from_env(false)?;
+    let symbol = cfg.symbol.clone();
+    let venue = ib::IbVenue::connect(cfg).await.map_err(|e| e.to_string())?;
+    let venue_net: i64 = venue::VenueAdapter::get_positions(&venue)
+        .await
+        .map_err(|e| format!("cannot read broker positions ({e}) — refusing to clear blind"))?
+        .iter()
+        .filter(|p| p.asset.to_string() == symbol)
+        .map(|p| {
+            let q: f64 = p.qty.try_into().unwrap_or(0.0);
+            q as i64
+        })
+        .sum();
+    if venue_net != model_net {
+        return Err(format!(
+            "broker {venue_net} vs model {model_net} in {symbol} — they still disagree, so the \
+             halt stands. Reconcile the account first."
+        ));
+    }
+
+    snap["halted"] = serde_json::Value::Null;
+    rec.put_snapshot(&bot_id, &chrono::Utc::now().to_rfc3339(), &snap.to_string())
+        .map_err(|e| e.to_string())?;
+    let line = format!(
+        "rail halt cleared by {by}: {reason} (was: {halted}; broker and model both {model_net})"
+    );
+    let _ = rec.log_line(&bot_id, "warn", &line);
+    println!("{line}");
+    println!("Start the bot when you are ready; it comes up unhalted.");
+    Ok(())
+}
+
+/// The broker's net contracts in `symbol`, as the reconcile counts them.
+async fn venue_net_contracts(trading: &Trading, symbol: &str) -> Result<i64, String> {
+    Ok(trading
+        .adapter()
+        .get_positions()
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|p| p.asset.to_string() == symbol)
+        .map(|p| {
+            let q: f64 = p.qty.try_into().unwrap_or(0.0);
+            q as i64
+        })
+        .sum())
+}
+
 async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     let live = get("--live").is_some() || std::env::args().any(|a| a == "--live");
     let mode = if live { "live" } else { "shadow" };
@@ -779,6 +877,11 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // the order is market risk the operator thought they had cancelled.
     // The primary path is push (ctrl_rx, milliseconds); this tick is the
     // fallback for a dead listener, and the reason it exists at all.
+    /// How long to wait before believing a broker/model disagreement. Orders
+    /// placed on this bar are still propagating, and a degraded Gateway API
+    /// answers "no positions" rather than erroring — so the first read can be
+    /// wrong in exactly the direction that triggers a halt.
+    const RECONCILE_SETTLE_S: u64 = 5;
     const CONTROL_TICK_S: u64 = 5;
     // Status publishing stays at a human cadence; only the control read
     // needs to be quick, and a status row every 5s is noise in the DB.
@@ -941,19 +1044,25 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             if outcome.session_rolled {
                 // Broker-vs-model reconciliation at the boundary. Mismatch is
                 // never auto-corrected: flatten and halt for a human.
-                let venue_net: i64 = trading
-                    .adapter()
-                    .get_positions()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .iter()
-                    .filter(|p| p.asset.to_string() == symbol)
-                    .map(|p| {
-                        let q: f64 = p.qty.try_into().unwrap_or(0.0);
-                        q as i64
-                    })
-                    .sum();
+                //
+                // Read it TWICE. Orders placed moments earlier on this very bar
+                // are still propagating — IB acknowledges the order before the
+                // position query reflects it — and a Gateway whose API is
+                // degraded answers "no positions" rather than failing. Either
+                // way the first read can say zero while the account is not.
+                // That cost a real halt: two entries fired on the roll bar, the
+                // reconcile ran in the same iteration, and the book latched
+                // `broker 0 vs model 2` against positions the broker was in the
+                // middle of taking on.
+                //
+                // A genuine divergence persists; a race resolves. Confirming
+                // costs a few seconds at a session boundary and nothing else.
                 let model_net = live::model_net_contracts(&book);
+                let mut venue_net = venue_net_contracts(&trading, &symbol).await?;
+                if venue_net != model_net {
+                    tokio::time::sleep(std::time::Duration::from_secs(RECONCILE_SETTLE_S)).await;
+                    venue_net = venue_net_contracts(&trading, &symbol).await?;
+                }
                 if venue_net != model_net {
                     let _ = trading.flatten_all(&bot_id).await;
                     book.halted = Some(format!(
@@ -1101,6 +1210,12 @@ async fn feed_task(
     rec: std::sync::Arc<records::blocking::Records>,
     bot_id: String,
 ) {
+    /// How long a subscribed realtime stream may print nothing, during market
+    /// hours, before we stop believing it. IB sends a 5-second bar every five
+    /// seconds while the contract is trading, so two minutes is twenty-four
+    /// missed bars — comfortably past a hiccup and far short of the 70-minute
+    /// stall watchdog that would otherwise be the only thing to notice.
+    const REALTIME_SILENCE_S: u64 = 120;
     // Narrate state CHANGES only. A log that repeats itself every 20s is
     // one nobody reads, and it buries the line that mattered.
     let say = |level: &str, line: String| {
@@ -1133,22 +1248,43 @@ async fn feed_task(
                     if let Some(done) = push(&first, &mut agg) {
                         let _ = tx.send(done).await;
                     }
-                    while let Some(item) = stream.next().await {
-                        let Ok(b) = item else { continue };
-                        if let Some(done) = push(&b, &mut agg) {
-                            if tx.send(done).await.is_err() {
-                                return;
+                    // A stream that ENDS is easy; a stream that stays open and
+                    // stops printing is the one that cost 2h16m of blindness.
+                    // `stream.next()` on a live-but-silent subscription parks
+                    // forever, so the fallback below — which only ran when the
+                    // stream ended — never fired, and the bot never returned to
+                    // the polling path it had been using successfully an hour
+                    // earlier. Silence is a failure mode, so it gets a clock.
+                    let why = loop {
+                        let next = tokio::time::timeout(
+                            std::time::Duration::from_secs(REALTIME_SILENCE_S),
+                            stream.next(),
+                        )
+                        .await;
+                        match next {
+                            Ok(None) => break "realtime stream ended",
+                            Ok(Some(item)) => {
+                                let Ok(b) = item else { continue };
+                                if let Some(done) = push(&b, &mut agg) {
+                                    if tx.send(done).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            // Out of hours a quiet stream is the market being
+                            // shut, not the feed being broken. Only silence
+                            // while the market should be printing is a fault.
+                            Err(_) => {
+                                if live::market_should_be_open(chrono::Utc::now()) {
+                                    break "realtime stream went silent";
+                                }
                             }
                         }
-                    }
-                    // The stream ended — the Gateway dropped it. Falling out
-                    // of the task here would leave the process alive with no
-                    // feed at all, so drop through to polling instead.
+                    };
+                    // Falling out of the task here would leave the process
+                    // alive with no feed at all, so drop through to polling.
                     health.lock().expect("feed health").source = "poll".into();
-                    say(
-                        "warn",
-                        "realtime stream ended — falling back to polling".into(),
-                    );
+                    say("warn", format!("{why} — falling back to polling"));
                 }
                 _ => {
                     health.lock().expect("feed health").source = "poll".into();

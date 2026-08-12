@@ -418,6 +418,27 @@ Suspend the schedule entirely:
 kubectl patch cronjob aitrader-paper-cycle -n trader -p '{"spec":{"suspend":true}}'
 ```
 
+### When the futures bot halts ITSELF
+
+Kill criterion, reconcile mismatch, refused order, feed stall: these are **rail
+halts**, and they latch. They live in the snapshot, so they survive restarts —
+`Start` clears an operator halt and deliberately does not clear these. The pill
+shows `halted · <reason>` in red, and it outranks whatever the feed is saying.
+
+Investigate first, then clear it with the broker's agreement:
+
+```bash
+kubectl exec -n trader $POD -c api -- futures-bot ib-check      # what does IB hold?
+# stop the bot first: a live process republishes the halt from its own snapshot
+curl -X POST localhost:7434/api/bots/futures-noise/stop
+kubectl exec -n trader $POD -c api -- futures-bot clear-halt \
+  --by magnus --reason "IB flat, mismatch was a propagation race"
+```
+
+`clear-halt` reads the broker and the stored book and **refuses unless they
+agree** — it cannot be used to paper over a real divergence, which is the whole
+reason the latch exists. Then press Start.
+
 ### Intervening on the futures bot
 
 Use the dashboard: **Start**, **Halt**, **Stop** on the bot page. They write the

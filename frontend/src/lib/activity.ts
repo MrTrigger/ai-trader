@@ -34,6 +34,7 @@ export type Activity = {
   key:
     | "disabled"
     | "unset"
+    | "self-halted"
     | "stopped"
     | "stopping"
     | "stop-not-applied"
@@ -138,6 +139,13 @@ export function activity(a: {
    * becomes a fault.
    */
   unackSeconds?: number;
+  /**
+   * The state the bot itself published, and why. A bot can stop itself —
+   * kill criterion, reconcile mismatch, refused order, feed stall — and that
+   * is the single most urgent thing it can say.
+   */
+  publishedState?: string | null;
+  stateReason?: string | null;
   feed?: FeedHealth;
 }): Activity {
   if (a.enabled === false) {
@@ -192,6 +200,25 @@ export function activity(a: {
       return { key: "starting", label: "starting", long: "starting", tone: "quiet" };
     }
     return { key: "not-running", label: "not running", long: "not running", tone: "alarm" };
+  }
+
+  // The bot stopped ITSELF. Kill criterion, reconcile mismatch, refused
+  // order, feed stall: a rail halt latches, means something is wrong, and is
+  // the most urgent thing on the page.
+  //
+  // This had no case at all, so a book halted on a broker mismatch was drawn
+  // as whatever the feed happened to be doing — "running · failure" over a
+  // bot that had already flattened and latched, with the reason nowhere on
+  // the page. The control word said running because the OPERATOR had not
+  // changed their mind; that is a different question from what the bot did.
+  //
+  // Operator halts are excluded: those come through the control word above,
+  // and reaching here with one would mean the bot is obeying, not failing.
+  if (
+    a.publishedState === "halted" &&
+    !["operator", "operator-stop"].includes(String(a.stateReason ?? ""))
+  ) {
+    return { key: "self-halted", label: "halted", long: "halted", tone: "alarm" };
   }
 
   // A feed that reports itself unhealthy outranks everything below: the bot

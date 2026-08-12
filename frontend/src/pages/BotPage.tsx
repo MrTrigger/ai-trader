@@ -51,8 +51,15 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   });
   // What it is doing, which is not what it was told (the control word) and
   // not what it is wired to do (the route chain). See lib/activity.
-  const act = activity({ enabled: d.enabled, control: ctl?.state, unackSeconds, feed });
-  const halted = ["halted", "stopped", "stopping", "stop-not-applied"].includes(act.key);
+  const act = activity({
+    enabled: d.enabled,
+    control: ctl?.state,
+    unackSeconds,
+    publishedState: st.state,
+    stateReason: st.state_reason == null ? undefined : String(st.state_reason),
+    feed,
+  });
+  const halted = ["halted", "self-halted", "stopped", "stopping", "stop-not-applied"].includes(act.key);
   const failing = act.key === "failure";
   const open = sleeves.filter(([, s]) => s.in_position).length;
 
