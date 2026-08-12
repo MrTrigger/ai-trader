@@ -31,6 +31,20 @@ fn main() -> Result<(), String> {
     };
     let root = PathBuf::from(get("--data-root").unwrap_or_else(|| "data".into()));
     let days: i64 = get("--days").and_then(|v| v.parse().ok()).unwrap_or(180);
+    // Spec 8: a position's cap is the lower of max_single_position and
+    // `participation_limit * hourly_volume / NAV`. The second term is linear in
+    // the volume of the hour we actually send in, so the trading hour sets how
+    // large the thin tail is allowed to be — a constraint, not a price.
+    let nav: f64 = get("--nav").and_then(|v| v.parse().ok()).unwrap_or(100_000.0);
+    let participation: f64 = get("--participation")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.05);
+    let max_single: f64 = get("--max-position")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.25);
+    let target_w: f64 = get("--target-weight")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.8 / 24.0);
 
     // The names actually traded, from the newest universe snapshot. An
     // hour-of-day profile over 600 delisted shells describes a market we do
@@ -44,6 +58,8 @@ fn main() -> Result<(), String> {
     let mut rel_amihud: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
     let mut rel_range: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
     let mut used = 0;
+    // asset -> median quote volume in each hour, kept for the capacity pass.
+    let mut hourly_vol: BTreeMap<String, BTreeMap<u32, f64>> = BTreeMap::new();
 
     for asset in &assets {
         let bars = match store::read_asset(&root, 3600, asset) {
@@ -78,6 +94,15 @@ fn main() -> Result<(), String> {
             median(&mut all)
         };
         let (bv, ba, br) = (med_of(&vol), med_of(&ami), med_of(&rng));
+        hourly_vol.insert(
+            asset.clone(),
+            (0..24u32)
+                .filter_map(|h| {
+                    let mut v = vol.get(&h)?.clone();
+                    Some((h, median(&mut v)))
+                })
+                .collect(),
+        );
         for h in 0..24u32 {
             if let (Some(v), Some(a), Some(r)) = (vol.get(&h), ami.get(&h), rng.get(&h)) {
                 let (mut v, mut a, mut r) = (v.clone(), a.clone(), r.clone());
@@ -133,6 +158,44 @@ fn main() -> Result<(), String> {
             row.2,
             row.2 / best.2,
             row.1 / best.1
+        );
+    }
+    // --- capacity: how large may the thin tail be, at each hour ---------------
+    let want = target_w * nav;
+    let ceiling = max_single * nav;
+    println!(
+        "\ncapacity at NAV ${nav:.0}: target position ${want:.0}, \
+         hard cap ${ceiling:.0}, participation {:.1}% of the hour",
+        participation * 100.0
+    );
+    println!("hour   names capped   median cap $   book the caps allow $");
+    let mut cap_rows = Vec::new();
+    for h in [1u32, 2, 14] {
+        let mut caps: Vec<f64> = Vec::new();
+        for v in hourly_vol.values() {
+            let Some(vol_h) = v.get(&h) else { continue };
+            caps.push((participation * vol_h).min(ceiling));
+        }
+        if caps.is_empty() {
+            continue;
+        }
+        let capped = caps.iter().filter(|c| **c < want).count();
+        let allowed: f64 = caps.iter().map(|c| c.min(want)).sum();
+        let mut sorted = caps.clone();
+        println!(
+            "{h:02}:00 {capped:>13} {:>14.0} {allowed:>23.0}",
+            median(&mut sorted)
+        );
+        cap_rows.push((h, capped, allowed));
+    }
+    if let (Some(a), Some(b)) = (
+        cap_rows.iter().find(|r| r.0 == 1),
+        cap_rows.iter().find(|r| r.0 == 14),
+    ) {
+        println!(
+            "\n14:00 vs 01:00: {} fewer names capped, {:.2}x the book the caps allow",
+            a.1 as i64 - b.1 as i64,
+            b.2 / a.2
         );
     }
     Ok(())
