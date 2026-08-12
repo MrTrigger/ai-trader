@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cme-data = { workspace = true }
 equity-data = { workspace = true }
+features-common = { workspace = true }
 features-stockholm = { workspace = true }
 ib = { path = "../ib" }
 lightgbm-json = { workspace = true }

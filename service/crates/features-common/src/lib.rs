@@ -40,6 +40,63 @@ pub fn rank_normalise(values: &[Vec<Option<f64>>]) -> Result<Vec<Vec<f64>>, Stri
     Ok(out)
 }
 
+/// Spearman rank correlation with average ranks for ties. This is shared
+/// diagnostics math, not a strategy feature: callers supply the causal
+/// cross-section and target whose ordering they want to audit.
+pub fn spearman(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len()
+        || left.len() < 3
+        || left.iter().chain(right).any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    pearson(&average_ranks(left), &average_ranks(right))
+}
+
+fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        values[*left]
+            .total_cmp(&values[*right])
+            .then_with(|| left.cmp(right))
+    });
+    let mut ranks = vec![0.0; values.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let rank = (start + end - 1) as f64 / 2.0;
+        for index in &order[start..end] {
+            ranks[*index] = rank;
+        }
+        start = end;
+    }
+    ranks
+}
+
+fn pearson(left: &[f64], right: &[f64]) -> Option<f64> {
+    let n = left.len() as f64;
+    let left_mean = left.iter().sum::<f64>() / n;
+    let right_mean = right.iter().sum::<f64>() / n;
+    let covariance = left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| (a - left_mean) * (b - right_mean))
+        .sum::<f64>();
+    let left_variance = left
+        .iter()
+        .map(|value| (value - left_mean).powi(2))
+        .sum::<f64>();
+    let right_variance = right
+        .iter()
+        .map(|value| (value - right_mean).powi(2))
+        .sum::<f64>();
+    let denominator = (left_variance * right_variance).sqrt();
+    (denominator > 0.0).then_some(covariance / denominator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +117,12 @@ mod tests {
     #[test]
     fn refuses_ragged_rows() {
         assert!(rank_normalise(&[vec![Some(1.0)], vec![]]).is_err());
+    }
+
+    #[test]
+    fn spearman_uses_average_ranks_and_rejects_constant_inputs() {
+        assert_eq!(spearman(&[1.0, 2.0, 3.0], &[30.0, 20.0, 10.0]), Some(-1.0));
+        assert!(spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]).is_none());
+        assert!(spearman(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
     }
 }

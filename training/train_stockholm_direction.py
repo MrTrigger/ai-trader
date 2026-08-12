@@ -18,11 +18,11 @@ import numpy as np
 
 FORMAT_VERSION = "stockholm-direction-model-json-1"
 MODEL_VERSION = "stockholm-direction-model-1"
-FEATURE_SET_VERSION = "fs-rust-stockholm-direction-1"
-SCORE_SCALE = 0.04
+FEATURE_SET_VERSIONS = {
+    "fs-rust-stockholm-direction-1",
+    "fs-rust-stockholm-direction-2",
+}
 PARAMS = {
-    "objective": "regression",
-    "metric": "l2",
     "learning_rate": 0.025,
     "num_leaves": 7,
     "max_depth": 3,
@@ -38,9 +38,17 @@ PARAMS = {
     "verbose": -1,
 }
 NUM_ROUNDS = 200
+REWARDS = ("absolute_return", "direction_sign")
+OBJECTIVES = {
+    "l2": ("regression", "l2"),
+    "l1": ("regression_l1", "l1"),
+    "huber": ("huber", "huber"),
+}
 
 
-def load_training_prefix(path: Path, through: date, clip_quantile: float):
+def load_training_prefix(
+    path: Path, through: date, clip_quantile: float, reward: str = "absolute_return"
+):
     with path.open(encoding="utf-8") as source:
         manifest = json.loads(next(source))
         rows = [
@@ -52,18 +60,30 @@ def load_training_prefix(path: Path, through: date, clip_quantile: float):
         ]
     if manifest.get("kind") != "stockholm_direction_training_manifest":
         raise ValueError("first row is not a Stockholm direction matrix manifest")
-    if manifest.get("feature_set_version") != FEATURE_SET_VERSION:
-        raise ValueError("direction feature-set version differs from the trainer")
+    if manifest.get("feature_set_version") not in FEATURE_SET_VERSIONS:
+        raise ValueError("unsupported direction feature-set version")
     if len(rows) < 500:
         raise ValueError(f"only {len(rows)} direction rows through {through}")
     if not 0.0 <= clip_quantile < 0.5:
         raise ValueError("clip quantile must be in [0, 0.5)")
+    if reward not in REWARDS:
+        raise ValueError(f"unsupported direction reward {reward!r}")
     features = manifest["features"]
     x = np.asarray(
         [[row["features"][feature] for feature in features] for row in rows],
         dtype=np.float64,
     )
-    y = np.asarray([row["target"] for row in rows], dtype=np.float64)
+    absolute_y = np.asarray([row["target"] for row in rows], dtype=np.float64)
+    if reward == "direction_sign":
+        if clip_quantile:
+            raise ValueError("direction-sign labels are Rust-bounded; clipping must be zero")
+        if any("sign_target" not in row for row in rows):
+            raise ValueError("Rust direction matrix lacks sign labels")
+        y = np.asarray([row["sign_target"] for row in rows], dtype=np.float64)
+        if not np.isin(y, [-1.0, 0.0, 1.0]).all():
+            raise ValueError("Rust direction matrix has invalid sign labels")
+    else:
+        y = absolute_y.copy()
     if not np.isfinite(x).all() or not np.isfinite(y).all():
         raise ValueError("Rust direction matrix contains non-finite values")
     clip = None
@@ -71,7 +91,7 @@ def load_training_prefix(path: Path, through: date, clip_quantile: float):
         lower, upper = np.quantile(y, [clip_quantile, 1.0 - clip_quantile])
         y = np.clip(y, lower, upper)
         clip = [float(lower), float(upper)]
-    return manifest, features, rows, x, y, clip
+    return manifest, features, rows, x, y, absolute_y, clip
 
 
 def main() -> None:
@@ -80,13 +100,23 @@ def main() -> None:
     parser.add_argument("--through", type=date.fromisoformat, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--clip-quantile", type=float, default=0.01)
+    parser.add_argument("--objective", choices=OBJECTIVES, default="l2")
+    parser.add_argument("--reward", choices=REWARDS, default="absolute_return")
     args = parser.parse_args()
 
-    manifest, features, rows, x, y, clip = load_training_prefix(
-        args.matrix, args.through, args.clip_quantile
+    manifest, features, rows, x, y, absolute_y, clip = load_training_prefix(
+        args.matrix, args.through, args.clip_quantile, args.reward
     )
     dataset = lgb.Dataset(x, label=y, feature_name=features)
-    booster = lgb.train(PARAMS, dataset, num_boost_round=NUM_ROUNDS)
+    objective, metric = OBJECTIVES[args.objective]
+    booster = lgb.train(
+        dict(PARAMS, objective=objective, metric=metric),
+        dataset,
+        num_boost_round=NUM_ROUNDS,
+    )
+    score_scale = float(np.std(absolute_y))
+    if not np.isfinite(score_scale) or score_scale <= 0.0:
+        raise ValueError("direction target scale is not finite and positive")
     document = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,
@@ -98,16 +128,18 @@ def main() -> None:
         "n_dates": len(rows),
         "features": features,
         "model_family": "lightgbm",
-        "objective": "l2",
+        "reward": args.reward,
+        "objective": args.objective,
         "target_clip": clip,
-        "score_scale": SCORE_SCALE,
+        "score_scale": score_scale,
         "tree_info": booster.dump_model()["tree_info"],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(document, sort_keys=True, indent=2) + "\n")
     print(
         f"wrote {args.out}: {len(rows):,} causal daily rows, "
-        f"{len(features)} Rust-owned inputs, through {args.through}"
+        f"{len(features)} Rust-owned inputs, {args.reward}/{args.objective}, "
+        f"through {args.through}"
     )
 
 

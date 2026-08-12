@@ -14,10 +14,14 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let dir = std::env::args().nth(1).expect("usage: ws_capture <output-dir>");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: ws_capture <output-dir>");
     std::fs::create_dir_all(&dir).unwrap();
     let url = hyperliquid::ws::ws_url(hyperliquid::MAINNET);
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
 
     for sub in [
         serde_json::json!({"type": "candle", "coin": "BTC", "interval": "1m"}),
@@ -28,7 +32,9 @@ async fn main() {
         socket.send(Message::Text(msg.to_string())).await.unwrap();
     }
     socket
-        .send(Message::Text(serde_json::json!({"method": "ping"}).to_string()))
+        .send(Message::Text(
+            serde_json::json!({"method": "ping"}).to_string(),
+        ))
         .await
         .unwrap();
 
@@ -42,12 +48,26 @@ async fn main() {
             f = socket.next() => f,
             _ = tokio::time::sleep_until(deadline) => break,
         };
-        let Some(Ok(Message::Text(text))) = frame else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let Some(channel) = v.get("channel").and_then(|c| c.as_str()) else { continue };
+        let Some(Ok(Message::Text(text))) = frame else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(channel) = v.get("channel").and_then(|c| c.as_str()) else {
+            continue;
+        };
         if wanted.contains(channel) && !have.contains(channel) {
-            let name = if channel == "userFills" { "user_fills" } else { channel };
-            let name = if name == "subscriptionResponse" { "subscription_response" } else { name };
+            let name = if channel == "userFills" {
+                "user_fills"
+            } else {
+                channel
+            };
+            let name = if name == "subscriptionResponse" {
+                "subscription_response"
+            } else {
+                name
+            };
             std::fs::write(format!("{dir}/{name}.json"), &text).unwrap();
             println!("captured {channel}");
             have.insert(channel.to_string());

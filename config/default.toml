@@ -79,6 +79,32 @@ benchmark = "BTC"
 # headroom, which is what a screen should be.
 min_dollar_volume = "5000000"
 
+# The same screen, keyed to the hours this bot actually sends orders in.
+#
+# A whole day is the wrong window to screen on, because it is not the window we
+# trade. KAITO clears the 5M daily floor comfortably and trades $55,720 in the
+# 01:00-02:00 UTC hour we cross it - we sent $9,141 into that. It is where the
+# live book capture found a 4.9-15.3bp spread against the flat 0.50 the model
+# charged, a 17.4bp crossing cost against a modelled 3.1, and it is the one
+# name that took realised cost to 1.53x the model, right on the written kill
+# line. Excluding it, cost came out at 1.02x - the model was not broadly
+# miscalibrated, one illiquid name was.
+#
+# So this is the cheap half of the fix and `participation_limit` is the
+# expensive half. The cap sizes a thin name down (KAITO to 0.46% of NAV at
+# $600k); the screen keeps it out of the cross-section altogether, which costs
+# nothing and does not spend a holding slot on a position too small to matter.
+#
+# Requires `liquidity_profile`: a name it has not measured keeps its
+# eligibility rather than being assumed thin. Off - zero is the shipped
+# behaviour. Turning it on changes what the book holds and has not been through
+# a walk-forward.
+#
+# 250000 is the value the 2026-08-12 measurement argues for: ~27x the largest
+# order the planner wanted to place in that hour, and above it the whole
+# measured cost excess disappears.
+# min_hourly_quote_volume = "250000"
+
 # --- measured liquidity -------------------------------------------------------
 # All three settings below are OFF, and turning any of them on changes what the
 # planner does. Nothing here has been through a walk-forward yet.

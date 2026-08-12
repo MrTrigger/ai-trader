@@ -14,11 +14,13 @@ use time::Date;
 
 pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-2";
 pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-1";
+pub const BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-14";
 pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-3";
 pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-4";
 pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-5";
 pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-6";
 pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-7";
+pub const QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-15";
 pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-8";
 pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-9";
 pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-10";
@@ -29,6 +31,7 @@ pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION
     "fs-rust-stockholm-13";
 pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
 pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
+pub const DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-2";
 pub const DIRECTION_INDEX_SYMBOLS: &[&str] = &[
     "OMXSGI", "OMXS30GI", "OMXSBGI", "SX10GI", "SX15GI", "SX20GI", "SX30GI", "SX50GI", "SX55GI",
     "SX60GI", "SX65GI",
@@ -85,6 +88,21 @@ pub const FEATURE_NAMES: &[&str] = &[
     "median_traded_notional_20",
     "amihud_20",
     "volume_surge_20",
+];
+
+/// Global risk context from the shared CME archive. These values are common
+/// to every stock on a decision date and therefore remain in level units;
+/// cross-sectional ranking would erase them. Only the last completed UTC day
+/// strictly before the Stockholm decision date is admissible.
+pub const GLOBAL_RISK_FEATURE_NAMES: &[&str] = &[
+    "es_ret_1",
+    "es_ret_5",
+    "es_ret_21",
+    "es_ret_63",
+    "es_ret_126",
+    "es_vol_20",
+    "es_vol_60",
+    "es_max_drawdown_126",
 ];
 
 /// Predeclared residual-risk and execution-context additions from the v3
@@ -148,6 +166,28 @@ pub const REPORT_EVENT_FEATURE_NAMES: &[&str] = &[
 /// ratios and price joins are finalized here in Rust.
 pub const FUNDAMENTAL_FEATURE_NAMES: &[&str] = &[
     "days_since_annual_fundamentals",
+    "fundamental_equity_to_assets",
+    "fundamental_cash_to_assets",
+    "fundamental_cfo_to_assets",
+    "fundamental_accruals_to_assets",
+    "fundamental_operating_margin",
+    "fundamental_net_margin",
+    "fundamental_revenue_growth",
+    "fundamental_net_income_change_to_assets",
+    "fundamental_asset_growth",
+    "fundamental_equity_growth",
+    "fundamental_current_ratio",
+    "fundamental_eps_yield",
+    "fundamental_book_to_market",
+    "fundamental_sales_to_market",
+];
+
+/// The same provider-neutral ratios as the annual contract, but the freshness
+/// field explicitly identifies a quarterly, filing-date-controlled source.
+/// A separate feature/version contract prevents annual ESEF and quarterly
+/// licensed data from being mistaken for interchangeable model inputs.
+pub const QUARTERLY_FUNDAMENTAL_FEATURE_NAMES: &[&str] = &[
+    "days_since_quarterly_fundamentals",
     "fundamental_equity_to_assets",
     "fundamental_cash_to_assets",
     "fundamental_cfo_to_assets",
@@ -315,6 +355,14 @@ pub struct MacroSeries {
     pub observations: Vec<MacroObservation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalRiskBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub close: f64,
+}
+
 /// Provider-neutral completed-session market microstructure observation.
 /// Provider response parsing and units remain owned by `equity-data`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -368,10 +416,14 @@ pub struct DirectionTrainingRow {
     pub date: Date,
     /// OMXSGI next-session SOD to SOD after the declared horizon.
     pub target: f64,
+    /// Direction-only secondary label finalized in Rust. Zero returns remain
+    /// neutral; Python may select this value for fitting but may not derive it.
+    #[serde(default)]
+    pub sign_target: f64,
     pub entry_value: f64,
     pub exit_value: f64,
     pub annualised_volatility_20: f64,
-    /// Final Rust-owned values in [`direction_model_feature_names`] order.
+    /// Final Rust-owned values in the matrix's declared feature order.
     pub features: BTreeMap<String, f64>,
 }
 
@@ -410,6 +462,22 @@ pub fn direction_model_feature_names() -> Vec<String> {
         .collect()
 }
 
+pub fn direction_global_risk_model_feature_names() -> Vec<String> {
+    direction_model_feature_names()
+        .into_iter()
+        .chain(
+            GLOBAL_RISK_FEATURE_NAMES
+                .iter()
+                .map(|name| format!("g_{name}")),
+        )
+        .chain(
+            GLOBAL_RISK_FEATURE_NAMES
+                .iter()
+                .map(|name| format!("g_missing_{name}")),
+        )
+        .collect()
+}
+
 /// Build the finalized absolute-return direction matrix. No later observation
 /// can change a row's features: all inputs end at `date`, while only the label
 /// reads the primary index's following SOD values.
@@ -418,6 +486,19 @@ pub fn direction_training_matrix(
     start: Date,
     end: Date,
     horizon_sessions: usize,
+) -> Result<DirectionTrainingMatrix, String> {
+    direction_training_matrix_with_global_risk(series, start, end, horizon_sessions, &[])
+}
+
+/// Build direction features with optional completed-session global risk
+/// context. When supplied, global observations are exposed only from UTC
+/// dates strictly before the Stockholm decision date.
+pub fn direction_training_matrix_with_global_risk(
+    series: &[MarketIndexSeries],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    global_risk: &[GlobalRiskBar],
 ) -> Result<DirectionTrainingMatrix, String> {
     if end < start {
         return Err("direction matrix end precedes start".into());
@@ -449,7 +530,12 @@ pub fn direction_training_matrix(
     }
     let primary = by_symbol["OMXSGI"];
     let primary_positions = &positions["OMXSGI"];
-    let names = direction_model_feature_names();
+    let global_risk_values = global_risk_features(global_risk)?;
+    let names = if global_risk.is_empty() {
+        direction_model_feature_names()
+    } else {
+        direction_global_risk_model_feature_names()
+    };
     let mut rows = Vec::new();
     for index in 252..primary.bars.len() {
         let decision = primary.bars[index].date;
@@ -531,6 +617,11 @@ pub fn direction_training_matrix(
         let mut finalized = Vec::with_capacity(names.len());
         finalized.extend(raw.iter().map(|value| value.unwrap_or(0.0)));
         finalized.extend(raw.iter().map(|value| f64::from(value.is_none())));
+        if !global_risk.is_empty() {
+            let global = global_risk_before(&global_risk_values, decision);
+            finalized.extend(global.iter().map(|value| value.unwrap_or(0.0)));
+            finalized.extend(global.iter().map(|value| f64::from(value.is_none())));
+        }
         if finalized.iter().any(|value| !value.is_finite()) {
             return Err(format!("non-finite direction feature on {decision}"));
         }
@@ -544,6 +635,7 @@ pub fn direction_training_matrix(
         rows.push(DirectionTrainingRow {
             date: decision,
             target,
+            sign_target: target.signum(),
             entry_value,
             exit_value,
             annualised_volatility_20,
@@ -811,6 +903,22 @@ pub fn baseline_model_feature_names() -> Vec<String> {
         .collect()
 }
 
+pub fn baseline_global_risk_model_feature_names() -> Vec<String> {
+    baseline_model_feature_names()
+        .into_iter()
+        .chain(
+            GLOBAL_RISK_FEATURE_NAMES
+                .iter()
+                .map(|name| format!("g_{name}")),
+        )
+        .chain(
+            GLOBAL_RISK_FEATURE_NAMES
+                .iter()
+                .map(|name| format!("g_missing_{name}")),
+        )
+        .collect()
+}
+
 pub fn residual_model_feature_names() -> Vec<String> {
     FEATURE_NAMES
         .iter()
@@ -886,6 +994,22 @@ pub fn fundamental_model_feature_names() -> Vec<String> {
                 .iter()
                 .chain(RESIDUAL_FEATURE_NAMES)
                 .chain(FUNDAMENTAL_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn quarterly_fundamental_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(QUARTERLY_FUNDAMENTAL_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(QUARTERLY_FUNDAMENTAL_FEATURE_NAMES)
                 .map(|name| format!("m_{name}")),
         )
         .collect()
@@ -1007,11 +1131,13 @@ pub fn validate_selection(names: &[String]) -> Result<(), String> {
     }
     let all: BTreeSet<_> = model_feature_names()
         .into_iter()
+        .chain(baseline_global_risk_model_feature_names())
         .chain(residual_model_feature_names())
         .chain(public_short_model_feature_names())
         .chain(pdmr_model_feature_names())
         .chain(pdmr_report_model_feature_names())
         .chain(fundamental_model_feature_names())
+        .chain(quarterly_fundamental_model_feature_names())
         .chain(pdmr_macro_model_feature_names())
         .chain(pdmr_microstructure_model_feature_names())
         .chain(pdmr_microstructure_borrow_model_feature_names())
@@ -1178,12 +1304,14 @@ pub struct CrossSectionInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureSet {
     Baseline,
+    BaselineGlobalRisk,
     Context,
     Residual,
     ResidualPublicShort,
     ResidualPdmr,
     ResidualPdmrReports,
     ResidualFundamentals,
+    ResidualQuarterlyFundamentals,
     ResidualPdmrMacro,
     ResidualPdmrMicrostructure,
     ResidualPdmrMicrostructureBorrow,
@@ -2474,12 +2602,14 @@ impl<'a> AnnualFundamentalCursor<'a> {
         if decision_date <= self.first_available_date {
             return vec![None; FUNDAMENTAL_FEATURE_NAMES.len()];
         }
-        let Some(event) = self
-            .by_instrument
-            .get(instrument_id)
-            .and_then(|events| events.last())
-            .copied()
-        else {
+        let Some(event) = self.by_instrument.get(instrument_id).and_then(|events| {
+            events.iter().copied().max_by(|left, right| {
+                left.report_period_end
+                    .cmp(&right.report_period_end)
+                    .then_with(|| left.available_date.cmp(&right.available_date))
+                    .then_with(|| left.filing_key.cmp(&right.filing_key))
+            })
+        }) else {
             return vec![None; FUNDAMENTAL_FEATURE_NAMES.len()];
         };
         let price = self.histories.get(instrument_id).and_then(|history| {
@@ -2678,6 +2808,85 @@ fn baseline_cross_section(inputs: &[CrossSectionInput]) -> Result<Vec<Normalised
             values,
         })
         .collect())
+}
+
+fn baseline_global_risk_cross_section(
+    inputs: &[CrossSectionInput],
+    global: &[Option<f64>],
+) -> Result<Vec<NormalisedRow>, String> {
+    if global.len() != GLOBAL_RISK_FEATURE_NAMES.len() {
+        return Err("invalid global-risk feature row".into());
+    }
+    let mut rows = baseline_cross_section(inputs)?;
+    for row in &mut rows {
+        row.values
+            .extend(global.iter().map(|value| value.unwrap_or(0.0)));
+        row.values
+            .extend(global.iter().map(|value| f64::from(value.is_none())));
+    }
+    Ok(rows)
+}
+
+fn global_risk_features(
+    observations: &[GlobalRiskBar],
+) -> Result<BTreeMap<Date, Vec<Option<f64>>>, String> {
+    if observations.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if observations
+        .windows(2)
+        .any(|pair| pair[0].date >= pair[1].date)
+        || observations
+            .iter()
+            .any(|bar| !bar.close.is_finite() || bar.close <= 0.0)
+    {
+        return Err("global-risk history must be valid, strictly increasing daily closes".into());
+    }
+    let mut output = BTreeMap::new();
+    for index in 0..observations.len() {
+        let simple_return = |window: usize| {
+            let start = index.checked_sub(window)?;
+            finite(observations[index].close / observations[start].close - 1.0)
+        };
+        let volatility = |window: usize| {
+            let start = index.checked_sub(window)?;
+            let returns = (start + 1..=index)
+                .map(|slot| finite((observations[slot].close / observations[slot - 1].close).ln()))
+                .collect::<Option<Vec<_>>>()?;
+            finite(standard_deviation(&returns)? * 252.0_f64.sqrt())
+        };
+        let drawdown = index.checked_add(1).and_then(|end| {
+            let start = end.checked_sub(126)?;
+            let mut peak = observations[start].close;
+            let mut worst = 0.0_f64;
+            for bar in &observations[start..=index] {
+                peak = peak.max(bar.close);
+                worst = worst.min(bar.close / peak - 1.0);
+            }
+            finite(worst)
+        });
+        let values = vec![
+            simple_return(1),
+            simple_return(5),
+            simple_return(21),
+            simple_return(63),
+            simple_return(126),
+            volatility(20),
+            volatility(60),
+            drawdown,
+        ];
+        debug_assert_eq!(values.len(), GLOBAL_RISK_FEATURE_NAMES.len());
+        output.insert(observations[index].date, values);
+    }
+    Ok(output)
+}
+
+fn global_risk_before(features: &BTreeMap<Date, Vec<Option<f64>>>, date: Date) -> Vec<Option<f64>> {
+    features
+        .range(..date)
+        .next_back()
+        .map(|(_, values)| values.clone())
+        .unwrap_or_else(|| vec![None; GLOBAL_RISK_FEATURE_NAMES.len()])
 }
 
 /// Build trailing residual-risk inputs from the complete eligible universe.
@@ -3279,6 +3488,11 @@ pub struct TrainingRow {
     pub isin: String,
     pub sector: String,
     pub bucket: UniverseBucket,
+    /// Adjusted-close return from `t-252` through `t-21`. This Rust-owned raw
+    /// value supports the predeclared fixed 12-1 momentum baseline; it is not
+    /// silently added to any existing model feature contract.
+    #[serde(default)]
+    pub momentum_12_1: Option<f64>,
     /// Adjusted next-session open to adjusted open after `horizon_sessions`.
     pub target: f64,
     /// Equal-weight return of the complete eligible decision-date cross-section
@@ -3332,6 +3546,70 @@ pub struct TrainingMatrix {
     pub rows: Vec<TrainingRow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureTargetDiagnostic {
+    pub feature: String,
+    pub decision_dates: usize,
+    pub positive_dates: usize,
+    pub mean_rank_ic: f64,
+}
+
+/// Audit each already-finalized Rust input against the cross-sectional forward
+/// return ordering. The calculation is date-local, so common market direction
+/// cannot masquerade as stock-selection skill. This routine never changes a
+/// feature, label, model, or portfolio decision.
+pub fn feature_target_diagnostics(
+    rows: &[TrainingRow],
+    feature_names: &[String],
+) -> Result<Vec<FeatureTargetDiagnostic>, String> {
+    if rows.is_empty() {
+        return Err("feature diagnostics require matrix rows".into());
+    }
+    let mut by_date = BTreeMap::<Date, Vec<&TrainingRow>>::new();
+    for row in rows {
+        by_date.entry(row.date).or_default().push(row);
+    }
+    let mut correlations = vec![Vec::<f64>::new(); feature_names.len()];
+    for group in by_date.values() {
+        let targets = group
+            .iter()
+            .map(|row| row.relative_target.unwrap_or(row.target))
+            .collect::<Vec<_>>();
+        for (index, name) in feature_names.iter().enumerate() {
+            let values = group
+                .iter()
+                .map(|row| {
+                    row.features.get(name).copied().ok_or_else(|| {
+                        format!(
+                            "matrix row {} on {} lacks feature {name:?}",
+                            row.instrument_id, row.date
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(value) = features_common::spearman(&values, &targets) {
+                correlations[index].push(value);
+            }
+        }
+    }
+    Ok(feature_names
+        .iter()
+        .cloned()
+        .zip(correlations)
+        .map(|(feature, values)| FeatureTargetDiagnostic {
+            feature,
+            decision_dates: values.len(),
+            positive_dates: values.iter().filter(|value| **value > 0.0).count(),
+            mean_rank_ic: if values.is_empty() {
+                0.0
+            } else {
+                values.iter().sum::<f64>() / values.len() as f64
+            },
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
     meta: InstrumentMeta,
@@ -3341,6 +3619,7 @@ struct Candidate {
     exit_price: f64,
     adv20_sek: f64,
     vol60: f64,
+    momentum_12_1: f64,
 }
 
 /// Construct the final ordered matrix and labels in Rust. Bars after a row's
@@ -3518,6 +3797,7 @@ pub fn training_matrix_for_named_feature_set_with_fundamentals(
         &[],
         &[],
         &[],
+        &[],
     )
 }
 
@@ -3539,6 +3819,54 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
     borrow_fees: &[BorrowFeeBar],
     company_news_events: &[CompanyNewsEvent],
     report_text_events: &[FinancialReportTextEvent],
+    global_risk: &[GlobalRiskBar],
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        public_short_events,
+        pdmr_events,
+        report_events,
+        fundamental_events,
+        macro_series,
+        microstructure,
+        borrow_fees,
+        company_news_events,
+        report_text_events,
+        global_risk,
+        &BTreeMap::new(),
+    )
+}
+
+/// Construct the final matrix while enforcing known point-in-time eligibility
+/// before any cross-sectional feature, relative label, or sample weight is
+/// finalized. Missing instruments are deliberately unrestricted: callers must
+/// disclose coverage rather than manufacture admission dates.
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+    pdmr_events: &[PdmrTransactionEvent],
+    report_events: &[FinancialReportEvent],
+    fundamental_events: &[AnnualFundamentalEvent],
+    macro_series: &[MacroSeries],
+    microstructure: &[MarketMicrostructureBar],
+    borrow_fees: &[BorrowFeeBar],
+    company_news_events: &[CompanyNewsEvent],
+    report_text_events: &[FinancialReportTextEvent],
+    global_risk: &[GlobalRiskBar],
+    eligible_from: &BTreeMap<String, Date>,
 ) -> Result<TrainingMatrix, String> {
     if end < start {
         return Err("matrix end precedes start".into());
@@ -3563,6 +3891,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
             | FeatureSet::ResidualPdmr
             | FeatureSet::ResidualPdmrReports
             | FeatureSet::ResidualFundamentals
+            | FeatureSet::ResidualQuarterlyFundamentals
             | FeatureSet::ResidualPdmrMacro
             | FeatureSet::ResidualPdmrMicrostructure
             | FeatureSet::ResidualPdmrMicrostructureBorrow
@@ -3579,14 +3908,11 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
     } else {
         BTreeMap::new()
     };
-    let microstructure_rows = if matches!(
-        feature_set,
-        FeatureSet::ResidualPdmrMicrostructure
-            | FeatureSet::ResidualPdmrMicrostructureBorrow
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNews
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
-    ) {
+    // Execution metadata is independent of the alpha feature contract. When
+    // official microstructure is supplied, always carry the causal median
+    // spread on TrainingRow so every model family receives the same replay
+    // costs; only the selected feature sets expose microstructure to the model.
+    let microstructure_rows = if !microstructure.is_empty() {
         microstructure_features(microstructure)?
     } else {
         MicrostructureFeatureRows {
@@ -3595,14 +3921,19 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
         }
     };
     let microstructure_values = &microstructure_rows.features;
-    let borrow_fee_values = if matches!(
-        feature_set,
-        FeatureSet::ResidualPdmrMicrostructureBorrow
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNews
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
-            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportAttachments
-    ) {
+    // Borrow holding cost is likewise a portfolio input, not an alpha feature.
+    // Populate it whenever IB fee history is available without adding it to a
+    // feature map that did not request the borrow feature family.
+    let borrow_fee_values = if !borrow_fees.is_empty() {
         borrow_fee_features(borrow_fees)?
+    } else {
+        BTreeMap::new()
+    };
+    let global_risk_values = if feature_set == FeatureSet::BaselineGlobalRisk {
+        if global_risk.is_empty() {
+            return Err("baseline-global-risk requires global-risk history".into());
+        }
+        global_risk_features(global_risk)?
     } else {
         BTreeMap::new()
     };
@@ -3637,6 +3968,12 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
             if decision < start || decision > end {
                 continue;
             }
+            if eligible_from
+                .get(instrument_id)
+                .is_some_and(|admission| decision < *admission)
+            {
+                continue;
+            }
             let Some(exit_index) = index.checked_add(1 + horizon_sessions) else {
                 continue;
             };
@@ -3652,6 +3989,9 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
                 continue;
             };
             let Some(vol60) = feature.values[vol_index] else {
+                continue;
+            };
+            let Some(momentum_12_1) = skipped_return(&history, index, 252, 21) else {
                 continue;
             };
             if feature.values[slow_index].is_none() || adv20_sek < min_adv20_sek {
@@ -3676,17 +4016,20 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
                 exit_price: exit,
                 adv20_sek,
                 vol60,
+                momentum_12_1,
             });
         }
     }
     let names = match feature_set {
         FeatureSet::Baseline => baseline_model_feature_names(),
+        FeatureSet::BaselineGlobalRisk => baseline_global_risk_model_feature_names(),
         FeatureSet::Context => model_feature_names(),
         FeatureSet::Residual => residual_model_feature_names(),
         FeatureSet::ResidualPublicShort => public_short_model_feature_names(),
         FeatureSet::ResidualPdmr => pdmr_model_feature_names(),
         FeatureSet::ResidualPdmrReports => pdmr_report_model_feature_names(),
         FeatureSet::ResidualFundamentals => fundamental_model_feature_names(),
+        FeatureSet::ResidualQuarterlyFundamentals => quarterly_fundamental_model_feature_names(),
         FeatureSet::ResidualPdmrMacro => pdmr_macro_model_feature_names(),
         FeatureSet::ResidualPdmrMicrostructure => pdmr_microstructure_model_feature_names(),
         FeatureSet::ResidualPdmrMicrostructureBorrow => {
@@ -3715,9 +4058,12 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
     let mut report_cursor = (feature_set == FeatureSet::ResidualPdmrReports)
         .then(|| FinancialReportCursor::new(report_events, bars))
         .transpose()?;
-    let mut fundamental_cursor = (feature_set == FeatureSet::ResidualFundamentals)
-        .then(|| AnnualFundamentalCursor::new(fundamental_events, bars))
-        .transpose()?;
+    let mut fundamental_cursor = matches!(
+        feature_set,
+        FeatureSet::ResidualFundamentals | FeatureSet::ResidualQuarterlyFundamentals
+    )
+    .then(|| AnnualFundamentalCursor::new(fundamental_events, bars))
+    .transpose()?;
     let mut macro_pdmr_cursor = (feature_set == FeatureSet::ResidualPdmrMacro)
         .then(|| PdmrCursor::new(pdmr_events))
         .transpose()?;
@@ -3947,6 +4293,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
             };
         let normalised = match feature_set {
             FeatureSet::Baseline => baseline_cross_section(&context)?,
+            FeatureSet::BaselineGlobalRisk => baseline_global_risk_cross_section(
+                &context,
+                &global_risk_before(&global_risk_values, date),
+            )?,
             FeatureSet::Context => model_cross_section(&context)?,
             FeatureSet::Residual => residual_cross_section(&context, &residual)?,
             FeatureSet::ResidualPublicShort => {
@@ -3957,6 +4307,9 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
                 residual_pdmr_report_cross_section(&context, &residual, &pdmr_reports)?
             }
             FeatureSet::ResidualFundamentals => {
+                residual_fundamental_cross_section(&context, &residual, &fundamentals)?
+            }
+            FeatureSet::ResidualQuarterlyFundamentals => {
                 residual_fundamental_cross_section(&context, &residual, &fundamentals)?
             }
             FeatureSet::ResidualPdmrMacro => {
@@ -4022,6 +4375,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources(
                 isin: candidate.meta.isin,
                 sector: candidate.meta.sector,
                 bucket: candidate.meta.bucket,
+                momentum_12_1: Some(candidate.momentum_12_1),
                 target: candidate.target,
                 market_target: Some(market_target),
                 relative_target: Some(relative_target),
@@ -4334,6 +4688,181 @@ mod tests {
         assert_eq!(row.len(), BORROW_FEE_FEATURE_NAMES.len());
         assert_eq!(row[0], Some(0.012));
         assert!(row.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn global_risk_features_are_strictly_prior_day_and_prefix_invariant() {
+        let start = Date::from_calendar_date(2023, Month::January, 1).unwrap();
+        let full = (0..200)
+            .map(|index| GlobalRiskBar {
+                date: start + Duration::days(index),
+                close: 4_000.0 * 1.001_f64.powi(index as i32),
+            })
+            .collect::<Vec<_>>();
+        let prefix = global_risk_features(&full[..160]).unwrap();
+        let complete = global_risk_features(&full).unwrap();
+        let decision = full[160].date;
+
+        assert_eq!(
+            global_risk_before(&prefix, decision),
+            global_risk_before(&complete, decision)
+        );
+        let prior = global_risk_before(&complete, decision);
+        assert!((prior[0].unwrap() - 0.001).abs() < 1e-12);
+        assert_eq!(prior.len(), GLOBAL_RISK_FEATURE_NAMES.len());
+        assert_eq!(
+            baseline_global_risk_model_feature_names().len(),
+            baseline_model_feature_names().len() + 2 * GLOBAL_RISK_FEATURE_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn baseline_matrix_carries_execution_metadata_without_exposing_it_as_alpha() {
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        let mut microstructure = Vec::new();
+        let mut borrow_fees = Vec::new();
+        for index in 0..5 {
+            let instrument_id = format!("E{index}");
+            let history = bars(&instrument_id, 300, 1.0 + index as f64 / 100.0);
+            for (day, bar) in history.iter().enumerate() {
+                microstructure.push(MarketMicrostructureBar {
+                    date: bar.date,
+                    instrument_id: instrument_id.clone(),
+                    bid: Some(bar.raw_close - 0.05),
+                    ask: Some(bar.raw_close + 0.05),
+                    close: bar.raw_close,
+                    average: Some(bar.raw_close),
+                    turnover_sek: 1_000_000.0,
+                    trades: Some(1_000),
+                });
+                borrow_fees.push(BorrowFeeBar {
+                    date: bar.date,
+                    instrument_id: instrument_id.clone(),
+                    annual_rate: 0.01 + day as f64 / 100_000.0,
+                });
+            }
+            all_bars.extend(history);
+            instruments.push(InstrumentMeta {
+                instrument_id: instrument_id.clone(),
+                symbol: instrument_id,
+                isin: format!("SE{index:010}"),
+                sector: "Industrials".into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        let decision = all_bars
+            .iter()
+            .find(|bar| bar.instrument_id == "E0")
+            .unwrap()
+            .date
+            + Duration::days(280);
+        let matrix = training_matrix_for_named_feature_set_with_all_sources(
+            &all_bars,
+            &instruments,
+            decision,
+            decision,
+            5,
+            0.0,
+            FeatureSet::Baseline,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &microstructure,
+            &borrow_fees,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(matrix.features, baseline_model_feature_names());
+        assert!(!matrix
+            .features
+            .iter()
+            .any(|name| name.starts_with("x_nasdaq_") || name.starts_with("x_ib_")));
+        assert_eq!(matrix.rows.len(), 5);
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| row.median_closing_spread_bps_20.is_some()));
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| row.borrow_fee_annualized.is_some()));
+    }
+
+    #[test]
+    fn point_in_time_eligibility_precedes_cross_sectional_labels_and_weights() {
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..6 {
+            let instrument_id = format!("M{index}");
+            let mut history = bars(&instrument_id, 300, 1.0 + index as f64 / 100.0);
+            if index == 5 {
+                // Give the instrument that will be ineligible a distinct
+                // future outcome. Its removal must change the market label,
+                // not merely remove its already-finalized row.
+                history[286].adjusted_close *= 2.0;
+            }
+            all_bars.extend(history);
+            instruments.push(InstrumentMeta {
+                instrument_id: instrument_id.clone(),
+                symbol: instrument_id,
+                isin: format!("SE{index:010}"),
+                sector: "Industrials".into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        let decision =
+            Date::from_calendar_date(2024, Month::January, 1).unwrap() + Duration::days(280);
+        let build = |eligible_from: &BTreeMap<String, Date>| {
+            training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+                &all_bars,
+                &instruments,
+                decision,
+                decision,
+                5,
+                0.0,
+                FeatureSet::Baseline,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                eligible_from,
+            )
+            .unwrap()
+        };
+
+        let unrestricted = build(&BTreeMap::new());
+        let restricted = build(&BTreeMap::from([(
+            "M5".to_owned(),
+            decision + Duration::days(1),
+        )]));
+
+        assert_eq!(unrestricted.rows.len(), 6);
+        assert_eq!(restricted.rows.len(), 5);
+        assert!(restricted.rows.iter().all(|row| row.instrument_id != "M5"));
+        assert!(restricted
+            .rows
+            .iter()
+            .all(|row| (row.sample_weight - 0.2).abs() < 1e-12));
+        assert_ne!(
+            unrestricted.rows[0].market_target, restricted.rows[0].market_target,
+            "eligibility must be applied before the market-relative label"
+        );
+        let diagnostics =
+            feature_target_diagnostics(&restricted.rows, &restricted.features).unwrap();
+        assert_eq!(diagnostics.len(), restricted.features.len());
+        assert!(diagnostics.iter().all(|row| row.decision_dates <= 1));
     }
 
     #[test]
@@ -4656,6 +5185,49 @@ mod tests {
     }
 
     #[test]
+    fn later_restatement_of_old_period_does_not_replace_newer_quarter() {
+        let history = bars("I1", 50, 1.0);
+        let template = AnnualFundamentalEvent {
+            instrument_id: "I1".into(),
+            available_date: history[10].date,
+            report_period_end: history[5].date,
+            filing_key: "old-original".into(),
+            reporting_currency: Some("iso4217:SEK".into()),
+            revenue: Some(100.0),
+            prior_revenue: Some(90.0),
+            operating_profit: Some(10.0),
+            net_income: Some(8.0),
+            prior_net_income: Some(7.0),
+            assets: Some(200.0),
+            prior_assets: Some(190.0),
+            equity: Some(80.0),
+            prior_equity: Some(70.0),
+            cash: Some(20.0),
+            operating_cash_flow: Some(9.0),
+            current_assets: Some(50.0),
+            current_liabilities: Some(25.0),
+            basic_eps: Some(0.8),
+            weighted_average_shares: Some(10.0),
+        };
+        let mut newer = template.clone();
+        newer.available_date = history[20].date;
+        newer.report_period_end = history[15].date;
+        newer.filing_key = "newer-quarter".into();
+        newer.equity = Some(120.0);
+        let mut old_restatement = template;
+        old_restatement.available_date = history[21].date;
+        old_restatement.filing_key = "old-restatement".into();
+        old_restatement.equity = Some(20.0);
+        let events = [newer, old_restatement];
+        let mut cursor = AnnualFundamentalCursor::new(&events, &history).unwrap();
+        let decision = history[22].date;
+        cursor.advance_before(decision);
+        let values = cursor.values("I1", decision);
+        assert_eq!(values[0], Some(2.0));
+        assert_eq!(values[1], Some(0.6));
+    }
+
+    #[test]
     fn macro_exposure_features_are_causal_and_require_declared_series() {
         let history = bars("I1", 300, 1.0);
         let instrument = InstrumentMeta {
@@ -4790,6 +5362,7 @@ mod tests {
                 .abs()
                 < 1e-12
         );
+        assert_eq!(full.rows[0].sign_target, full.rows[0].target.signum());
         assert_eq!(
             full.rows[0].features["m_sector_breadth_positive_21"], 1.0,
             "early sector history must be marked missing rather than backfilled"
@@ -4816,6 +5389,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prefix.rows, full.rows[..prefix.rows.len()]);
+    }
+
+    #[test]
+    fn direction_global_risk_matrix_uses_only_prior_utc_days() {
+        let indexes = direction_indexes(480, 300);
+        let primary = indexes
+            .iter()
+            .find(|series| series.symbol == "OMXSGI")
+            .unwrap();
+        let start = primary.bars[252].date;
+        let end = primary.bars[470].date;
+        let global = primary
+            .bars
+            .iter()
+            .enumerate()
+            .map(|(index, bar)| GlobalRiskBar {
+                date: bar.date,
+                close: 4_000.0 * 1.001_f64.powi(index as i32),
+            })
+            .collect::<Vec<_>>();
+
+        let full =
+            direction_training_matrix_with_global_risk(&indexes, start, end, 20, &global).unwrap();
+        assert_eq!(full.features, direction_global_risk_model_feature_names());
+        assert_eq!(
+            full.features.len(),
+            direction_model_feature_names().len() + 2 * GLOBAL_RISK_FEATURE_NAMES.len()
+        );
+        assert!((full.rows[0].features["g_es_ret_1"] - 0.001).abs() < 1e-12);
+        assert_eq!(full.rows[0].features["g_missing_es_ret_1"], 0.0);
+
+        let same_day = global.iter().position(|bar| bar.date == start).unwrap();
+        let prefix = direction_training_matrix_with_global_risk(
+            &indexes,
+            start,
+            end,
+            20,
+            &global[..=same_day],
+        )
+        .unwrap();
+        assert_eq!(
+            prefix.rows[0], full.rows[0],
+            "same-day and future CME bars must not alter the decision row"
+        );
     }
 
     #[test]
@@ -4872,6 +5489,7 @@ mod tests {
         validate_selection(&["x_sector_rel_ret_21".into()]).unwrap();
         validate_selection(&["x_market_breadth_positive_21".into()]).unwrap();
         validate_selection(&["x_market_resid_ret_126".into()]).unwrap();
+        validate_selection(&["g_es_ret_21".into()]).unwrap();
         assert!(validate_selection(&["ret_21".into()]).is_err());
         assert!(validate_selection(&["x_made_up".into()]).is_err());
     }

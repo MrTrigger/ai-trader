@@ -552,3 +552,62 @@ and revisions, observed spreads, and historical borrow availability or a
 declared availability scenario. The decomposed market-direction plus residual
 ranker has now been implemented and rejected on the available information; its
 next verdict requires genuinely new data or new elapsed time.
+
+## 2026-08-12 matrix-ordering correction and acceptance audit
+
+The historical-admission filter was originally applied to an already finalized
+matrix. That removed pre-admission rows, but it did **not** remove those names
+before same-date ranks, equal-weight market labels, relative labels, and sample
+weights were calculated. The matrix builder now accepts effective admission
+dates and applies them while each decision-date candidate set is formed. A
+prefix test proves the ineligible name cannot influence another row's label or
+weight. This is an implementation correction, not a new alpha hypothesis.
+
+Replaying the unchanged 20-session baseline after the correction materially
+improved the closed development estimate, but did not change the final verdict:
+
+| model / window | base return | base Sharpe | 2x-cost return | 2x-cost Sharpe | rank IC | OMXSGI return / Sharpe |
+|---|---:|---:|---:|---:|---:|---:|
+| lean LightGBM, 2022-09–2025-09 | +122.2% | 1.41 | +87.7% | 1.13 | +0.0387 | +49.4% / 0.92 |
+| lean ridge, 2022-09–2025-09 | +87.6% | 1.38 | +82.1% | 1.24 | +0.0390 | +49.4% / 0.92 |
+| rich v11 LightGBM, 2022-09–2025-09 | +62.5% | 0.88 | +54.7% | 0.86 | +0.0270 | +49.4% / 0.92 |
+| frozen 50/50 lean/rich blend | +82.6% | 1.19 | +59.3% | 0.91 | +0.0361 | +49.4% / 0.92 |
+| lean LightGBM, 2025-10–2026-07 diagnostic | -17.9% | -0.99 | -14.5% | -0.78 | -0.0291 | +14.0% / 1.25 |
+| lean ridge, 2025-10–2026-07 diagnostic | +3.2% | 0.45 | -5.2% | -0.74 | -0.0245 | +14.0% / 1.25 |
+| rich v11, 2025-10–2026-07 diagnostic | -22.1% | -2.78 | -19.4% | -2.50 | -0.0113 | +14.0% / 1.25 |
+| frozen lean/rich blend, recent diagnostic | -9.6% | -0.77 | -9.1% | -0.89 | -0.0227 | +14.0% / 1.25 |
+
+All four corrected lean development folds were profitable, but the most recent
+already-exposed interval inverted the ordering: the prediction top decile lost
+while the bottom decile gained. Costs were not the primary cause. A Rust-owned
+feature diagnostic found several training-period relationships reversing sign,
+including volatility, Amihud illiquidity, and median traded notional. Ridge
+reduced the loss but did not beat OMXSGI and did not restore positive rank IC.
+
+The already-predeclared 5-, 10-, and 20-session cadences were then rerun after
+the same ordering correction. Shorter horizons supplied more decisions but
+weaker signal and much greater cost sensitivity:
+
+| horizon | development base Sharpe | development 2x-cost Sharpe | recent diagnostic Sharpe | recent rank IC |
+|---|---:|---:|---:|---:|
+| 5 sessions | 0.87 | -0.02 | -0.52 | -0.0138 |
+| 10 sessions | 1.09 | 0.39 | -1.50 | -0.0367 |
+| 20 sessions | **1.41** | **1.13** | -0.99 | -0.0291 |
+
+An exact adjusted-price 12-1 momentum acceptance control was also added outside
+the fitted feature contract. With fixed 5% name weights, no direction quota,
+and identical measured execution/borrow accounting, it returned -37.8% at
+Sharpe -0.67 in development and -11.0% at Sharpe -0.57 recently. The
+development long-only arm returned +42.9% at Sharpe 0.73 versus OMXSGI +49.4%
+at 0.92. Thus neither missing canonical momentum nor rebalance cadence explains
+the gap to target.
+
+The next data contract is `fs-rust-stockholm-15`: licensed quarterly financial
+statements with provider `filing_date`, stable ISIN matching, year-over-year
+comparatives, and Rust-owned ratios. `collect-eodhd-fundamentals` is implemented
+in the shared `equity-data` crate for current Main Market securities and
+officially noticed delistings. It rejects statements without a causal filing
+date and retains revision limitations explicitly. No dataset or model has been
+produced because `EODHD_API_TOKEN` is not configured. This gate, plus inactive
+price history and historical borrow availability, remains blocking evidence;
+the corrected 1.41 development Sharpe is not a paper/live promotion result.

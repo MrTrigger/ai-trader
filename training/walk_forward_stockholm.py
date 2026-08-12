@@ -40,6 +40,14 @@ def matrix_dates(path: Path) -> tuple[dict, list[date]]:
     return manifest, sorted(dates)
 
 
+def matrix_manifest(path: Path) -> dict:
+    with path.open(encoding="utf-8") as source:
+        manifest = json.loads(next(source))
+    if manifest.get("kind") != "stockholm_training_manifest":
+        raise ValueError("first row is not a Stockholm Rust matrix manifest")
+    return manifest
+
+
 def build_folds(
     sessions: list[date],
     start: date,
@@ -93,6 +101,14 @@ def run(command: list[str]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", type=Path, required=True)
+    parser.add_argument(
+        "--training-matrix",
+        type=Path,
+        help=(
+            "optional shorter-horizon Rust matrix used only for fitting; Rust "
+            "explicitly aggregates its forecast to the holding matrix horizon"
+        ),
+    )
     parser.add_argument("--benchmark", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -118,6 +134,13 @@ def main() -> None:
     )
     parser.add_argument("--seeds", type=int, default=1)
     parser.add_argument("--ridge-lambda", type=float, default=25.0)
+    parser.add_argument("--calibration-sessions", type=int, default=0)
+    parser.add_argument(
+        "--training-window-sessions",
+        type=int,
+        default=0,
+        help="zero uses an expanding prefix; otherwise fit only this many trailing sessions",
+    )
     parser.add_argument("--clip-quantile", type=float, default=0.005)
     parser.add_argument("--stress-multiple", type=float, default=2.0)
     parser.add_argument(
@@ -125,20 +148,61 @@ def main() -> None:
         action="store_true",
         help="enable the fixed Rust OMX direction baseline in every replay",
     )
+    parser.add_argument(
+        "--market-forecast-matrix",
+        type=Path,
+        help=(
+            "Rust direction matrix used to train a causal OMXSGI return model "
+            "for composing relative stock forecasts"
+        ),
+    )
+    parser.add_argument(
+        "--prediction-composition",
+        choices=("direct", "cross-sectional-residual-plus-market"),
+        default="direct",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    relative_reward = args.reward in (
+        "relative_return",
+        "relative_return_per_risk",
+        "relative_rank",
+    )
+    if relative_reward and not args.direction_overlay:
+        parser.error("relative rewards require --direction-overlay")
+    if relative_reward and args.market_forecast_matrix is None:
+        parser.error("relative rewards require --market-forecast-matrix")
+    if not relative_reward and args.market_forecast_matrix is not None:
+        parser.error("absolute rewards must not use --market-forecast-matrix")
     if args.out.exists() and any(args.out.iterdir()) and not args.force:
         parser.error(f"{args.out} is not empty; use --force or a new experiment directory")
     if not args.binary.is_file():
         parser.error(f"Rust binary does not exist: {args.binary}")
+    if args.training_window_sessions < 0:
+        parser.error("--training-window-sessions must be non-negative")
     manifest, sessions = matrix_dates(args.matrix)
     horizon = int(manifest["horizon_sessions"])
+    training_matrix = args.training_matrix or args.matrix
+    training_manifest = matrix_manifest(training_matrix)
+    training_horizon = int(training_manifest["horizon_sessions"])
+    aggregate_short_horizon = training_matrix != args.matrix
+    if aggregate_short_horizon:
+        contract_fields = ("features", "feature_set_version", "survivorship_status")
+        if any(training_manifest.get(field) != manifest.get(field) for field in contract_fields):
+            raise ValueError("training and holding matrix feature contracts differ")
+        if training_horizon >= horizon or horizon % training_horizon:
+            raise ValueError(
+                "training horizon must be a proper divisor of holding horizon"
+            )
     folds = build_folds(sessions, args.start, args.end, args.folds, horizon)
     args.out.mkdir(parents=True, exist_ok=True)
     plan = {
         "kind": "stockholm_purged_expanding_walk_forward_plan",
         "matrix": str(args.matrix),
+        "training_matrix": str(training_matrix),
         "horizon_sessions": horizon,
+        "training_horizon_sessions": training_horizon,
+        "prediction_horizon_scale": horizon / training_horizon,
         "reward": args.reward,
         "model_family": args.model_family,
         "objective": args.objective,
@@ -147,7 +211,13 @@ def main() -> None:
         "ridge_lambda": (
             args.ridge_lambda if args.model_family in ("ridge", "hybrid") else None
         ),
+        "calibration_sessions": args.calibration_sessions,
+        "training_window_sessions": args.training_window_sessions,
         "direction_overlay": args.direction_overlay,
+        "market_forecast_matrix": (
+            str(args.market_forecast_matrix) if args.market_forecast_matrix else None
+        ),
+        "prediction_composition": args.prediction_composition,
         "folds": [
             {
                 **asdict(fold),
@@ -160,15 +230,22 @@ def main() -> None:
     }
     (args.out / "fold-plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     trainer = Path(__file__).with_name("train_stockholm.py")
+    direction_trainer = Path(__file__).with_name("train_stockholm_direction.py")
     summarizer = Path(__file__).with_name("summarize_stockholm.py")
     for fold in folds:
         model = args.out / f"model-{fold.number}.json"
+        market_model = args.out / f"market-model-{fold.number}.json"
+        training_from = None
+        if args.training_window_sessions:
+            cutoff_index = sessions.index(fold.trained_through)
+            from_index = max(0, cutoff_index - args.training_window_sessions + 1)
+            training_from = sessions[from_index]
         run(
             [
                 sys.executable,
                 str(trainer),
                 "--matrix",
-                str(args.matrix),
+                str(training_matrix),
                 "--through",
                 fold.trained_through.isoformat(),
                 "--out",
@@ -185,8 +262,24 @@ def main() -> None:
                 str(args.clip_quantile),
                 "--ridge-lambda",
                 str(args.ridge_lambda),
+                "--calibration-sessions",
+                str(args.calibration_sessions),
             ]
+            + (["--from", training_from.isoformat()] if training_from else [])
         )
+        if args.market_forecast_matrix is not None:
+            run(
+                [
+                    sys.executable,
+                    str(direction_trainer),
+                    "--matrix",
+                    str(args.market_forecast_matrix),
+                    "--through",
+                    fold.trained_through.isoformat(),
+                    "--out",
+                    str(market_model),
+                ]
+            )
         for scenario, multiple in (("base", 1.0), ("stress", args.stress_multiple)):
             report = args.out / f"fold-{fold.number}-{scenario}.json"
             run(
@@ -209,8 +302,25 @@ def main() -> None:
                     str(horizon),
                     "--cost-multiple",
                     str(multiple),
+                    "--prediction-composition",
+                    args.prediction_composition,
                 ]
                 + (["--direction-overlay"] if args.direction_overlay else [])
+                + (
+                    ["--aggregate-short-horizon-forecast"]
+                    if aggregate_short_horizon
+                    else []
+                )
+                + (
+                    [
+                        "--market-forecast-matrix",
+                        str(args.market_forecast_matrix),
+                        "--market-forecast-model",
+                        str(market_model),
+                    ]
+                    if args.market_forecast_matrix is not None
+                    else []
+                )
             )
     for scenario in ("base", "stress"):
         command = [

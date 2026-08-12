@@ -132,9 +132,25 @@ fn warning(kind: WarningKind, message: impl Into<String>) -> Warning {
     }
 }
 
+/// What the book may hold at all, before any signal ranks it.
+///
+/// Two liquidity floors, and they screen different things. `min_dollar_volume`
+/// asks whether a name trades at all, over a whole day. `min_hourly_quote_volume`
+/// asks whether it trades in the hours *we* send orders in, which is the
+/// quantity that decides what a trade costs — a name can clear a $5M day on
+/// volume that arrives while this bot is idle. KAITO does exactly that: it
+/// clears the daily floor and trades $55,720 in the hour we cross it, which is
+/// where 5.4x-under cost estimates and a measured 1.53x cost overrun came
+/// from. Excluding that one name put realised cost at 1.02x the model.
+///
+/// Screening is the cheap fix and the cap is the expensive one: a name that
+/// never enters the book costs nothing to size, while a name capped at 0.46%
+/// of NAV has already consumed a slot in the cross-section to hold almost
+/// nothing.
 fn eligible<'a>(
     rows: impl Iterator<Item = &'a DailyRow>,
     cfg: &Config,
+    profile: Option<&liquidity::Profile>,
 ) -> Result<(Vec<&'a DailyRow>, Vec<String>), String> {
     let mut keep = Vec::new();
     let mut notes = Vec::new();
@@ -164,6 +180,22 @@ fn eligible<'a>(
             ));
             continue;
         }
+        // The hour we trade in, not the day. Only a measured name can fail
+        // this: an unmeasured one is not condemned for want of a reading.
+        if cfg.min_hourly_quote_volume > Decimal::ZERO {
+            if let Some(hourly) = profile.and_then(|p| p.hourly_volume(&row.asset)) {
+                if hourly < cfg.min_hourly_quote_volume {
+                    notes.push(format!(
+                        "{}: {} of volume in the hours we trade, below {} - too thin to cross \
+                         at our size",
+                        row.asset,
+                        q(hourly, 0),
+                        cfg.min_hourly_quote_volume
+                    ));
+                    continue;
+                }
+            }
+        }
         if row
             .vol_30
             .is_some_and(|v| d(v).is_ok_and(|v| v < cfg.min_volatility))
@@ -186,8 +218,9 @@ fn generate_signal(
     hourly: &BTreeMap<String, &HourlyRow>,
     score_date: chrono::NaiveDate,
     cfg: &Config,
+    profile: Option<&liquidity::Profile>,
 ) -> Result<Signals, String> {
-    let (mut rows, mut notes) = eligible(cross.iter().copied(), cfg)?;
+    let (mut rows, mut notes) = eligible(cross.iter().copied(), cfg, profile)?;
     let mut warnings = Vec::new();
     let mut scoring_version = "none".to_string();
     let mut model_id = None;
@@ -1243,13 +1276,16 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         .date_naive()
         .pred_opt()
         .ok_or("date underflow")?;
-    let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg)?;
     // Measured tradeability, if anyone has measured it. Absent is the shipped
-    // behaviour: one flat spread, impact against daily volume, no cap.
+    // behaviour: one flat spread, impact against daily volume, no cap, no
+    // hourly floor. Loaded before the signal because eligibility is the first
+    // thing it decides — a name too thin to cross should never be ranked, let
+    // alone sized and then capped back down to nothing.
     let profile = match cfg.liquidity_profile.as_deref() {
         Some(path) => Some(liquidity::Profile::load(path)?),
         None => None,
     };
+    let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg, profile.as_ref())?;
     let construction = construct(&generated.values, cfg, nav, profile.as_ref())?;
     let betas: BTreeMap<_, _> = latest
         .iter()
@@ -1588,6 +1624,66 @@ mod tests {
         p
     }
 
+    /// The KAITO case, as measured on 2026-08-12: it clears the $5M daily
+    /// floor and trades $55,720 in the hour we cross it. The daily screen has
+    /// nothing to say about that; the hourly one removes it.
+    #[test]
+    fn a_name_that_clears_the_day_can_still_be_too_thin_in_our_hour() {
+        let mut cfg = config();
+        cfg.min_hourly_quote_volume = Decimal::from(250_000);
+        let ts = "2026-08-01T00:00:00Z".parse().unwrap();
+        let rows = [row("BTC", ts, 100.0), row("KAITO", ts, 1.0)];
+        // Both clear min_dollar_volume comfortably.
+        assert!(d(rows[1].adv_quote.unwrap()).unwrap() > cfg.min_dollar_volume);
+
+        let mut profile = thin_profile("KAITO", 55_720);
+        profile.assets.insert(
+            "BTC".into(),
+            liquidity::AssetLiquidity {
+                hourly_quote_volume: Some(Decimal::from(40_000_000)),
+                ..Default::default()
+            },
+        );
+        let (keep, notes) = eligible(rows.iter(), &cfg, Some(&profile)).unwrap();
+        assert_eq!(
+            keep.iter().map(|r| r.asset.as_str()).collect::<Vec<_>>(),
+            ["BTC"]
+        );
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("KAITO") && n.contains("55720") && n.contains("hours we trade")));
+    }
+
+    #[test]
+    fn the_hourly_floor_is_off_until_set_and_never_condemns_an_unmeasured_name() {
+        let mut cfg = config();
+        let ts = "2026-08-01T00:00:00Z".parse().unwrap();
+        let rows = [row("KAITO", ts, 1.0)];
+        let profile = thin_profile("KAITO", 55_720);
+
+        // Shipped: the floor is zero, so a measured-thin name stays eligible.
+        assert_eq!(cfg.min_hourly_quote_volume, Decimal::ZERO);
+        assert_eq!(
+            eligible(rows.iter(), &cfg, Some(&profile)).unwrap().0.len(),
+            1
+        );
+
+        // Set, but with no profile at all: nothing to screen against, and the
+        // planner does not invent a reading in order to drop a name.
+        cfg.min_hourly_quote_volume = Decimal::from(250_000);
+        assert_eq!(eligible(rows.iter(), &cfg, None).unwrap().0.len(), 1);
+
+        // Set, with a profile that covers other names but not this one.
+        let elsewhere = thin_profile("BTC", 40_000_000);
+        assert_eq!(
+            eligible(rows.iter(), &cfg, Some(&elsewhere))
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn a_measured_spread_replaces_the_flat_one_only_where_it_was_measured() {
         let cfg = config();
@@ -1872,7 +1968,7 @@ mod tests {
         rows[3].ret_30_skip_7 = Some(2.0);
         rows[4].ret_30_skip_7 = None;
         let refs: Vec<_> = rows.iter().collect();
-        let out = generate_signal(&refs, &BTreeMap::new(), ts.date_naive(), &cfg).unwrap();
+        let out = generate_signal(&refs, &BTreeMap::new(), ts.date_naive(), &cfg, None).unwrap();
         let scores: BTreeMap<_, _> = out
             .values
             .iter()
@@ -1909,7 +2005,7 @@ mod tests {
         benchmark.gc_regime_slope = Some(1.0);
         rows.push(benchmark);
         let refs: Vec<_> = rows.iter().collect();
-        let out = generate_signal(&refs, &BTreeMap::new(), ts.date_naive(), &cfg).unwrap();
+        let out = generate_signal(&refs, &BTreeMap::new(), ts.date_naive(), &cfg, None).unwrap();
         assert_eq!(out.values.len(), 6);
         assert_eq!(
             out.values

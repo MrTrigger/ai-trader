@@ -637,6 +637,60 @@ pub struct EodhdStockholmDelistedCollection {
     pub failures: usize,
 }
 
+/// One provider-normalized quarterly filing. Values remain statement units;
+/// price joins and ratios belong to the Rust feature crate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdQuarterlyFundamental {
+    #[serde(with = "date_serde")]
+    pub report_period_end: Date,
+    /// Provider filing date. This, rather than the accounting period end, is
+    /// the earliest date on which the row may enter a causal feature matrix.
+    #[serde(with = "date_serde")]
+    pub available_date: Date,
+    pub filing_key: String,
+    pub values: AnnualFundamentals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdFundamentalHistory {
+    pub symbol: EodhdDelistedSymbol,
+    pub quarterly: Vec<EodhdQuarterlyFundamental>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdStockholmFundamentalDataset {
+    pub format_version: String,
+    pub generated_at: String,
+    pub provider: String,
+    pub endpoint: String,
+    pub exchange_code: String,
+    pub operating_mic: String,
+    pub universe_source: String,
+    pub official_notice_source: String,
+    pub raw_cache_dir: String,
+    pub pause_ms: u64,
+    pub limitations: Vec<String>,
+    pub provider_symbols: usize,
+    pub target_isins: usize,
+    pub matched_isins: usize,
+    pub failures: BTreeMap<String, String>,
+    pub histories: Vec<EodhdFundamentalHistory>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EodhdStockholmFundamentalCollection {
+    pub dataset_path: PathBuf,
+    pub provider_symbols: usize,
+    pub target_isins: usize,
+    pub matched_isins: usize,
+    pub histories: usize,
+    pub quarterly_filings: usize,
+    pub failures: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NasdaqEquityNoticeKind {
@@ -3775,6 +3829,217 @@ impl PublicEquityData {
         })
     }
 
+    /// Collect licensed point-in-time quarterly statements for current Main
+    /// Market securities and officially noticed Stockholm delistings. Stable
+    /// ISIN matching is completed here so no vendor symbol logic enters a bot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_eodhd_stockholm_fundamentals(
+        &self,
+        root: &Path,
+        universe_path: &Path,
+        universe: &[Instrument],
+        official_notices_path: &Path,
+        official_notices: &NasdaqEquityNoticeDataset,
+        api_token: &str,
+        pause_ms: u64,
+        limit: usize,
+    ) -> Result<EodhdStockholmFundamentalCollection, String> {
+        if api_token.trim().is_empty() {
+            return Err("EODHD_API_TOKEN is empty".into());
+        }
+        let cache_dir = root.join("eodhd-stockholm-fundamentals").join("raw");
+        let response_dir = cache_dir.join("fundamentals");
+        std::fs::create_dir_all(&response_dir).map_err(|error| error.to_string())?;
+        let active_path = cache_dir.join("ST-active-common-stock.json");
+        let inactive_path = cache_dir.join("ST-delisted-common-stock.json");
+        let active = self.eodhd_symbol_list(&active_path, api_token, false)?;
+        let inactive = self.eodhd_symbol_list(&inactive_path, api_token, true)?;
+        let mut provider_symbols = active.into_iter().chain(inactive).collect::<Vec<_>>();
+        provider_symbols.sort_by(|left, right| {
+            left.isin
+                .cmp(&right.isin)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        provider_symbols.dedup_by(|right, left| right.isin == left.isin && right.code == left.code);
+
+        let mut target_isins = universe
+            .iter()
+            .filter(|instrument| {
+                matches!(
+                    instrument.bucket,
+                    UniverseBucket::LargeCap | UniverseBucket::MidCap | UniverseBucket::SmallCap
+                ) && valid_isin(&instrument.isin)
+            })
+            .map(|instrument| instrument.isin.clone())
+            .collect::<BTreeSet<_>>();
+        for notice in &official_notices.notices {
+            if notice.body_mentions_stockholm
+                && notice.event_kind == NasdaqEquityNoticeKind::Delisting
+            {
+                target_isins.extend(notice.isins.iter().filter(|isin| valid_isin(isin)).cloned());
+            }
+        }
+        let mut matched = provider_symbols
+            .iter()
+            .filter(|symbol| target_isins.contains(&symbol.isin))
+            .cloned()
+            .collect::<Vec<_>>();
+        matched.sort_by(|left, right| {
+            left.isin
+                .cmp(&right.isin)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        // Prefer one stable response per security. Multiple share-class codes
+        // with the same ISIN are provider duplicates, not extra observations.
+        matched.dedup_by(|right, left| right.isin == left.isin);
+        let matched_isins = matched.len();
+        if limit > 0 {
+            matched.truncate(limit);
+        }
+
+        let mut failures = BTreeMap::new();
+        let mut histories = Vec::new();
+        for (index, symbol) in matched.iter().enumerate() {
+            let safe_code = symbol
+                .code
+                .replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+            let raw_path = response_dir.join(format!("{safe_code}-ST.json"));
+            let bytes = if raw_path.exists() {
+                std::fs::read(&raw_path).map_err(|error| format!("{}: {error}", raw_path.display()))
+            } else {
+                let result = self
+                    .client
+                    .get(format!("{EODHD_API}/v1.1/fundamentals/{}.ST", symbol.code))
+                    .query(&[("fmt", "json"), ("api_token", api_token)])
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .and_then(|response| response.bytes())
+                    .map_err(|error| format!("EODHD fundamentals {}.ST: {error}", symbol.code))
+                    .map(|bytes| bytes.to_vec());
+                if pause_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(pause_ms));
+                }
+                result.and_then(|bytes| {
+                    parse_eodhd_quarterly_fundamentals(symbol, &bytes)?;
+                    std::fs::write(&raw_path, &bytes)
+                        .map_err(|error| format!("{}: {error}", raw_path.display()))?;
+                    Ok(bytes)
+                })
+            };
+            match bytes.and_then(|bytes| parse_eodhd_quarterly_fundamentals(symbol, &bytes)) {
+                Ok(quarterly) if !quarterly.is_empty() => {
+                    histories.push(EodhdFundamentalHistory {
+                        symbol: symbol.clone(),
+                        quarterly,
+                    });
+                }
+                Ok(_) => {
+                    failures.insert(
+                        symbol.isin.clone(),
+                        "EODHD returned no causal quarterly filings".into(),
+                    );
+                }
+                Err(error) => {
+                    failures.insert(symbol.isin.clone(), error);
+                }
+            }
+            if (index + 1) % 25 == 0 || index + 1 == matched.len() {
+                eprintln!(
+                    "EODHD Stockholm fundamentals: {}/{}, {} histories, {} failures",
+                    index + 1,
+                    matched.len(),
+                    histories.len(),
+                    failures.len()
+                );
+            }
+        }
+        histories.sort_by(|left, right| left.symbol.isin.cmp(&right.symbol.isin));
+        let now = OffsetDateTime::now_utc();
+        let dataset = EodhdStockholmFundamentalDataset {
+            format_version: "eodhd-stockholm-quarterly-fundamentals-1".into(),
+            generated_at: now.to_string(),
+            provider: "EODHD licensed Fundamentals API v1.1".into(),
+            endpoint: "https://eodhd.com/api/v1.1/fundamentals/{ticker}.ST".into(),
+            exchange_code: "ST".into(),
+            operating_mic: "XSTO".into(),
+            universe_source: universe_path.to_string_lossy().into_owned(),
+            official_notice_source: official_notices_path.to_string_lossy().into_owned(),
+            raw_cache_dir: cache_dir.to_string_lossy().into_owned(),
+            pause_ms,
+            limitations: vec![
+                "Every accounting value is withheld until the provider filing_date; period-end dates are never used as availability dates".into(),
+                "Current Main Market securities are matched by checksum-valid ISIN. Inactive candidates additionally require an official Nasdaq Stockholm delisting notice".into(),
+                "Provider statement history can include later restatements. Using the row's filing_date is conservative but cannot reconstruct values that a provider overwrote without a revision archive".into(),
+                "Quarterly statement durations may be quarter-only or year-to-date depending on issuer reporting. Ratios and year-over-year comparisons must retain this limitation".into(),
+                "Official point-in-time Large/Mid/Small segment membership and terminal delisting outcomes remain separate required datasets".into(),
+            ],
+            provider_symbols: provider_symbols.len(),
+            target_isins: target_isins.len(),
+            matched_isins,
+            failures,
+            histories,
+        };
+        let snapshot_dir = root
+            .join("eodhd-stockholm-fundamentals")
+            .join("snapshots")
+            .join(format!("{}-{}", now.date(), now.unix_timestamp()));
+        std::fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
+        let dataset_path = snapshot_dir.join("quarterly-fundamentals.json");
+        write_json(&dataset_path, &dataset)?;
+        write_json(
+            &root
+                .join("eodhd-stockholm-fundamentals")
+                .join("latest-quarterly-fundamentals.json"),
+            &dataset,
+        )?;
+        Ok(EodhdStockholmFundamentalCollection {
+            dataset_path,
+            provider_symbols: dataset.provider_symbols,
+            target_isins: dataset.target_isins,
+            matched_isins: dataset.matched_isins,
+            histories: dataset.histories.len(),
+            quarterly_filings: dataset
+                .histories
+                .iter()
+                .map(|history| history.quarterly.len())
+                .sum(),
+            failures: dataset.failures.len(),
+        })
+    }
+
+    fn eodhd_symbol_list(
+        &self,
+        path: &Path,
+        api_token: &str,
+        delisted: bool,
+    ) -> Result<Vec<EodhdDelistedSymbol>, String> {
+        let bytes = if path.exists() {
+            std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?
+        } else {
+            let mut request = self
+                .client
+                .get(format!("{EODHD_API}/exchange-symbol-list/ST"))
+                .query(&[
+                    ("type", "common_stock"),
+                    ("fmt", "json"),
+                    ("api_token", api_token),
+                ]);
+            if delisted {
+                request = request.query(&[("delisted", "1")]);
+            }
+            let bytes = request
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .and_then(|response| response.bytes())
+                .map_err(|error| format!("EODHD Stockholm symbol list: {error}"))?
+                .to_vec();
+            parse_eodhd_symbols(&bytes)?;
+            std::fs::write(path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+            bytes
+        };
+        parse_eodhd_symbols(&bytes)
+    }
+
     fn xbrl_api_page(
         &self,
         cache_dir: &Path,
@@ -3946,6 +4211,58 @@ pub fn load_skv_equity_history_catalogue(path: &Path) -> Result<SkvEquityHistory
     read_json(path)
 }
 
+pub fn load_skv_listing_history(path: &Path) -> Result<SkvListingHistoryDataset, String> {
+    read_json(path)
+}
+
+/// Return the start of the current continuous Stockholm Main Market spell for
+/// each issuer key supported by Skatteverket's effective-dated history. An
+/// explicit delisting or move to First North/another venue resets an older
+/// admission; later share-class admissions do not shorten an uninterrupted
+/// issuer-level Main Market spell.
+pub fn skv_current_main_market_admission_dates(
+    dataset: &SkvListingHistoryDataset,
+) -> BTreeMap<String, Date> {
+    let mut by_issuer = BTreeMap::<String, Vec<&SkvListingHistoryRow>>::new();
+    for row in &dataset.rows {
+        let key = stockholm_security_issuer_key(&row.company_name);
+        if !key.is_empty() && row.effective_date.is_some() {
+            by_issuer.entry(key).or_default().push(row);
+        }
+    }
+    by_issuer
+        .into_iter()
+        .filter_map(|(issuer, mut rows)| {
+            rows.sort_by_key(|row| row.effective_date);
+            let last_exit = rows
+                .iter()
+                .filter(|row| {
+                    row.event_kind == SkvListingEventKind::Delisting
+                        || matches!(
+                            (row.event_kind, row.market_hint),
+                            (
+                                SkvListingEventKind::Listing | SkvListingEventKind::ListChange,
+                                SkvMarketHint::FirstNorth | SkvMarketHint::OtherSwedishVenue
+                            )
+                        )
+                })
+                .filter_map(|row| row.effective_date)
+                .max();
+            rows.into_iter()
+                .filter(|row| {
+                    matches!(
+                        row.event_kind,
+                        SkvListingEventKind::Listing | SkvListingEventKind::ListChange
+                    ) && row.market_hint == SkvMarketHint::StockholmMainMarket
+                })
+                .filter_map(|row| row.effective_date)
+                .filter(|date| last_exit.is_none_or(|exit| *date > exit))
+                .min()
+                .map(|date| (issuer, date))
+        })
+        .collect()
+}
+
 pub fn collect_skv_listing_history(
     root: &Path,
     catalogue: &SkvEquityHistoryCatalogue,
@@ -4090,7 +4407,36 @@ pub fn collect_eodhd_stockholm_delisted(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn collect_eodhd_stockholm_fundamentals(
+    root: &Path,
+    universe_path: &Path,
+    universe: &[Instrument],
+    official_notices_path: &Path,
+    official_notices: &NasdaqEquityNoticeDataset,
+    api_token: &str,
+    pause_ms: u64,
+    limit: usize,
+) -> Result<EodhdStockholmFundamentalCollection, String> {
+    PublicEquityData::new()?.collect_eodhd_stockholm_fundamentals(
+        root,
+        universe_path,
+        universe,
+        official_notices_path,
+        official_notices,
+        api_token,
+        pause_ms,
+        limit,
+    )
+}
+
 pub fn load_eodhd_stockholm_delisted(path: &Path) -> Result<EodhdStockholmDelistedDataset, String> {
+    read_json(path)
+}
+
+pub fn load_eodhd_stockholm_fundamentals(
+    path: &Path,
+) -> Result<EodhdStockholmFundamentalDataset, String> {
     read_json(path)
 }
 
@@ -5713,6 +6059,193 @@ fn parse_eodhd_bars(bytes: &[u8], start: Date, end: Date) -> Result<Vec<EodhdDai
     Ok(bars)
 }
 
+fn parse_eodhd_quarterly_fundamentals(
+    symbol: &EodhdDelistedSymbol,
+    bytes: &[u8],
+) -> Result<Vec<EodhdQuarterlyFundamental>, String> {
+    let root: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("EODHD fundamentals response: {error}"))?;
+    let response_isin = root
+        .pointer("/General/ISIN")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if response_isin != symbol.isin {
+        return Err(format!(
+            "EODHD fundamentals ISIN mismatch for {}.ST: expected {}, got {:?}",
+            symbol.code, symbol.isin, response_isin
+        ));
+    }
+    let mut by_period = BTreeMap::<Date, (Date, AnnualFundamentals)>::new();
+    for (statement, kind) in [
+        ("Income_Statement", "income"),
+        ("Balance_Sheet", "balance"),
+        ("Cash_Flow", "cash_flow"),
+    ] {
+        let Some(section) = root.pointer(&format!("/Financials/{statement}")) else {
+            continue;
+        };
+        let currency = section
+            .get("currency_symbol")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                value.len() == 3
+                    && value
+                        .chars()
+                        .all(|character| character.is_ascii_alphabetic())
+            })
+            .map(|value| format!("iso4217:{}", value.to_ascii_uppercase()));
+        let Some(rows) = section
+            .get("quarterly")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (key, row) in rows {
+            let period_end = row
+                .get("date")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(key);
+            let Ok(period_end) = parse_iso_date_prefix(period_end) else {
+                continue;
+            };
+            let Some(filing_date) = row
+                .get("filing_date")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| parse_iso_date_prefix(value).ok())
+                .filter(|date| *date > period_end)
+            else {
+                // Statement values without an actual publication boundary are
+                // unusable in a causal matrix and are intentionally dropped.
+                continue;
+            };
+            let (available, values) = by_period
+                .entry(period_end)
+                .or_insert_with(|| (filing_date, empty_annual_fundamentals()));
+            *available = (*available).max(filing_date);
+            if values.reporting_currency.is_none() {
+                values.reporting_currency.clone_from(&currency);
+            }
+            match kind {
+                "income" => {
+                    values.revenue = eodhd_number(row, &["totalRevenue", "revenue"]);
+                    values.operating_profit = eodhd_number(row, &["operatingIncome", "ebit"]);
+                    values.net_income = eodhd_number(row, &["netIncome"]);
+                    values.basic_eps = eodhd_number(row, &["eps", "dilutedEPS"]);
+                    values.weighted_average_shares = eodhd_number(
+                        row,
+                        &[
+                            "weightedAverageShsOutDil",
+                            "weightedAverageShsOut",
+                            "weightedAverageShares",
+                        ],
+                    );
+                }
+                "balance" => {
+                    values.assets = eodhd_number(row, &["totalAssets"]);
+                    values.equity =
+                        eodhd_number(row, &["totalStockholderEquity", "totalStockholdersEquity"]);
+                    values.cash = eodhd_number(
+                        row,
+                        &["cash", "cashAndShortTermInvestments", "cashAndEquivalents"],
+                    );
+                    values.current_assets = eodhd_number(row, &["totalCurrentAssets"]);
+                    values.current_liabilities = eodhd_number(row, &["totalCurrentLiabilities"]);
+                }
+                "cash_flow" => {
+                    values.operating_cash_flow = eodhd_number(
+                        row,
+                        &[
+                            "totalCashFromOperatingActivities",
+                            "cashFromOperatingActivities",
+                        ],
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    let mut filings = by_period
+        .into_iter()
+        .filter_map(|(report_period_end, (available_date, values))| {
+            (values.revenue.is_some()
+                || values.net_income.is_some()
+                || values.assets.is_some()
+                || values.operating_cash_flow.is_some())
+            .then_some(EodhdQuarterlyFundamental {
+                report_period_end,
+                available_date,
+                filing_key: format!("{}:{report_period_end}:{available_date}", symbol.isin),
+                values,
+            })
+        })
+        .collect::<Vec<_>>();
+    filings.sort_by_key(|filing| filing.report_period_end);
+    let snapshots = filings.clone();
+    for filing in &mut filings {
+        let prior = snapshots
+            .iter()
+            .filter(|candidate| {
+                let days = (filing.report_period_end - candidate.report_period_end).whole_days();
+                (300..=430).contains(&days)
+            })
+            .min_by_key(|candidate| {
+                ((filing.report_period_end - candidate.report_period_end).whole_days() - 365).abs()
+            });
+        if let Some(prior) = prior {
+            filing.values.prior_revenue = prior.values.revenue;
+            filing.values.prior_net_income = prior.values.net_income;
+            filing.values.prior_assets = prior.values.assets;
+            filing.values.prior_equity = prior.values.equity;
+        }
+    }
+    // Availability order is what the causal feature cursor consumes. A later
+    // restatement of an old period must not displace a newer report until its
+    // own filing date is reached.
+    filings.sort_by(|left, right| {
+        left.available_date
+            .cmp(&right.available_date)
+            .then_with(|| left.report_period_end.cmp(&right.report_period_end))
+            .then_with(|| left.filing_key.cmp(&right.filing_key))
+    });
+    Ok(filings)
+}
+
+fn empty_annual_fundamentals() -> AnnualFundamentals {
+    AnnualFundamentals {
+        reporting_currency: None,
+        revenue: None,
+        prior_revenue: None,
+        operating_profit: None,
+        net_income: None,
+        prior_net_income: None,
+        assets: None,
+        prior_assets: None,
+        equity: None,
+        prior_equity: None,
+        cash: None,
+        operating_cash_flow: None,
+        current_assets: None,
+        current_liabilities: None,
+        basic_eps: None,
+        weighted_average_shares: None,
+    }
+}
+
+fn eodhd_number(row: &serde_json::Value, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        let value = row.get(*name)?;
+        let parsed = match value {
+            serde_json::Value::Number(number) => number.as_f64(),
+            serde_json::Value::String(value) => value.trim().parse::<f64>().ok(),
+            _ => None,
+        }?;
+        parsed.is_finite().then_some(parsed)
+    })
+}
+
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
@@ -5832,6 +6365,62 @@ mod tests {
         assert_eq!(rows[1].market_hint, SkvMarketHint::StockholmMainMarket);
         assert_eq!(rows[2].event_kind, SkvListingEventKind::Listing);
         assert_eq!(rows[2].effective_date.unwrap().to_string(), "1999-11-04");
+    }
+
+    #[test]
+    fn current_main_market_spell_starts_after_an_explicit_venue_exit() {
+        let row = |date: &str, event_kind, market_hint| SkvListingHistoryRow {
+            company_name: "Example AB".into(),
+            source_url: "fixture".into(),
+            year: None,
+            effective_date: Some(
+                Date::parse(
+                    date,
+                    &time::macros::format_description!("[year]-[month]-[day]"),
+                )
+                .unwrap(),
+            ),
+            comment: "fixture".into(),
+            event_kind,
+            market_hint,
+        };
+        let dataset = SkvListingHistoryDataset {
+            format_version: "fixture".into(),
+            generated_at: "fixture".into(),
+            source_catalogue: "fixture".into(),
+            raw_cache_dir: "fixture".into(),
+            pause_ms: 0,
+            companies_requested: 1,
+            companies_archived: 1,
+            failures: BTreeMap::new(),
+            limitations: Vec::new(),
+            rows: vec![
+                row(
+                    "2010-01-01",
+                    SkvListingEventKind::Listing,
+                    SkvMarketHint::StockholmMainMarket,
+                ),
+                row(
+                    "2015-01-01",
+                    SkvListingEventKind::Listing,
+                    SkvMarketHint::FirstNorth,
+                ),
+                row(
+                    "2020-01-01",
+                    SkvListingEventKind::Listing,
+                    SkvMarketHint::StockholmMainMarket,
+                ),
+                row(
+                    "2022-01-01",
+                    SkvListingEventKind::Listing,
+                    SkvMarketHint::StockholmMainMarket,
+                ),
+            ],
+        };
+        assert_eq!(
+            skv_current_main_market_admission_dates(&dataset)["example"].to_string(),
+            "2020-01-01"
+        );
     }
 
     #[test]
@@ -6168,5 +6757,47 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].date.to_string(), "2022-12-29");
         assert_eq!(bars[0].adjusted_close, 114.9);
+    }
+
+    #[test]
+    fn parses_eodhd_quarterly_fundamentals_only_at_filing_date() {
+        let symbol = EodhdDelistedSymbol {
+            code: "TEST".into(),
+            name: "Test AB".into(),
+            exchange: "ST".into(),
+            currency: "SEK".into(),
+            security_type: "Common Stock".into(),
+            isin: "SE0015812219".into(),
+        };
+        let bytes = br#"{
+          "General":{"ISIN":"SE0015812219"},
+          "Financials":{
+            "Income_Statement":{"currency_symbol":"SEK","quarterly":{
+              "2023-03-31":{"date":"2023-03-31","filing_date":"2023-04-28","totalRevenue":"100","operatingIncome":"10","netIncome":"8","eps":"0.8","weightedAverageShsOut":"10"},
+              "2024-03-31":{"date":"2024-03-31","filing_date":"2024-04-26","totalRevenue":"120","operatingIncome":"15","netIncome":"12","eps":"1.2","weightedAverageShsOut":"10"},
+              "2024-06-30":{"date":"2024-06-30","filing_date":"0000-00-00","totalRevenue":"130"}
+            }},
+            "Balance_Sheet":{"currency_symbol":"SEK","quarterly":{
+              "2023-03-31":{"date":"2023-03-31","filing_date":"2023-04-28","totalAssets":"200","totalStockholderEquity":"80"},
+              "2024-03-31":{"date":"2024-03-31","filing_date":"2024-04-29","totalAssets":"240","totalStockholderEquity":"100","cash":"30","totalCurrentAssets":"90","totalCurrentLiabilities":"45"}
+            }},
+            "Cash_Flow":{"currency_symbol":"SEK","quarterly":{
+              "2024-03-31":{"date":"2024-03-31","filing_date":"2024-04-26","totalCashFromOperatingActivities":"18"}
+            }}
+          }
+        }"#;
+        let filings = parse_eodhd_quarterly_fundamentals(&symbol, bytes).unwrap();
+        assert_eq!(filings.len(), 2);
+        let latest = filings.last().unwrap();
+        assert_eq!(latest.report_period_end.to_string(), "2024-03-31");
+        assert_eq!(latest.available_date.to_string(), "2024-04-29");
+        assert_eq!(
+            latest.values.reporting_currency.as_deref(),
+            Some("iso4217:SEK")
+        );
+        assert_eq!(latest.values.revenue, Some(120.0));
+        assert_eq!(latest.values.prior_revenue, Some(100.0));
+        assert_eq!(latest.values.prior_assets, Some(200.0));
+        assert_eq!(latest.values.operating_cash_flow, Some(18.0));
     }
 }

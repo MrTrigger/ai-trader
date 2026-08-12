@@ -3,6 +3,7 @@ from datetime import date
 
 import pytest
 
+from blend_stockholm_models import blend_documents
 from train_stockholm import fit_ridge, load_matrix
 
 
@@ -123,3 +124,43 @@ def test_weighted_ridge_exports_intercept_and_coefficients():
     assert intercept == pytest.approx(0.25)
     assert coefficients[0] == pytest.approx(0.5)
     assert coefficients[1] == pytest.approx(0.0)
+
+
+def test_model_blend_remaps_features_and_scales_leaf_values():
+    def document(features, split_feature):
+        return {
+            "format_version": "stockholm-model-json-2",
+            "model_version": "stockholm-ranker-1",
+            "feature_set_version": f"fs-{len(features)}",
+            "label_version": "forward-adjusted-open-20-v1",
+            "trained_through": "2024-01-01",
+            "survivorship_status": "SURVIVORSHIP_CONTAMINATED",
+            "model_family": "lightgbm",
+            "reward": "absolute_return",
+            "objective": "l2",
+            "target_clip": [-0.2, 0.2],
+            "reward_scale": None,
+            "calibration": None,
+            "features": features,
+            "tree_info": [
+                {
+                    "tree_index": 0,
+                    "tree_structure": {
+                        "split_feature": split_feature,
+                        "left_child": {"leaf_value": 2.0},
+                        "right_child": {"leaf_value": -2.0},
+                    },
+                }
+            ],
+        }
+
+    lean = document(["b"], 0)
+    rich = document(["a", "b"], 0)
+    result = blend_documents(
+        [lean, rich], ["a" * 64, "b" * 64], [0.5, 0.5], 1
+    )
+    assert result["features"] == ["a", "b"]
+    assert result["tree_info"][0]["tree_structure"]["split_feature"] == 1
+    assert result["tree_info"][1]["tree_structure"]["split_feature"] == 0
+    assert result["tree_info"][0]["tree_structure"]["left_child"]["leaf_value"] == 1.0
+    assert [tree["tree_index"] for tree in result["tree_info"]] == [0, 1]

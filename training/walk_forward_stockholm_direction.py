@@ -86,6 +86,10 @@ def main() -> None:
     parser.add_argument("--end", type=date.fromisoformat, required=True)
     parser.add_argument("--folds", type=int, default=6)
     parser.add_argument("--clip-quantile", type=float, default=0.01)
+    parser.add_argument("--objective", choices=("l2", "l1", "huber"), default="l2")
+    parser.add_argument(
+        "--reward", choices=("absolute_return", "direction_sign"), default="absolute_return"
+    )
     parser.add_argument("--max-gross", type=float, default=1.0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -102,6 +106,8 @@ def main() -> None:
         "matrix": str(args.matrix),
         "horizon_sessions": horizon,
         "clip_quantile": args.clip_quantile,
+        "objective": args.objective,
+        "reward": args.reward,
         "max_gross": args.max_gross,
         "folds": [
             {
@@ -130,6 +136,10 @@ def main() -> None:
                 str(model),
                 "--clip-quantile",
                 str(args.clip_quantile),
+                "--objective",
+                args.objective,
+                "--reward",
+                args.reward,
             ]
         )
         run(

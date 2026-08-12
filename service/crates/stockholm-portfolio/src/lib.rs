@@ -18,6 +18,18 @@ pub const MODEL_VERSION: &str = "stockholm-ranker-1";
 pub const DIRECTION_FORMAT_VERSION: &str = "stockholm-direction-model-json-1";
 pub const DIRECTION_MODEL_VERSION: &str = "stockholm-direction-model-1";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionComposition {
+    /// Consume the stock model in the return space declared by its reward.
+    #[default]
+    Direct,
+    /// Preserve an absolute model's cross-sectional ordering, remove its
+    /// same-date equal-weight market component, and add a separately fitted
+    /// causal OMXSGI forecast before choosing a side.
+    CrossSectionalResidualPlusMarket,
+}
+
 fn default_model_family() -> String {
     "lightgbm".into()
 }
@@ -28,6 +40,10 @@ fn default_reward() -> String {
 
 fn default_objective() -> String {
     "l1".into()
+}
+
+fn default_direction_objective() -> String {
+    "l2".into()
 }
 
 fn default_ensemble_seeds() -> usize {
@@ -72,8 +88,38 @@ pub struct Model {
     pub tree_blend_weight: Option<f64>,
     #[serde(default)]
     pub tree_info: Vec<lightgbm_json::Tree>,
+    /// Purged time-prefix calibration from raw model return units to a
+    /// conservative expected return consumed by portfolio construction.
+    #[serde(default)]
+    pub calibration: Option<PredictionCalibration>,
+    /// Frozen source artefacts whose already-fitted predictions were averaged
+    /// into this tree ensemble. Empty for an ordinary single fit.
+    #[serde(default)]
+    pub blend_components: Vec<ModelBlendComponent>,
     #[serde(skip)]
     pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBlendComponent {
+    pub sha256: String,
+    pub feature_set_version: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionCalibration {
+    pub method: String,
+    #[serde(with = "date_serde")]
+    pub start: Date,
+    #[serde(with = "date_serde")]
+    pub end: Date,
+    pub observations: usize,
+    pub intercept: f64,
+    pub slope: f64,
+    pub residual_standard_deviation: f64,
 }
 
 impl Model {
@@ -180,10 +226,46 @@ impl Model {
         match (model.reward.as_str(), model.reward_scale) {
             ("relative_rank", Some(scale)) if scale.is_finite() && scale > 0.0 => {}
             ("relative_rank", _) => {
-                return Err("relative-rank model lacks a positive reward scale".into())
+                return Err("relative-rank model lacks a positive reward scale".into());
             }
             (_, Some(_)) => return Err("non-rank model unexpectedly has a reward scale".into()),
             (_, None) => {}
+        }
+        if let Some(calibration) = &model.calibration {
+            if calibration.method != "purged_oos_affine_shrinkage_v1"
+                || calibration.start > calibration.end
+                || calibration.end > model.trained_through
+                || calibration.observations == 0
+                || !calibration.intercept.is_finite()
+                || !calibration.slope.is_finite()
+                || !(0.0..=1.0).contains(&calibration.slope)
+                || !calibration.residual_standard_deviation.is_finite()
+                || calibration.residual_standard_deviation < 0.0
+            {
+                return Err("model prediction calibration is invalid".into());
+            }
+        }
+        if !model.blend_components.is_empty() {
+            let total_weight = model
+                .blend_components
+                .iter()
+                .map(|component| component.weight)
+                .sum::<f64>();
+            if model.blend_components.len() < 2
+                || (total_weight - 1.0).abs() > 1e-12
+                || model.blend_components.iter().any(|component| {
+                    component.sha256.len() != 64
+                        || !component
+                            .sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        || component.feature_set_version.is_empty()
+                        || !component.weight.is_finite()
+                        || component.weight <= 0.0
+                })
+            {
+                return Err("model blend provenance is invalid".into());
+            }
         }
         model.model_id = format!("{:x}", Sha256::digest(&bytes))[..16].to_owned();
         Ok(model)
@@ -233,7 +315,7 @@ impl Model {
             }
             other => return Err(format!("unsupported Stockholm model family {other:?}")),
         };
-        match self.reward.as_str() {
+        let return_prediction = match self.reward.as_str() {
             "absolute_return" => Ok(score),
             "return_per_risk" | "relative_return_per_risk" => Ok(score * row.vol60),
             "relative_return" => Ok(score),
@@ -242,7 +324,13 @@ impl Model {
                     .reward_scale
                     .expect("validated relative-rank reward scale")),
             _ => Err(format!("unsupported Stockholm reward {:?}", self.reward)),
-        }
+        }?;
+        Ok(self
+            .calibration
+            .as_ref()
+            .map_or(return_prediction, |calibration| {
+                calibration.intercept + calibration.slope * return_prediction
+            }))
     }
 
     fn diagnostic_target(&self, row: &TrainingRow) -> Result<f64, String> {
@@ -277,6 +365,8 @@ pub struct DirectionModel {
     pub n_dates: usize,
     pub features: Vec<String>,
     pub model_family: String,
+    #[serde(default = "default_reward")]
+    pub reward: String,
     pub objective: String,
     pub target_clip: Option<[f64; 2]>,
     /// Fixed conversion from predicted horizon return to the policy's bounded
@@ -304,9 +394,16 @@ impl DirectionModel {
         {
             return Err("unsupported Stockholm direction model format or version".into());
         }
-        if model.feature_set_version != features_stockholm::DIRECTION_FEATURE_SET_VERSION
-            || model.features != features_stockholm::direction_model_feature_names()
-        {
+        let expected = match model.feature_set_version.as_str() {
+            features_stockholm::DIRECTION_FEATURE_SET_VERSION => {
+                features_stockholm::direction_model_feature_names()
+            }
+            features_stockholm::DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION => {
+                features_stockholm::direction_global_risk_model_feature_names()
+            }
+            _ => return Err("unsupported direction model feature-set version".into()),
+        };
+        if model.features != expected {
             return Err("direction model feature contract differs from Rust".into());
         }
         if features_stockholm::direction_label_horizon(&model.label_version).is_none() {
@@ -315,8 +412,13 @@ impl DirectionModel {
                 model.label_version
             ));
         }
-        if model.model_family != "lightgbm" || model.objective != "l2" {
-            return Err("direction model must use the declared LightGBM/L2 baseline".into());
+        if model.model_family != "lightgbm"
+            || !matches!(model.objective.as_str(), "l2" | "l1" | "huber")
+        {
+            return Err("direction model must use a supported LightGBM objective".into());
+        }
+        if !matches!(model.reward.as_str(), "absolute_return" | "direction_sign") {
+            return Err("direction model has an unsupported reward".into());
         }
         if model.tree_info.is_empty() {
             return Err("direction model contains no trees".into());
@@ -350,13 +452,24 @@ impl DirectionModel {
                     .ok_or_else(|| format!("direction row lacks model feature {name:?}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let predicted_return = lightgbm_json::predict(&self.tree_info, &values)?;
+        let raw_prediction = lightgbm_json::predict(&self.tree_info, &values)?;
+        let (predicted_return, score) = match self.reward.as_str() {
+            "absolute_return" => (
+                raw_prediction,
+                (raw_prediction / self.score_scale).clamp(-1.0, 1.0),
+            ),
+            "direction_sign" => (
+                raw_prediction.clamp(-1.0, 1.0) * self.score_scale,
+                raw_prediction.clamp(-1.0, 1.0),
+            ),
+            _ => unreachable!("reward validated on load"),
+        };
         if !predicted_return.is_finite() {
             return Err("direction model produced a non-finite forecast".into());
         }
         Ok(DirectionPrediction {
             predicted_return,
-            score: (predicted_return / self.score_scale).clamp(-1.0, 1.0),
+            score,
         })
     }
 }
@@ -365,6 +478,9 @@ fn expected_features(version: &str) -> Result<Vec<String>, String> {
     match version {
         features_stockholm::BASELINE_FEATURE_SET_VERSION => {
             Ok(features_stockholm::baseline_model_feature_names())
+        }
+        features_stockholm::BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION => {
+            Ok(features_stockholm::baseline_global_risk_model_feature_names())
         }
         features_stockholm::FEATURE_SET_VERSION => Ok(features_stockholm::model_feature_names()),
         features_stockholm::RESIDUAL_FEATURE_SET_VERSION => {
@@ -381,6 +497,9 @@ fn expected_features(version: &str) -> Result<Vec<String>, String> {
         }
         features_stockholm::FUNDAMENTAL_FEATURE_SET_VERSION => {
             Ok(features_stockholm::fundamental_model_feature_names())
+        }
+        features_stockholm::QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION => {
+            Ok(features_stockholm::quarterly_fundamental_model_feature_names())
         }
         features_stockholm::PDMR_MACRO_FEATURE_SET_VERSION => {
             Ok(features_stockholm::pdmr_macro_model_feature_names())
@@ -552,8 +671,19 @@ pub struct PositionResult {
     pub instrument_id: String,
     pub symbol: String,
     pub bucket: UniverseBucket,
+    #[serde(default)]
+    pub sector: String,
     pub direction: Direction,
+    /// Expected absolute stock return used for the economic hurdle and side.
     pub predicted_return: f64,
+    /// Stock-selection model output before adding the market forecast. For an
+    /// absolute-return model this is absent because `predicted_return` already
+    /// has the required meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_prediction: Option<f64>,
+    /// Causal OMXSGI horizon-return forecast added to a relative prediction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_return_prediction: Option<f64>,
     pub net_edge: f64,
     pub realised_return: f64,
     pub weight: f64,
@@ -576,6 +706,10 @@ pub struct Step {
     pub allocation: Option<portfolio_construction::AllocationDiagnostics>,
     #[serde(default)]
     pub direction: Option<DirectionAttribution>,
+    /// Causal absolute OMXSGI forecast used to translate a relative stock
+    /// forecast into an absolute expected return on this decision date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_return_prediction: Option<f64>,
     /// Standalone gross return of the direction layer's smoothed target net
     /// applied to OMXSGI over this holding period. Execution costs are absent
     /// and disclosed in `DirectionLayerMetrics`.
@@ -616,6 +750,102 @@ pub struct DirectionLayerMetrics {
     pub down_periods: usize,
     pub strong_down_periods: usize,
     pub cost_status: String,
+}
+
+/// Research-only isolation of the cross-sectional stock-selection signal.
+/// This deliberately holds equal long and short sleeves so market direction
+/// cannot hide whether the ordering itself adds value. It is never used as a
+/// portfolio budget or live target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionLayerMetrics {
+    pub periods: usize,
+    pub total_return: f64,
+    pub annualised_return: f64,
+    pub annualised_volatility: f64,
+    pub sharpe: f64,
+    pub max_drawdown: f64,
+    pub positive_periods: usize,
+    pub gross_return_before_costs: f64,
+    pub cost_drag: f64,
+    pub positions_per_side: usize,
+    pub construction: String,
+    pub steps: Vec<SelectionLayerStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionLayerStep {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub gross_return_before_costs: f64,
+    pub cost_drag: f64,
+    pub net_return: f64,
+    pub turnover: f64,
+    pub long_positions: usize,
+    pub short_positions: usize,
+}
+
+/// Costed acceptance control for the canonical adjusted-price 12-1 momentum
+/// signal. This is deliberately separate from the fitted model contract: it
+/// answers whether the research stack can beat a simple, predeclared rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixedMomentumBacktestResult {
+    pub kind: String,
+    pub signal: String,
+    pub survivorship_status: String,
+    #[serde(with = "date_serde")]
+    pub start: Date,
+    #[serde(with = "date_serde")]
+    pub end: Date,
+    pub cadence_sessions: usize,
+    pub max_positions: usize,
+    pub position_weight: f64,
+    pub costs: CostConfig,
+    pub directional: FixedMomentumPerformance,
+    pub long_only: FixedMomentumPerformance,
+    pub long_short_diagnostic: FixedMomentumPerformance,
+    pub disclosures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixedMomentumPerformance {
+    pub construction: String,
+    pub metrics: Metrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<BenchmarkComparison>,
+    pub steps: Vec<FixedMomentumStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixedMomentumStep {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub nav: f64,
+    pub gross_return_before_costs: f64,
+    pub cost_drag: f64,
+    pub net_return: f64,
+    pub turnover: f64,
+    pub gross: f64,
+    pub net: f64,
+    pub long_pnl: f64,
+    pub short_pnl: f64,
+    pub long_positions: usize,
+    pub short_positions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_period_return: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedMomentumConfig {
+    pub start: Date,
+    pub end: Date,
+    pub cadence_sessions: usize,
+    pub max_positions: usize,
+    /// Fixed maximum per-name weight. Missing signals remain cash; surviving
+    /// names are never scaled up to fill a sleeve or gross-exposure quota.
+    pub position_weight: f64,
+    pub costs: CostConfig,
+    pub benchmark: Option<BenchmarkHistory>,
+    pub survivorship_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +893,10 @@ pub struct DirectionBacktestResult {
     pub model_id: String,
     pub feature_set_version: String,
     pub label_version: String,
+    #[serde(default = "default_reward")]
+    pub reward: String,
+    #[serde(default = "default_direction_objective")]
+    pub objective: String,
     #[serde(with = "date_serde")]
     pub trained_through: Date,
     #[serde(with = "date_serde")]
@@ -695,6 +929,8 @@ pub struct DirectionWalkForwardSummary {
     pub model_ids: Vec<String>,
     pub feature_set_version: String,
     pub label_version: String,
+    pub reward: String,
+    pub objective: String,
     #[serde(with = "date_serde")]
     pub start: Date,
     #[serde(with = "date_serde")]
@@ -728,7 +964,7 @@ pub fn direction_backtest(
     let cadence = features_stockholm::direction_label_horizon(&model.label_version)
         .ok_or("direction model has an invalid label horizon")?;
     let trained_model = evaluate_direction_strategy(
-        "trained_absolute_return_model",
+        &format!("trained_{}_model", model.reward),
         rows,
         start,
         end,
@@ -760,6 +996,8 @@ pub fn direction_backtest(
         model_id: model.model_id.clone(),
         feature_set_version: model.feature_set_version.clone(),
         label_version: model.label_version.clone(),
+        reward: model.reward.clone(),
+        objective: model.objective.clone(),
         trained_through: model.trained_through,
         start,
         end,
@@ -788,6 +1026,8 @@ pub fn summarize_direction_folds(
     for report in &reports {
         if report.feature_set_version != first.feature_set_version
             || report.label_version != first.label_version
+            || report.reward != first.reward
+            || report.objective != first.objective
             || report.cadence_sessions != first.cadence_sessions
             || report.config != first.config
         {
@@ -835,12 +1075,14 @@ pub fn summarize_direction_folds(
             .collect(),
         feature_set_version: first.feature_set_version.clone(),
         label_version: first.label_version.clone(),
+        reward: first.reward.clone(),
+        objective: first.objective.clone(),
         start: first.start,
         end: reports.last().expect("non-empty reports").end,
         cadence_sessions: first.cadence_sessions,
         config: first.config,
         trained_model: direction_evaluation_from_steps(
-            "trained_absolute_return_model",
+            &format!("trained_{}_model", first.reward),
             trained_steps,
             first.cadence_sessions,
         ),
@@ -1120,12 +1362,27 @@ pub struct BacktestResult {
     pub target_clip: Option<[f64; 2]>,
     #[serde(default)]
     pub reward_scale: Option<f64>,
+    #[serde(default)]
+    pub calibration: Option<PredictionCalibration>,
+    #[serde(default)]
+    pub prediction_composition: PredictionComposition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blend_components: Vec<ModelBlendComponent>,
     pub survivorship_status: String,
     #[serde(with = "date_serde")]
     pub start: Date,
     #[serde(with = "date_serde")]
     pub end: Date,
     pub cadence_sessions: usize,
+    /// Horizon encoded by the fitted model's label contract. This normally
+    /// equals `cadence_sessions`; a shorter value is allowed only by an
+    /// explicit multi-session forecast aggregation experiment.
+    #[serde(default)]
+    pub model_horizon_sessions: usize,
+    /// Fixed conversion from the model-horizon return forecast to the holding
+    /// horizon. One preserves the ordinary same-horizon contract.
+    #[serde(default = "default_prediction_horizon_scale")]
+    pub prediction_horizon_scale: f64,
     #[serde(default)]
     pub ranking: portfolio_construction::RankingMethod,
     #[serde(default)]
@@ -1140,16 +1397,27 @@ pub struct BacktestResult {
     pub min_position_weight: f64,
     #[serde(default)]
     pub direction_config: Option<portfolio_construction::DirectionConfig>,
+    /// Separate absolute-market model used to compose relative stock forecasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_forecast_model_id: Option<String>,
     /// Maximum absolute single-name weight. Retained under its original field
     /// name so frozen v1 reports remain readable.
     pub position_weight: f64,
     pub max_positions: usize,
+    /// Incumbents may remain while still inside this overall rank. Equal to
+    /// `max_positions` disables the hold buffer.
+    #[serde(default)]
+    pub retention_rank: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sector_gross: Option<f64>,
     pub costs: CostConfig,
     pub metrics: Metrics,
     #[serde(default)]
     pub diagnostics: Option<PredictionDiagnostics>,
     #[serde(default)]
     pub direction_metrics: Option<DirectionLayerMetrics>,
+    #[serde(default)]
+    pub selection_layer: Option<SelectionLayerMetrics>,
     #[serde(default)]
     pub benchmark: Option<BenchmarkComparison>,
     #[serde(default)]
@@ -1172,12 +1440,25 @@ fn default_reference_volatility() -> f64 {
     0.02
 }
 
+fn default_prediction_horizon_scale() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
     pub start: Date,
     pub end: Date,
     pub cadence_sessions: usize,
+    /// Horizon represented by `Model::predict`. Portfolio P&L always comes
+    /// from matrix labels spanning `cadence_sessions`.
+    pub model_horizon_sessions: usize,
+    /// Predeclared conversion from model-horizon expected return to expected
+    /// return over `cadence_sessions`. This affects economic hurdles and
+    /// reported predictions, never realised labels.
+    pub prediction_horizon_scale: f64,
     pub max_positions: usize,
+    pub retention_rank: usize,
+    pub max_sector_gross: Option<f64>,
     pub ranking: portfolio_construction::RankingMethod,
     pub sizing: portfolio_construction::SizingMethod,
     pub allocation_budget: portfolio_construction::Budget,
@@ -1190,6 +1471,11 @@ pub struct BacktestConfig {
     pub reference_edge: f64,
     pub reference_volatility: f64,
     pub direction_config: Option<portfolio_construction::DirectionConfig>,
+    pub prediction_composition: PredictionComposition,
+    /// Causal expected OMXSGI horizon return by decision date. Relative-return
+    /// stock models and explicit residual composition require this.
+    pub market_return_forecasts: Option<BTreeMap<Date, f64>>,
+    pub market_forecast_model_id: Option<String>,
     pub costs: CostConfig,
     pub benchmark: Option<BenchmarkHistory>,
 }
@@ -1198,7 +1484,9 @@ pub struct BacktestConfig {
 struct Candidate<'a> {
     row: &'a TrainingRow,
     direction: Direction,
-    prediction: f64,
+    absolute_prediction: f64,
+    relative_prediction: Option<f64>,
+    market_return_prediction: Option<f64>,
     edge: f64,
     execution_cost: ExecutionCost,
 }
@@ -1212,13 +1500,34 @@ pub fn backtest(
     let end = config.end;
     let cadence_sessions = config.cadence_sessions;
     let max_positions = config.max_positions;
+    let retention_rank = config.retention_rank;
+    let max_sector_gross = config.max_sector_gross;
     let ranking = config.ranking;
     let sizing = config.sizing;
     let fallback_budget = config.allocation_budget;
     let position_weight = config.position_weight;
     let costs = config.costs.clone();
+    let relative_reward = matches!(
+        model.reward.as_str(),
+        "relative_return" | "relative_return_per_risk" | "relative_rank"
+    );
+    let residual_composition =
+        config.prediction_composition == PredictionComposition::CrossSectionalResidualPlusMarket;
+    let uses_market_forecast = relative_reward || residual_composition;
     if cadence_sessions == 0 || max_positions == 0 {
         return Err("cadence and max positions must be positive".into());
+    }
+    if config.model_horizon_sessions == 0
+        || !config.prediction_horizon_scale.is_finite()
+        || config.prediction_horizon_scale <= 0.0
+    {
+        return Err("model horizon and prediction horizon scale must be positive".into());
+    }
+    if retention_rank < max_positions {
+        return Err("retention rank must be at least max positions".into());
+    }
+    if max_sector_gross.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err("maximum sector gross must be finite and positive".into());
     }
     if !position_weight.is_finite() || position_weight <= 0.0 || position_weight > 1.0 {
         return Err("maximum position weight must be finite and in (0, 1]".into());
@@ -1230,12 +1539,36 @@ pub fn backtest(
             return Err("direction overlay requires benchmark history".into());
         }
     }
-    if matches!(
-        model.reward.as_str(),
-        "relative_return" | "relative_return_per_risk" | "relative_rank"
-    ) && config.direction_config.is_none()
+    if residual_composition && relative_reward {
+        return Err(
+            "cross-sectional residual composition requires an absolute-return stock model".into(),
+        );
+    }
+    if uses_market_forecast {
+        if config.direction_config.is_none() {
+            return Err("market-forecast composition requires an explicit direction layer".into());
+        }
+        if config.market_return_forecasts.is_none()
+            || config
+                .market_forecast_model_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(
+                "market-forecast composition requires a separate causal market-return forecast"
+                    .into(),
+            );
+        }
+    } else if config.market_return_forecasts.is_some() || config.market_forecast_model_id.is_some()
     {
-        return Err("relative-return selection requires an explicit direction layer".into());
+        return Err("absolute-return selection must not add a market-return forecast".into());
+    }
+    if config
+        .market_return_forecasts
+        .as_ref()
+        .is_some_and(|forecasts| forecasts.values().any(|value| !value.is_finite()))
+    {
+        return Err("market-return forecasts must be finite".into());
     }
     let mut by_date: BTreeMap<Date, Vec<&TrainingRow>> = BTreeMap::new();
     for row in rows {
@@ -1294,19 +1627,61 @@ pub fn backtest(
             .as_ref()
             .map(|attribution| attribution.decision.budget)
             .unwrap_or(fallback_budget);
+        let market_return_prediction = if uses_market_forecast {
+            Some(
+                config
+                    .market_return_forecasts
+                    .as_ref()
+                    .expect("relative forecast map validated")
+                    .get(&date)
+                    .copied()
+                    .ok_or_else(|| format!("market-return forecast is missing on {date}"))?,
+            )
+        } else {
+            None
+        };
         let mut candidates = Vec::new();
         let mut diagnostic_block = Vec::with_capacity(by_date[&date].len());
-        for row in &by_date[&date] {
-            let prediction = model.predict(row)?;
-            diagnostic_block.push((prediction, model.diagnostic_target(row)?));
+        let raw_predictions = by_date[&date]
+            .iter()
+            .map(|row| Ok((*row, model.predict(row)? * config.prediction_horizon_scale)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let prediction_center = if residual_composition {
+            raw_predictions
+                .iter()
+                .map(|(_, prediction)| *prediction)
+                .sum::<f64>()
+                / raw_predictions.len() as f64
+        } else {
+            0.0
+        };
+        for (row, raw_prediction) in raw_predictions {
+            let selection_prediction = raw_prediction - prediction_center;
+            let diagnostic_target = if residual_composition {
+                row.relative_target.ok_or_else(|| {
+                    format!(
+                        "matrix row {} on {} lacks its Rust relative target",
+                        row.instrument_id, row.date
+                    )
+                })?
+            } else {
+                model.diagnostic_target(row)?
+            };
+            diagnostic_block.push((selection_prediction, diagnostic_target));
+            // Relative cross-sectional scores only describe performance versus
+            // OMXSGI. Their sign cannot determine an absolute BUY/SELL side.
+            // Compose the separately trained market forecast first, then apply
+            // execution and borrow hurdles to the resulting stock forecast.
+            let absolute_prediction =
+                selection_prediction + market_return_prediction.unwrap_or(0.0);
             let execution_cost = execution_cost(row, &costs)?;
             let long_cost = execution_cost.total_bps() / 10_000.0;
             let borrow_cost = holding_borrow_cost(row, cadence_sessions, &costs)?;
             let short_cost = (execution_cost.total_bps() + costs.short_availability_bps) / 10_000.0
                 + borrow_cost;
             let margin = costs.safety_margin_bps / 10_000.0;
-            let long_edge = prediction - long_cost - margin;
-            let short_edge = -prediction - short_cost - margin;
+            let long_edge = absolute_prediction - long_cost - margin;
+            let short_edge = -absolute_prediction - short_cost - margin;
             let (direction, edge) = if long_edge >= short_edge {
                 (Direction::Long, long_edge)
             } else {
@@ -1316,7 +1691,9 @@ pub fn backtest(
                 candidates.push(Candidate {
                     row,
                     direction,
-                    prediction,
+                    absolute_prediction,
+                    relative_prediction: uses_market_forecast.then_some(selection_prediction),
+                    market_return_prediction,
                     edge,
                     execution_cost,
                 });
@@ -1347,14 +1724,32 @@ pub fn backtest(
                 volatility: candidate.row.vol60,
             })
             .collect::<Vec<_>>();
-        let ranked = portfolio_construction::ranked_ids(&construction_candidates, ranking)?;
+        let incumbents = previous
+            .iter()
+            .filter_map(|(id, (weight, _, _))| {
+                ((*weight).abs() > f64::EPSILON).then_some((
+                    id.clone(),
+                    if *weight > 0.0 {
+                        portfolio_construction::Direction::Long
+                    } else {
+                        portfolio_construction::Direction::Short
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let ranked = portfolio_construction::buffered_ranked_ids(
+            &construction_candidates,
+            ranking,
+            &incumbents,
+            max_positions,
+            retention_rank,
+        )?;
         let mut by_id = candidates
             .into_iter()
             .map(|candidate| (candidate.row.instrument_id.clone(), candidate))
             .collect::<BTreeMap<_, _>>();
         let candidates = ranked
             .into_iter()
-            .take(max_positions)
             .map(|id| by_id.remove(&id).expect("ranked candidate exists"))
             .collect::<Vec<_>>();
         let selected = candidates
@@ -1380,7 +1775,25 @@ pub fn backtest(
                 reference_volatility: config.reference_volatility,
             },
         )?;
-        let allocation = portfolio_construction::allocate(&proposals, allocation_budget)?;
+        let groups = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.row.instrument_id.clone(),
+                    candidate.row.sector.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let allocation = if let Some(maximum) = max_sector_gross {
+            portfolio_construction::allocate_with_group_cap(
+                &proposals,
+                allocation_budget,
+                &groups,
+                maximum,
+            )?
+        } else {
+            portfolio_construction::allocate(&proposals, allocation_budget)?
+        };
         let weights = &allocation.weights;
         let target: BTreeMap<_, _> = candidates
             .iter()
@@ -1497,8 +1910,11 @@ pub fn backtest(
                 instrument_id: candidate.row.instrument_id.clone(),
                 symbol: candidate.row.symbol.clone(),
                 bucket: candidate.row.bucket.clone(),
+                sector: candidate.row.sector.clone(),
                 direction: candidate.direction,
-                predicted_return: candidate.prediction,
+                predicted_return: candidate.absolute_prediction,
+                relative_prediction: candidate.relative_prediction,
+                market_return_prediction: candidate.market_return_prediction,
                 net_edge: candidate.edge,
                 realised_return: candidate.row.target,
                 weight: signed_weight,
@@ -1530,6 +1946,7 @@ pub fn backtest(
             net,
             allocation: Some(allocation.diagnostics),
             direction,
+            market_return_prediction,
             direction_market_return,
             turnover,
             long_pnl,
@@ -1545,6 +1962,14 @@ pub fn backtest(
     let metrics = metrics(&steps, cadence_sessions);
     let diagnostics = prediction_diagnostics(&diagnostic_blocks);
     let direction_metrics = direction_layer_metrics(&steps, cadence_sessions);
+    let selection_layer = selection_layer_metrics(
+        model,
+        &by_date,
+        &selected_dates,
+        cadence_sessions,
+        max_positions,
+        &costs,
+    )?;
     let benchmark = config
         .benchmark
         .as_ref()
@@ -1558,6 +1983,35 @@ pub fn backtest(
     ];
     if config.direction_config.is_some() {
         disclosures.push("The standalone direction-layer series applies smoothed target net exposure to OMXSGI before execution costs; it diagnoses timing only and cannot be treated as a tradable net result.".into());
+    }
+    if (config.prediction_horizon_scale - 1.0).abs() > f64::EPSILON {
+        disclosures.push(format!(
+            "The model predicts a {}-session return and its forecast is multiplied by {:.6} before economic hurdles for this {}-session holding replay. Realised P&L always uses the matrix's unscaled {}-session executable label.",
+            config.model_horizon_sessions,
+            config.prediction_horizon_scale,
+            cadence_sessions,
+            cadence_sessions,
+        ));
+    }
+    if relative_reward {
+        disclosures.push("Relative stock forecasts are translated to absolute expected returns by adding the separately trained causal OMXSGI horizon-return forecast before BUY/SELL classification and economic hurdles; the relative score is used unchanged for prediction diagnostics.".into());
+    }
+    if residual_composition {
+        disclosures.push("The absolute stock model is used for cross-sectional ordering only: its equal-weight same-date prediction mean is removed and a separately trained causal OMXSGI forecast is added before BUY/SELL classification and economic hurdles. Centering changes no stock rank and uses no future value.".into());
+    }
+    if selection_layer.is_some() {
+        disclosures.push("The selection-layer diagnostic forces equal long and short top/bottom sleeves solely to isolate ranking skill, with measured execution and borrow costs. It is not a portfolio target and does not impose market neutrality on live construction.".into());
+    }
+    if retention_rank > max_positions {
+        disclosures.push(format!(
+            "Turnover hysteresis retains an incumbent only while it still clears the economic hurdle, keeps the same predicted side, and ranks within the top {retention_rank}; vacancies are filled from the strongest candidates."
+        ));
+    }
+    if let Some(maximum) = max_sector_gross {
+        disclosures.push(format!(
+            "Each sector has a maximum {:.1}% gross exposure. Binding sectors scale down proportionally and the excess stays in cash.",
+            maximum * 100.0
+        ));
     }
     if rows.iter().any(|row| row.borrow_fee_annualized.is_some()) {
         disclosures.push("Short holding costs use completed-session IB historical FEE_RATE when present, annualized over the holding sessions; missing records use the configured fixed fallback. FEE_RATE is cost, not locate availability.".into());
@@ -1579,10 +2033,15 @@ pub fn backtest(
         ensemble_seeds: model.ensemble_seeds,
         target_clip: model.target_clip,
         reward_scale: model.reward_scale,
+        calibration: model.calibration.clone(),
+        prediction_composition: config.prediction_composition,
+        blend_components: model.blend_components.clone(),
         survivorship_status: model.survivorship_status.clone(),
         start,
         end,
         cadence_sessions,
+        model_horizon_sessions: config.model_horizon_sessions,
+        prediction_horizon_scale: config.prediction_horizon_scale,
         ranking,
         sizing,
         allocation_budget: fallback_budget,
@@ -1590,12 +2049,16 @@ pub fn backtest(
         reference_volatility: config.reference_volatility,
         min_position_weight: config.min_position_weight,
         direction_config: config.direction_config,
+        market_forecast_model_id: config.market_forecast_model_id.clone(),
         position_weight,
         max_positions,
+        retention_rank,
+        max_sector_gross,
         costs,
         metrics,
         diagnostics: Some(diagnostics),
         direction_metrics,
+        selection_layer,
         benchmark,
         borrow_diagnostics,
         execution_cost_diagnostics,
@@ -1685,6 +2148,457 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
     })
 }
 
+fn selection_layer_metrics(
+    model: &Model,
+    by_date: &BTreeMap<Date, Vec<&TrainingRow>>,
+    selected_dates: &[Date],
+    cadence: usize,
+    max_positions: usize,
+    costs: &CostConfig,
+) -> Result<Option<SelectionLayerMetrics>, String> {
+    let positions_per_side = max_positions / 2;
+    if positions_per_side == 0 {
+        return Ok(None);
+    }
+    let unit_weight = 0.5 / positions_per_side as f64;
+    let mut previous: BTreeMap<String, (f64, ExecutionCost)> = BTreeMap::new();
+    let mut steps = Vec::with_capacity(selected_dates.len());
+    for (date_index, date) in selected_dates.iter().copied().enumerate() {
+        let rows = &by_date[&date];
+        if rows.len() < positions_per_side * 2 {
+            continue;
+        }
+        let mut ranked = rows
+            .iter()
+            .map(|row| Ok((*row, model.predict(row)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        ranked.sort_by(|(left_row, left_score), (right_row, right_score)| {
+            left_score
+                .total_cmp(right_score)
+                .then_with(|| left_row.instrument_id.cmp(&right_row.instrument_id))
+        });
+        let mut target = BTreeMap::new();
+        for (row, _) in ranked.iter().take(positions_per_side) {
+            target.insert(
+                row.instrument_id.clone(),
+                (-unit_weight, execution_cost(row, costs)?, *row),
+            );
+        }
+        for (row, _) in ranked.iter().rev().take(positions_per_side) {
+            target.insert(
+                row.instrument_id.clone(),
+                (unit_weight, execution_cost(row, costs)?, *row),
+            );
+        }
+
+        let gross_return_before_costs = target
+            .values()
+            .map(|(weight, _, row)| weight * row.target)
+            .sum::<f64>();
+        let mut cost_drag = 0.0;
+        let mut turnover = 0.0;
+        let mut identities = previous
+            .keys()
+            .chain(target.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities.dedup();
+        for instrument_id in identities {
+            let previous_weight = previous
+                .get(&instrument_id)
+                .map(|(weight, _)| *weight)
+                .unwrap_or(0.0);
+            let target_weight = target
+                .get(&instrument_id)
+                .map(|(weight, _, _)| *weight)
+                .unwrap_or(0.0);
+            let cost = target
+                .get(&instrument_id)
+                .map(|(_, cost, _)| *cost)
+                .or_else(|| previous.get(&instrument_id).map(|(_, cost)| *cost))
+                .expect("selection identity comes from target or previous");
+            let delta = (target_weight - previous_weight).abs();
+            turnover += delta;
+            cost_drag += delta * cost.total_bps() / 20_000.0;
+            let previous_short = (-previous_weight).max(0.0);
+            let target_short = (-target_weight).max(0.0);
+            cost_drag +=
+                (target_short - previous_short).max(0.0) * costs.short_availability_bps / 10_000.0;
+            if let Some((_, _, row)) = target.get(&instrument_id) {
+                cost_drag += target_short * holding_borrow_cost(row, cadence, costs)?;
+            }
+            // Include terminal liquidation so this diagnostic has the same
+            // complete-holding accounting as the executable portfolio.
+            if date_index + 1 == selected_dates.len() {
+                turnover += target_weight.abs();
+                cost_drag += target_weight.abs() * cost.total_bps() / 20_000.0;
+            }
+        }
+        steps.push(SelectionLayerStep {
+            date,
+            gross_return_before_costs,
+            cost_drag,
+            net_return: gross_return_before_costs - cost_drag,
+            turnover,
+            long_positions: positions_per_side,
+            short_positions: positions_per_side,
+        });
+        previous = target
+            .into_iter()
+            .map(|(id, (weight, cost, _))| (id, (weight, cost)))
+            .collect();
+    }
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    let net_returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
+    let gross_returns = steps
+        .iter()
+        .map(|step| step.gross_return_before_costs)
+        .collect::<Vec<_>>();
+    let net = return_metrics(&net_returns, cadence);
+    let gross = return_metrics(&gross_returns, cadence);
+    Ok(Some(SelectionLayerMetrics {
+        periods: steps.len(),
+        total_return: net.total_return,
+        annualised_return: net.annualised_return,
+        annualised_volatility: net.annualised_volatility,
+        sharpe: net.sharpe,
+        max_drawdown: net.max_drawdown,
+        positive_periods: net_returns.iter().filter(|value| **value > 0.0).count(),
+        gross_return_before_costs: gross.total_return,
+        cost_drag: steps.iter().map(|step| step.cost_drag).sum(),
+        positions_per_side,
+        construction: "research_only_equal_weight_top_bottom_dollar_neutral".into(),
+        steps,
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FixedMomentumMode {
+    Directional,
+    LongOnly,
+    LongShort,
+}
+
+/// Replay three fixed 12-1 momentum controls on the same executable labels and
+/// cost machinery as the learned portfolio. The directional arm takes the
+/// strongest absolute signals regardless of side, so its net exposure is an
+/// outcome of available stock trends rather than a forced hedge ratio.
+pub fn fixed_momentum_backtest(
+    rows: &[TrainingRow],
+    config: &FixedMomentumConfig,
+) -> Result<FixedMomentumBacktestResult, String> {
+    if config.end < config.start {
+        return Err("fixed momentum end precedes start".into());
+    }
+    if config.cadence_sessions == 0 || config.max_positions == 0 {
+        return Err("fixed momentum cadence and max positions must be positive".into());
+    }
+    if !config.position_weight.is_finite()
+        || config.position_weight <= 0.0
+        || config.position_weight > 1.0
+        || config.position_weight * config.max_positions as f64 > 1.0 + 1e-12
+    {
+        return Err(
+            "fixed momentum position weight must be positive and total maximum gross cannot exceed one"
+                .into(),
+        );
+    }
+    let mut by_date: BTreeMap<Date, Vec<&TrainingRow>> = BTreeMap::new();
+    for row in rows {
+        if row.date < config.start || row.date > config.end {
+            continue;
+        }
+        match row.momentum_12_1 {
+            Some(value) if value.is_finite() => by_date.entry(row.date).or_default().push(row),
+            Some(_) => {
+                return Err(format!(
+                    "matrix row {} on {} has non-finite 12-1 momentum",
+                    row.instrument_id, row.date
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "matrix row {} on {} lacks Rust-owned 12-1 momentum; rebuild the matrix",
+                    row.instrument_id, row.date
+                ));
+            }
+        }
+    }
+    if by_date.is_empty() {
+        return Err("fixed momentum window has no matrix rows".into());
+    }
+    let selected_dates = by_date
+        .keys()
+        .copied()
+        .step_by(config.cadence_sessions)
+        .collect::<Vec<_>>();
+    let directional = fixed_momentum_performance(
+        &by_date,
+        &selected_dates,
+        FixedMomentumMode::Directional,
+        config,
+    )?;
+    let long_only = fixed_momentum_performance(
+        &by_date,
+        &selected_dates,
+        FixedMomentumMode::LongOnly,
+        config,
+    )?;
+    let long_short_diagnostic = fixed_momentum_performance(
+        &by_date,
+        &selected_dates,
+        FixedMomentumMode::LongShort,
+        config,
+    )?;
+    Ok(FixedMomentumBacktestResult {
+        kind: "stockholm_fixed_momentum_acceptance_control".into(),
+        signal: "adjusted_close_t_minus_21 / adjusted_close_t_minus_252 - 1".into(),
+        survivorship_status: config.survivorship_status.clone(),
+        start: config.start,
+        end: config.end,
+        cadence_sessions: config.cadence_sessions,
+        max_positions: config.max_positions,
+        position_weight: config.position_weight,
+        costs: config.costs.clone(),
+        directional,
+        long_only,
+        long_short_diagnostic,
+        disclosures: vec![
+            "The fixed rule and its 12-1 lookback were declared before this replay; it is an acceptance control, not a newly fitted model.".into(),
+            "The directional arm chooses the strongest absolute positive or negative stock trends without a long/short quota. Each name keeps the fixed maximum weight and unused capacity stays cash.".into(),
+            "The long/short arm is a dollar-neutral ranking diagnostic only; it is not the intended live allocation policy.".into(),
+            "Historical borrow quantity is unavailable. Short holding fees use causal IB FEE_RATE where present and the configured fallback otherwise; new shorts also pay an availability penalty.".into(),
+            "The current-security history still omits many inactive and delisted shares, so survivorship contamination prevents capital authorization.".into(),
+        ],
+    })
+}
+
+fn fixed_momentum_performance(
+    by_date: &BTreeMap<Date, Vec<&TrainingRow>>,
+    selected_dates: &[Date],
+    mode: FixedMomentumMode,
+    config: &FixedMomentumConfig,
+) -> Result<FixedMomentumPerformance, String> {
+    let mut previous: BTreeMap<String, (f64, ExecutionCost)> = BTreeMap::new();
+    let mut nav = 1.0;
+    let mut steps = Vec::with_capacity(selected_dates.len());
+    for (date_index, date) in selected_dates.iter().copied().enumerate() {
+        let mut ranked = by_date[&date]
+            .iter()
+            .map(|row| (*row, row.momentum_12_1.expect("validated above")))
+            .filter(|(_, momentum)| *momentum != 0.0)
+            .collect::<Vec<_>>();
+        let selected = match mode {
+            FixedMomentumMode::Directional => {
+                ranked.sort_by(|(left_row, left), (right_row, right)| {
+                    right
+                        .abs()
+                        .total_cmp(&left.abs())
+                        .then_with(|| left_row.instrument_id.cmp(&right_row.instrument_id))
+                });
+                ranked
+                    .into_iter()
+                    .take(config.max_positions)
+                    .collect::<Vec<_>>()
+            }
+            FixedMomentumMode::LongOnly => {
+                ranked.retain(|(_, momentum)| *momentum > 0.0);
+                ranked.sort_by(|(left_row, left), (right_row, right)| {
+                    right
+                        .total_cmp(left)
+                        .then_with(|| left_row.instrument_id.cmp(&right_row.instrument_id))
+                });
+                ranked
+                    .into_iter()
+                    .take(config.max_positions)
+                    .collect::<Vec<_>>()
+            }
+            FixedMomentumMode::LongShort => {
+                let per_side = config.max_positions / 2;
+                let mut longs = ranked
+                    .iter()
+                    .copied()
+                    .filter(|(_, momentum)| *momentum > 0.0)
+                    .collect::<Vec<_>>();
+                let mut shorts = ranked
+                    .into_iter()
+                    .filter(|(_, momentum)| *momentum < 0.0)
+                    .collect::<Vec<_>>();
+                longs.sort_by(|(left_row, left), (right_row, right)| {
+                    right
+                        .total_cmp(left)
+                        .then_with(|| left_row.instrument_id.cmp(&right_row.instrument_id))
+                });
+                shorts.sort_by(|(left_row, left), (right_row, right)| {
+                    left.total_cmp(right)
+                        .then_with(|| left_row.instrument_id.cmp(&right_row.instrument_id))
+                });
+                longs
+                    .into_iter()
+                    .take(per_side)
+                    .chain(shorts.into_iter().take(per_side))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let mut target = BTreeMap::new();
+        for (row, momentum) in selected {
+            let weight = momentum.signum() * config.position_weight;
+            target.insert(
+                row.instrument_id.clone(),
+                (weight, execution_cost(row, &config.costs)?, row),
+            );
+        }
+
+        let long_pnl = target
+            .values()
+            .filter(|(weight, _, _)| *weight > 0.0)
+            .map(|(weight, _, row)| weight * row.target)
+            .sum::<f64>();
+        let short_pnl = target
+            .values()
+            .filter(|(weight, _, _)| *weight < 0.0)
+            .map(|(weight, _, row)| weight * row.target)
+            .sum::<f64>();
+        let gross_return_before_costs = long_pnl + short_pnl;
+        let gross = target.values().map(|(weight, _, _)| weight.abs()).sum();
+        let net = target.values().map(|(weight, _, _)| weight).sum();
+        let long_positions = target
+            .values()
+            .filter(|(weight, _, _)| *weight > 0.0)
+            .count();
+        let short_positions = target.len() - long_positions;
+        let mut turnover = 0.0;
+        let mut cost_drag = 0.0;
+        let mut identities = previous
+            .keys()
+            .chain(target.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities.dedup();
+        for instrument_id in identities {
+            let previous_weight = previous
+                .get(&instrument_id)
+                .map(|(weight, _)| *weight)
+                .unwrap_or(0.0);
+            let target_weight = target
+                .get(&instrument_id)
+                .map(|(weight, _, _)| *weight)
+                .unwrap_or(0.0);
+            let execution = target
+                .get(&instrument_id)
+                .map(|(_, execution, _)| *execution)
+                .or_else(|| {
+                    previous
+                        .get(&instrument_id)
+                        .map(|(_, execution)| *execution)
+                })
+                .expect("momentum identity comes from target or previous");
+            let delta = (target_weight - previous_weight).abs();
+            turnover += delta;
+            cost_drag += delta * execution.total_bps() / 20_000.0;
+            let previous_short = (-previous_weight).max(0.0);
+            let target_short = (-target_weight).max(0.0);
+            cost_drag += (target_short - previous_short).max(0.0)
+                * config.costs.short_availability_bps
+                / 10_000.0;
+            if let Some((_, _, row)) = target.get(&instrument_id) {
+                cost_drag += target_short
+                    * holding_borrow_cost(row, config.cadence_sessions, &config.costs)?;
+            }
+            if date_index + 1 == selected_dates.len() {
+                turnover += target_weight.abs();
+                cost_drag += target_weight.abs() * execution.total_bps() / 20_000.0;
+            }
+        }
+        let net_return = gross_return_before_costs - cost_drag;
+        nav *= 1.0 + net_return;
+        let benchmark_period_return = config
+            .benchmark
+            .as_ref()
+            .map(|history| benchmark_return(history, date, config.cadence_sessions))
+            .transpose()?;
+        steps.push(FixedMomentumStep {
+            date,
+            nav,
+            gross_return_before_costs,
+            cost_drag,
+            net_return,
+            turnover,
+            gross,
+            net,
+            long_pnl,
+            short_pnl,
+            long_positions,
+            short_positions,
+            benchmark_period_return,
+        });
+        previous = target
+            .into_iter()
+            .map(|(instrument_id, (weight, execution, _))| (instrument_id, (weight, execution)))
+            .collect();
+    }
+    let metrics = fixed_momentum_metrics(&steps, config.cadence_sessions);
+    let benchmark = config
+        .benchmark
+        .as_ref()
+        .map(|history| {
+            let portfolio_returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
+            let benchmark_returns = steps
+                .iter()
+                .map(|step| {
+                    step.benchmark_period_return
+                        .ok_or("benchmark return missing from momentum step")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            benchmark_comparison_from_returns(
+                &portfolio_returns,
+                &metrics,
+                &benchmark_returns,
+                config.cadence_sessions,
+                history,
+            )
+        })
+        .transpose()?;
+    let construction = match mode {
+        FixedMomentumMode::Directional => {
+            "fixed_weight_strongest_absolute_12_1_sign_determines_side"
+        }
+        FixedMomentumMode::LongOnly => "fixed_weight_top_positive_12_1_long_only",
+        FixedMomentumMode::LongShort => "diagnostic_fixed_weight_top_positive_bottom_negative_12_1",
+    };
+    Ok(FixedMomentumPerformance {
+        construction: construction.into(),
+        metrics,
+        benchmark,
+        steps,
+    })
+}
+
+fn fixed_momentum_metrics(steps: &[FixedMomentumStep], cadence: usize) -> Metrics {
+    let returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
+    let values = return_metrics(&returns, cadence);
+    Metrics {
+        periods: steps.len(),
+        total_return: values.total_return,
+        annualised_return: values.annualised_return,
+        annualised_volatility: values.annualised_volatility,
+        sharpe: values.sharpe,
+        max_drawdown: values.max_drawdown,
+        positive_periods: returns.iter().filter(|value| **value > 0.0).count(),
+        long_pnl: steps.iter().map(|step| step.long_pnl).sum(),
+        short_pnl: steps.iter().map(|step| step.short_pnl).sum(),
+        cost_drag: steps.iter().map(|step| step.cost_drag).sum(),
+        mean_gross: mean(&steps.iter().map(|step| step.gross).collect::<Vec<_>>()),
+        mean_net: mean(&steps.iter().map(|step| step.net).collect::<Vec<_>>()),
+        long_positions: steps.iter().map(|step| step.long_positions).sum(),
+        short_positions: steps.iter().map(|step| step.short_positions).sum(),
+    }
+}
+
 fn prediction_diagnostics(blocks: &[Vec<(f64, f64)>]) -> PredictionDiagnostics {
     const N_BUCKETS: usize = 10;
     let mut correlations = Vec::new();
@@ -1758,54 +2672,7 @@ fn prediction_diagnostics(blocks: &[Vec<(f64, f64)>]) -> PredictionDiagnostics {
 }
 
 fn spearman(left: &[f64], right: &[f64]) -> Option<f64> {
-    if left.len() != right.len() || left.len() < 3 {
-        return None;
-    }
-    pearson(&average_ranks(left), &average_ranks(right))
-}
-
-fn average_ranks(values: &[f64]) -> Vec<f64> {
-    let mut order = (0..values.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| {
-        values[*left]
-            .total_cmp(&values[*right])
-            .then_with(|| left.cmp(right))
-    });
-    let mut ranks = vec![0.0; values.len()];
-    let mut start = 0;
-    while start < order.len() {
-        let mut end = start + 1;
-        while end < order.len() && values[order[end]] == values[order[start]] {
-            end += 1;
-        }
-        let average = (start + end - 1) as f64 / 2.0;
-        for index in &order[start..end] {
-            ranks[*index] = average;
-        }
-        start = end;
-    }
-    ranks
-}
-
-fn pearson(left: &[f64], right: &[f64]) -> Option<f64> {
-    let n = left.len() as f64;
-    let left_mean = left.iter().sum::<f64>() / n;
-    let right_mean = right.iter().sum::<f64>() / n;
-    let covariance = left
-        .iter()
-        .zip(right)
-        .map(|(a, b)| (a - left_mean) * (b - right_mean))
-        .sum::<f64>();
-    let left_variance = left
-        .iter()
-        .map(|value| (value - left_mean).powi(2))
-        .sum::<f64>();
-    let right_variance = right
-        .iter()
-        .map(|value| (value - right_mean).powi(2))
-        .sum::<f64>();
-    let denominator = (left_variance * right_variance).sqrt();
-    (denominator > 0.0).then_some(covariance / denominator)
+    features_common::spearman(left, right)
 }
 
 /// Attribute an already-frozen Rust replay to a benchmark without rescoring
@@ -1895,10 +2762,29 @@ fn benchmark_comparison(
         .iter()
         .map(|step| step.period_return)
         .collect::<Vec<_>>();
-    let benchmark_stats = return_metrics(&benchmark_returns, cadence);
+    benchmark_comparison_from_returns(
+        &portfolio_returns,
+        portfolio,
+        &benchmark_returns,
+        cadence,
+        history,
+    )
+}
+
+fn benchmark_comparison_from_returns(
+    portfolio_returns: &[f64],
+    portfolio: &Metrics,
+    benchmark_returns: &[f64],
+    cadence: usize,
+    history: &BenchmarkHistory,
+) -> Result<BenchmarkComparison, String> {
+    if portfolio_returns.len() != benchmark_returns.len() {
+        return Err("portfolio and benchmark return counts differ".into());
+    }
+    let benchmark_stats = return_metrics(benchmark_returns, cadence);
     let active = portfolio_returns
         .iter()
-        .zip(&benchmark_returns)
+        .zip(benchmark_returns)
         .map(|(portfolio, benchmark)| portfolio - benchmark)
         .collect::<Vec<_>>();
     let periods_per_year = 252.0 / cadence as f64;
@@ -2158,6 +3044,8 @@ mod tests {
                     diagnostics: Default::default(),
                 },
             }],
+            calibration: None,
+            blend_components: Vec::new(),
             model_id: "fixture".into(),
         }
     }
@@ -2182,6 +3070,21 @@ mod tests {
         model.reward = "relative_rank".into();
         model.reward_scale = Some(0.04);
         assert!((model.predict(&row(day("2024-01-02"))).unwrap() - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn purged_calibration_shrinks_the_prediction_before_construction() {
+        let mut model = constant_model(0.10);
+        model.calibration = Some(PredictionCalibration {
+            method: "purged_oos_affine_shrinkage_v1".into(),
+            start: day("2023-01-01"),
+            end: day("2023-12-31"),
+            observations: 1_000,
+            intercept: 0.01,
+            slope: 0.20,
+            residual_standard_deviation: 0.05,
+        });
+        assert!((model.predict(&row(day("2024-01-02"))).unwrap() - 0.03).abs() < 1e-12);
     }
 
     #[test]
@@ -2220,6 +3123,15 @@ mod tests {
         assert_eq!(
             expected_features(features_stockholm::FUNDAMENTAL_FEATURE_SET_VERSION).unwrap(),
             features_stockholm::fundamental_model_feature_names()
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_the_complete_quarterly_fundamental_feature_contract() {
+        assert_eq!(
+            expected_features(features_stockholm::QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION)
+                .unwrap(),
+            features_stockholm::quarterly_fundamental_model_feature_names()
         );
     }
 
@@ -2267,6 +3179,15 @@ mod tests {
             )
             .unwrap(),
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names()
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_the_global_risk_feature_contract() {
+        assert_eq!(
+            expected_features(features_stockholm::BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION)
+                .unwrap(),
+            features_stockholm::baseline_global_risk_model_feature_names()
         );
     }
 
@@ -2324,6 +3245,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selection_layer_is_a_costed_diagnostic_not_the_live_budget() {
+        let date = day("2024-01-02");
+        let rows = [-2.0, -1.0, 1.0, 2.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| {
+                let mut value = row(date);
+                value.instrument_id = format!("TX{index}");
+                value.features.insert("x_ret_1".into(), score);
+                value.target = score * 0.05;
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut model = constant_model(0.0);
+        model.model_family = "ridge".into();
+        model.ridge_lambda = Some(25.0);
+        model.linear_intercept = Some(0.0);
+        model.linear_weights = Some(vec![1.0]);
+        model.tree_info.clear();
+        let by_date = BTreeMap::from([(date, rows.iter().collect::<Vec<_>>())]);
+        let diagnostic =
+            selection_layer_metrics(&model, &by_date, &[date], 20, 4, &zero_execution_costs())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(diagnostic.positions_per_side, 2);
+        assert!((diagnostic.total_return - 0.075).abs() < 1e-12);
+        assert_eq!(diagnostic.cost_drag, 0.0);
+        assert_eq!(diagnostic.steps[0].long_positions, 2);
+        assert_eq!(diagnostic.steps[0].short_positions, 2);
+    }
+
+    #[test]
+    fn fixed_momentum_directional_arm_chooses_strongest_signals_without_side_quota() {
+        let date = day("2024-02-01");
+        let rows = [
+            ("A", 0.40, 0.10),
+            ("B", 0.20, 0.05),
+            ("C", -0.30, -0.08),
+            ("D", -0.10, -0.03),
+        ]
+        .into_iter()
+        .map(|(instrument, momentum, target)| {
+            let mut value = row(date);
+            value.instrument_id = instrument.into();
+            value.symbol = instrument.into();
+            value.momentum_12_1 = Some(momentum);
+            value.target = target;
+            value
+        })
+        .collect::<Vec<_>>();
+        let result = fixed_momentum_backtest(
+            &rows,
+            &FixedMomentumConfig {
+                start: date,
+                end: date,
+                cadence_sessions: 20,
+                max_positions: 2,
+                position_weight: 0.5,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                survivorship_status: "test".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.directional.steps[0].long_positions, 1);
+        assert_eq!(result.directional.steps[0].short_positions, 1);
+        assert!((result.directional.steps[0].net_return - 0.09).abs() < 1e-12);
+        assert_eq!(result.long_only.steps[0].long_positions, 2);
+        assert_eq!(result.long_only.steps[0].short_positions, 0);
+        assert!((result.long_only.steps[0].net_return - 0.075).abs() < 1e-12);
+    }
+
     fn row(date: Date) -> TrainingRow {
         TrainingRow {
             date,
@@ -2332,6 +3328,7 @@ mod tests {
             isin: "SE0000000001".into(),
             sector: "Industrials".into(),
             bucket: UniverseBucket::LargeCap,
+            momentum_12_1: Some(0.1),
             target: 0.01,
             market_target: Some(0.005),
             relative_target: Some(0.005),
@@ -2403,7 +3400,11 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-03"),
                 cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
                 max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
@@ -2412,6 +3413,9 @@ mod tests {
                 reference_edge: 0.01,
                 reference_volatility: 0.02,
                 direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
                 costs,
                 benchmark: None,
             },
@@ -2430,6 +3434,131 @@ mod tests {
     }
 
     #[test]
+    fn shorter_horizon_forecast_is_scaled_before_the_economic_hurdle() {
+        let costs = CostConfig {
+            round_trip_bps: 50.0,
+            round_trip_commission_bps: 50.0,
+            ..zero_execution_costs()
+        };
+        let result = backtest(
+            &constant_model(0.002),
+            &[row(day("2024-01-02"))],
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-02"),
+                cadence_sessions: 5,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 5.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                position_weight: 0.05,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs,
+                benchmark: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.model_horizon_sessions, 1);
+        assert_eq!(result.prediction_horizon_scale, 5.0);
+        assert_eq!(result.metrics.long_positions, 1);
+        assert!((result.steps[0].positions[0].predicted_return - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn relative_selection_is_composed_with_market_return_before_choosing_side() {
+        let benchmark = rising_benchmark(330);
+        let decision_date = benchmark.bars[300].date;
+        let mut model = constant_model(-0.01);
+        model.reward = "relative_return".into();
+        let result = backtest(
+            &model,
+            &[row(decision_date)],
+            &BacktestConfig {
+                start: decision_date,
+                end: decision_date,
+                cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                position_weight: 0.05,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: Some(
+                    portfolio_construction::DirectionConfig::baseline(1.0).unwrap(),
+                ),
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: Some(BTreeMap::from([(decision_date, 0.03)])),
+                market_forecast_model_id: Some("market-fixture".into()),
+                costs: zero_execution_costs(),
+                benchmark: Some(benchmark),
+            },
+        )
+        .unwrap();
+        let position = &result.steps[0].positions[0];
+        assert!(matches!(position.direction, Direction::Long));
+        assert!((position.relative_prediction.unwrap() + 0.01).abs() < 1e-12);
+        assert!((position.market_return_prediction.unwrap() - 0.03).abs() < 1e-12);
+        assert!((position.predicted_return - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn absolute_ordering_can_be_centered_and_composed_with_a_market_forecast() {
+        let benchmark = rising_benchmark(330);
+        let decision_date = benchmark.bars[300].date;
+        let result = backtest(
+            &constant_model(0.02),
+            &[row(decision_date)],
+            &BacktestConfig {
+                start: decision_date,
+                end: decision_date,
+                cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                position_weight: 0.05,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: Some(
+                    portfolio_construction::DirectionConfig::baseline(1.0).unwrap(),
+                ),
+                prediction_composition: PredictionComposition::CrossSectionalResidualPlusMarket,
+                market_return_forecasts: Some(BTreeMap::from([(decision_date, -0.03)])),
+                market_forecast_model_id: Some("market-fixture".into()),
+                costs: zero_execution_costs(),
+                benchmark: Some(benchmark),
+            },
+        )
+        .unwrap();
+        let position = &result.steps[0].positions[0];
+        assert!(matches!(position.direction, Direction::Short));
+        assert_eq!(position.relative_prediction, Some(0.0));
+        assert_eq!(position.market_return_prediction, Some(-0.03));
+        assert!((position.predicted_return + 0.03).abs() < 1e-12);
+    }
+
+    #[test]
     fn measured_spread_replaces_fallback_and_cost_components_reconcile() {
         let mut measured = row(day("2024-01-02"));
         measured.median_closing_spread_bps_20 = Some(20.0);
@@ -2444,7 +3573,11 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
                 max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
@@ -2453,6 +3586,9 @@ mod tests {
                 reference_edge: 0.01,
                 reference_volatility: 0.02,
                 direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
                 costs,
                 benchmark: None,
             },
@@ -2500,7 +3636,11 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
                 max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
@@ -2509,6 +3649,9 @@ mod tests {
                 reference_edge: 0.01,
                 reference_volatility: 0.02,
                 direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
                 costs: CostConfig {
                     short_borrow_bps: 10.0,
                     short_availability_bps: 20.0,
@@ -2539,7 +3682,11 @@ mod tests {
                 start: rows[0].date,
                 end: rows[1].date,
                 cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
                 max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
@@ -2550,6 +3697,9 @@ mod tests {
                 direction_config: Some(
                     portfolio_construction::DirectionConfig::baseline(1.0).unwrap(),
                 ),
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
             },
@@ -2601,7 +3751,11 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
                 max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
@@ -2610,6 +3764,9 @@ mod tests {
                 reference_edge: 0.01,
                 reference_volatility: 0.02,
                 direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(history),
             },

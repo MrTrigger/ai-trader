@@ -12,7 +12,11 @@ use tokio_tungstenite::tungstenite::Message;
 /// The WS endpoint for a REST base: `https://api.hyperliquid.xyz` →
 /// `wss://api.hyperliquid.xyz/ws`.
 pub fn ws_url(base: &str) -> String {
-    format!("{}/ws", base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1))
+    format!(
+        "{}/ws",
+        base.replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    )
 }
 
 /// One parsed frame from the stream.
@@ -30,7 +34,10 @@ pub enum WsEvent {
     /// deserialize into that channel's shape (a venue schema change, most
     /// likely). Distinct from [`Other`](WsEvent::Other) so the consumer's
     /// logs can tell "new channel" apart from "known channel, broken parse".
-    Unparseable { channel: String, raw: String },
+    Unparseable {
+        channel: String,
+        raw: String,
+    },
 }
 
 /// Top of book. `bbo[0]` is the bid, `bbo[1]` the ask; a side can be empty.
@@ -98,15 +105,24 @@ pub fn parse_frame(text: &str) -> Result<WsEvent, serde_json::Error> {
     Ok(match frame.channel.as_str() {
         "candle" => match serde_json::from_value(frame.data) {
             Ok(c) => WsEvent::Candle(c),
-            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+            Err(_) => WsEvent::Unparseable {
+                channel: frame.channel,
+                raw: text.to_string(),
+            },
         },
         "bbo" => match serde_json::from_value(frame.data) {
             Ok(b) => WsEvent::Bbo(b),
-            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+            Err(_) => WsEvent::Unparseable {
+                channel: frame.channel,
+                raw: text.to_string(),
+            },
         },
         "userFills" => match serde_json::from_value(frame.data) {
             Ok(f) => WsEvent::UserFills(f),
-            Err(_) => WsEvent::Unparseable { channel: frame.channel, raw: text.to_string() },
+            Err(_) => WsEvent::Unparseable {
+                channel: frame.channel,
+                raw: text.to_string(),
+            },
         },
         "subscriptionResponse" => WsEvent::SubscriptionResponse,
         "pong" => WsEvent::Pong,
@@ -352,7 +368,10 @@ mod tests {
                 let ask = b.bbo[1].as_ref().expect("ask side present in fixture");
                 let bid_px: rust_decimal::Decimal = bid.px.parse().unwrap();
                 let ask_px: rust_decimal::Decimal = ask.px.parse().unwrap();
-                assert!(bid_px < ask_px, "crossed fixture book: {bid_px} >= {ask_px}");
+                assert!(
+                    bid_px < ask_px,
+                    "crossed fixture book: {bid_px} >= {ask_px}"
+                );
             }
             other => panic!("expected a bbo, got {other:?}"),
         }
@@ -377,7 +396,10 @@ mod tests {
             parse_frame(&fixture("subscription_response")).unwrap(),
             WsEvent::SubscriptionResponse
         ));
-        assert!(matches!(parse_frame(&fixture("pong")).unwrap(), WsEvent::Pong));
+        assert!(matches!(
+            parse_frame(&fixture("pong")).unwrap(),
+            WsEvent::Pong
+        ));
         assert!(matches!(
             parse_frame(r#"{"channel":"notifications","data":{}}"#).unwrap(),
             WsEvent::Other(c) if c == "notifications"

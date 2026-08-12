@@ -199,7 +199,14 @@ impl Hyperliquid {
                 }
             }
         };
-        let action = order_action(index, is_buy, limit_px, order.qty, opts, &order.client_order_id);
+        let action = order_action(
+            index,
+            is_buy,
+            limit_px,
+            order.qty,
+            opts,
+            &order.client_order_id,
+        );
         let res = self.exchange(action).await?;
         let statuses = res.statuses().map_err(VenueError::Unreachable)?;
         let first = statuses
@@ -221,7 +228,9 @@ impl Hyperliquid {
         client_order_id: &str,
     ) -> Result<(), VenueError> {
         let index = self.asset_index(asset).await?;
-        let res = self.exchange(cancel_by_cloid_action(index, client_order_id)).await?;
+        let res = self
+            .exchange(cancel_by_cloid_action(index, client_order_id))
+            .await?;
         if res.status != "ok" {
             return Err(VenueError::Unreachable(format!(
                 "cancel refused: venue returned status {}",
@@ -320,7 +329,9 @@ fn cancel_by_cloid_action(index: u32, client_order_id: &str) -> serde_json::Valu
 fn cancel_outcome(statuses: &[serde_json::Value]) -> Result<(), VenueError> {
     for s in statuses {
         if let Some(msg) = s.get("error").and_then(|v| v.as_str()) {
-            return Err(VenueError::Rejected { message: msg.to_string() });
+            return Err(VenueError::Rejected {
+                message: msg.to_string(),
+            });
         }
     }
     Ok(())
@@ -385,7 +396,11 @@ impl VenueAdapter for Hyperliquid {
 
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
         let opts = OrderOpts {
-            tif: if order.limit_price.is_some() { Tif::Gtc } else { Tif::Ioc },
+            tif: if order.limit_price.is_some() {
+                Tif::Gtc
+            } else {
+                Tif::Ioc
+            },
             reduce_only: false,
         };
         self.place_order_opts(order, opts).await
@@ -682,7 +697,11 @@ mod tests {
         assert_eq!(a.venue_order_id, "77");
         assert_eq!(a.state, OrderState::Open);
         let f = ack_from_status(
-            Status::Filled { oid: 9, total_sz: "0.4".into(), avg_px: "64520.0".into() },
+            Status::Filled {
+                oid: 9,
+                total_sz: "0.4".into(),
+                avg_px: "64520.0".into(),
+            },
             "id-2",
         )
         .unwrap();
@@ -697,9 +716,13 @@ mod tests {
             message: "Post only order would have immediately matched, bbo was 64520@64521".into(),
         };
         assert!(is_post_only_rejection(&e));
-        let other = VenueError::Rejected { message: "Insufficient margin".into() };
+        let other = VenueError::Rejected {
+            message: "Insufficient margin".into(),
+        };
         assert!(!is_post_only_rejection(&other));
-        assert!(!is_post_only_rejection(&VenueError::Unreachable("timeout".into())));
+        assert!(!is_post_only_rejection(&VenueError::Unreachable(
+            "timeout".into()
+        )));
     }
 
     #[test]
@@ -709,7 +732,10 @@ mod tests {
             true,
             "64520.1".parse().unwrap(),
             "0.4".parse().unwrap(),
-            OrderOpts { tif: Tif::Alo, reduce_only: true },
+            OrderOpts {
+                tif: Tif::Alo,
+                reduce_only: true,
+            },
             "my-id",
         );
         let o = &a["orders"][0];
@@ -741,8 +767,12 @@ mod tests {
     #[test]
     fn a_successful_cancel_is_ok_and_a_refused_one_says_why() {
         assert!(cancel_outcome(&[serde_json::json!("success")]).is_ok());
-        let e = cancel_outcome(&[serde_json::json!({"error": "Order was never placed, already canceled, or filled."})])
-            .unwrap_err();
-        assert!(matches!(&e, VenueError::Rejected { message } if message.contains("already canceled")));
+        let e = cancel_outcome(&[
+            serde_json::json!({"error": "Order was never placed, already canceled, or filled."}),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(&e, VenueError::Rejected { message } if message.contains("already canceled"))
+        );
     }
 }

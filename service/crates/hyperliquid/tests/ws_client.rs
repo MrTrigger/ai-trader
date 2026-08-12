@@ -10,10 +10,7 @@ const CANDLE: &str = r#"{"channel":"candle","data":{"t":1754956800000,"T":175495
 
 /// Accept one WS connection, record what the client sends, push `frames`,
 /// then drop the connection.
-async fn serve_once(
-    listener: &tokio::net::TcpListener,
-    frames: &[&str],
-) -> Vec<serde_json::Value> {
+async fn serve_once(listener: &tokio::net::TcpListener, frames: &[&str]) -> Vec<serde_json::Value> {
     let (stream, _) = listener.accept().await.unwrap();
     let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
     let mut received = Vec::new();
@@ -41,7 +38,10 @@ async fn the_client_reconnects_and_resubscribes() {
         backoff_cap: std::time::Duration::from_millis(200),
         connect_timeout: std::time::Duration::from_secs(15),
     };
-    let subs = vec![Subscription::Candle { coin: "BTC".into(), interval: "1m".into() }];
+    let subs = vec![Subscription::Candle {
+        coin: "BTC".into(),
+        interval: "1m".into(),
+    }];
     let mut rx = ws::spawn(url, subs, cfg);
 
     let server = tokio::spawn(async move {
@@ -59,7 +59,10 @@ async fn the_client_reconnects_and_resubscribes() {
     assert!(matches!(rx.recv().await, Some(WsMessage::Connected)));
 
     let (first, second) = server.await.unwrap();
-    assert_eq!(first, second, "the resubscribe must repeat the original subscriptions");
+    assert_eq!(
+        first, second,
+        "the resubscribe must repeat the original subscriptions"
+    );
     assert_eq!(first[0]["method"], "subscribe");
     assert_eq!(first[0]["subscription"]["type"], "candle");
     assert_eq!(first[0]["subscription"]["coin"], "BTC");
@@ -97,8 +100,12 @@ async fn the_first_message_a_consumer_receives_is_never_disconnected() {
         // anything the client sends — the shape that can race the
         // subscribe send against the connection closing.
         for _ in 0..5 {
-            let Ok((stream, _)) = listener.accept().await else { break };
-            let Ok(socket) = tokio_tungstenite::accept_async(stream).await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
+                continue;
+            };
             drop(socket);
         }
     });
@@ -137,7 +144,10 @@ async fn a_silently_dead_link_is_detected_by_ping_staleness_not_left_hanging() {
         backoff_cap: std::time::Duration::from_millis(200),
         connect_timeout: std::time::Duration::from_secs(15),
     };
-    let subs = vec![Subscription::Candle { coin: "BTC".into(), interval: "1m".into() }];
+    let subs = vec![Subscription::Candle {
+        coin: "BTC".into(),
+        interval: "1m".into(),
+    }];
     let mut rx = ws::spawn(url, subs, cfg);
 
     let server = tokio::spawn(async move {
@@ -151,7 +161,10 @@ async fn a_silently_dead_link_is_detected_by_ping_staleness_not_left_hanging() {
                 other => panic!("client hung up early: {other:?}"),
             }
         }
-        socket.send(Message::Text(CANDLE.to_string())).await.unwrap();
+        socket
+            .send(Message::Text(CANDLE.to_string()))
+            .await
+            .unwrap();
         // Go silent without closing: never read (so the client's pings pile
         // up unanswered) and never drop the socket. Held open for the rest
         // of the test; the outer test aborts this task when it's done.

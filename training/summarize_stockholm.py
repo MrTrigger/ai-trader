@@ -29,12 +29,32 @@ def main() -> None:
             fold.get("reward", "absolute_return"),
             fold.get("objective", "l1"),
             fold.get("ensemble_seeds", 1),
+            (fold.get("calibration") or {}).get("method"),
+            fold.get("retention_rank", fold.get("max_positions", 0)),
+            len(fold.get("blend_components", [])),
+            fold.get("max_sector_gross"),
+            fold.get("prediction_composition", "direct"),
+            fold.get("model_horizon_sessions", fold["cadence_sessions"]),
+            fold.get("prediction_horizon_scale", 1.0),
         )
         for fold in folds
     }
     if len(specifications) != 1:
         raise ValueError("fold model specifications differ")
-    model_family, feature_set_version, reward, objective, ensemble_seeds = specifications.pop()
+    (
+        model_family,
+        feature_set_version,
+        reward,
+        objective,
+        ensemble_seeds,
+        calibration_method,
+        retention_rank,
+        blend_component_count,
+        max_sector_gross,
+        prediction_composition,
+        model_horizon_sessions,
+        prediction_horizon_scale,
+    ) = specifications.pop()
     diagnostics = [fold.get("diagnostics") for fold in folds]
     if any(item is None for item in diagnostics):
         raise ValueError("every fold must contain Rust prediction diagnostics")
@@ -113,6 +133,7 @@ def main() -> None:
             "mean_rank_ic": fold["diagnostics"]["mean_rank_ic"],
             "directional_accuracy": fold["diagnostics"]["directional_accuracy"],
             "reward_scale": fold.get("reward_scale"),
+            "calibration": fold.get("calibration"),
             "borrow_fee_row_coverage": (
                 fold.get("borrow_diagnostics", {}).get("matrix_rows_with_fee", 0)
                 / max(1, fold.get("borrow_diagnostics", {}).get("matrix_rows", 0))
@@ -139,6 +160,13 @@ def main() -> None:
         "reward": reward,
         "objective": objective,
         "ensemble_seeds": ensemble_seeds,
+        "calibration_method": calibration_method,
+        "retention_rank": retention_rank,
+        "blend_component_count": blend_component_count,
+        "max_sector_gross": max_sector_gross,
+        "prediction_composition": prediction_composition,
+        "model_horizon_sessions": model_horizon_sessions,
+        "prediction_horizon_scale": prediction_horizon_scale,
         "folds": fold_rows,
         "periods": len(returns),
         "positive_folds": sum(row["return"] > 0 for row in fold_rows),
@@ -328,6 +356,67 @@ def main() -> None:
                     "strong_down",
                 )
             },
+        }
+    selection_presence = [fold.get("selection_layer") is not None for fold in folds]
+    if any(selection_presence) and not all(selection_presence):
+        raise ValueError("selection diagnostic is present in only some folds")
+    if all(selection_presence):
+        selection_steps = [
+            step
+            for fold in folds
+            for step in fold["selection_layer"]["steps"]
+        ]
+        selection_returns = np.asarray(
+            [step["net_return"] for step in selection_steps], dtype=np.float64
+        )
+        selection_gross_returns = np.asarray(
+            [step["gross_return_before_costs"] for step in selection_steps],
+            dtype=np.float64,
+        )
+        if not np.isfinite(selection_returns).all() or not np.isfinite(
+            selection_gross_returns
+        ).all():
+            raise ValueError("selection-layer returns are invalid")
+        selection_nav = np.cumprod(1.0 + selection_returns)
+        selection_gross_nav = np.cumprod(1.0 + selection_gross_returns)
+        selection_peaks = np.maximum.accumulate(
+            np.concatenate(([1.0], selection_nav))
+        )
+        selection_drawdowns = (
+            np.concatenate(([1.0], selection_nav)) / selection_peaks - 1.0
+        )
+        selection_mean = float(selection_returns.mean())
+        selection_vol = float(selection_returns.std()) * math.sqrt(periods_per_year)
+        positions_per_side = {
+            fold["selection_layer"]["positions_per_side"] for fold in folds
+        }
+        constructions = {
+            fold["selection_layer"]["construction"] for fold in folds
+        }
+        if len(positions_per_side) != 1 or len(constructions) != 1:
+            raise ValueError("selection-layer constructions differ")
+        report["selection_layer"] = {
+            "construction": constructions.pop(),
+            "periods": len(selection_returns),
+            "positions_per_side": positions_per_side.pop(),
+            "total_return": float(selection_nav[-1] - 1.0),
+            "gross_return_before_costs": float(selection_gross_nav[-1] - 1.0),
+            "cost_drag": float(
+                sum(step["cost_drag"] for step in selection_steps)
+            ),
+            "annualised_return": float(
+                selection_nav[-1]
+                ** (periods_per_year / len(selection_returns))
+                - 1.0
+            ),
+            "annualised_volatility": selection_vol,
+            "sharpe": (
+                selection_mean * periods_per_year / selection_vol
+                if selection_vol
+                else 0.0
+            ),
+            "max_drawdown": float(selection_drawdowns.min()),
+            "positive_periods": int((selection_returns > 0).sum()),
         }
     for bucket_index in range(10):
         parts = [item["buckets"][bucket_index] for item in diagnostics]

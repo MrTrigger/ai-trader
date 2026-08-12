@@ -400,6 +400,8 @@ pub struct AllocationDiagnostics {
     pub capped_positions: Vec<String>,
     #[serde(default)]
     pub dropped_below_minimum: Vec<String>,
+    #[serde(default)]
+    pub capped_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -425,6 +427,50 @@ pub fn ranked_ids(candidates: &[Candidate], method: RankingMethod) -> Result<Vec
     Ok(ranked
         .into_iter()
         .map(|candidate| candidate.id.clone())
+        .collect())
+}
+
+/// Retain economically eligible incumbents inside a wider rank buffer, then
+/// fill remaining slots from the strongest candidates. Direction changes are
+/// never buffered: an incumbent is retained only while its newly predicted
+/// best side matches the held side. No side receives a quota.
+pub fn buffered_ranked_ids(
+    candidates: &[Candidate],
+    method: RankingMethod,
+    incumbents: &BTreeMap<String, Direction>,
+    max_positions: usize,
+    retention_rank: usize,
+) -> Result<Vec<String>, String> {
+    if max_positions == 0 || retention_rank < max_positions {
+        return Err("retention rank must be at least the positive position limit".into());
+    }
+    let ranked = ranked_ids(candidates, method)?;
+    let by_id = candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = ranked
+        .iter()
+        .take(retention_rank)
+        .filter(|id| {
+            incumbents.get(*id).is_some_and(|held_side| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|candidate| candidate.direction == *held_side)
+            })
+        })
+        .take(max_positions)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for id in &ranked {
+        if selected.len() == max_positions {
+            break;
+        }
+        selected.insert(id.clone());
+    }
+    Ok(ranked
+        .into_iter()
+        .filter(|id| selected.contains(id))
         .collect())
 }
 
@@ -550,11 +596,71 @@ pub fn allocate(proposals: &[Proposal], budget: Budget) -> Result<Allocation, St
         unused_gross: (budget.max_gross - realised_gross).max(0.0),
         capped_positions,
         dropped_below_minimum,
+        capped_groups: Vec::new(),
     };
     Ok(Allocation {
         weights,
         diagnostics,
     })
+}
+
+/// Apply one common gross ceiling to arbitrary groups after ordinary caps and
+/// budgets. Binding groups are scaled down proportionally; freed exposure is
+/// left in cash and never redistributed to another group or side.
+pub fn allocate_with_group_cap(
+    proposals: &[Proposal],
+    budget: Budget,
+    groups: &BTreeMap<String, String>,
+    max_group_gross: f64,
+) -> Result<Allocation, String> {
+    if !max_group_gross.is_finite() || max_group_gross <= 0.0 {
+        return Err("maximum group gross must be finite and positive".into());
+    }
+    if proposals.iter().any(|proposal| {
+        groups
+            .get(&proposal.id)
+            .is_none_or(|group| group.trim().is_empty())
+    }) {
+        return Err("every proposal must have a non-empty group".into());
+    }
+    let mut allocation = allocate(proposals, budget)?;
+    let mut totals = BTreeMap::<&str, f64>::new();
+    for (id, weight) in &allocation.weights {
+        *totals.entry(groups[id].as_str()).or_default() += weight.abs();
+    }
+    let scales = totals
+        .iter()
+        .map(|(group, total)| (*group, scale_down(*total, max_group_gross)))
+        .collect::<BTreeMap<_, _>>();
+    allocation.diagnostics.capped_groups = totals
+        .iter()
+        .filter(|(_, total)| **total > max_group_gross + EPSILON)
+        .map(|(group, _)| (*group).to_owned())
+        .collect();
+    for (id, weight) in &mut allocation.weights {
+        *weight *= scales[groups[id].as_str()];
+    }
+    let realised_long = allocation
+        .weights
+        .values()
+        .copied()
+        .filter(|weight| *weight > 0.0)
+        .sum::<f64>();
+    let realised_short = -allocation
+        .weights
+        .values()
+        .copied()
+        .filter(|weight| *weight < 0.0)
+        .sum::<f64>();
+    let realised_gross = realised_long + realised_short;
+    allocation.diagnostics.realised_long = realised_long;
+    allocation.diagnostics.realised_short = realised_short;
+    allocation.diagnostics.realised_gross = realised_gross;
+    allocation.diagnostics.realised_net = realised_long - realised_short;
+    allocation.diagnostics.unused_long = (budget.max_long - realised_long).max(0.0);
+    allocation.diagnostics.unused_short = (budget.max_short - realised_short).max(0.0);
+    allocation.diagnostics.unused_gross = (budget.max_gross - realised_gross).max(0.0);
+    Ok(allocation)
 }
 
 fn side_total(capped: &[(&Proposal, f64)], direction: Direction) -> f64 {
@@ -786,6 +892,35 @@ mod tests {
     }
 
     #[test]
+    fn rank_buffer_retains_eligible_incumbents_without_side_quotas() {
+        let candidates = (0..6)
+            .map(|index| {
+                candidate(
+                    &format!("c{index}"),
+                    if index == 4 {
+                        Direction::Short
+                    } else {
+                        Direction::Long
+                    },
+                    1.0 - index as f64 / 10.0,
+                    0.02,
+                )
+            })
+            .collect::<Vec<_>>();
+        let incumbents = BTreeMap::from([
+            ("c3".into(), Direction::Long),
+            ("c4".into(), Direction::Long),
+        ]);
+        let selected =
+            buffered_ranked_ids(&candidates, RankingMethod::Edge, &incumbents, 3, 5).unwrap();
+        assert_eq!(selected, ["c0", "c1", "c3"]);
+        assert!(
+            !selected.contains(&"c4".into()),
+            "side flips are never buffered"
+        );
+    }
+
+    #[test]
     fn cap_excess_is_not_redistributed() {
         let allocation = allocate(
             &[
@@ -801,6 +936,29 @@ mod tests {
         assert!((allocation.weights["c"] - 0.1).abs() < EPSILON);
         assert!((allocation.diagnostics.realised_gross - 0.6).abs() < EPSILON);
         assert_eq!(allocation.diagnostics.capped_positions, ["a"]);
+    }
+
+    #[test]
+    fn group_cap_scales_only_the_binding_group_and_leaves_cash() {
+        let proposals = [
+            proposal("a", Direction::Long, 0.20, 0.20),
+            proposal("b", Direction::Long, 0.20, 0.20),
+            proposal("c", Direction::Short, 0.20, 0.20),
+        ];
+        let groups = BTreeMap::from([
+            ("a".into(), "one".into()),
+            ("b".into(), "one".into()),
+            ("c".into(), "two".into()),
+        ]);
+        let allocation =
+            allocate_with_group_cap(&proposals, Budget::gross_only(1.0).unwrap(), &groups, 0.25)
+                .unwrap();
+        assert!((allocation.weights["a"] - 0.125).abs() < EPSILON);
+        assert!((allocation.weights["b"] - 0.125).abs() < EPSILON);
+        assert!((allocation.weights["c"] + 0.20).abs() < EPSILON);
+        assert_eq!(allocation.diagnostics.capped_groups, ["one"]);
+        assert!((allocation.diagnostics.realised_gross - 0.45).abs() < EPSILON);
+        assert!((allocation.diagnostics.unused_gross - 0.55).abs() < EPSILON);
     }
 
     #[test]

@@ -809,7 +809,8 @@ Implemented foundation as of 2026-08-11:
   residual momentum inputs with prefix-invariance coverage. The v9 contract
   adds provider-neutral completed-session Nasdaq spread/trade observations;
   its closed-fold Sharpe improved to 0.76 but still failed the 2.0 gate and
-  remains research-only;
+  remains research-only. The v15 contract adds filing-date-controlled licensed
+  quarterly statement ratios without moving provider decoding into the bot;
 - `stockholm-portfolio` owns no-quota direction selection and turnover-aware
   replay, including exact-horizon OMXSGI attribution and an explicitly enabled
   direction-overlay ablation with separate direction-only metrics. Relative
@@ -997,6 +998,17 @@ request could be made. Yahoo's public chart endpoint likewise returned 404,
 “symbol may be delisted,” for all three tickers. The free Nasdaq/Yahoo/IB stack
 therefore cannot supply the inactive-price panel; that remains a licensed-data
 procurement requirement rather than an engineering retry.
+
+The shared provider now has two guarded EODHD paths ready for a licensed trial.
+`collect-eodhd-delisted` intersects inactive `ST` common stocks with official
+Nasdaq delisting ISINs before downloading EOD history.
+`collect-eodhd-fundamentals` intersects active securities with the current
+Large/Mid/Small universe and inactive securities with official delisting
+notices, then normalizes quarterly statements using each row's `filing_date`.
+The token is request-only and is never serialized. Feature version
+`fs-rust-stockholm-15` exposes the resulting point-in-time quarterly ratios in
+Rust. Neither path has been run because `EODHD_API_TOKEN` is not configured;
+provider coverage and revision behavior therefore remain unproven.
 
 Before choosing a provider, submit a fixed acceptance pack containing at least
 twenty delisted Main Market ISINs across Large, Mid, and Small Cap, including

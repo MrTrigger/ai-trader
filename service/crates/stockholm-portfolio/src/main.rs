@@ -91,33 +91,66 @@ usage: stockholm-portfolio <command>
       With EODHD_API_TOKEN, archive licensed inactive Stockholm common-stock
       EOD histories only where ISIN matches an official Nasdaq delisting.
 
+  collect-eodhd-fundamentals --data-root <dir> --universe <json>
+                             --nasdaq-equity-notices <json>
+                             [--pause-ms 100] [--limit 0]
+      With EODHD_API_TOKEN, archive licensed quarterly statements using their
+      filing dates for current Main Market and officially delisted securities.
+
   training-matrix --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                   --out <jsonl> [--horizon-sessions 5] [--min-adv-sek 1000000]
-                  [--feature-set baseline|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text|residual-pdmr-microstructure-borrow-news-report-attachments]
+                  [--skv-listing-history <json>]
+                  [--feature-set baseline|baseline-global-risk|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-quarterly-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text|residual-pdmr-microstructure-borrow-news-report-attachments]
                   [--fi-net-shorts <json>] [--fi-pdmr <json>]
                   [--nasdaq-reports <json>] [--esef-annual <json>]
+                  [--eodhd-fundamentals <json>]
                   [--nasdaq-company-news <json>]
                   [--nasdaq-report-messages <json>]
                   [--nasdaq-report-attachments <json>]
                   [--riksbank-macro <json>]
                   [--nasdaq-market-history-root <dir>]
                   [--ib-fee-history-root <dir>]
+                  [--cme-bars-root <dir>]
       Emit final Rust-owned features, missing flags, labels, and sample weights
-      for Nasdaq Stockholm Large, Mid, and Small Cap only.
+      for Nasdaq Stockholm Large, Mid, and Small Cap only. When supplied,
+      effective authority admission dates are enforced before cross-sectional
+      ranks and labels are finalized.
 
   direction-training-matrix --index-dir <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                             --out <jsonl> [--horizon-sessions 20]
+                            [--cme-bars-root <dir>]
       Emit causal Rust-owned market-direction features and executable OMXSGI
       SOD-to-SOD absolute-return labels from official Nasdaq index histories.
+
+  filter-main-membership --matrix <jsonl> --universe <json>
+                         --skv-listing-history <json> --out <jsonl>
+      Conservatively remove rows before an issuer's effective-dated current
+      Stockholm Main Market admission. This does not add delisted histories.
+
+  diagnose-features --matrix <jsonl> --start YYYY-MM-DD --end YYYY-MM-DD
+                    --out <json> [--cadence-sessions 20]
+      Report date-local rank IC for every finalized Rust model input without
+      changing features, labels, models, or portfolio decisions.
+
+  fixed-momentum-backtest --matrix <jsonl> --start YYYY-MM-DD --end YYYY-MM-DD
+                          --out <json> [--benchmark <json>]
+                          [--cadence-sessions 20] [--max-positions 20]
+                          [--position-weight 0.05] [--cost-multiple 1]
+      Replay the predeclared adjusted-price 12-1 acceptance control as
+      unconstrained directional, long-only, and long/short diagnostic arms.
 
   backtest --matrix <jsonl> --model <json> --start YYYY-MM-DD --end YYYY-MM-DD
            --out <json> [--benchmark <json>] [--cadence-sessions 5]
            [--max-positions 20]
+           [--retention-rank 20]
+           [--max-sector-gross 0.25]
            [--ranking edge|edge_volatility]
            [--sizing equal|conviction|inverse_volatility|edge_volatility]
            [--max-gross 1] [--target-net <N>] [--direction-overlay]
+           [--market-forecast-matrix <jsonl> --market-forecast-model <json>]
            [--position-weight 0.05] [--min-position-weight 0]
            [--reference-edge 0.01] [--reference-volatility 0.02]
+           [--aggregate-short-horizon-forecast]
            [--cost-multiple 1]
       Replay one strictly-forward model fold with no long/short quota.
 
@@ -188,6 +221,12 @@ struct MatrixManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     esef_mapping_coverage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarterly_fundamental_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarterly_fundamental_asof_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarterly_fundamental_coverage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     macro_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macro_asof_policy: Option<String>,
@@ -203,6 +242,18 @@ struct MatrixManifest {
     borrow_fee_asof_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     borrow_fee_coverage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_asof_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_coverage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership_coverage: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -216,6 +267,12 @@ struct DirectionMatrixManifest {
     index_sources: std::collections::BTreeMap<String, String>,
     decision_policy: String,
     label_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_asof_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global_risk_coverage: Option<String>,
 }
 
 fn get(args: &[String], name: &str) -> Option<String> {
@@ -621,9 +678,75 @@ fn collect_eodhd_delisted(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn collect_eodhd_fundamentals(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let universe_path = PathBuf::from(need(args, "--universe")?);
+    let universe = equity_data::load_instruments(&universe_path)?;
+    let notices_path = PathBuf::from(need(args, "--nasdaq-equity-notices")?);
+    let notices = equity_data::load_nasdaq_equity_notices(&notices_path)?;
+    let token = std::env::var("EODHD_API_TOKEN")
+        .map_err(|_| "EODHD_API_TOKEN is required for collect-eodhd-fundamentals".to_owned())?;
+    let collection = equity_data::collect_eodhd_stockholm_fundamentals(
+        &root,
+        &universe_path,
+        &universe,
+        &notices_path,
+        &notices,
+        &token,
+        number(args, "--pause-ms", 100_u64)?,
+        number(args, "--limit", 0_usize)?,
+    )?;
+    println!(
+        "matched {}/{} target ISINs against {} EODHD Stockholm symbols: {} histories, {} causal quarterly filings, {} failures -> {}",
+        collection.matched_isins,
+        collection.target_isins,
+        collection.provider_symbols,
+        collection.histories,
+        collection.quarterly_filings,
+        collection.failures,
+        collection.dataset_path.display(),
+    );
+    Ok(())
+}
+
 fn matrix(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let (source, histories) = equity_data::load_stockholm(&root)?;
+    let membership_history_path = get(args, "--skv-listing-history").map(PathBuf::from);
+    let membership_history = membership_history_path
+        .as_ref()
+        .map(|path| equity_data::load_skv_listing_history(path))
+        .transpose()?;
+    let membership_admissions = membership_history
+        .as_ref()
+        .map(equity_data::skv_current_main_market_admission_dates)
+        .unwrap_or_default();
+    let main_instrument_count = histories
+        .iter()
+        .filter(|history| {
+            matches!(
+                history.instrument.bucket,
+                DataBucket::LargeCap | DataBucket::MidCap | DataBucket::SmallCap
+            )
+        })
+        .count();
+    let eligible_from = histories
+        .iter()
+        .filter(|history| {
+            matches!(
+                history.instrument.bucket,
+                DataBucket::LargeCap | DataBucket::MidCap | DataBucket::SmallCap
+            )
+        })
+        .filter_map(|history| {
+            membership_admissions
+                .get(&equity_data::stockholm_security_issuer_key(
+                    &history.instrument.name,
+                ))
+                .copied()
+                .map(|date| (history.instrument.orderbook_id.clone(), date))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let company_news_dataset = get(args, "--nasdaq-reports")
         .map(|path| equity_data::load_nasdaq_company_news(Path::new(&path)))
         .transpose()?;
@@ -840,9 +963,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
     if let Some(coverage) = &report_text_metric_coverage {
         eprintln!(
             "Rust report-text extraction: {}/{} deduplicated events have at least one declared metric ({:?})",
-            coverage.events_with_any_metric,
-            coverage.deduplicated_events,
-            coverage.by_feature,
+            coverage.events_with_any_metric, coverage.deduplicated_events, coverage.by_feature,
         );
     }
     let esef_dataset = get(args, "--esef-annual")
@@ -850,7 +971,7 @@ fn matrix(args: &[String]) -> Result<(), String> {
         .transpose()?;
     let mut matched_esef_filings = 0_usize;
     let mut matched_esef_instruments = std::collections::BTreeSet::new();
-    let fundamental_events = esef_dataset
+    let annual_fundamental_events = esef_dataset
         .as_ref()
         .map(|dataset| {
             dataset
@@ -903,6 +1024,80 @@ fn matrix(args: &[String]) -> Result<(), String> {
             instruments_by_issuer.values().map(Vec::len).sum::<usize>()
         );
     }
+    let quarterly_fundamental_dataset = get(args, "--eodhd-fundamentals")
+        .map(|path| equity_data::load_eodhd_stockholm_fundamentals(Path::new(&path)))
+        .transpose()?;
+    let instruments_by_isin = histories
+        .iter()
+        .filter(|history| {
+            matches!(
+                history.instrument.bucket,
+                DataBucket::LargeCap | DataBucket::MidCap | DataBucket::SmallCap
+            )
+        })
+        .map(|history| {
+            (
+                history.instrument.isin.as_str(),
+                history.instrument.orderbook_id.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut matched_quarterly_filings = 0_usize;
+    let mut matched_quarterly_instruments = std::collections::BTreeSet::new();
+    let quarterly_fundamental_events = quarterly_fundamental_dataset
+        .as_ref()
+        .map(|dataset| {
+            dataset
+                .histories
+                .iter()
+                .flat_map(|history| {
+                    let Some(instrument_id) = instruments_by_isin.get(history.symbol.isin.as_str())
+                    else {
+                        return Vec::new();
+                    };
+                    matched_quarterly_instruments.insert((*instrument_id).to_owned());
+                    matched_quarterly_filings += history.quarterly.len();
+                    history
+                        .quarterly
+                        .iter()
+                        .map(|filing| {
+                            let values = &filing.values;
+                            features_stockholm::AnnualFundamentalEvent {
+                                instrument_id: (*instrument_id).to_owned(),
+                                available_date: filing.available_date,
+                                report_period_end: filing.report_period_end,
+                                filing_key: filing.filing_key.clone(),
+                                reporting_currency: values.reporting_currency.clone(),
+                                revenue: values.revenue,
+                                prior_revenue: values.prior_revenue,
+                                operating_profit: values.operating_profit,
+                                net_income: values.net_income,
+                                prior_net_income: values.prior_net_income,
+                                assets: values.assets,
+                                prior_assets: values.prior_assets,
+                                equity: values.equity,
+                                prior_equity: values.prior_equity,
+                                cash: values.cash,
+                                operating_cash_flow: values.operating_cash_flow,
+                                current_assets: values.current_assets,
+                                current_liabilities: values.current_liabilities,
+                                basic_eps: values.basic_eps,
+                                weighted_average_shares: values.weighted_average_shares,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(dataset) = &quarterly_fundamental_dataset {
+        eprintln!(
+            "EODHD quarterly-fundamental mapping: {matched_quarterly_filings} filings, {}/{} current Main Market securities ({} provider histories)",
+            matched_quarterly_instruments.len(),
+            instruments_by_isin.len(),
+            dataset.histories.len(),
+        );
+    }
     let horizon = number(args, "--horizon-sessions", 5_usize)?;
     let min_adv = number(args, "--min-adv-sek", 1_000_000.0_f64)?;
     let mut bars = Vec::new();
@@ -935,12 +1130,16 @@ fn matrix(args: &[String]) -> Result<(), String> {
     let feature_set = get(args, "--feature-set").unwrap_or_else(|| "baseline".into());
     let feature_set = match feature_set.as_str() {
         "baseline" => features_stockholm::FeatureSet::Baseline,
+        "baseline-global-risk" => features_stockholm::FeatureSet::BaselineGlobalRisk,
         "context" => features_stockholm::FeatureSet::Context,
         "residual" => features_stockholm::FeatureSet::Residual,
         "residual-public-short" => features_stockholm::FeatureSet::ResidualPublicShort,
         "residual-pdmr" => features_stockholm::FeatureSet::ResidualPdmr,
         "residual-pdmr-reports" => features_stockholm::FeatureSet::ResidualPdmrReports,
         "residual-fundamentals" => features_stockholm::FeatureSet::ResidualFundamentals,
+        "residual-quarterly-fundamentals" => {
+            features_stockholm::FeatureSet::ResidualQuarterlyFundamentals
+        }
         "residual-pdmr-macro" => features_stockholm::FeatureSet::ResidualPdmrMacro,
         "residual-pdmr-microstructure" => {
             features_stockholm::FeatureSet::ResidualPdmrMicrostructure
@@ -959,6 +1158,27 @@ fn matrix(args: &[String]) -> Result<(), String> {
         }
         other => return Err(format!("unknown Stockholm feature set {other:?}")),
     };
+    let global_risk_dataset = get(args, "--cme-bars-root")
+        .map(|path| cme_data::load_daily_closes(Path::new(&path), "ES", 300))
+        .transpose()?;
+    if feature_set == features_stockholm::FeatureSet::BaselineGlobalRisk
+        && global_risk_dataset.is_none()
+    {
+        return Err("--cme-bars-root is required for baseline-global-risk features".into());
+    }
+    let global_risk = global_risk_dataset
+        .as_ref()
+        .map(|series| {
+            series
+                .observations
+                .iter()
+                .map(|bar| features_stockholm::GlobalRiskBar {
+                    date: bar.date,
+                    close: bar.close,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let public_short_dataset = get(args, "--fi-net-shorts")
         .map(|path| equity_data::load_fi_net_shorts(Path::new(&path)))
         .transpose()?;
@@ -1009,6 +1229,19 @@ fn matrix(args: &[String]) -> Result<(), String> {
     {
         return Err("--esef-annual is required for residual-fundamentals features".into());
     }
+    if feature_set == features_stockholm::FeatureSet::ResidualQuarterlyFundamentals
+        && quarterly_fundamental_dataset.is_none()
+    {
+        return Err(
+            "--eodhd-fundamentals is required for residual-quarterly-fundamentals features".into(),
+        );
+    }
+    let fundamental_events =
+        if feature_set == features_stockholm::FeatureSet::ResidualQuarterlyFundamentals {
+            &quarterly_fundamental_events
+        } else {
+            &annual_fundamental_events
+        };
     let pdmr_events = pdmr_dataset
         .as_ref()
         .map(|dataset| {
@@ -1161,24 +1394,27 @@ fn matrix(args: &[String]) -> Result<(), String> {
         })
         .flatten()
         .collect::<Vec<_>>();
-    let matrix = features_stockholm::training_matrix_for_named_feature_set_with_all_sources(
-        &bars,
-        &instruments,
-        date(args, "--start")?,
-        date(args, "--end")?,
-        horizon,
-        min_adv,
-        feature_set,
-        &public_short_events,
-        &pdmr_events,
-        &report_events,
-        &fundamental_events,
-        &macro_series,
-        &microstructure,
-        &borrow_fees,
-        &company_news_events,
-        &report_text_events,
-    )?;
+    let matrix =
+        features_stockholm::training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+            &bars,
+            &instruments,
+            date(args, "--start")?,
+            date(args, "--end")?,
+            horizon,
+            min_adv,
+            feature_set,
+            &public_short_events,
+            &pdmr_events,
+            &report_events,
+            fundamental_events,
+            &macro_series,
+            &microstructure,
+            &borrow_fees,
+            &company_news_events,
+            &report_text_events,
+            &global_risk,
+            &eligible_from,
+        )?;
     let path = PathBuf::from(need(args, "--out")?);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1190,6 +1426,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
         feature_set_version: match feature_set {
             features_stockholm::FeatureSet::Baseline => {
                 features_stockholm::BASELINE_FEATURE_SET_VERSION
+            }
+            features_stockholm::FeatureSet::BaselineGlobalRisk => {
+                features_stockholm::BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION
             }
             features_stockholm::FeatureSet::Context => features_stockholm::FEATURE_SET_VERSION,
             features_stockholm::FeatureSet::Residual => {
@@ -1206,6 +1445,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
             }
             features_stockholm::FeatureSet::ResidualFundamentals => {
                 features_stockholm::FUNDAMENTAL_FEATURE_SET_VERSION
+            }
+            features_stockholm::FeatureSet::ResidualQuarterlyFundamentals => {
+                features_stockholm::QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION
             }
             features_stockholm::FeatureSet::ResidualPdmrMacro => {
                 features_stockholm::PDMR_MACRO_FEATURE_SET_VERSION
@@ -1342,6 +1584,21 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 instruments_by_issuer.values().map(Vec::len).sum::<usize>()
             )
         }),
+        quarterly_fundamental_source: quarterly_fundamental_dataset
+            .as_ref()
+            .map(|dataset| dataset.provider.clone()),
+        quarterly_fundamental_asof_policy: quarterly_fundamental_dataset.as_ref().map(|_| {
+            "licensed quarterly statements are ISIN-mapped in equity-data and become usable only after their provider filing_date; accounting period end never controls availability"
+                .into()
+        }),
+        quarterly_fundamental_coverage: quarterly_fundamental_dataset.as_ref().map(|dataset| {
+            format!(
+                "{matched_quarterly_filings} causal quarterly filings mapped to {}/{} current Main Market securities from {} provider histories",
+                matched_quarterly_instruments.len(),
+                instruments_by_isin.len(),
+                dataset.histories.len(),
+            )
+        }),
         macro_source: macro_dataset.as_ref().map(|dataset| dataset.source.clone()),
         macro_asof_policy: macro_dataset.as_ref().map(|dataset| {
             format!(
@@ -1399,6 +1656,49 @@ fn matrix(args: &[String]) -> Result<(), String> {
                 borrow_fees.len()
             )
         }),
+        global_risk_source: global_risk_dataset.as_ref().map(|series| {
+            format!(
+                "archived CME {} {}-second Parquet bars in {}",
+                series.symbol,
+                series.interval_seconds,
+                series.source_root.display()
+            )
+        }),
+        global_risk_asof_policy: global_risk_dataset.as_ref().map(|_| {
+            "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
+                .into()
+        }),
+        global_risk_coverage: global_risk_dataset.as_ref().map(|series| {
+            format!(
+                "{} source rows in {} partitions produce {} daily observations, {} through {}",
+                series.source_rows,
+                series.source_files,
+                series.observations.len(),
+                series
+                    .observations
+                    .first()
+                    .map(|bar| bar.date.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                series
+                    .observations
+                    .last()
+                    .map(|bar| bar.date.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            )
+        }),
+        membership_source: membership_history_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        membership_policy: membership_history.as_ref().map(|_| {
+            "Rows before an issuer's current continuous effective-dated Stockholm Main Market admission are removed in Rust before cross-sectional features, relative labels, and sample weights are finalized; unmatched issuers are retained, and no inactive history is synthesized."
+                .into()
+        }),
+        membership_coverage: membership_history.as_ref().map(|_| {
+            format!(
+                "{}/{} current Large/Mid/Small Cap lines map by normalized issuer name to a Skatteverket effective Main Market admission",
+                eligible_from.len(), main_instrument_count
+            )
+        }),
     };
     serde_json::to_writer(&mut output, &manifest).map_err(|error| error.to_string())?;
     output.write_all(b"\n").map_err(|error| error.to_string())?;
@@ -1411,6 +1711,130 @@ fn matrix(args: &[String]) -> Result<(), String> {
         "wrote {} final Rust Stockholm rows -> {}",
         matrix.rows.len(),
         path.display()
+    );
+    Ok(())
+}
+
+fn filter_main_membership(args: &[String]) -> Result<(), String> {
+    let matrix_path = PathBuf::from(need(args, "--matrix")?);
+    let universe_path = PathBuf::from(need(args, "--universe")?);
+    let history_path = PathBuf::from(need(args, "--skv-listing-history")?);
+    let output_path = PathBuf::from(need(args, "--out")?);
+    if matrix_path == output_path || output_path.exists() {
+        return Err("membership-filter output must be a new path distinct from the input".into());
+    }
+    let instruments = equity_data::load_instruments(&universe_path)?;
+    let history = equity_data::load_skv_listing_history(&history_path)?;
+    let admissions = equity_data::skv_current_main_market_admission_dates(&history);
+    let main_instruments = instruments
+        .iter()
+        .filter(|instrument| {
+            matches!(
+                instrument.bucket,
+                DataBucket::LargeCap | DataBucket::MidCap | DataBucket::SmallCap
+            )
+        })
+        .collect::<Vec<_>>();
+    let eligible_from = main_instruments
+        .iter()
+        .filter_map(|instrument| {
+            admissions
+                .get(&equity_data::stockholm_security_issuer_key(
+                    &instrument.name,
+                ))
+                .copied()
+                .map(|date| (instrument.orderbook_id.clone(), date))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let input = std::fs::File::open(&matrix_path)
+        .map_err(|error| format!("{}: {error}", matrix_path.display()))?;
+    let mut lines = std::io::BufReader::new(input).lines();
+    let first = lines
+        .next()
+        .ok_or_else(|| "training matrix is empty".to_string())?
+        .map_err(|error| error.to_string())?;
+    let mut manifest: MatrixManifest =
+        serde_json::from_str(&first).map_err(|error| error.to_string())?;
+    if manifest.kind != "stockholm_training_manifest" {
+        return Err("first row is not a Stockholm training manifest".into());
+    }
+    if manifest.membership_source.is_some() {
+        return Err("training matrix already carries a membership filter".into());
+    }
+    manifest.membership_source = Some(history_path.to_string_lossy().into_owned());
+    manifest.membership_policy = Some(
+        "Rows before an issuer's current continuous effective-dated Stockholm Main Market admission are removed in Rust; unmatched issuers are retained, and no inactive history is synthesized. Existing feature and relative-label cross-sections are not recomputed."
+            .into(),
+    );
+    manifest.membership_coverage = Some(format!(
+        "{}/{} current Large/Mid/Small Cap lines map by normalized issuer name to a Skatteverket effective Main Market admission",
+        eligible_from.len(),
+        main_instruments.len()
+    ));
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|error| format!("{}: {error}", output_path.display()))?;
+    let mut writer = std::io::BufWriter::new(output);
+    serde_json::to_writer(&mut writer, &manifest).map_err(|error| error.to_string())?;
+    writer.write_all(b"\n").map_err(|error| error.to_string())?;
+
+    let mut current_date = None;
+    let mut block = Vec::<TrainingRow>::new();
+    let mut input_rows = 0_usize;
+    let mut output_rows = 0_usize;
+    let mut clipped_rows = 0_usize;
+    let flush = |block: &mut Vec<TrainingRow>,
+                 writer: &mut std::io::BufWriter<std::fs::File>,
+                 output_rows: &mut usize|
+     -> Result<(), String> {
+        let weight = 1.0 / block.len() as f64;
+        for mut row in block.drain(..) {
+            row.sample_weight = weight;
+            serde_json::to_writer(&mut *writer, &row).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+            *output_rows += 1;
+        }
+        Ok(())
+    };
+    for line in lines {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        input_rows += 1;
+        let row: TrainingRow = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if current_date.is_some_and(|date| row.date < date) {
+            return Err("training matrix rows are not ordered by decision date".into());
+        }
+        if current_date.is_some_and(|date| row.date != date) && !block.is_empty() {
+            flush(&mut block, &mut writer, &mut output_rows)?;
+        }
+        current_date = Some(row.date);
+        if eligible_from
+            .get(&row.instrument_id)
+            .is_some_and(|admission| row.date < *admission)
+        {
+            clipped_rows += 1;
+        } else {
+            block.push(row);
+        }
+    }
+    if !block.is_empty() {
+        flush(&mut block, &mut writer, &mut output_rows)?;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    println!(
+        "membership filter retained {output_rows}/{input_rows} rows and clipped {clipped_rows} pre-admission rows for {}/{} Main Market lines -> {}",
+        eligible_from.len(),
+        main_instruments.len(),
+        output_path.display()
     );
     Ok(())
 }
@@ -1444,11 +1868,28 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
                 .collect(),
         });
     }
-    let matrix = features_stockholm::direction_training_matrix(
+    let global_risk_dataset = get(args, "--cme-bars-root")
+        .map(|path| cme_data::load_daily_closes(Path::new(&path), "ES", 300))
+        .transpose()?;
+    let global_risk = global_risk_dataset
+        .as_ref()
+        .map(|series| {
+            series
+                .observations
+                .iter()
+                .map(|bar| features_stockholm::GlobalRiskBar {
+                    date: bar.date,
+                    close: bar.close,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let matrix = features_stockholm::direction_training_matrix_with_global_risk(
         &inputs,
         date(args, "--start")?,
         date(args, "--end")?,
         horizon,
+        &global_risk,
     )?;
     let path = PathBuf::from(need(args, "--out")?);
     if let Some(parent) = path.parent() {
@@ -1458,7 +1899,12 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
     let mut output = std::io::BufWriter::new(file);
     let manifest = DirectionMatrixManifest {
         kind: "stockholm_direction_training_manifest".into(),
-        feature_set_version: features_stockholm::DIRECTION_FEATURE_SET_VERSION.into(),
+        feature_set_version: if global_risk_dataset.is_some() {
+            features_stockholm::DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION
+        } else {
+            features_stockholm::DIRECTION_FEATURE_SET_VERSION
+        }
+        .into(),
         label_version: features_stockholm::direction_label_version(horizon)?,
         features: matrix.features,
         horizon_sessions: horizon,
@@ -1470,6 +1916,36 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
         label_policy:
             "OMXSGI next-session official SOD value to official SOD value after the declared holding horizon"
                 .into(),
+        global_risk_source: global_risk_dataset.as_ref().map(|series| {
+            format!(
+                "archived CME {} {}-second Parquet bars in {}",
+                series.symbol,
+                series.interval_seconds,
+                series.source_root.display()
+            )
+        }),
+        global_risk_asof_policy: global_risk_dataset.as_ref().map(|_| {
+            "Rust aggregates the last completed CME bar per UTC day and exposes only observations with a UTC date strictly before the Stockholm decision date"
+                .into()
+        }),
+        global_risk_coverage: global_risk_dataset.as_ref().map(|series| {
+            format!(
+                "{} source rows in {} partitions produce {} daily observations, {} through {}",
+                series.source_rows,
+                series.source_files,
+                series.observations.len(),
+                series
+                    .observations
+                    .first()
+                    .map(|bar| bar.date.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                series
+                    .observations
+                    .last()
+                    .map(|bar| bar.date.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            )
+        }),
     };
     serde_json::to_writer(&mut output, &manifest).map_err(|error| error.to_string())?;
     output.write_all(b"\n").map_err(|error| error.to_string())?;
@@ -1487,7 +1963,11 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn load_matrix(path: &Path) -> Result<(MatrixManifest, Vec<TrainingRow>), String> {
+fn load_matrix(
+    path: &Path,
+    start: Date,
+    end: Date,
+) -> Result<(MatrixManifest, Vec<TrainingRow>), String> {
     let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut lines = std::io::BufReader::new(file).lines();
     let first = lines
@@ -1495,17 +1975,127 @@ fn load_matrix(path: &Path) -> Result<(MatrixManifest, Vec<TrainingRow>), String
         .ok_or("empty matrix")?
         .map_err(|error| error.to_string())?;
     let manifest = serde_json::from_str(&first).map_err(|error| error.to_string())?;
-    let rows = lines
-        .filter_map(|line| match line {
-            Ok(value) if value.trim().is_empty() => None,
-            other => Some(other),
-        })
-        .map(|line| {
-            let line = line.map_err(|error| error.to_string())?;
-            serde_json::from_str(&line).map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = Vec::new();
+    for line in lines {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: TrainingRow = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if row.date >= start && row.date <= end {
+            rows.push(row);
+        }
+    }
     Ok((manifest, rows))
+}
+
+fn diagnose_features(args: &[String]) -> Result<(), String> {
+    let matrix_path = PathBuf::from(need(args, "--matrix")?);
+    let start = date(args, "--start")?;
+    let end = date(args, "--end")?;
+    let cadence = number(args, "--cadence-sessions", 20_usize)?;
+    if cadence == 0 {
+        return Err("feature diagnostic cadence must be positive".into());
+    }
+    let (manifest, mut rows) = load_matrix(&matrix_path, start, end)?;
+    let selected_dates = rows
+        .iter()
+        .map(|row| row.date)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .step_by(cadence)
+        .collect::<std::collections::BTreeSet<_>>();
+    rows.retain(|row| selected_dates.contains(&row.date));
+    let diagnostics = features_stockholm::feature_target_diagnostics(&rows, &manifest.features)?;
+    let report = serde_json::json!({
+        "kind": "stockholm_feature_target_diagnostics",
+        "matrix": matrix_path,
+        "feature_set_version": manifest.feature_set_version,
+        "label_version": manifest.label_version,
+        "survivorship_status": manifest.survivorship_status,
+        "start": start,
+        "end": end,
+        "cadence_sessions": cadence,
+        "decision_dates": selected_dates.len(),
+        "rows": rows.len(),
+        "features": diagnostics,
+        "disclosures": [
+            "Each value is the mean of decision-date-local Spearman correlations between one finalized Rust input and the Rust forward relative-return ordering.",
+            "This is retrospective drift diagnosis, not a fitted model or an independently held-out feature selection result."
+        ]
+    });
+    let path = PathBuf::from(need(args, "--out")?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "wrote {} feature drift rows over {} matrix rows -> {}",
+        manifest.features.len(),
+        rows.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+fn run_fixed_momentum_backtest(args: &[String]) -> Result<(), String> {
+    let matrix_path = PathBuf::from(need(args, "--matrix")?);
+    let start = date(args, "--start")?;
+    let end = date(args, "--end")?;
+    let cadence = number(args, "--cadence-sessions", 20_usize)?;
+    let max_positions = number(args, "--max-positions", 20_usize)?;
+    let (manifest, rows) = load_matrix(&matrix_path, start, end)?;
+    if manifest.horizon_sessions != cadence {
+        return Err(format!(
+            "matrix label holds {} sessions but replay cadence is {cadence}",
+            manifest.horizon_sessions
+        ));
+    }
+    let multiple = number(args, "--cost-multiple", 1.0_f64)?;
+    if !multiple.is_finite() || multiple <= 0.0 {
+        return Err("--cost-multiple must be finite and positive".into());
+    }
+    let mut costs = stockholm_portfolio::CostConfig::default();
+    costs.market_friction_multiple = multiple;
+    costs.round_trip_bps = costs.round_trip_commission_bps
+        + multiple * (costs.round_trip_impact_bps + costs.fallback_spread_bps);
+    costs.short_borrow_bps *= cadence as f64 / 5.0;
+    let benchmark = get(args, "--benchmark")
+        .map(|path| equity_data::load_benchmark(Path::new(&path)))
+        .transpose()?;
+    let result = stockholm_portfolio::fixed_momentum_backtest(
+        &rows,
+        &stockholm_portfolio::FixedMomentumConfig {
+            start,
+            end,
+            cadence_sessions: cadence,
+            max_positions,
+            position_weight: number(args, "--position-weight", 0.05_f64)?,
+            costs,
+            benchmark,
+            survivorship_status: manifest.survivorship_status,
+        },
+    )?;
+    let path = PathBuf::from(need(args, "--out")?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "directional {:.2}%, Sharpe {:.2}; long-only {:.2}%, {:.2}; long/short {:.2}%, {:.2} -> {}",
+        result.directional.metrics.total_return * 100.0,
+        result.directional.metrics.sharpe,
+        result.long_only.metrics.total_return * 100.0,
+        result.long_only.metrics.sharpe,
+        result.long_short_diagnostic.metrics.total_return * 100.0,
+        result.long_short_diagnostic.metrics.sharpe,
+        path.display()
+    );
+    Ok(())
 }
 
 fn load_direction_matrix(
@@ -1618,12 +2208,13 @@ fn summarize_direction(args: &[String]) -> Result<(), String> {
 
 fn run_backtest(args: &[String]) -> Result<(), String> {
     let matrix_path = PathBuf::from(need(args, "--matrix")?);
-    let (manifest, rows) = load_matrix(&matrix_path)?;
+    let start = date(args, "--start")?;
+    let end = date(args, "--end")?;
+    let (manifest, rows) = load_matrix(&matrix_path, start, end)?;
     let model = stockholm_portfolio::Model::load(Path::new(&need(args, "--model")?))?;
     let cadence = number(args, "--cadence-sessions", 5_usize)?;
     if manifest.features != model.features
         || manifest.feature_set_version != model.feature_set_version
-        || model.label_version != manifest.label_version
         || model.survivorship_status != manifest.survivorship_status
     {
         return Err("matrix/model/runtime contracts differ".into());
@@ -1634,6 +2225,26 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             manifest.horizon_sessions
         ));
     }
+    let model_horizon = features_stockholm::label_horizon(&model.label_version)
+        .ok_or_else(|| format!("unsupported model label version {:?}", model.label_version))?;
+    let aggregate_short_horizon = args
+        .iter()
+        .any(|argument| argument == "--aggregate-short-horizon-forecast");
+    let prediction_horizon_scale = if model.label_version == manifest.label_version {
+        1.0
+    } else if aggregate_short_horizon {
+        if model_horizon >= cadence || cadence % model_horizon != 0 {
+            return Err(format!(
+                "model horizon {model_horizon} must be a proper divisor of holding horizon {cadence}"
+            ));
+        }
+        cadence as f64 / model_horizon as f64
+    } else {
+        return Err(format!(
+            "model label {:?} differs from matrix label {:?}; pass --aggregate-short-horizon-forecast only for the explicit shorter-horizon experiment",
+            model.label_version, manifest.label_version
+        ));
+    };
     let multiple = number(args, "--cost-multiple", 1.0_f64)?;
     if !multiple.is_finite() || multiple <= 0.0 {
         return Err("--cost-multiple must be finite and positive".into());
@@ -1681,14 +2292,88 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     let direction_config = direction_overlay
         .then(|| portfolio_construction::DirectionConfig::baseline(max_gross))
         .transpose()?;
+    let prediction_composition = match get(args, "--prediction-composition").as_deref() {
+        None | Some("direct") => stockholm_portfolio::PredictionComposition::Direct,
+        Some("cross-sectional-residual-plus-market") => {
+            stockholm_portfolio::PredictionComposition::CrossSectionalResidualPlusMarket
+        }
+        Some(value) => {
+            return Err(format!(
+                "unsupported --prediction-composition {value:?}; expected direct or cross-sectional-residual-plus-market"
+            ));
+        }
+    };
+    if prediction_horizon_scale != 1.0
+        && (model.reward != "absolute_return"
+            || prediction_composition != stockholm_portfolio::PredictionComposition::Direct)
+    {
+        return Err(
+            "short-horizon forecast aggregation currently requires a direct absolute-return model"
+                .into(),
+        );
+    }
+    let market_forecast_matrix = get(args, "--market-forecast-matrix");
+    let market_forecast_model = get(args, "--market-forecast-model");
+    let (market_return_forecasts, market_forecast_model_id) =
+        match (market_forecast_matrix, market_forecast_model) {
+            (None, None) => (None, None),
+            (Some(matrix_path), Some(model_path)) => {
+                if !direction_overlay {
+                    return Err(
+                        "market-return forecast composition requires --direction-overlay".into(),
+                    );
+                }
+                let (direction_manifest, direction_rows) =
+                    load_direction_matrix(Path::new(&matrix_path))?;
+                let direction_model =
+                    stockholm_portfolio::DirectionModel::load(Path::new(&model_path))?;
+                if direction_manifest.features != direction_model.features
+                    || direction_manifest.feature_set_version != direction_model.feature_set_version
+                    || direction_manifest.label_version != direction_model.label_version
+                    || direction_manifest.horizon_sessions != cadence
+                {
+                    return Err("market forecast matrix/model/runtime contracts differ".into());
+                }
+                if direction_model.trained_through != model.trained_through {
+                    return Err(format!(
+                        "stock and market models have different training cutoffs: {} versus {}",
+                        model.trained_through, direction_model.trained_through
+                    ));
+                }
+                let forecasts = direction_rows
+                    .iter()
+                    .filter(|row| row.date >= start && row.date <= end)
+                    .map(|row| Ok((row.date, direction_model.predict(row)?.predicted_return)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+                if forecasts.is_empty() {
+                    return Err("market forecast matrix has no rows in the replay window".into());
+                }
+                (Some(forecasts), Some(direction_model.model_id))
+            }
+            _ => return Err(
+                "--market-forecast-matrix and --market-forecast-model must be supplied together"
+                    .into(),
+            ),
+        };
+    let max_positions = number(args, "--max-positions", 20_usize)?;
     let result = stockholm_portfolio::backtest(
         &model,
         &rows,
         &stockholm_portfolio::BacktestConfig {
-            start: date(args, "--start")?,
-            end: date(args, "--end")?,
+            start,
+            end,
             cadence_sessions: cadence,
-            max_positions: number(args, "--max-positions", 20_usize)?,
+            model_horizon_sessions: model_horizon,
+            prediction_horizon_scale,
+            max_positions,
+            retention_rank: number(args, "--retention-rank", max_positions)?,
+            max_sector_gross: get(args, "--max-sector-gross")
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("bad --max-sector-gross: {error}"))
+                })
+                .transpose()?,
             ranking,
             sizing,
             allocation_budget,
@@ -1697,6 +2382,9 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             reference_edge: number(args, "--reference-edge", 0.01_f64)?,
             reference_volatility: number(args, "--reference-volatility", 0.02_f64)?,
             direction_config,
+            prediction_composition,
+            market_return_forecasts,
+            market_forecast_model_id,
             costs,
             benchmark,
         },
@@ -1810,7 +2498,11 @@ fn main() -> ExitCode {
         Some("collect-esef-annual") => collect_esef_annual(&args[1..]),
         Some("collect-riksbank-macro") => collect_riksbank_macro(&args[1..]),
         Some("collect-eodhd-delisted") => collect_eodhd_delisted(&args[1..]),
+        Some("collect-eodhd-fundamentals") => collect_eodhd_fundamentals(&args[1..]),
         Some("training-matrix") => matrix(&args[1..]),
+        Some("filter-main-membership") => filter_main_membership(&args[1..]),
+        Some("diagnose-features") => diagnose_features(&args[1..]),
+        Some("fixed-momentum-backtest") => run_fixed_momentum_backtest(&args[1..]),
         Some("direction-training-matrix") => direction_matrix(&args[1..]),
         Some("backtest") => run_backtest(&args[1..]),
         Some("direction-backtest") => run_direction_backtest(&args[1..]),

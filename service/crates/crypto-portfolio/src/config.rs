@@ -48,6 +48,17 @@ pub struct Config {
     pub universe: Vec<String>,
     pub benchmark: Option<String>,
     pub min_dollar_volume: Decimal,
+    /// Eligibility floor on the volume of the hours this bot actually trades
+    /// in, from the liquidity profile. `min_dollar_volume` screens on a whole
+    /// day, which a name can clear on volume that arrives in hours we are
+    /// asleep for — KAITO clears the daily floor comfortably and trades
+    /// $55,720 in the hour we send into it.
+    ///
+    /// Zero disables it, which is the behaviour that shipped. A name the
+    /// profile has not measured keeps its eligibility rather than being
+    /// assumed thin, for the same reason the participation cap leaves it on
+    /// the mandate cap: absence of a measurement is not a measurement.
+    pub min_hourly_quote_volume: Decimal,
     /// How many slices the executor will split each order into. The cost model
     /// needs it because impact meets one slice against one hour, not the whole
     /// order against a day — see `estimate`. It is the runner that decides the
@@ -194,6 +205,11 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned),
             min_dollar_volume: dec(p, "min_dollar_volume")?,
+            min_hourly_quote_volume: p
+                .get("min_hourly_quote_volume")
+                .map(|_| dec(p, "min_hourly_quote_volume"))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO),
             execution_slices: p
                 .get("execution_slices")
                 .map(|_| usize_value(p, "execution_slices"))
