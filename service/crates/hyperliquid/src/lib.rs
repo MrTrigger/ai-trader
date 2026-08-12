@@ -297,29 +297,7 @@ impl VenueAdapter for Hyperliquid {
             .next()
             .ok_or_else(|| VenueError::Unreachable("the venue accepted nothing".into()))?;
 
-        match first {
-            Status::Resting { oid } => Ok(OrderAck {
-                venue_order_id: oid.to_string(),
-                client_order_id: order.client_order_id.clone(),
-                state: OrderState::Open,
-                accepted_at: OffsetDateTime::now_utc(),
-            }),
-            Status::Filled { oid, .. } => Ok(OrderAck {
-                venue_order_id: oid.to_string(),
-                client_order_id: order.client_order_id.clone(),
-                state: OrderState::Filled,
-                accepted_at: OffsetDateTime::now_utc(),
-            }),
-            // A rejection is an answer, not a transport failure. It must not be
-            // retried, and the venue's own words are the most useful thing to
-            // carry up.
-            Status::Error(msg) => Err(VenueError::InsufficientBalance {
-                currency: QUOTE.into(),
-                need: order.qty,
-                available: Decimal::ZERO,
-            })
-            .map_err(|_: VenueError| VenueError::Unreachable(format!("order rejected: {msg}"))),
-        }
+        ack_from_status(first, &order.client_order_id)
     }
 
     async fn cancel_order(&self, venue_order_id: &str) -> Result<(), VenueError> {
@@ -355,6 +333,31 @@ fn px_string(p: Decimal) -> String {
     let mut s = p.round_sf(5).unwrap_or(p).normalize();
     s.rescale(s.scale().min(6));
     s.normalize().to_string()
+}
+
+/// Turn one per-order venue status into an ack or a typed refusal.
+fn ack_from_status(status: Status, client_order_id: &str) -> Result<OrderAck, VenueError> {
+    match status {
+        Status::Resting { oid } => Ok(OrderAck {
+            venue_order_id: oid.to_string(),
+            client_order_id: client_order_id.to_string(),
+            state: OrderState::Open,
+            accepted_at: OffsetDateTime::now_utc(),
+        }),
+        Status::Filled { oid, .. } => Ok(OrderAck {
+            venue_order_id: oid.to_string(),
+            client_order_id: client_order_id.to_string(),
+            state: OrderState::Filled,
+            accepted_at: OffsetDateTime::now_utc(),
+        }),
+        Status::Error(msg) => Err(VenueError::Rejected { message: msg }),
+    }
+}
+
+/// Whether a refusal is the *expected* one for an Alo order that would have
+/// taken liquidity. This one is not an error to a scalper — it means "reprice".
+pub fn is_post_only_rejection(e: &VenueError) -> bool {
+    matches!(e, VenueError::Rejected { message } if message.contains("immediately match"))
 }
 
 /// The venue's client order id is a 128-bit hex value, not free text. Ours is a
@@ -551,5 +554,37 @@ mod tests {
         let r: ExchangeResponse =
             serde_json::from_str(r#"{"status":"err","response":null}"#).unwrap();
         assert!(r.statuses().is_err());
+    }
+
+    #[test]
+    fn a_venue_rejection_is_a_rejection_not_a_transport_failure() {
+        let e = ack_from_status(Status::Error("Insufficient margin".into()), "id-1").unwrap_err();
+        assert!(matches!(&e, VenueError::Rejected { message } if message.contains("margin")));
+    }
+
+    #[test]
+    fn resting_and_filled_statuses_become_acks() {
+        let a = ack_from_status(Status::Resting { oid: 77 }, "id-1").unwrap();
+        assert_eq!(a.venue_order_id, "77");
+        assert_eq!(a.state, OrderState::Open);
+        let f = ack_from_status(
+            Status::Filled { oid: 9, total_sz: "0.4".into(), avg_px: "64520.0".into() },
+            "id-2",
+        )
+        .unwrap();
+        assert_eq!(f.state, OrderState::Filled);
+    }
+
+    #[test]
+    fn post_only_rejections_are_recognisable() {
+        // Exact live wording is confirmed in Task 7's testnet checklist; both known
+        // phrasings share "immediately match".
+        let e = VenueError::Rejected {
+            message: "Post only order would have immediately matched, bbo was 64520@64521".into(),
+        };
+        assert!(is_post_only_rejection(&e));
+        let other = VenueError::Rejected { message: "Insufficient margin".into() };
+        assert!(!is_post_only_rejection(&other));
+        assert!(!is_post_only_rejection(&VenueError::Unreachable("timeout".into())));
     }
 }
