@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use calamine::{open_workbook_auto_from_rs, Data, Reader};
+use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use rayon::prelude::*;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -3854,7 +3854,15 @@ impl PublicEquityData {
         let inactive_path = cache_dir.join("ST-delisted-common-stock.json");
         let active = self.eodhd_symbol_list(&active_path, api_token, false)?;
         let inactive = self.eodhd_symbol_list(&inactive_path, api_token, true)?;
-        let mut provider_symbols = active.into_iter().chain(inactive).collect::<Vec<_>>();
+        // Keep the complete vendor count for provenance, but choose one code
+        // per ISIN with an active listing preferred over an inactive alias.
+        // Sorting a combined list by code would otherwise make the choice
+        // accidental and could pin a current security to a stale endpoint.
+        let mut provider_symbols = active
+            .iter()
+            .chain(inactive.iter())
+            .cloned()
+            .collect::<Vec<_>>();
         provider_symbols.sort_by(|left, right| {
             left.isin
                 .cmp(&right.isin)
@@ -3879,19 +3887,7 @@ impl PublicEquityData {
                 target_isins.extend(notice.isins.iter().filter(|isin| valid_isin(isin)).cloned());
             }
         }
-        let mut matched = provider_symbols
-            .iter()
-            .filter(|symbol| target_isins.contains(&symbol.isin))
-            .cloned()
-            .collect::<Vec<_>>();
-        matched.sort_by(|left, right| {
-            left.isin
-                .cmp(&right.isin)
-                .then_with(|| left.code.cmp(&right.code))
-        });
-        // Prefer one stable response per security. Multiple share-class codes
-        // with the same ISIN are provider duplicates, not extra observations.
-        matched.dedup_by(|right, left| right.isin == left.isin);
+        let mut matched = preferred_eodhd_symbols(&target_isins, active, inactive);
         let matched_isins = matched.len();
         if limit > 0 {
             matched.truncate(limit);
@@ -6017,6 +6013,25 @@ fn parse_eodhd_symbols(bytes: &[u8]) -> Result<Vec<EodhdDelistedSymbol>, String>
     Ok(symbols)
 }
 
+fn preferred_eodhd_symbols(
+    target_isins: &BTreeSet<String>,
+    active: Vec<EodhdDelistedSymbol>,
+    inactive: Vec<EodhdDelistedSymbol>,
+) -> Vec<EodhdDelistedSymbol> {
+    let mut preferred = BTreeMap::<String, EodhdDelistedSymbol>::new();
+    for symbol in inactive {
+        if target_isins.contains(&symbol.isin) {
+            preferred.entry(symbol.isin.clone()).or_insert(symbol);
+        }
+    }
+    for symbol in active {
+        if target_isins.contains(&symbol.isin) {
+            preferred.insert(symbol.isin.clone(), symbol);
+        }
+    }
+    preferred.into_values().collect()
+}
+
 fn parse_eodhd_bars(bytes: &[u8], start: Date, end: Date) -> Result<Vec<EodhdDailyBar>, String> {
     let rows: Vec<EodhdBarResponse> =
         serde_json::from_slice(bytes).map_err(|error| format!("EODHD EOD response: {error}"))?;
@@ -6757,6 +6772,25 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].date.to_string(), "2022-12-29");
         assert_eq!(bars[0].adjusted_close, 114.9);
+    }
+
+    #[test]
+    fn eodhd_fundamental_symbol_selection_prefers_active_code_for_same_isin() {
+        let symbol = |code: &str| EodhdDelistedSymbol {
+            code: code.into(),
+            name: "Test AB".into(),
+            exchange: "ST".into(),
+            currency: "SEK".into(),
+            security_type: "Common Stock".into(),
+            isin: "SE0015812219".into(),
+        };
+        let selected = preferred_eodhd_symbols(
+            &BTreeSet::from(["SE0015812219".to_owned()]),
+            vec![symbol("TEST")],
+            vec![symbol("TEST_old")],
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].code, "TEST");
     }
 
     #[test]

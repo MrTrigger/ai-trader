@@ -621,6 +621,16 @@ policy—the later selectors remain below the Sharpe gate—but it supersedes th
 five-session starting hypothesis for the current experiment. Daily evaluation
 and immediate risk/borrow reductions remain unchanged.
 
+The rebalance grid itself is not a tunable parameter. Research must replay all
+`H` possible offsets for an `H`-session holding policy and equal-weight them as
+`1/H`-capital tranches. The shared portfolio-construction helper averages only
+the common complete holding prefix; the Rust summary rejects missing,
+duplicate, or mixed-contract phases. On the corrected baseline, this removes a
+large phase range but raises development Sharpe only from 1.41 to 1.52, still
+below the evidence gate. A live implementation would therefore evaluate daily
+and refresh one twentieth of the book per session, but only after a model
+passes the separate alpha and data-quality gates.
+
 ### 9.3 Order policy
 
 The decision uses session `t`; no order may claim a fill at that same close.

@@ -594,6 +594,35 @@ weaker signal and much greater cost sensitivity:
 | 10 sessions | 1.09 | 0.39 | -1.50 | -0.0367 |
 | 20 sessions | **1.41** | **1.13** | -0.99 | -0.0291 |
 
+Two crypto-ranker patterns were then isolated rather than assumed to transfer.
+First, a one-session Rust label supplied non-overlapping daily training
+feedback. It achieved rank IC +0.0355, positive in all four development folds,
+but its expected edges almost never cleared measured Stockholm round-trip
+costs. The direction-free executable book returned +0.4% at Sharpe 0.42; the
+forced top/bottom ranking diagnostic was gross-profitable but lost heavily
+after 150–190% daily turnover. Training on the one-session label, multiplying
+the forecast by five, and realizing only the unchanged five-session executable
+label returned +20.8% at Sharpe 0.46 (2x costs: -24.1%, Sharpe -0.50). Dense
+feedback therefore contains ordering information but not enough persistent
+edge to finance Stockholm daily execution.
+
+Second, the corrected 20-session model was replayed on every one of the 20
+possible rebalance offsets. Each offset is a separate one-twentieth-capital
+book; the shared `portfolio-construction` crate equal-weights their common
+complete holding periods, and Rust rejects missing or duplicate phases. No
+phase is selected by performance. This improves the closed development result
+to +78.5%, Sharpe 1.52, and -11.9% drawdown versus phase-averaged OMXSGI +48.4%,
+Sharpe 1.20. All four combined folds are profitable, but fold Sharpes are 2.28,
+0.71, 4.56, and 0.49. Staggering removes large calendar-phase luck and modestly
+improves risk adjustment; it does not clear the 2.0 target or repair the last
+fold's weak alpha.
+
+A fixed two-year (504-session) rolling window also fails the regime-drift
+diagnosis. The tree reaches +66.9%, Sharpe 0.99 in development and -14.4%,
+Sharpe -0.72 recently; ridge reaches +54.0%, Sharpe 0.90 and -2.1%, Sharpe
+-0.17 respectively. Rolling fits reduce some recent loss but discard useful
+older information and do not restore a positive current ordering.
+
 An exact adjusted-price 12-1 momentum acceptance control was also added outside
 the fitted feature contract. With fixed 5% name weights, no direction quota,
 and identical measured execution/borrow accounting, it returned -37.8% at

@@ -410,6 +410,27 @@ pub struct Allocation {
     pub diagnostics: AllocationDiagnostics,
 }
 
+/// Combine equal-capital rebalance phases without selecting a favourable
+/// calendar alignment. Each input is a complete return series for one phase;
+/// only the common complete prefix is used, so a partial terminal holding can
+/// never receive extra weight.
+pub fn equal_weight_phase_returns(phases: &[Vec<f64>]) -> Result<Vec<f64>, String> {
+    if phases.is_empty() || phases.iter().any(Vec::is_empty) {
+        return Err("rebalance phases must be non-empty".into());
+    }
+    if phases
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite() || *value <= -1.0)
+    {
+        return Err("rebalance phase returns must be finite and greater than -1".into());
+    }
+    let common = phases.iter().map(Vec::len).min().expect("non-empty phases");
+    Ok((0..common)
+        .map(|index| phases.iter().map(|phase| phase[index]).sum::<f64>() / phases.len() as f64)
+        .collect())
+}
+
 /// Return candidate identities from strongest to weakest. Direction never
 /// enters the score, so a side cannot receive a quota or bonus.
 pub fn ranked_ids(candidates: &[Candidate], method: RankingMethod) -> Result<Vec<String>, String> {
@@ -680,11 +701,7 @@ fn scale_down(value: f64, maximum: f64) -> f64 {
 }
 
 fn normalise_zero(value: f64) -> f64 {
-    if value.abs() <= EPSILON {
-        0.0
-    } else {
-        value
-    }
+    if value.abs() <= EPSILON { 0.0 } else { value }
 }
 
 fn validate_sizing(config: &SizingConfig) -> Result<(), String> {
@@ -862,9 +879,11 @@ mod tests {
         let mut config = DirectionConfig::baseline(1.0).unwrap();
         config.exit_threshold = config.enter_threshold;
         assert!(config.validate().is_err());
-        assert!(DirectionState::default()
-            .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
-            .is_err());
+        assert!(
+            DirectionState::default()
+                .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1066,5 +1085,12 @@ mod tests {
             ranked_ids(&candidates, RankingMethod::EdgeVolatility).unwrap(),
             ["long_low_risk", "short", "long_high_risk"]
         );
+    }
+
+    #[test]
+    fn equal_weight_phases_use_only_the_common_complete_prefix() {
+        let combined =
+            equal_weight_phase_returns(&[vec![0.10, -0.05, 0.20], vec![0.00, 0.05]]).unwrap();
+        assert_eq!(combined, [0.05, 0.0]);
     }
 }

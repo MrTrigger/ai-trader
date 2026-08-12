@@ -142,6 +142,7 @@ usage: stockholm-portfolio <command>
   backtest --matrix <jsonl> --model <json> --start YYYY-MM-DD --end YYYY-MM-DD
            --out <json> [--benchmark <json>] [--cadence-sessions 5]
            [--max-positions 20]
+           [--rebalance-offset-sessions 0]
            [--retention-rank 20]
            [--max-sector-gross 0.25]
            [--ranking edge|edge_volatility]
@@ -163,6 +164,14 @@ usage: stockholm-portfolio <command>
   summarize-direction --fold <json> [--fold <json> ...] --out <json>
       Recompute aggregate walk-forward direction metrics in Rust from frozen,
       non-overlapping fold steps.
+
+  summarize-rebalance-phases --phase <json> [--phase <json> ...] --out <json>
+      Equal-weight every rebalance offset for one frozen model/fold. Exactly
+      one report per offset from zero through cadence minus one is required.
+
+  summarize-rebalance-phase-folds --fold <json> [--fold <json> ...] --out <json>
+      Stitch non-overlapping equal-weight phase summaries into one auditable
+      walk-forward result without treating overlapping phases as observations.
 
   add-benchmark --report <json> --benchmark <json> [--out <json>]
       Add exact-session benchmark attribution to an existing frozen Rust fold
@@ -280,6 +289,14 @@ fn get(args: &[String], name: &str) -> Option<String> {
         .position(|value| value == name)
         .and_then(|index| args.get(index + 1))
         .cloned()
+}
+
+fn repeated(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == name).then(|| args.get(index + 1)).flatten())
+        .cloned()
+        .collect()
 }
 
 fn need(args: &[String], name: &str) -> Result<String, String> {
@@ -2363,6 +2380,7 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             start,
             end,
             cadence_sessions: cadence,
+            rebalance_offset_sessions: number(args, "--rebalance-offset-sessions", 0_usize)?,
             model_horizon_sessions: model_horizon,
             prediction_horizon_scale,
             max_positions,
@@ -2424,6 +2442,71 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             direction.cost_status,
         );
     }
+    Ok(())
+}
+
+fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
+    let paths = repeated(args, "--phase");
+    if paths.is_empty() {
+        return Err("at least one --phase report is required".into());
+    }
+    let reports = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+            serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
+        })
+        .collect::<Result<Vec<stockholm_portfolio::BacktestResult>, String>>()?;
+    let summary = stockholm_portfolio::summarize_rebalance_phases(&reports)?;
+    let path = PathBuf::from(need(args, "--out")?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&summary).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "{} equal-weight phases, {} periods: return {:.2}%, Sharpe {:.2}, max DD {:.2}% -> {}",
+        summary.phase_count,
+        summary.performance.periods,
+        summary.performance.total_return * 100.0,
+        summary.performance.sharpe,
+        summary.performance.max_drawdown * 100.0,
+        path.display(),
+    );
+    Ok(())
+}
+
+fn summarize_rebalance_phase_folds(args: &[String]) -> Result<(), String> {
+    let paths = repeated(args, "--fold");
+    if paths.is_empty() {
+        return Err("at least one --fold phase summary is required".into());
+    }
+    let folds = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+            serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
+        })
+        .collect::<Result<Vec<stockholm_portfolio::RebalancePhaseSummary>, String>>()?;
+    let summary = stockholm_portfolio::summarize_rebalance_phase_folds(&folds)?;
+    let path = PathBuf::from(need(args, "--out")?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&summary).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "{} folds, {} equal-weight phases: return {:.2}%, Sharpe {:.2}, max DD {:.2}%, passed={} -> {}",
+        summary.folds,
+        summary.phase_count,
+        summary.performance.total_return * 100.0,
+        summary.performance.sharpe,
+        summary.performance.max_drawdown * 100.0,
+        summary.passed,
+        path.display(),
+    );
     Ok(())
 }
 
@@ -2507,6 +2590,8 @@ fn main() -> ExitCode {
         Some("backtest") => run_backtest(&args[1..]),
         Some("direction-backtest") => run_direction_backtest(&args[1..]),
         Some("summarize-direction") => summarize_direction(&args[1..]),
+        Some("summarize-rebalance-phases") => summarize_rebalance_phases(&args[1..]),
+        Some("summarize-rebalance-phase-folds") => summarize_rebalance_phase_folds(&args[1..]),
         Some("add-benchmark") => add_benchmark(&args[1..]),
         _ => Err(USAGE.into()),
     };

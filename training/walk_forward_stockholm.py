@@ -144,6 +144,11 @@ def main() -> None:
     parser.add_argument("--clip-quantile", type=float, default=0.005)
     parser.add_argument("--stress-multiple", type=float, default=2.0)
     parser.add_argument(
+        "--all-rebalance-phases",
+        action="store_true",
+        help="replay and equal-weight every holding-cadence offset in Rust",
+    )
+    parser.add_argument(
         "--direction-overlay",
         action="store_true",
         help="enable the fixed Rust OMX direction baseline in every replay",
@@ -213,6 +218,7 @@ def main() -> None:
         ),
         "calibration_sessions": args.calibration_sessions,
         "training_window_sessions": args.training_window_sessions,
+        "all_rebalance_phases": args.all_rebalance_phases,
         "direction_overlay": args.direction_overlay,
         "market_forecast_matrix": (
             str(args.market_forecast_matrix) if args.market_forecast_matrix else None
@@ -281,54 +287,83 @@ def main() -> None:
                 ]
             )
         for scenario, multiple in (("base", 1.0), ("stress", args.stress_multiple)):
-            report = args.out / f"fold-{fold.number}-{scenario}.json"
-            run(
-                [
-                    str(args.binary),
-                    "backtest",
-                    "--matrix",
-                    str(args.matrix),
-                    "--model",
-                    str(model),
-                    "--start",
-                    fold.test_start.isoformat(),
-                    "--end",
-                    fold.test_end.isoformat(),
-                    "--out",
-                    str(report),
-                    "--benchmark",
-                    str(args.benchmark),
-                    "--cadence-sessions",
-                    str(horizon),
-                    "--cost-multiple",
-                    str(multiple),
-                    "--prediction-composition",
-                    args.prediction_composition,
-                ]
-                + (["--direction-overlay"] if args.direction_overlay else [])
-                + (
-                    ["--aggregate-short-horizon-forecast"]
-                    if aggregate_short_horizon
-                    else []
+            phase_reports = []
+            offsets = range(horizon) if args.all_rebalance_phases else (0,)
+            for offset in offsets:
+                report = (
+                    args.out / f"fold-{fold.number}-phase-{offset}-{scenario}.json"
+                    if args.all_rebalance_phases
+                    else args.out / f"fold-{fold.number}-{scenario}.json"
                 )
-                + (
+                phase_reports.append(report)
+                run(
                     [
-                        "--market-forecast-matrix",
-                        str(args.market_forecast_matrix),
-                        "--market-forecast-model",
-                        str(market_model),
+                        str(args.binary),
+                        "backtest",
+                        "--matrix",
+                        str(args.matrix),
+                        "--model",
+                        str(model),
+                        "--start",
+                        fold.test_start.isoformat(),
+                        "--end",
+                        fold.test_end.isoformat(),
+                        "--out",
+                        str(report),
+                        "--benchmark",
+                        str(args.benchmark),
+                        "--cadence-sessions",
+                        str(horizon),
+                        "--rebalance-offset-sessions",
+                        str(offset),
+                        "--cost-multiple",
+                        str(multiple),
+                        "--prediction-composition",
+                        args.prediction_composition,
                     ]
-                    if args.market_forecast_matrix is not None
-                    else []
+                    + (["--direction-overlay"] if args.direction_overlay else [])
+                    + (
+                        ["--aggregate-short-horizon-forecast"]
+                        if aggregate_short_horizon
+                        else []
+                    )
+                    + (
+                        [
+                            "--market-forecast-matrix",
+                            str(args.market_forecast_matrix),
+                            "--market-forecast-model",
+                            str(market_model),
+                        ]
+                        if args.market_forecast_matrix is not None
+                        else []
+                    )
                 )
-            )
+            if args.all_rebalance_phases:
+                command = [
+                    str(args.binary),
+                    "summarize-rebalance-phases",
+                    "--out",
+                    str(args.out / f"fold-{fold.number}-{scenario}.json"),
+                ]
+                for report in phase_reports:
+                    command.extend(["--phase", str(report)])
+                run(command)
     for scenario in ("base", "stress"):
-        command = [
-            sys.executable,
-            str(summarizer),
-            "--out",
-            str(args.out / f"report-{scenario}.json"),
-        ]
+        command = (
+            [
+                str(args.binary),
+                "summarize-rebalance-phase-folds",
+                "--out",
+                str(args.out / f"report-{scenario}.json"),
+            ]
+            if args.all_rebalance_phases
+            else [
+                sys.executable,
+                str(summarizer),
+                "--out",
+                str(args.out / f"report-{scenario}.json"),
+            ]
+        )
         for fold in folds:
             command.extend(
                 ["--fold", str(args.out / f"fold-{fold.number}-{scenario}.json")]

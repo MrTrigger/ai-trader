@@ -3,7 +3,7 @@
 //! Provider access lives in `equity-data`, feature/matrix semantics in
 //! `features-stockholm`, and generic LightGBM evaluation in `lightgbm-json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use equity_data::BenchmarkHistory;
@@ -523,7 +523,7 @@ fn expected_features(version: &str) -> Result<Vec<String>, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostConfig {
     /// All-in round-trip fallback reference at the configured friction
@@ -1374,6 +1374,11 @@ pub struct BacktestResult {
     #[serde(with = "date_serde")]
     pub end: Date,
     pub cadence_sessions: usize,
+    /// Zero-based phase inside the holding cadence. Zero is the historical
+    /// single-grid replay; all phases can be evaluated without choosing a
+    /// favourable calendar alignment.
+    #[serde(default)]
+    pub rebalance_offset_sessions: usize,
     /// Horizon encoded by the fitted model's label contract. This normally
     /// equals `cadence_sessions`; a shorter value is allowed only by an
     /// explicit multi-session forecast aggregation experiment.
@@ -1428,6 +1433,88 @@ pub struct BacktestResult {
     pub disclosures: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePhasePerformance {
+    pub periods: usize,
+    pub total_return: f64,
+    pub annualised_return: f64,
+    pub annualised_volatility: f64,
+    pub sharpe: f64,
+    pub max_drawdown: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePhaseDiagnostic {
+    pub offset_sessions: usize,
+    pub periods: usize,
+    pub total_return: f64,
+    pub sharpe: f64,
+    pub max_drawdown: f64,
+    pub mean_rank_ic: f64,
+}
+
+/// Equal-capital combination of every possible calendar phase for one frozen
+/// model/fold. This removes rebalance-day selection; it does not create new
+/// forecasts or treat overlapping holdings as independent observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePhaseSummary {
+    pub kind: String,
+    pub model_id: String,
+    pub model_family: String,
+    pub feature_set_version: String,
+    pub reward: String,
+    pub objective: String,
+    pub survivorship_status: String,
+    #[serde(with = "date_serde")]
+    pub start: Date,
+    #[serde(with = "date_serde")]
+    pub end: Date,
+    pub cadence_sessions: usize,
+    pub phase_count: usize,
+    pub common_complete_periods: usize,
+    pub performance: RebalancePhasePerformance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_performance: Option<RebalancePhasePerformance>,
+    pub phase_diagnostics: Vec<RebalancePhaseDiagnostic>,
+    pub period_returns: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_period_returns: Vec<f64>,
+    pub disclosures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePhaseFoldDiagnostic {
+    #[serde(with = "date_serde")]
+    pub start: Date,
+    #[serde(with = "date_serde")]
+    pub end: Date,
+    pub performance: RebalancePhasePerformance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancePhaseFoldSummary {
+    pub kind: String,
+    pub model_family: String,
+    pub feature_set_version: String,
+    pub reward: String,
+    pub objective: String,
+    pub survivorship_status: String,
+    pub folds: usize,
+    pub positive_folds: usize,
+    pub cadence_sessions: usize,
+    pub phase_count: usize,
+    pub target_sharpe: f64,
+    pub performance: RebalancePhasePerformance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_performance: Option<RebalancePhasePerformance>,
+    pub fold_diagnostics: Vec<RebalancePhaseFoldDiagnostic>,
+    pub period_returns: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_period_returns: Vec<f64>,
+    pub passed: bool,
+    pub disclosures: Vec<String>,
+}
+
 fn default_budget() -> portfolio_construction::Budget {
     portfolio_construction::Budget::gross_only(1.0).expect("one is a valid gross budget")
 }
@@ -1449,6 +1536,7 @@ pub struct BacktestConfig {
     pub start: Date,
     pub end: Date,
     pub cadence_sessions: usize,
+    pub rebalance_offset_sessions: usize,
     /// Horizon represented by `Model::predict`. Portfolio P&L always comes
     /// from matrix labels spanning `cadence_sessions`.
     pub model_horizon_sessions: usize,
@@ -1516,6 +1604,9 @@ pub fn backtest(
     let uses_market_forecast = relative_reward || residual_composition;
     if cadence_sessions == 0 || max_positions == 0 {
         return Err("cadence and max positions must be positive".into());
+    }
+    if config.rebalance_offset_sessions >= cadence_sessions {
+        return Err("rebalance offset must be smaller than cadence".into());
     }
     if config.model_horizon_sessions == 0
         || !config.prediction_horizon_scale.is_finite()
@@ -1585,6 +1676,7 @@ pub fn backtest(
     let mut steps = Vec::new();
     let selected_dates = dates
         .into_iter()
+        .skip(config.rebalance_offset_sessions)
         .step_by(cadence_sessions)
         .collect::<Vec<_>>();
     let direction_schedule = match (config.direction_config, config.benchmark.as_ref()) {
@@ -2040,6 +2132,7 @@ pub fn backtest(
         start,
         end,
         cadence_sessions,
+        rebalance_offset_sessions: config.rebalance_offset_sessions,
         model_horizon_sessions: config.model_horizon_sessions,
         prediction_horizon_scale: config.prediction_horizon_scale,
         ranking,
@@ -2065,6 +2158,223 @@ pub fn backtest(
         steps,
         disclosures,
     })
+}
+
+pub fn summarize_rebalance_phases(
+    reports: &[BacktestResult],
+) -> Result<RebalancePhaseSummary, String> {
+    let first = reports
+        .first()
+        .ok_or("at least one rebalance-phase report is required")?;
+    let cadence = first.cadence_sessions;
+    if cadence == 0 || reports.len() != cadence {
+        return Err(format!(
+            "expected exactly {cadence} rebalance phases, got {}",
+            reports.len()
+        ));
+    }
+    let mut ordered = reports.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|report| report.rebalance_offset_sessions);
+    if ordered
+        .iter()
+        .enumerate()
+        .any(|(offset, report)| report.rebalance_offset_sessions != offset)
+    {
+        return Err("rebalance phase offsets must cover 0..cadence exactly once".into());
+    }
+    let same_contract = |report: &&BacktestResult| {
+        report.model_id == first.model_id
+            && report.model_family == first.model_family
+            && report.feature_set_version == first.feature_set_version
+            && report.reward == first.reward
+            && report.objective == first.objective
+            && report.survivorship_status == first.survivorship_status
+            && report.start == first.start
+            && report.end == first.end
+            && report.cadence_sessions == cadence
+            && report.model_horizon_sessions == first.model_horizon_sessions
+            && report.prediction_horizon_scale == first.prediction_horizon_scale
+            && report.costs == first.costs
+    };
+    if !ordered.iter().all(same_contract) {
+        return Err("rebalance phase report contracts differ".into());
+    }
+    let return_series = ordered
+        .iter()
+        .map(|report| {
+            report
+                .steps
+                .iter()
+                .map(|step| step.period_return)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let period_returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+    let benchmark_presence = ordered
+        .iter()
+        .map(|report| report.benchmark.is_some())
+        .collect::<BTreeSet<_>>();
+    if benchmark_presence.len() != 1 {
+        return Err("benchmark attribution is present in only some phases".into());
+    }
+    let benchmark_period_returns = if *benchmark_presence
+        .first()
+        .expect("reports establish benchmark presence")
+    {
+        let phases = ordered
+            .iter()
+            .map(|report| {
+                report
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        step.benchmark_period_return
+                            .ok_or_else(|| "phase step lacks benchmark return".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        portfolio_construction::equal_weight_phase_returns(&phases)?
+    } else {
+        Vec::new()
+    };
+    let performance = phase_performance(&period_returns, cadence);
+    let benchmark_performance = (!benchmark_period_returns.is_empty())
+        .then(|| phase_performance(&benchmark_period_returns, cadence));
+    let phase_diagnostics = ordered
+        .iter()
+        .map(|report| RebalancePhaseDiagnostic {
+            offset_sessions: report.rebalance_offset_sessions,
+            periods: report.metrics.periods,
+            total_return: report.metrics.total_return,
+            sharpe: report.metrics.sharpe,
+            max_drawdown: report.metrics.max_drawdown,
+            mean_rank_ic: report
+                .diagnostics
+                .as_ref()
+                .map_or(0.0, |diagnostics| diagnostics.mean_rank_ic),
+        })
+        .collect();
+    Ok(RebalancePhaseSummary {
+        kind: "stockholm_equal_weight_rebalance_phases".into(),
+        model_id: first.model_id.clone(),
+        model_family: first.model_family.clone(),
+        feature_set_version: first.feature_set_version.clone(),
+        reward: first.reward.clone(),
+        objective: first.objective.clone(),
+        survivorship_status: first.survivorship_status.clone(),
+        start: first.start,
+        end: first.end,
+        cadence_sessions: cadence,
+        phase_count: ordered.len(),
+        common_complete_periods: period_returns.len(),
+        performance,
+        benchmark_performance,
+        phase_diagnostics,
+        period_returns,
+        benchmark_period_returns,
+        disclosures: vec![
+            "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".into(),
+            "Only the common complete prefix across phases is aggregated, so incomplete terminal holdings are discarded.".into(),
+            "Overlapping phase holdings are one combined portfolio, not independent observations; annualisation remains tied to the original holding cadence.".into(),
+            "SURVIVORSHIP_CONTAMINATED research data cannot authorize paper or live capital regardless of this result.".into(),
+        ],
+    })
+}
+
+pub fn summarize_rebalance_phase_folds(
+    folds: &[RebalancePhaseSummary],
+) -> Result<RebalancePhaseFoldSummary, String> {
+    let first = folds
+        .first()
+        .ok_or("at least one rebalance-phase fold is required")?;
+    let mut ordered = folds.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|fold| fold.start);
+    if ordered.windows(2).any(|pair| pair[0].end >= pair[1].start) {
+        return Err("rebalance-phase folds overlap or are out of order".into());
+    }
+    if ordered.iter().any(|fold| {
+        fold.model_family != first.model_family
+            || fold.feature_set_version != first.feature_set_version
+            || fold.reward != first.reward
+            || fold.objective != first.objective
+            || fold.survivorship_status != first.survivorship_status
+            || fold.cadence_sessions != first.cadence_sessions
+            || fold.phase_count != first.phase_count
+            || fold.common_complete_periods == 0
+    }) {
+        return Err("rebalance-phase fold contracts differ".into());
+    }
+    let benchmark_presence = ordered
+        .iter()
+        .map(|fold| fold.benchmark_performance.is_some())
+        .collect::<BTreeSet<_>>();
+    if benchmark_presence.len() != 1 {
+        return Err("benchmark attribution is present in only some phase folds".into());
+    }
+    let period_returns = ordered
+        .iter()
+        .flat_map(|fold| fold.period_returns.iter().copied())
+        .collect::<Vec<_>>();
+    let benchmark_period_returns = ordered
+        .iter()
+        .flat_map(|fold| fold.benchmark_period_returns.iter().copied())
+        .collect::<Vec<_>>();
+    let performance = phase_performance(&period_returns, first.cadence_sessions);
+    let benchmark_performance = (!benchmark_period_returns.is_empty())
+        .then(|| phase_performance(&benchmark_period_returns, first.cadence_sessions));
+    let fold_diagnostics = ordered
+        .iter()
+        .map(|fold| RebalancePhaseFoldDiagnostic {
+            start: fold.start,
+            end: fold.end,
+            performance: fold.performance.clone(),
+        })
+        .collect::<Vec<_>>();
+    let positive_folds = ordered
+        .iter()
+        .filter(|fold| fold.performance.total_return > 0.0)
+        .count();
+    let target_sharpe = 2.0;
+    let passed = first.survivorship_status == "POINT_IN_TIME"
+        && performance.total_return > 0.0
+        && performance.sharpe >= target_sharpe
+        && positive_folds * 2 > ordered.len();
+    Ok(RebalancePhaseFoldSummary {
+        kind: "stockholm_equal_weight_rebalance_phase_walk_forward".into(),
+        model_family: first.model_family.clone(),
+        feature_set_version: first.feature_set_version.clone(),
+        reward: first.reward.clone(),
+        objective: first.objective.clone(),
+        survivorship_status: first.survivorship_status.clone(),
+        folds: ordered.len(),
+        positive_folds,
+        cadence_sessions: first.cadence_sessions,
+        phase_count: first.phase_count,
+        target_sharpe,
+        performance,
+        benchmark_performance,
+        fold_diagnostics,
+        period_returns,
+        benchmark_period_returns,
+        passed,
+        disclosures: vec![
+            "Fold returns are concatenated only after every calendar phase is equal-weighted within each strictly forward fold.".into(),
+            "The phase combination removes arbitrary rebalance alignment but cannot correct survivorship bias or unstable alpha.".into(),
+        ],
+    })
+}
+
+fn phase_performance(returns: &[f64], cadence: usize) -> RebalancePhasePerformance {
+    let values = return_metrics(returns, cadence);
+    RebalancePhasePerformance {
+        periods: returns.len(),
+        total_return: values.total_return,
+        annualised_return: values.annualised_return,
+        annualised_volatility: values.annualised_volatility,
+        sharpe: values.sharpe,
+        max_drawdown: values.max_drawdown,
+    }
 }
 
 fn build_direction_schedule(
@@ -3400,6 +3710,7 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-03"),
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3447,6 +3758,7 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 5,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 5.0,
                 max_positions: 1,
@@ -3475,6 +3787,58 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_phase_summary_requires_and_equal_weights_every_offset() {
+        let rows = [
+            row(day("2024-01-02")),
+            row(day("2024-01-03")),
+            row(day("2024-01-04")),
+            row(day("2024-01-05")),
+        ];
+        let replay = |offset| {
+            backtest(
+                &constant_model(0.02),
+                &rows,
+                &BacktestConfig {
+                    start: rows[0].date,
+                    end: rows[3].date,
+                    cadence_sessions: 2,
+                    rebalance_offset_sessions: offset,
+                    model_horizon_sessions: 2,
+                    prediction_horizon_scale: 1.0,
+                    max_positions: 1,
+                    retention_rank: 1,
+                    max_sector_gross: None,
+                    ranking: portfolio_construction::RankingMethod::Edge,
+                    sizing: portfolio_construction::SizingMethod::Equal,
+                    allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                    position_weight: 0.05,
+                    min_position_weight: 0.0,
+                    reference_edge: 0.01,
+                    reference_volatility: 0.02,
+                    direction_config: None,
+                    prediction_composition: PredictionComposition::Direct,
+                    market_return_forecasts: None,
+                    market_forecast_model_id: None,
+                    costs: zero_execution_costs(),
+                    benchmark: None,
+                },
+            )
+            .unwrap()
+        };
+        let phase_zero = replay(0);
+        let phase_one = replay(1);
+        let summary = summarize_rebalance_phases(&[phase_zero.clone(), phase_one]).unwrap();
+        assert_eq!(summary.phase_count, 2);
+        assert_eq!(summary.common_complete_periods, 2);
+        assert_eq!(summary.period_returns.len(), 2);
+        assert!(
+            summarize_rebalance_phases(&[phase_zero.clone(), phase_zero])
+                .unwrap_err()
+                .contains("offsets")
+        );
+    }
+
+    #[test]
     fn relative_selection_is_composed_with_market_return_before_choosing_side() {
         let benchmark = rising_benchmark(330);
         let decision_date = benchmark.bars[300].date;
@@ -3487,6 +3851,7 @@ mod tests {
                 start: decision_date,
                 end: decision_date,
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3528,6 +3893,7 @@ mod tests {
                 start: decision_date,
                 end: decision_date,
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3573,6 +3939,7 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3636,6 +4003,7 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3682,6 +4050,7 @@ mod tests {
                 start: rows[0].date,
                 end: rows[1].date,
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,
@@ -3751,6 +4120,7 @@ mod tests {
                 start: day("2024-01-02"),
                 end: day("2024-01-02"),
                 cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
                 model_horizon_sessions: 1,
                 prediction_horizon_scale: 1.0,
                 max_positions: 1,

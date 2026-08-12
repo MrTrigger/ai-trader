@@ -34,6 +34,7 @@ def main() -> None:
             len(fold.get("blend_components", [])),
             fold.get("max_sector_gross"),
             fold.get("prediction_composition", "direct"),
+            fold.get("rebalance_offset_sessions", 0),
             fold.get("model_horizon_sessions", fold["cadence_sessions"]),
             fold.get("prediction_horizon_scale", 1.0),
         )
@@ -52,6 +53,7 @@ def main() -> None:
         blend_component_count,
         max_sector_gross,
         prediction_composition,
+        rebalance_offset_sessions,
         model_horizon_sessions,
         prediction_horizon_scale,
     ) = specifications.pop()
@@ -165,6 +167,7 @@ def main() -> None:
         "blend_component_count": blend_component_count,
         "max_sector_gross": max_sector_gross,
         "prediction_composition": prediction_composition,
+        "rebalance_offset_sessions": rebalance_offset_sessions,
         "model_horizon_sessions": model_horizon_sessions,
         "prediction_horizon_scale": prediction_horizon_scale,
         "folds": fold_rows,
