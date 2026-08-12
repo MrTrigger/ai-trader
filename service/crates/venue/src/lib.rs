@@ -347,6 +347,9 @@ pub enum VenueError {
     #[error("no market for asset {0}")]
     UnknownMarket(AssetId),
 
+    #[error("this venue does not support {0}")]
+    Unsupported(&'static str),
+
     #[error("no price available for {0}; refusing to price an order against nothing")]
     NoPrice(AssetId),
 
@@ -438,6 +441,87 @@ pub trait VenueAdapter: Send + Sync {
 
     /// Fills at or after `since`, oldest first. `None` means everything.
     async fn get_fills(&self, since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError>;
+
+    /// The resting book for one asset, best price first on each side.
+    ///
+    /// Optional, because not every venue publishes depth and a bot that never
+    /// asks should not be blocked by one that cannot answer. It exists on the
+    /// trait rather than on one adapter because the question — what does
+    /// crossing this size actually cost — is asked of every venue we trade,
+    /// and the answer is the only honest input to an impact model. A paper
+    /// venue forwards it: the simulated fill is ours, the book is the market's.
+    async fn get_order_book(&self, _asset: &str) -> Result<OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
+}
+
+/// One side's resting orders, best price first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderBook {
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookLevel {
+    pub price: Decimal,
+    pub qty: Decimal,
+}
+
+impl OrderBook {
+    pub fn best_bid(&self) -> Option<Decimal> {
+        self.bids.first().map(|l| l.price)
+    }
+
+    pub fn best_ask(&self) -> Option<Decimal> {
+        self.asks.first().map(|l| l.price)
+    }
+
+    /// Full spread in basis points against the mid, when both sides exist.
+    pub fn spread_bps(&self) -> Option<Decimal> {
+        let (bid, ask) = (self.best_bid()?, self.best_ask()?);
+        let mid = (bid + ask) / Decimal::TWO;
+        (mid > Decimal::ZERO).then(|| (ask - bid) / mid * Decimal::from(10_000))
+    }
+
+    /// What crossing `notional` of quote currency costs against the mid, in
+    /// basis points, by eating levels until it is filled. `None` when the side
+    /// is too thin to fill it at all — which is itself the answer.
+    pub fn cross_bps(&self, notional: Decimal, side: Side) -> Option<Decimal> {
+        let levels = match side {
+            Side::Buy => &self.asks,
+            Side::Sell => &self.bids,
+        };
+        let (bid, ask) = (self.best_bid()?, self.best_ask()?);
+        let mid = (bid + ask) / Decimal::TWO;
+        if mid <= Decimal::ZERO || notional <= Decimal::ZERO {
+            return None;
+        }
+        let (mut left, mut spent, mut got) = (notional, Decimal::ZERO, Decimal::ZERO);
+        for level in levels {
+            if level.price <= Decimal::ZERO {
+                continue;
+            }
+            let available = level.price * level.qty;
+            let take = available.min(left);
+            spent += take;
+            got += take / level.price;
+            left -= take;
+            if left <= Decimal::ZERO {
+                break;
+            }
+        }
+        if left > Decimal::ZERO || got <= Decimal::ZERO {
+            return None;
+        }
+        let vwap = spent / got;
+        Some(
+            match side {
+                Side::Buy => (vwap - mid) / mid,
+                Side::Sell => (mid - vwap) / mid,
+            } * Decimal::from(10_000),
+        )
+    }
 }
 
 // --- price and time, as injectable seams -----------------------------------
@@ -467,6 +551,11 @@ pub trait PriceSource: Send + Sync {
 pub trait MarketData: Send + Sync {
     async fn markets(&self) -> Result<Vec<Market>, VenueError>;
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError>;
+    /// The resting book, for callers that need depth rather than a price.
+    /// Unsupported by default, as on [`VenueAdapter`].
+    async fn order_book(&self, _asset: &str) -> Result<OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
 }
 
 /// Any real venue is market data. This is what lets the paper book wrap the
@@ -478,6 +567,9 @@ impl<T: VenueAdapter + PriceSource + ?Sized> MarketData for T {
     }
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
         PriceSource::mark_price(self, asset).await
+    }
+    async fn order_book(&self, asset: &str) -> Result<OrderBook, VenueError> {
+        self.get_order_book(asset).await
     }
 }
 

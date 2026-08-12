@@ -676,4 +676,11 @@ impl<U: MarketData, C: Clock> VenueAdapter for PaperVenue<U, C> {
             .cloned()
             .collect())
     }
+
+    /// Forwarded, not simulated. A paper fill is ours to invent; the resting
+    /// book is the market's, and inventing one would make every cost measured
+    /// through this venue a measurement of our own assumptions.
+    async fn get_order_book(&self, asset: &str) -> Result<venue::OrderBook, VenueError> {
+        self.upstream.order_book(asset).await
+    }
 }

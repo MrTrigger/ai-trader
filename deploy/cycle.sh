@@ -47,6 +47,19 @@ $CP plan --config $CFG --data-root $DATA \
   --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --for-execution \
   --book <($BOT --config $BOTCFG book) --out "$STATE/plan.json"
 
+# What the book would charge us for this plan, read before anything is sent.
+# The cost model's spread is a constant and its impact coefficient is assumed,
+# and paper cannot correct either: a paper fill is the real mark moved by a
+# configured slippage, so fitting a model to it recovers the constant. The
+# resting book is the only honest source that costs no capital, and one reading
+# a day for the names actually traded is what turns it into a distribution.
+#
+# Never fatal. A missing measurement is a gap in a research series, not a reason
+# to skip a day's trading.
+say "book (measured spread, for the cost model)"
+$BOT --config $BOTCFG book-capture --plan "$STATE/plan.json" \
+  --out "$DATA/liquidity/spreads.json" || say "book capture failed; continuing"
+
 # The decision-lag gate refuses to fill a decision far behind the fill, because
 # the backtest says a 24h lag takes Sharpe from 2.22 to 0.29. On the daily
 # schedule the lag is five minutes and the gate never fires. A BOOTSTRAP run is

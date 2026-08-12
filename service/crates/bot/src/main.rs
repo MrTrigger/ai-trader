@@ -75,6 +75,9 @@ commands:
   settle                             attribute the period each past run opened
   mark-book --plan FILE              write the closing book onto the newest run
                                      if it was recorded without one
+  book-capture --plan FILE           measure the spread and the cost of crossing
+               [--out FILE]          each order in a plan, from the venue's
+                                     resting book (read-only, changes nothing)
   markets                            the assets this venue lists (stdout)
   book                               cash and positions, planner format (stdout)
   reconcile                          our record against the venue's; changes nothing
@@ -154,6 +157,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "positions" => block_on(cmd_positions(&cfg)),
         "settle" => cmd_settle(&cfg),
         "mark-book" => cmd_mark_book(&cfg, PathBuf::from(flags.need("--plan")?)),
+        "book-capture" => block_on(cmd_book_capture(
+            &cfg,
+            PathBuf::from(flags.need("--plan")?),
+            flags.get("--out").map(PathBuf::from),
+        )),
         "markets" => block_on(cmd_markets(&cfg)),
         "book" => block_on(cmd_book(&cfg)),
         "reconcile" => block_on(cmd_reconcile(&cfg)),
@@ -748,9 +756,109 @@ async fn mark_book_inner(
         max_decision_lag_minutes: cfg.max_decision_lag_minutes,
         accept_decision_lag: false,
     };
-    match runner.mark_recorded(&plan).await.map_err(|e| e.to_string())? {
+    match runner
+        .mark_recorded(&plan)
+        .await
+        .map_err(|e| e.to_string())?
+    {
         Some(id) => println!("marked the closing book on run {id}"),
         None => println!("nothing to mark: the newest run already has a closing book"),
+    }
+    Ok(())
+}
+
+/// What the venue would charge us for this plan, right now.
+///
+/// The cost model's spread is a constant and its impact coefficient is
+/// assumed; paper cannot correct either, because a paper fill is the real mark
+/// moved by a configured slippage and fitting a model to it recovers the
+/// constant. The resting book is the one honest source available without
+/// risking capital, so this reads it for the names and sizes the plan actually
+/// sends, and writes the spreads out for `crypto-portfolio liquidity-profile`
+/// to merge.
+///
+/// Read-only. It places nothing and changes nothing.
+async fn cmd_book_capture(
+    cfg: &BotConfig,
+    plan_path: PathBuf,
+    out: Option<PathBuf>,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(&plan_path)
+        .map_err(|e| format!("cannot read plan {}: {e}", plan_path.display()))?;
+    let plan = plan::Plan::parse(&text).map_err(|e| e.to_string())?;
+    let st = open_stores(cfg)?;
+    let venue = open_venue(cfg, st.rec.as_deref()).await?;
+
+    // Price each order at the mark the plan itself carries, so the size we
+    // walk the book for is the size that will be sent.
+    let nav = plan.nav.total;
+    let mut price: std::collections::BTreeMap<&str, rust_decimal::Decimal> = Default::default();
+    for c in &plan.current {
+        if !c.qty.is_zero() && !nav.is_zero() {
+            price.insert(c.asset.as_str(), (c.weight * nav / c.qty).abs());
+        }
+    }
+    // The executor splits each order; impact meets one slice, not the whole.
+    let slices = rust_decimal::Decimal::from(cfg.schedule.slices.max(1) as u64);
+
+    println!("{:<8}{:>12}{:>11}{:>11}", "ASSET", "ORDER $", "SPREAD bp", "CROSS bp");
+    let mut measured: std::collections::BTreeMap<String, (f64, u32)> = Default::default();
+    for order in &plan.orders {
+        let book = match venue.get_order_book(&order.asset).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{}: {e}", order.asset);
+                continue;
+            }
+        };
+        let Some(spread) = book.spread_bps() else {
+            eprintln!("{}: one side of the book is empty", order.asset);
+            continue;
+        };
+        let side = match order.side {
+            plan::Side::Buy => venue::Side::Buy,
+            plan::Side::Sell => venue::Side::Sell,
+        };
+        let notional = price
+            .get(order.asset.as_str())
+            .map(|p| order.qty * p / slices);
+        let cross = notional.and_then(|n| book.cross_bps(n, side));
+        println!(
+            "{:<8}{:>12}{:>11}{:>11}",
+            order.asset,
+            notional
+                .map(|n| format!("{:.0}", n * slices))
+                .unwrap_or_else(|| "new".into()),
+            format!("{:.2}", spread),
+            cross
+                .map(|c| format!("{c:.2}"))
+                .unwrap_or_else(|| "too thin".into()),
+        );
+        if let Ok(v) = spread.to_string().parse::<f64>() {
+            measured.insert(order.asset.to_string(), (v, 1));
+        }
+    }
+
+    if let Some(path) = out {
+        // Merge rather than overwrite: each run adds one observation per name,
+        // and a coefficient wants a distribution, not the latest reading.
+        let mut all: std::collections::BTreeMap<String, Vec<f64>> = match std::fs::read_to_string(&path)
+        {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
+        for (asset, (bps, _)) in &measured {
+            all.entry(asset.clone()).or_default().push(*bps);
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&all).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("\n{} names recorded -> {}", measured.len(), path.display());
     }
     Ok(())
 }

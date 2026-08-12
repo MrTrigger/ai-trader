@@ -251,6 +251,29 @@ impl VenueAdapter for Hyperliquid {
         self.info.fills(&self.account, since).await
     }
 
+    async fn get_order_book(&self, asset: &str) -> Result<venue::OrderBook, VenueError> {
+        let book = self.info.l2_book(asset).await?;
+        let side = |i: usize| -> Vec<venue::BookLevel> {
+            book.levels
+                .get(i)
+                .map(|ls| {
+                    ls.iter()
+                        .filter_map(|l| {
+                            Some(venue::BookLevel {
+                                price: l.px.parse().ok()?,
+                                qty: l.sz.parse().ok()?,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(venue::OrderBook {
+            bids: side(0),
+            asks: side(1),
+        })
+    }
+
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
         let index = self.asset_index(&order.asset).await?;
         let is_buy = matches!(order.side, Side::Buy);
