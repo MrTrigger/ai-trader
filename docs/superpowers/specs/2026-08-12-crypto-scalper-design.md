@@ -11,6 +11,11 @@ validated with the same evidence-gate discipline as the existing bots. This is a
 experiment; it must not touch the capital, account, or code paths of the frozen
 rank-reward crypto-portfolio strategy.
 
+**Success target: annualized Sharpe > 2.0**, computed on daily net-of-cost
+returns (not per-trade), out-of-sample in walk-forward. This is the bar the
+backtest gate must clear and the reference the shadow/paper phases are checked
+against.
+
 ## Decisions made during brainstorming
 
 | Question | Decision |
@@ -138,8 +143,9 @@ position count, gross exposure. Plain config, no optimizer.
 ## Validation gates (in order)
 
 1. **Backtest gate**: walk-forward on Binance perp 1m history at measured
-   per-symbol HL costs + taker fee. Positive net with meaningful margin. Also
-   performs universe selection.
+   per-symbol HL costs + taker fee. Must clear annualized Sharpe > 2.0 on daily
+   net returns, out-of-sample. Also performs universe selection (a symbol only
+   qualifies if the portfolio still clears the bar with it included).
 2. **Shadow gate**: ≥3–4 weeks on live HL data. Signal distribution matches
    backtest; zero unexplained infra faults; hypothetical-fill PnL tracks
    backtest expectations.
