@@ -34,6 +34,7 @@
 
 mod info;
 mod sign;
+pub mod ws;
 
 pub use info::{
     ApprovedAgent, Candle, Info, L2Book, L2Level, MAINNET, QUOTE, QUOTE_TOKEN, TESTNET,
@@ -48,6 +49,36 @@ use venue::{
     Balance, Fill, Market, OpenOrder, OrderAck, OrderRequest, OrderState, Position, PriceSource,
     Side, VenueAdapter, VenueError,
 };
+
+/// Time-in-force, spelled the way the venue spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tif {
+    /// Rest until cancelled.
+    Gtc,
+    /// Fill what crosses now, cancel the remainder.
+    Ioc,
+    /// Add-liquidity-only: refused rather than allowed to take. The maker order.
+    Alo,
+}
+
+impl Tif {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tif::Gtc => "Gtc",
+            Tif::Ioc => "Ioc",
+            Tif::Alo => "Alo",
+        }
+    }
+}
+
+/// Execution options beyond what `plan::OrderType` can express.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderOpts {
+    pub tif: Tif,
+    /// May only shrink an existing position — never grow or flip it. What
+    /// makes a stop-exit safe to fire twice.
+    pub reduce_only: bool,
+}
 
 /// How the adapter was configured, and therefore what it may do.
 pub struct Hyperliquid {
@@ -145,6 +176,66 @@ impl Hyperliquid {
         self.agent.as_ref().map(|a| a.address())
     }
 
+    /// Place an order with explicit execution options. The scalper's path.
+    ///
+    /// `order.limit_price = None` keeps the market-order behavior of the trait
+    /// method: an aggressive limit capped at mark ±5%.
+    pub async fn place_order_opts(
+        &self,
+        order: &OrderRequest,
+        opts: OrderOpts,
+    ) -> Result<OrderAck, VenueError> {
+        let index = self.asset_index(&order.asset).await?;
+        let is_buy = matches!(order.side, Side::Buy);
+        let limit_px = match order.limit_price {
+            Some(p) => p,
+            None => {
+                let mark = self.mark_price(&order.asset).await?;
+                let slip = Decimal::new(5, 2);
+                if is_buy {
+                    mark * (Decimal::ONE + slip)
+                } else {
+                    mark * (Decimal::ONE - slip)
+                }
+            }
+        };
+        let action = order_action(index, is_buy, limit_px, order.qty, opts, &order.client_order_id);
+        let res = self.exchange(action).await?;
+        let statuses = res.statuses().map_err(VenueError::Unreachable)?;
+        let first = statuses
+            .into_iter()
+            .next()
+            .ok_or_else(|| VenueError::Unreachable("the venue accepted nothing".into()))?;
+        ack_from_status(first, &order.client_order_id)
+    }
+
+    /// Cancel a resting order by the id *we* chose, with no oid lookup.
+    ///
+    /// A cancel refused because the order is already gone comes back as
+    /// [`VenueError::Rejected`]; for the scalper's cancel-then-reprice loop
+    /// that usually means "it filled while you decided", and the fills feed
+    /// settles which.
+    pub async fn cancel_by_cloid(
+        &self,
+        asset: &str,
+        client_order_id: &str,
+    ) -> Result<(), VenueError> {
+        let index = self.asset_index(asset).await?;
+        let res = self.exchange(cancel_by_cloid_action(index, client_order_id)).await?;
+        if res.status != "ok" {
+            return Err(VenueError::Unreachable(format!(
+                "cancel refused: venue returned status {}",
+                res.status
+            )));
+        }
+        let data = res
+            .response
+            .as_ref()
+            .and_then(|r| r.data.as_ref())
+            .ok_or_else(|| VenueError::Unreachable("no data in the venue's response".into()))?;
+        cancel_outcome(&data.statuses)
+    }
+
     fn agent_or_refuse(&self) -> Result<&Agent, VenueError> {
         self.agent.as_ref().ok_or_else(|| {
             VenueError::Unreachable(
@@ -217,6 +308,24 @@ fn client() -> Result<reqwest::Client, VenueError> {
         .map_err(|e| VenueError::Unreachable(e.to_string()))
 }
 
+fn cancel_by_cloid_action(index: u32, client_order_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cancelByCloid",
+        "cancels": [{"asset": index, "cloid": cloid(client_order_id)}],
+    })
+}
+
+/// Cancel statuses are the string `"success"` or `{"error": ...}` — a shape
+/// `ExchangeResponse::statuses()` was not built for, so they are read here.
+fn cancel_outcome(statuses: &[serde_json::Value]) -> Result<(), VenueError> {
+    for s in statuses {
+        if let Some(msg) = s.get("error").and_then(|v| v.as_str()) {
+            return Err(VenueError::Rejected { message: msg.to_string() });
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl PriceSource for Hyperliquid {
     async fn mark_price(&self, asset: &str) -> Result<Decimal, VenueError> {
@@ -275,76 +384,11 @@ impl VenueAdapter for Hyperliquid {
     }
 
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
-        let index = self.asset_index(&order.asset).await?;
-        let is_buy = matches!(order.side, Side::Buy);
-
-        // A market order is sent as an aggressive limit — Hyperliquid has no
-        // unconditional market type, and an "IOC at whatever" would be a blank
-        // cheque. The cap is the mark moved 5% against us: wide enough to cross
-        // a normal book, narrow enough that a broken feed or a flash move
-        // cannot fill us anywhere.
-        let limit_px = match order.limit_price {
-            Some(p) => p,
-            None => {
-                let mark = self.mark_price(&order.asset).await?;
-                let slip = Decimal::new(5, 2);
-                if is_buy {
-                    mark * (Decimal::ONE + slip)
-                } else {
-                    mark * (Decimal::ONE - slip)
-                }
-            }
+        let opts = OrderOpts {
+            tif: if order.limit_price.is_some() { Tif::Gtc } else { Tif::Ioc },
+            reduce_only: false,
         };
-
-        let tif = if order.limit_price.is_some() {
-            "Gtc"
-        } else {
-            "Ioc"
-        };
-        let action = serde_json::json!({
-            "type": "order",
-            "orders": [{
-                "a": index,
-                "b": is_buy,
-                "p": px_string(limit_px),
-                "s": order.qty.normalize().to_string(),
-                "r": false,
-                "t": {"limit": {"tif": tif}},
-                "c": cloid(&order.client_order_id),
-            }],
-            "grouping": "na",
-        });
-
-        let res = self.exchange(action).await?;
-        let statuses = res.statuses().map_err(VenueError::Unreachable)?;
-        let first = statuses
-            .into_iter()
-            .next()
-            .ok_or_else(|| VenueError::Unreachable("the venue accepted nothing".into()))?;
-
-        match first {
-            Status::Resting { oid } => Ok(OrderAck {
-                venue_order_id: oid.to_string(),
-                client_order_id: order.client_order_id.clone(),
-                state: OrderState::Open,
-                accepted_at: OffsetDateTime::now_utc(),
-            }),
-            Status::Filled { oid, .. } => Ok(OrderAck {
-                venue_order_id: oid.to_string(),
-                client_order_id: order.client_order_id.clone(),
-                state: OrderState::Filled,
-                accepted_at: OffsetDateTime::now_utc(),
-            }),
-            // A rejection is an answer, not a transport failure. It must not be
-            // retried, and the venue's own words are the most useful thing to
-            // carry up.
-            Status::Error(msg) => Err(VenueError::InsufficientBalance {
-                currency: QUOTE.into(),
-                need: order.qty,
-                available: Decimal::ZERO,
-            })
-            .map_err(|_: VenueError| VenueError::Unreachable(format!("order rejected: {msg}"))),
-        }
+        self.place_order_opts(order, opts).await
     }
 
     async fn cancel_order(&self, venue_order_id: &str) -> Result<(), VenueError> {
@@ -382,6 +426,31 @@ fn px_string(p: Decimal) -> String {
     s.normalize().to_string()
 }
 
+/// Turn one per-order venue status into an ack or a typed refusal.
+fn ack_from_status(status: Status, client_order_id: &str) -> Result<OrderAck, VenueError> {
+    match status {
+        Status::Resting { oid } => Ok(OrderAck {
+            venue_order_id: oid.to_string(),
+            client_order_id: client_order_id.to_string(),
+            state: OrderState::Open,
+            accepted_at: OffsetDateTime::now_utc(),
+        }),
+        Status::Filled { oid, .. } => Ok(OrderAck {
+            venue_order_id: oid.to_string(),
+            client_order_id: client_order_id.to_string(),
+            state: OrderState::Filled,
+            accepted_at: OffsetDateTime::now_utc(),
+        }),
+        Status::Error(msg) => Err(VenueError::Rejected { message: msg }),
+    }
+}
+
+/// Whether a refusal is the *expected* one for an Alo order that would have
+/// taken liquidity. This one is not an error to a scalper — it means "reprice".
+pub fn is_post_only_rejection(e: &VenueError) -> bool {
+    matches!(e, VenueError::Rejected { message } if message.contains("immediately match"))
+}
+
 /// The venue's client order id is a 128-bit hex value, not free text. Ours is a
 /// readable string, so it is hashed into that space — deterministically, so a
 /// replay still produces the same id and the venue's idempotency still holds.
@@ -397,6 +466,29 @@ fn cloid(id: &str) -> String {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     )
+}
+
+fn order_action(
+    index: u32,
+    is_buy: bool,
+    limit_px: Decimal,
+    qty: Decimal,
+    opts: OrderOpts,
+    client_order_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "order",
+        "orders": [{
+            "a": index,
+            "b": is_buy,
+            "p": px_string(limit_px),
+            "s": qty.normalize().to_string(),
+            "r": opts.reduce_only,
+            "t": {"limit": {"tif": opts.tif.as_str()}},
+            "c": cloid(client_order_id),
+        }],
+        "grouping": "na",
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,5 +668,81 @@ mod tests {
         let r: ExchangeResponse =
             serde_json::from_str(r#"{"status":"err","response":null}"#).unwrap();
         assert!(r.statuses().is_err());
+    }
+
+    #[test]
+    fn a_venue_rejection_is_a_rejection_not_a_transport_failure() {
+        let e = ack_from_status(Status::Error("Insufficient margin".into()), "id-1").unwrap_err();
+        assert!(matches!(&e, VenueError::Rejected { message } if message.contains("margin")));
+    }
+
+    #[test]
+    fn resting_and_filled_statuses_become_acks() {
+        let a = ack_from_status(Status::Resting { oid: 77 }, "id-1").unwrap();
+        assert_eq!(a.venue_order_id, "77");
+        assert_eq!(a.state, OrderState::Open);
+        let f = ack_from_status(
+            Status::Filled { oid: 9, total_sz: "0.4".into(), avg_px: "64520.0".into() },
+            "id-2",
+        )
+        .unwrap();
+        assert_eq!(f.state, OrderState::Filled);
+    }
+
+    #[test]
+    fn post_only_rejections_are_recognisable() {
+        // Exact live wording is confirmed in Task 7's testnet checklist; both known
+        // phrasings share "immediately match".
+        let e = VenueError::Rejected {
+            message: "Post only order would have immediately matched, bbo was 64520@64521".into(),
+        };
+        assert!(is_post_only_rejection(&e));
+        let other = VenueError::Rejected { message: "Insufficient margin".into() };
+        assert!(!is_post_only_rejection(&other));
+        assert!(!is_post_only_rejection(&VenueError::Unreachable("timeout".into())));
+    }
+
+    #[test]
+    fn the_order_action_carries_tif_and_reduce_only() {
+        let a = order_action(
+            7,
+            true,
+            "64520.1".parse().unwrap(),
+            "0.4".parse().unwrap(),
+            OrderOpts { tif: Tif::Alo, reduce_only: true },
+            "my-id",
+        );
+        let o = &a["orders"][0];
+        assert_eq!(o["a"], 7);
+        assert_eq!(o["b"], true);
+        assert_eq!(o["p"], "64520");
+        assert_eq!(o["s"], "0.4");
+        assert_eq!(o["r"], true);
+        assert_eq!(o["t"]["limit"]["tif"], "Alo");
+        assert_eq!(o["c"], serde_json::json!(cloid("my-id")));
+        assert_eq!(a["grouping"], "na");
+    }
+
+    #[test]
+    fn every_tif_spells_itself_the_way_the_venue_does() {
+        assert_eq!(Tif::Gtc.as_str(), "Gtc");
+        assert_eq!(Tif::Ioc.as_str(), "Ioc");
+        assert_eq!(Tif::Alo.as_str(), "Alo");
+    }
+
+    #[test]
+    fn the_cancel_by_cloid_action_names_the_asset_and_the_hashed_id() {
+        let a = cancel_by_cloid_action(7, "my-id");
+        assert_eq!(a["type"], "cancelByCloid");
+        assert_eq!(a["cancels"][0]["asset"], 7);
+        assert_eq!(a["cancels"][0]["cloid"], serde_json::json!(cloid("my-id")));
+    }
+
+    #[test]
+    fn a_successful_cancel_is_ok_and_a_refused_one_says_why() {
+        assert!(cancel_outcome(&[serde_json::json!("success")]).is_ok());
+        let e = cancel_outcome(&[serde_json::json!({"error": "Order was never placed, already canceled, or filled."})])
+            .unwrap_err();
+        assert!(matches!(&e, VenueError::Rejected { message } if message.contains("already canceled")));
     }
 }

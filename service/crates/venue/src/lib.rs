@@ -400,6 +400,12 @@ pub enum VenueError {
     #[error("no open order {0}")]
     UnknownOrder(String),
 
+    /// The venue understood the order and said no. Not a transport failure:
+    /// retrying the identical request will get the identical refusal. The
+    /// message is the venue's own wording, carried up verbatim.
+    #[error("order rejected: {message}")]
+    Rejected { message: String },
+
     #[error("venue unreachable: {0}")]
     Unreachable(String),
 }
