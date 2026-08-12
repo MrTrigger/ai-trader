@@ -2,9 +2,11 @@
 //!
 //!     cargo run -p hyperliquid --example ws_capture -- crates/hyperliquid/tests/fixtures/ws
 //!
-//! Subscribes to BTC 1m candles, BTC bbo, and userFills for an arbitrary
-//! address (fills snapshot arrives even when empty). Writes the first frame
-//! seen per channel and exits once it has one of each (or after 90s).
+//! Subscribes to BTC 1m candles, BTC bbo, and userFills for an active
+//! address (picked from a recent BTC trade, so the snapshot fixture has
+//! non-empty fills rather than just the empty-snapshot shape). Writes the
+//! first frame seen per channel and exits once it has one of each (or after
+//! 90s).
 
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
@@ -20,7 +22,7 @@ async fn main() {
     for sub in [
         serde_json::json!({"type": "candle", "coin": "BTC", "interval": "1m"}),
         serde_json::json!({"type": "bbo", "coin": "BTC"}),
-        serde_json::json!({"type": "userFills", "user": "0x0000000000000000000000000000000000000001"}),
+        serde_json::json!({"type": "userFills", "user": "0xfd66e330954b1d33772a78a70874cc2600754eec"}),
     ] {
         let msg = serde_json::json!({"method": "subscribe", "subscription": sub});
         socket.send(Message::Text(msg.to_string())).await.unwrap();
