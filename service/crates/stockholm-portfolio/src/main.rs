@@ -73,6 +73,12 @@ usage: stockholm-portfolio <command>
       Archive the four predeclared official SEK FX/KIX/policy-rate series
       through the shared equity data provider.
 
+  collect-eodhd-delisted --data-root <dir> --nasdaq-equity-notices <json>
+                         --start YYYY-MM-DD --end YYYY-MM-DD
+                         [--pause-ms 100] [--limit 0]
+      With EODHD_API_TOKEN, archive licensed inactive Stockholm common-stock
+      EOD histories only where ISIN matches an official Nasdaq delisting.
+
   training-matrix --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD
                   --out <jsonl> [--horizon-sessions 5] [--min-adv-sek 1000000]
                   [--feature-set baseline|context|residual|residual-public-short|residual-pdmr|residual-pdmr-reports|residual-fundamentals|residual-pdmr-macro|residual-pdmr-microstructure|residual-pdmr-microstructure-borrow|residual-pdmr-microstructure-borrow-news|residual-pdmr-microstructure-borrow-news-report-text]
@@ -461,6 +467,35 @@ fn collect_riksbank_macro(args: &[String]) -> Result<(), String> {
         "collected {} Riksbank series and {} observations -> {}",
         collection.series,
         collection.observations,
+        collection.dataset_path.display(),
+    );
+    Ok(())
+}
+
+fn collect_eodhd_delisted(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let notices_path = PathBuf::from(need(args, "--nasdaq-equity-notices")?);
+    let notices = equity_data::load_nasdaq_equity_notices(&notices_path)?;
+    let token = std::env::var("EODHD_API_TOKEN")
+        .map_err(|_| "EODHD_API_TOKEN is required for collect-eodhd-delisted".to_owned())?;
+    let collection = equity_data::collect_eodhd_stockholm_delisted(
+        &root,
+        &notices_path,
+        &notices,
+        &token,
+        date(args, "--start")?,
+        date(args, "--end")?,
+        number(args, "--pause-ms", 100_u64)?,
+        number(args, "--limit", 0_usize)?,
+    )?;
+    println!(
+        "matched {}/{} official delisting ISINs against {} EODHD inactive common stocks: {} histories, {} bars, {} failures -> {}",
+        collection.matched_isins,
+        collection.official_isins,
+        collection.provider_symbols,
+        collection.histories,
+        collection.bars,
+        collection.failures,
         collection.dataset_path.display(),
     );
     Ok(())
@@ -1550,6 +1585,7 @@ fn main() -> ExitCode {
         Some("collect-nasdaq-market-history") => collect_nasdaq_market_history(&args[1..]),
         Some("collect-esef-annual") => collect_esef_annual(&args[1..]),
         Some("collect-riksbank-macro") => collect_riksbank_macro(&args[1..]),
+        Some("collect-eodhd-delisted") => collect_eodhd_delisted(&args[1..]),
         Some("training-matrix") => matrix(&args[1..]),
         Some("direction-training-matrix") => direction_matrix(&args[1..]),
         Some("backtest") => run_backtest(&args[1..]),

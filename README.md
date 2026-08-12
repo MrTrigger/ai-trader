@@ -307,6 +307,48 @@ Use `relative_return_per_risk` for the second directory/arm. Use
 `relative_rank --clip-quantile 0` for the third; the other two retain the
 declared default clipping.
 
+The shared data source can also archive the complete issuer-news feed and the
+official body/attachment metadata of financial-report disclosures. Report
+HTML decoding remains in `equity-data`; finalized accounting changes remain in
+the Rust feature crate:
+
+```bash
+service/target/release/stockholm-portfolio collect-nasdaq-company-news \
+  --data-root var/stockholm/authority-data \
+  --start 2016-01-01 --end 2026-08-12
+
+service/target/release/stockholm-portfolio collect-nasdaq-report-messages \
+  --data-root var/stockholm/authority-data \
+  --nasdaq-reports var/stockholm/authority-data/nasdaq-company-news/latest-financial-reports.json \
+  --pause-ms 100 --concurrency 16
+```
+
+The completed report-text archive contains 31,611 bodies and 43,053 attachment
+links, with six explicit empty-body failures. The one-shot v12 report-text arm
+was rejected at its first fold (-5.4%, Sharpe -0.85); remaining folds were not
+run after the mandatory all-fold stability gate became impossible to pass.
+See the reward/loss study for measured-spread v11 attribution and the frozen
+v12 contract.
+
+The public Nasdaq chart endpoint drops inactive order books, so official
+delisting notices alone cannot supply survivorship-safe returns. With a
+licensed EODHD token, the shared provider can collect inactive Stockholm
+common-stock history while admitting only checksum-valid ISINs found in the
+official Nasdaq delisting archive:
+
+```bash
+export EODHD_API_TOKEN=... # secret; never written to an artifact
+service/target/release/stockholm-portfolio collect-eodhd-delisted \
+  --data-root var/stockholm/authority-data \
+  --nasdaq-equity-notices var/stockholm/authority-data/nasdaq-equity-notices/latest-stockholm-equity-notices.json \
+  --start 2015-01-01 --end 2026-08-12
+```
+
+This produces reference/history input, not an immediately tradable matrix:
+point-in-time Large/Mid/Small membership and terminal outcomes (takeover versus
+bankruptcy) still need validation before the survivorship warning can be
+removed.
+
 The first prospective IB capture returned current shortable quantity for 342
 of 412 Main Market lines: 140 Large, 119 Mid, and 83 Small Cap. That evidence
 supports a broad short candidate pool, but it is one timestamp and never

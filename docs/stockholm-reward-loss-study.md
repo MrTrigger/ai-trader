@@ -493,6 +493,16 @@ or threshold search is permitted after seeing the result. These folds are
 already exposed, so even a pass is diagnostic evidence only; it cannot
 authorize capital without a new forward interval and survivorship-safe data.
 
+V12 was stopped at its first independent fold because the predeclared
+stability gate had already failed: -5.4%, Sharpe -0.85, and -9.5% drawdown
+versus OMXSGI +18.6%, Sharpe 1.18. The model did use the new fields (report
+recency 94 splits, EPS growth 83, EBIT growth 60, order-intake growth 15,
+sales growth 7), so this is not an integration failure. The short sleeve lost
+5.6 percentage points gross and Large Cap positions lost 6.9 points gross;
+all 180 selected position-periods had observed spread. Remaining fits were
+not run because no aggregate can repair the already-failed all-fold stability
+requirement without turning the exercise into closed-fold selection.
+
 ## Verdict
 
 No candidate approaches the required 2.0 aggregate Sharpe, the development
@@ -500,6 +510,14 @@ winner fails its candidate-specific final block, every residual challenger
 fails, and OMXSGI has the higher pseudo-holdout Sharpe. The public dataset also
 omits delisted securities and historical borrow quantity. No model from this
 study may enter paper execution as an edge candidate.
+
+The shared provider now has a licensed-data path for the first omission:
+`collect-eodhd-delisted` reads EODHD exchange `ST` inactive common stocks and
+admits only checksum-valid ISINs present in the official Nasdaq delisting
+notices. The API token is request-only and never serialized. This collector is
+implemented and tested but not run because no `EODHD_API_TOKEN` is currently
+configured. Its output will still require point-in-time segment classification
+and terminal-outcome treatment before it can remove the survivorship warning.
 
 The observed 2016–2026 folds are closed for reward, loss, feature, ensemble, and
 constructor tuning. New feature contracts are run once and rejected unless

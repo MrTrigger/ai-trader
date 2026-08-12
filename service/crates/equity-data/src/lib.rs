@@ -4,7 +4,7 @@
 //! only the owned records below and contain no HTTP, symbol-mapping, or vendor
 //! decoding code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +39,7 @@ const RIKSBANK_API: &str = "https://api.riksbank.se/swea/v1";
 // Retain it only as a transport fallback for resolver failures; dataset source
 // attribution remains Sveriges Riksbank.
 const RIKSBANK_API_FALLBACK: &str = "https://apimgmt-prod1365.azure-api.net/swea/v1";
+const EODHD_API: &str = "https://eodhd.com/api";
 const USER_AGENT: &str = "ai-trader-stockholm-research/0.1";
 
 pub const RIKSBANK_STOCKHOLM_MACRO_SERIES: &[(&str, &str, &str)] = &[
@@ -517,6 +518,73 @@ pub struct NasdaqFinancialReportMessageCollection {
     pub failures: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdDelistedSymbol {
+    pub code: String,
+    pub name: String,
+    pub exchange: String,
+    pub currency: String,
+    pub security_type: String,
+    pub isin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdDailyBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub adjusted_close: f64,
+    pub volume: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdDelistedHistory {
+    pub symbol: EodhdDelistedSymbol,
+    pub official_notice_ids: Vec<u64>,
+    #[serde(default, with = "optional_date_serde")]
+    pub official_last_trading_date: Option<Date>,
+    pub bars: Vec<EodhdDailyBar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EodhdStockholmDelistedDataset {
+    pub format_version: String,
+    pub generated_at: String,
+    pub provider: String,
+    pub exchange_code: String,
+    pub operating_mic: String,
+    pub official_notice_source: String,
+    #[serde(with = "date_serde")]
+    pub requested_start: Date,
+    #[serde(with = "date_serde")]
+    pub requested_end: Date,
+    pub raw_cache_dir: String,
+    pub limitations: Vec<String>,
+    pub provider_delisted_symbols: usize,
+    pub official_delisting_isins: usize,
+    pub matched_isins: usize,
+    pub failures: BTreeMap<String, String>,
+    pub histories: Vec<EodhdDelistedHistory>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EodhdStockholmDelistedCollection {
+    pub dataset_path: PathBuf,
+    pub provider_symbols: usize,
+    pub official_isins: usize,
+    pub matched_isins: usize,
+    pub histories: usize,
+    pub bars: usize,
+    pub failures: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NasdaqEquityNoticeKind {
@@ -948,6 +1016,29 @@ struct NasdaqIndexRow {
     high: Option<f64>,
     low: Option<f64>,
     currency: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EodhdSymbolResponse {
+    code: String,
+    name: String,
+    exchange: String,
+    currency: String,
+    #[serde(rename = "Type")]
+    security_type: String,
+    isin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EodhdBarResponse {
+    date: String,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    adjusted_close: f64,
+    volume: f64,
 }
 
 pub struct PublicEquityData {
@@ -3190,6 +3281,206 @@ impl PublicEquityData {
         })
     }
 
+    /// Collect licensed EOD histories for provider-inactive Stockholm common
+    /// stocks, restricted to ISINs present in official Nasdaq delisting
+    /// notices. The token is accepted by the shared provider adapter and is
+    /// never persisted in raw URLs, manifests, or bot configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_eodhd_stockholm_delisted(
+        &self,
+        root: &Path,
+        official_notices_path: &Path,
+        official_notices: &NasdaqEquityNoticeDataset,
+        api_token: &str,
+        start: Date,
+        end: Date,
+        pause_ms: u64,
+        limit: usize,
+    ) -> Result<EodhdStockholmDelistedCollection, String> {
+        if api_token.trim().is_empty() {
+            return Err("EODHD_API_TOKEN is empty".into());
+        }
+        if end < start {
+            return Err("EODHD delisted-history end precedes start".into());
+        }
+        let cache_dir = root.join("eodhd-stockholm-delisted").join("raw");
+        let history_dir = cache_dir.join("eod");
+        std::fs::create_dir_all(&history_dir).map_err(|error| error.to_string())?;
+        let symbol_path = cache_dir.join("ST-delisted-common-stock.json");
+        let symbol_bytes = if symbol_path.exists() {
+            std::fs::read(&symbol_path)
+                .map_err(|error| format!("{}: {error}", symbol_path.display()))?
+        } else {
+            let bytes = self
+                .client
+                .get(format!("{EODHD_API}/exchange-symbol-list/ST"))
+                .query(&[
+                    ("delisted", "1"),
+                    ("type", "common_stock"),
+                    ("fmt", "json"),
+                    ("api_token", api_token),
+                ])
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .and_then(|response| response.bytes())
+                .map_err(|error| format!("EODHD Stockholm delisted symbols: {error}"))?
+                .to_vec();
+            parse_eodhd_symbols(&bytes)?;
+            std::fs::write(&symbol_path, &bytes)
+                .map_err(|error| format!("{}: {error}", symbol_path.display()))?;
+            bytes
+        };
+        let provider_symbols = parse_eodhd_symbols(&symbol_bytes)?;
+        let mut official_by_isin = BTreeMap::<String, Vec<&NasdaqEquityNotice>>::new();
+        for notice in &official_notices.notices {
+            if notice.event_kind == NasdaqEquityNoticeKind::Delisting {
+                for isin in &notice.isins {
+                    if valid_isin(isin) {
+                        official_by_isin
+                            .entry(isin.clone())
+                            .or_default()
+                            .push(notice);
+                    }
+                }
+            }
+        }
+        let official_isins = official_by_isin.len();
+        let mut matched = provider_symbols
+            .iter()
+            .filter(|symbol| official_by_isin.contains_key(&symbol.isin))
+            .cloned()
+            .collect::<Vec<_>>();
+        matched.sort_by(|a, b| a.isin.cmp(&b.isin).then_with(|| a.code.cmp(&b.code)));
+        matched.dedup_by(|right, left| right.isin == left.isin && right.code == left.code);
+        let matched_isins = matched
+            .iter()
+            .map(|symbol| symbol.isin.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if limit > 0 {
+            matched.truncate(limit);
+        }
+        let mut failures = BTreeMap::new();
+        let mut histories = Vec::new();
+        for (index, symbol) in matched.iter().enumerate() {
+            let safe_code = symbol
+                .code
+                .replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+            let raw_path = history_dir.join(format!("{safe_code}-ST-{start}_{end}.json"));
+            let bytes = if raw_path.exists() {
+                std::fs::read(&raw_path).map_err(|error| format!("{}: {error}", raw_path.display()))
+            } else {
+                let result = self
+                    .client
+                    .get(format!("{EODHD_API}/eod/{}.ST", symbol.code))
+                    .query(&[
+                        ("from", start.to_string()),
+                        ("to", end.to_string()),
+                        ("period", "d".into()),
+                        ("order", "a".into()),
+                        ("fmt", "json".into()),
+                        ("api_token", api_token.into()),
+                    ])
+                    .send()
+                    .and_then(reqwest::blocking::Response::error_for_status)
+                    .and_then(|response| response.bytes())
+                    .map_err(|error| format!("EODHD {}.ST: {error}", symbol.code))
+                    .map(|bytes| bytes.to_vec());
+                if pause_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(pause_ms));
+                }
+                result.and_then(|bytes| {
+                    parse_eodhd_bars(&bytes, start, end)?;
+                    std::fs::write(&raw_path, &bytes)
+                        .map_err(|error| format!("{}: {error}", raw_path.display()))?;
+                    Ok(bytes)
+                })
+            };
+            match bytes.and_then(|bytes| parse_eodhd_bars(&bytes, start, end)) {
+                Ok(bars) if !bars.is_empty() => {
+                    let notices = &official_by_isin[&symbol.isin];
+                    histories.push(EodhdDelistedHistory {
+                        symbol: symbol.clone(),
+                        official_notice_ids: notices
+                            .iter()
+                            .map(|notice| notice.disclosure_id)
+                            .collect(),
+                        official_last_trading_date: notices
+                            .iter()
+                            .filter_map(|notice| notice.last_trading_date)
+                            .max(),
+                        bars,
+                    });
+                }
+                Ok(_) => {
+                    failures.insert(symbol.isin.clone(), "EODHD returned no valid bars".into());
+                }
+                Err(error) => {
+                    failures.insert(symbol.isin.clone(), error);
+                }
+            }
+            if (index + 1) % 25 == 0 || index + 1 == matched.len() {
+                eprintln!(
+                    "EODHD Stockholm delisted: {}/{}, {} histories, {} failures",
+                    index + 1,
+                    matched.len(),
+                    histories.len(),
+                    failures.len()
+                );
+            }
+        }
+        histories.sort_by(|a, b| a.symbol.isin.cmp(&b.symbol.isin));
+        let now = OffsetDateTime::now_utc();
+        let dataset = EodhdStockholmDelistedDataset {
+            format_version: "eodhd-stockholm-official-delistings-1".into(),
+            generated_at: now.to_string(),
+            provider: "EODHD licensed EOD API".into(),
+            exchange_code: "ST".into(),
+            operating_mic: "XSTO".into(),
+            official_notice_source: official_notices_path.to_string_lossy().into_owned(),
+            requested_start: start,
+            requested_end: end,
+            raw_cache_dir: cache_dir.to_string_lossy().into_owned(),
+            limitations: vec![
+                "Provider inactive common stocks are admitted only when their checksum-valid ISIN appears in an official Nasdaq Stockholm delisting notice".into(),
+                "A delisting notice proves an event and identifier, not historical Large/Mid/Small membership; point-in-time size segment still requires reference data".into(),
+                "EODHD adjusted_close is provider-adjusted; corporate-action reconciliation against official notices remains required before promotion".into(),
+                "Delisting due to acquisition differs economically from bankruptcy; terminal outcomes must be modeled explicitly rather than treating all missing post-delist prices as zero".into(),
+            ],
+            provider_delisted_symbols: provider_symbols.len(),
+            official_delisting_isins: official_isins,
+            matched_isins,
+            failures,
+            histories,
+        };
+        let snapshot_dir = root
+            .join("eodhd-stockholm-delisted")
+            .join("snapshots")
+            .join(format!("{}-{}", now.date(), now.unix_timestamp()));
+        std::fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
+        let dataset_path = snapshot_dir.join("official-delistings.json");
+        write_json(&dataset_path, &dataset)?;
+        write_json(
+            &root
+                .join("eodhd-stockholm-delisted")
+                .join("latest-official-delistings.json"),
+            &dataset,
+        )?;
+        Ok(EodhdStockholmDelistedCollection {
+            dataset_path,
+            provider_symbols: dataset.provider_delisted_symbols,
+            official_isins: dataset.official_delisting_isins,
+            matched_isins: dataset.matched_isins,
+            histories: dataset.histories.len(),
+            bars: dataset
+                .histories
+                .iter()
+                .map(|history| history.bars.len())
+                .sum(),
+            failures: dataset.failures.len(),
+        })
+    }
+
     fn xbrl_api_page(
         &self,
         cache_dir: &Path,
@@ -3403,6 +3694,33 @@ pub fn collect_riksbank_stockholm_macro(
     end: Date,
 ) -> Result<RiksbankMacroCollection, String> {
     PublicEquityData::new()?.collect_riksbank_stockholm_macro(root, start, end)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn collect_eodhd_stockholm_delisted(
+    root: &Path,
+    official_notices_path: &Path,
+    official_notices: &NasdaqEquityNoticeDataset,
+    api_token: &str,
+    start: Date,
+    end: Date,
+    pause_ms: u64,
+    limit: usize,
+) -> Result<EodhdStockholmDelistedCollection, String> {
+    PublicEquityData::new()?.collect_eodhd_stockholm_delisted(
+        root,
+        official_notices_path,
+        official_notices,
+        api_token,
+        start,
+        end,
+        pause_ms,
+        limit,
+    )
+}
+
+pub fn load_eodhd_stockholm_delisted(path: &Path) -> Result<EodhdStockholmDelistedDataset, String> {
+    read_json(path)
 }
 
 pub fn collect_nasdaq_benchmark(
@@ -4818,6 +5136,73 @@ fn fi_pdmr_key(transaction: &FiPdmrTransaction) -> String {
     serde_json::to_string(transaction).expect("serializable FI PDMR transaction")
 }
 
+fn parse_eodhd_symbols(bytes: &[u8]) -> Result<Vec<EodhdDelistedSymbol>, String> {
+    let rows: Vec<EodhdSymbolResponse> =
+        serde_json::from_slice(bytes).map_err(|error| format!("EODHD symbol response: {error}"))?;
+    let mut symbols = rows
+        .into_iter()
+        .filter_map(|row| {
+            let isin = row.isin?.trim().to_ascii_uppercase();
+            (valid_isin(&isin)
+                && row.security_type.eq_ignore_ascii_case("Common Stock")
+                && row.exchange.eq_ignore_ascii_case("ST"))
+            .then_some(EodhdDelistedSymbol {
+                code: row.code,
+                name: row.name,
+                exchange: row.exchange,
+                currency: row.currency,
+                security_type: row.security_type,
+                isin,
+            })
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_by(|a, b| a.isin.cmp(&b.isin).then_with(|| a.code.cmp(&b.code)));
+    symbols.dedup_by(|right, left| right.isin == left.isin && right.code == left.code);
+    Ok(symbols)
+}
+
+fn parse_eodhd_bars(bytes: &[u8], start: Date, end: Date) -> Result<Vec<EodhdDailyBar>, String> {
+    let rows: Vec<EodhdBarResponse> =
+        serde_json::from_slice(bytes).map_err(|error| format!("EODHD EOD response: {error}"))?;
+    let mut bars = rows
+        .into_iter()
+        .filter_map(|row| {
+            let date = parse_iso_date_prefix(&row.date).ok()?;
+            let values = [
+                row.open,
+                row.high,
+                row.low,
+                row.close,
+                row.adjusted_close,
+                row.volume,
+            ];
+            (date >= start
+                && date <= end
+                && values.iter().all(|value| value.is_finite())
+                && row.open > 0.0
+                && row.high > 0.0
+                && row.low > 0.0
+                && row.close > 0.0
+                && row.adjusted_close > 0.0
+                && row.volume >= 0.0
+                && row.low <= row.open.max(row.close)
+                && row.high >= row.open.min(row.close))
+            .then_some(EodhdDailyBar {
+                date,
+                open: row.open,
+                high: row.high,
+                low: row.low,
+                close: row.close,
+                adjusted_close: row.adjusted_close,
+                volume: row.volume,
+            })
+        })
+        .collect::<Vec<_>>();
+    bars.sort_by_key(|bar| bar.date);
+    bars.dedup_by_key(|bar| bar.date);
+    Ok(bars)
+}
+
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
@@ -5229,5 +5614,31 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].date.to_string(), "2024-01-02");
         assert_eq!(values[1].value, 10.2);
+    }
+
+    #[test]
+    fn parses_eodhd_delisted_common_stocks_and_valid_eod_rows() {
+        let symbols = br#"[
+          {"Code":"SWMA_old","Name":"Swedish Match AB","Country":"Sweden","Exchange":"ST","Currency":"SEK","Type":"Common Stock","Isin":"SE0015812219"},
+          {"Code":"FUND","Name":"Fund","Country":"Sweden","Exchange":"ST","Currency":"SEK","Type":"Fund","Isin":"SE0000000001"}
+        ]"#;
+        let symbols = parse_eodhd_symbols(symbols).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].code, "SWMA_old");
+        assert_eq!(symbols[0].isin, "SE0015812219");
+
+        let bars = br#"[
+          {"date":"2022-12-29","open":114.8,"high":115.0,"low":114.7,"close":114.9,"adjusted_close":114.9,"volume":1000},
+          {"date":"2023-01-03","open":0,"high":0,"low":0,"close":0,"adjusted_close":0,"volume":0}
+        ]"#;
+        let bars = parse_eodhd_bars(
+            bars,
+            parse_iso_date_prefix("2022-01-01").unwrap(),
+            parse_iso_date_prefix("2023-12-31").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].date.to_string(), "2022-12-29");
+        assert_eq!(bars[0].adjusted_close, 114.9);
     }
 }

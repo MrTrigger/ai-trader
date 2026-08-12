@@ -2419,8 +2419,10 @@ mod tests {
     fn measured_spread_replaces_fallback_and_cost_components_reconcile() {
         let mut measured = row(day("2024-01-02"));
         measured.median_closing_spread_bps_20 = Some(20.0);
-        let mut costs = CostConfig::default();
-        costs.fallback_spread_bps = 100.0;
+        let costs = CostConfig {
+            fallback_spread_bps: 100.0,
+            ..CostConfig::default()
+        };
         let result = backtest(
             &constant_model(0.02),
             &[measured],
