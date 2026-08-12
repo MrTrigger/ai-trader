@@ -314,6 +314,12 @@ impl VenueAdapter for FakeVenue {
         self.flaky()?;
         Ok(self.fills.lock().unwrap().clone())
     }
+
+    /// The fakes have no depth to offer, and the trait makes them say so
+    /// rather than inherit an answer.
+    async fn get_order_book(&self, _asset: &str) -> Result<venue::OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
 }
 
 /// A clock that jumps rather than waits, and can run a hook at each jump.

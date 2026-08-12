@@ -161,6 +161,18 @@ impl VenueAdapter for Active {
             Active::Live { adapter, .. } => adapter.get_fills(since).await,
         }
     }
+    /// Delegated like everything else here. `get_order_book` has a default so
+    /// a venue without depth blocks nobody, and the price of that default is
+    /// that every hand-written impl between the caller and the exchange must
+    /// remember to pass it on. There are three of them - this, `PaperUpstream`,
+    /// and the paper venue - and any one forgetting turns a venue that
+    /// publishes full depth into one that "does not support order book".
+    async fn get_order_book(&self, asset: &str) -> Result<venue::OrderBook, VenueError> {
+        match self {
+            Active::Paper(v) => v.get_order_book(asset).await,
+            Active::Live { adapter, .. } => adapter.get_order_book(asset).await,
+        }
+    }
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
         match self {
             Active::Paper(v) => v.place_order(order).await,

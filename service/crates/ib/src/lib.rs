@@ -609,6 +609,11 @@ impl VenueAdapter for IbVenue {
         out.sort_by_key(|f| f.ts);
         Ok(out)
     }
+    /// Not wired. Both venues publish depth; nobody has needed it here yet, and
+    /// saying so is the honest answer until someone does.
+    async fn get_order_book(&self, _asset: &str) -> Result<venue::OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
 }
 
 /// A lazily-connecting wrapper so a synchronous venue registry can hand
@@ -664,6 +669,11 @@ impl VenueAdapter for IbLazy {
     }
     async fn get_fills(&self, since: Option<OffsetDateTime>) -> Result<Vec<Fill>, VenueError> {
         self.venue().await?.get_fills(since).await
+    }
+    /// Not wired. Both venues publish depth; nobody has needed it here yet, and
+    /// saying so is the honest answer until someone does.
+    async fn get_order_book(&self, _asset: &str) -> Result<venue::OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
     }
 }
 

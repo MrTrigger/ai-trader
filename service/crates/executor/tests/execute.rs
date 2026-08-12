@@ -148,6 +148,12 @@ impl VenueAdapter for FakeVenue {
     ) -> Result<Vec<Fill>, VenueError> {
         Ok(Vec::new())
     }
+
+    /// The fakes have no depth to offer, and the trait makes them say so
+    /// rather than inherit an answer.
+    async fn get_order_book(&self, _asset: &str) -> Result<venue::OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
 }
 
 fn position(asset: &str, qty: &str) -> Position {

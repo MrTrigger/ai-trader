@@ -450,15 +450,20 @@ pub trait VenueAdapter: Send + Sync {
 
     /// The resting book for one asset, best price first on each side.
     ///
-    /// Optional, because not every venue publishes depth and a bot that never
-    /// asks should not be blocked by one that cannot answer. It exists on the
-    /// trait rather than on one adapter because the question — what does
-    /// crossing this size actually cost — is asked of every venue we trade,
-    /// and the answer is the only honest input to an impact model. A paper
-    /// venue forwards it: the simulated fill is ours, the book is the market's.
-    async fn get_order_book(&self, _asset: &str) -> Result<OrderBook, VenueError> {
-        Err(VenueError::Unsupported("order book"))
-    }
+    /// Required, and returning `Unsupported` is a perfectly good answer.
+    ///
+    /// It had a default. Three hand-written impls sit between a caller and the
+    /// exchange — the `Active` enum, `PaperUpstream`, and the paper venue —
+    /// and two of them inherited that default silently, so a venue publishing
+    /// full depth reported "does not support order book" for every name. The
+    /// default made forgetting invisible. Now the compiler asks each adapter
+    /// the question and a delegating impl cannot answer it by accident.
+    ///
+    /// It belongs on the trait rather than on one adapter because "what does
+    /// crossing this size cost" is asked of every venue we trade, and the
+    /// resting book is the only honest input to an impact model. A paper venue
+    /// forwards it: the simulated fill is ours, the book is the market's.
+    async fn get_order_book(&self, asset: &str) -> Result<OrderBook, VenueError>;
 }
 
 /// One side's resting orders, best price first.
@@ -558,10 +563,9 @@ pub trait MarketData: Send + Sync {
     async fn markets(&self) -> Result<Vec<Market>, VenueError>;
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError>;
     /// The resting book, for callers that need depth rather than a price.
-    /// Unsupported by default, as on [`VenueAdapter`].
-    async fn order_book(&self, _asset: &str) -> Result<OrderBook, VenueError> {
-        Err(VenueError::Unsupported("order book"))
-    }
+    /// Required for the same reason as on [`VenueAdapter`]: a default here is
+    /// a way to forget.
+    async fn order_book(&self, asset: &str) -> Result<OrderBook, VenueError>;
 }
 
 /// Any real venue is market data. This is what lets the paper book wrap the
@@ -598,6 +602,11 @@ impl<M: MarketData, P: PriceSource> MarketData for MarketsWithPrices<M, P> {
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
         self.prices.mark_price(asset).await
     }
+    /// From whoever supplied the instruments. A price source is a price, not
+    /// a book.
+    async fn order_book(&self, asset: &str) -> Result<OrderBook, VenueError> {
+        self.markets.order_book(asset).await
+    }
 }
 
 /// A fixed instrument list, for tests and for a venue read once and held.
@@ -609,6 +618,10 @@ impl MarketData for Vec<Market> {
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
         Err(VenueError::NoPrice(AssetId::from(asset.to_string())))
     }
+    /// A list of instruments has no depth, and says so rather than pretending.
+    async fn order_book(&self, _asset: &str) -> Result<OrderBook, VenueError> {
+        Err(VenueError::Unsupported("order book"))
+    }
 }
 
 #[async_trait]
@@ -618,6 +631,9 @@ impl<T: MarketData + ?Sized> MarketData for std::sync::Arc<T> {
     }
     async fn mark(&self, asset: &str) -> Result<Decimal, VenueError> {
         (**self).mark(asset).await
+    }
+    async fn order_book(&self, asset: &str) -> Result<OrderBook, VenueError> {
+        (**self).order_book(asset).await
     }
 }
 
