@@ -1,6 +1,8 @@
 mod binance_um;
 mod books;
+mod costs;
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -11,6 +13,8 @@ use crypto_portfolio::store;
 use hyperliquid::{Info, MAINNET};
 
 use binance_um::{binance_um_symbol, fetch_um_month, parse_um_klines_zip};
+use books::BookSnapshot;
+use costs::{summarize, CostSummary};
 
 const USAGE: &str = "\
 usage: scalper-data <command>
@@ -27,6 +31,14 @@ usage: scalper-data <command>
       --top N picks the N largest markets by day_volume_usd() instead of a
       fixed --assets list. A coin's fetch or book error is a warning, not a
       reason to stop the run.
+
+  summarize-costs --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD [--notionals 1000,5000,20000]
+      Read every {data-root}/books/{YYYY-MM-DD}.jsonl in [--start, --end]
+      (inclusive, UTC days) and turn the recorded snapshots into a per-coin
+      spread and depth-walked cross-cost summary. Writes the pretty-printed
+      summary to {data-root}/costs/summary-{start}-{end}.json and prints a
+      table sorted by spread. A missing day file is skipped with a note, not
+      a fatal error.
 ";
 
 fn get(args: &[String], name: &str) -> Option<String> {
@@ -239,6 +251,105 @@ async fn cmd_record_books(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `--notionals` default: round dollar sizes spanning a scalper's likely
+/// clip size, small enough that a healthy book should absorb the smallest
+/// without complaint.
+const DEFAULT_NOTIONALS: &str = "1000,5000,20000";
+
+fn cmd_summarize_costs(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let start_str = need(args, "--start")?;
+    let end_str = need(args, "--end")?;
+    let start = parse_date(&start_str)?;
+    let end = parse_date(&end_str)?;
+    if start > end {
+        return Err("--start must not be after --end".into());
+    }
+    let notionals: Vec<f64> = get(args, "--notionals")
+        .unwrap_or_else(|| DEFAULT_NOTIONALS.to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<f64>()
+                .map_err(|e| format!("bad --notionals value {v:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if notionals.is_empty() {
+        return Err("--notionals produced no values".into());
+    }
+
+    let books_dir = root.join("books");
+    let mut snapshots = Vec::new();
+    let mut day = start;
+    while day <= end {
+        let path = books_dir.join(format!("{}.jsonl", day.format("%Y-%m-%d")));
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                for (i, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let snap: BookSnapshot = serde_json::from_str(line)
+                        .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
+                    snapshots.push(snap);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("{}: no data (skipped)", path.display());
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        day += chrono::Duration::days(1);
+    }
+    if snapshots.is_empty() {
+        return Err("no book snapshots found in range".into());
+    }
+
+    let summary = summarize(&snapshots, &notionals);
+
+    let costs_dir = root.join("costs");
+    std::fs::create_dir_all(&costs_dir).map_err(|e| e.to_string())?;
+    let out_path = costs_dir.join(format!("summary-{start_str}-{end_str}.json"));
+    let json = serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?;
+    std::fs::write(&out_path, &json).map_err(|e| format!("{}: {e}", out_path.display()))?;
+
+    print_cost_table(&summary);
+    println!("wrote {}", out_path.display());
+    Ok(())
+}
+
+/// Sorted by spread (tightest first): the columns a reader scans to pick
+/// which coins are cheap enough to trade at scalper size.
+fn print_cost_table(summary: &BTreeMap<String, CostSummary>) {
+    let mut rows: Vec<(&String, &CostSummary)> = summary.iter().collect();
+    rows.sort_by(|a, b| a.1.spread_bps_median.total_cmp(&b.1.spread_bps_median));
+
+    println!(
+        "{:<8} {:>6} {:>11} {:>11} {:>16}  cross_bps",
+        "coin", "n", "spread_bps", "p75_bps", "top_depth_usd"
+    );
+    for (coin, s) in rows {
+        let cross: Vec<String> = s
+            .cross_bps
+            .iter()
+            .map(|(notional, bps)| match bps {
+                Some(v) => format!("{notional}=>{v:.2}"),
+                None => format!("{notional}=>thin"),
+            })
+            .collect();
+        println!(
+            "{:<8} {:>6} {:>11.3} {:>11.3} {:>16.0}  {}",
+            coin,
+            s.samples,
+            s.spread_bps_median,
+            s.spread_bps_p75,
+            s.top_depth_usd_median,
+            cross.join(" "),
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -268,6 +379,7 @@ fn main() -> ExitCode {
             };
             runtime.block_on(cmd_record_books(&args[1..]))
         }
+        Some("summarize-costs") => cmd_summarize_costs(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
