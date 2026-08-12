@@ -12,8 +12,8 @@ set -uo pipefail
 BOT=/usr/local/bin/futures-bot
 BARS=${FUTURES_BARS:-/data/futures/bars.jsonl}
 WARMUP_DAYS=${FUTURES_WARMUP_DAYS:-45}
-HOST=${IB_PAPER_HOST:-127.0.0.1}
-PORT=${IB_PAPER_PORT:-4004}
+HOST=${IB_GATEWAY_HOST:-127.0.0.1}
+PORT=${IB_GATEWAY_PORT:-4004}
 say() { echo "[$(date -u +%H:%M:%SZ)] futures: $*"; }
 
 # The bar cache and the registered state dir. Neither holds anything durable —

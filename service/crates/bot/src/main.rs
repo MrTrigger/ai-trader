@@ -777,9 +777,9 @@ async fn mark_book_inner(
 fn cmd_plan_of(cfg: &BotConfig, run_id: String) -> Result<(), String> {
     let st = open_stores(cfg)?;
     let found = match &st.store {
-        runner::RunStore::Db { rec, bot_id } => {
-            rec.plan_for_run(bot_id, &run_id).map_err(|e| e.to_string())?
-        }
+        runner::RunStore::Db { rec, bot_id } => rec
+            .plan_for_run(bot_id, &run_id)
+            .map_err(|e| e.to_string())?,
         runner::RunStore::File { root } => {
             // The file store keys plans by plan id, so find the run first.
             let run = st
@@ -788,8 +788,9 @@ fn cmd_plan_of(cfg: &BotConfig, run_id: String) -> Result<(), String> {
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .find(|r| r.run_id == run_id);
-            run.and_then(|r| r.plan_id)
-                .and_then(|id| std::fs::read_to_string(root.join("plans").join(format!("{id}.json"))).ok())
+            run.and_then(|r| r.plan_id).and_then(|id| {
+                std::fs::read_to_string(root.join("plans").join(format!("{id}.json"))).ok()
+            })
         }
     };
     match found {

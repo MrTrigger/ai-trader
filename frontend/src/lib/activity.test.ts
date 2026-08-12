@@ -1,5 +1,62 @@
 import { expect, test } from "bun:test";
-import { activity, type Activity } from "./activity";
+import { activity, unackSeconds, type Activity } from "./activity";
+
+const NOW = Date.parse("2026-08-12T10:00:00Z");
+const ago = (s: number) => new Date(NOW - s * 1000).toISOString();
+
+test("a control on a bot that has never published is never acknowledged", () => {
+  // The fourth door into one green lie. `unackSeconds` could only tell that a
+  // control was pending by comparing it against the bot's LAST PUBLISH — so
+  // when there had never been one, the comparison was impossible and the code
+  // read that as taken up. The cluster's futures bot, which has never once
+  // reached its loop, showed a green RUNNING pill next to its own "no
+  // heartbeat" and a red "nothing has ever run this bot".
+  const pending = unackSeconds({
+    control: "running",
+    setAt: ago(200),
+    heartbeatAgeSeconds: null,
+    now: NOW,
+  });
+  expect(pending).toBeCloseTo(200, 0);
+  // And the pill that follows from it, which is the whole point.
+  expect(activity({ enabled: true, control: "running", unackSeconds: pending }).key).toBe(
+    "not-running",
+  );
+  // Freshly pressed: a transition, not yet a fault.
+  const fresh = unackSeconds({
+    control: "running",
+    setAt: ago(5),
+    heartbeatAgeSeconds: null,
+    now: NOW,
+  });
+  expect(activity({ enabled: true, control: "running", unackSeconds: fresh }).key).toBe("starting");
+});
+
+test("a bot that is publishing acknowledges by publishing", () => {
+  // Set two minutes ago, published thirty seconds ago: the bot has seen it.
+  expect(
+    unackSeconds({ control: "running", setAt: ago(120), heartbeatAgeSeconds: 30, now: NOW }),
+  ).toBeUndefined();
+  // Set after the last publish: still pending, and measured from set_at.
+  expect(
+    unackSeconds({ control: "stopped", setAt: ago(10), heartbeatAgeSeconds: 300, now: NOW }),
+  ).toBeCloseTo(10, 0);
+  // The bot's own published state naming the outcome outranks every clock.
+  expect(
+    unackSeconds({
+      control: "stopped",
+      setAt: ago(10),
+      publishedState: "halted",
+      heartbeatAgeSeconds: 300,
+      now: NOW,
+    }),
+  ).toBeUndefined();
+});
+
+test("no control word means nothing is pending", () => {
+  expect(unackSeconds({ control: null, setAt: ago(10), now: NOW })).toBeUndefined();
+  expect(unackSeconds({ control: "running", setAt: null, now: NOW })).toBeUndefined();
+});
 
 /**
  * The colour table is a contract with the operator's eye, not a style

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-cme", "crates/features-crypto", "crates/crypto-portfolio", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot"]
+members = ["crates/plan", "crates/records", "crates/venue", "crates/paper", "crates/executor", "crates/runner", "crates/hyperliquid", "crates/bot", "crates/api", "crates/viewer", "crates/features-common", "crates/features-cme", "crates/features-crypto", "crates/features-stockholm", "crates/equity-data", "crates/lightgbm-json", "crates/portfolio-construction", "crates/stockholm-portfolio", "crates/crypto-portfolio", "crates/noise-book", "crates/ib", "crates/rithmic", "crates/futures-bot"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,12 @@ runner = { path = "crates/runner" }
 hyperliquid = { path = "crates/hyperliquid" }
 features-cme = { path = "crates/features-cme" }
 features-crypto = { path = "crates/features-crypto" }
+features-common = { path = "crates/features-common" }
+features-stockholm = { path = "crates/features-stockholm" }
+equity-data = { path = "crates/equity-data" }
+lightgbm-json = { path = "crates/lightgbm-json" }
+portfolio-construction = { path = "crates/portfolio-construction" }
+stockholm-portfolio = { path = "crates/stockholm-portfolio" }
 crypto-portfolio = { path = "crates/crypto-portfolio" }
 noise-book = { path = "crates/noise-book" }
 async-trait = "0.1"

@@ -1,0 +1,4986 @@
+//! Sole implementation of Stockholm-equity feature values used by research,
+//! training-matrix generation, replay, and live inference.
+//!
+//! Raw OHLCV and corporate-action-adjusted closes enter this crate as owned
+//! records. Broker requests do not. Python receives only the final normalised
+//! values emitted here (or by a Rust portfolio matrix builder calling here).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use time::Date;
+
+pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-2";
+pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-1";
+pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-3";
+pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-4";
+pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-5";
+pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-6";
+pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-7";
+pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-8";
+pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-9";
+pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-10";
+pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-11";
+pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str =
+    "fs-rust-stockholm-12";
+pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
+pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
+pub const DIRECTION_INDEX_SYMBOLS: &[&str] = &[
+    "OMXSGI", "OMXS30GI", "OMXSBGI", "SX10GI", "SX15GI", "SX20GI", "SX30GI", "SX50GI", "SX55GI",
+    "SX60GI", "SX65GI",
+];
+pub const DIRECTION_SECTOR_SYMBOLS: &[&str] = &[
+    "SX10GI", "SX15GI", "SX20GI", "SX30GI", "SX50GI", "SX55GI", "SX60GI", "SX65GI",
+];
+pub const DIRECTION_RAW_FEATURE_NAMES: &[&str] = &[
+    "omxsgi_ret_5",
+    "omxsgi_ret_21",
+    "omxsgi_ret_63",
+    "omxsgi_ret_126",
+    "omxsgi_ret_252",
+    "omxsgi_price_vs_ma50",
+    "omxsgi_ma50_vs_ma200",
+    "omxsgi_vol_20",
+    "omxsgi_vol_60",
+    "omxsgi_max_drawdown_126",
+    "omxs30gi_excess_ret_21",
+    "omxs30gi_excess_ret_63",
+    "omxs30gi_excess_ret_126",
+    "omxsbgi_excess_ret_21",
+    "omxsbgi_excess_ret_63",
+    "omxsbgi_excess_ret_126",
+    "sector_breadth_positive_21",
+    "sector_breadth_positive_63",
+    "sector_breadth_positive_126",
+    "sector_median_ret_21",
+    "sector_median_ret_63",
+    "sector_median_ret_126",
+    "sector_dispersion_ret_21",
+    "sector_dispersion_ret_63",
+];
+/// Per-instrument trailing features. These are calculated independently and
+/// then ranked inside the point-in-time size-bucket cross-section.
+pub const FEATURE_NAMES: &[&str] = &[
+    "ret_1",
+    "ret_5",
+    "ret_21",
+    "ret_63",
+    "ret_126",
+    "ret_252",
+    "ret_21_skip_5",
+    "vol_20",
+    "vol_60",
+    "downside_vol_60",
+    "skew_60",
+    "max_drawdown_126",
+    "dist_high_252",
+    "dist_low_252",
+    "gap_1",
+    "range_frac_1",
+    "close_location_1",
+    "median_traded_notional_20",
+    "amihud_20",
+    "volume_surge_20",
+];
+
+/// Predeclared residual-risk and execution-context additions from the v3
+/// design. Values are calculated causally from the eligible main-market
+/// universe, then ranked inside the same size-bucket cross-section as v1.
+pub const RESIDUAL_FEATURE_NAMES: &[&str] = &[
+    "beta_252",
+    "idio_vol_60",
+    "log_adv_sek_20",
+    "log_adv_sek_60",
+    "amihud_60",
+    "range_frac_14",
+    "close_location_5",
+    "market_resid_ret_21",
+    "market_resid_ret_126",
+    "sector_resid_ret_21",
+    "sector_resid_ret_126",
+];
+
+/// Public-disclosure short-demand features. These describe disclosed holder
+/// crowding and its changes; they are not stock-loan inventory or historical
+/// locate availability. Events are admitted strictly after their position
+/// date, conservatively avoiding same-day publication leakage.
+pub const PUBLIC_SHORT_FEATURE_NAMES: &[&str] = &[
+    "fi_public_short_percent",
+    "fi_public_short_holder_count",
+    "fi_public_short_change_30d",
+    "fi_public_short_change_90d",
+    "fi_days_since_public_short_event",
+    "fi_public_short_events_30d",
+];
+
+/// Manager transaction features derived from FI's public PDMR register. Only
+/// initial notifications of cash-valued share acquisitions and disposals are
+/// admitted. This avoids using today's revised/cancelled status to rewrite
+/// what was observable on an earlier decision date.
+pub const PDMR_FEATURE_NAMES: &[&str] = &[
+    "fi_pdmr_net_value_30d",
+    "fi_pdmr_net_value_90d",
+    "fi_pdmr_buy_value_90d",
+    "fi_pdmr_sell_value_90d",
+    "fi_pdmr_transactions_30d",
+    "fi_pdmr_unique_buyers_90d",
+    "fi_days_since_pdmr_buy",
+];
+
+/// Official Nasdaq financial-report release features. Event counts and
+/// reactions deduplicate translations sharing one issuer/timestamp. A report
+/// is never available on its publication date in daily research.
+pub const REPORT_EVENT_FEATURE_NAMES: &[&str] = &[
+    "nasdaq_days_since_financial_report",
+    "nasdaq_financial_reports_30d",
+    "nasdaq_financial_reports_90d",
+    "nasdaq_financial_report_reaction_1",
+    "nasdaq_financial_report_reaction_5",
+    "nasdaq_financial_report_reaction_21",
+];
+
+/// Point-in-time annual fundamental features from standardized financial
+/// statement fields. Availability is controlled by the source event; all
+/// ratios and price joins are finalized here in Rust.
+pub const FUNDAMENTAL_FEATURE_NAMES: &[&str] = &[
+    "days_since_annual_fundamentals",
+    "fundamental_equity_to_assets",
+    "fundamental_cash_to_assets",
+    "fundamental_cfo_to_assets",
+    "fundamental_accruals_to_assets",
+    "fundamental_operating_margin",
+    "fundamental_net_margin",
+    "fundamental_revenue_growth",
+    "fundamental_net_income_change_to_assets",
+    "fundamental_asset_growth",
+    "fundamental_equity_growth",
+    "fundamental_current_ratio",
+    "fundamental_eps_yield",
+    "fundamental_book_to_market",
+    "fundamental_sales_to_market",
+];
+
+pub const MACRO_FEATURE_NAMES: &[&str] = &[
+    "usdsek_beta_126",
+    "eursek_beta_126",
+    "kix_beta_126",
+    "usdsek_trend_exposure_21",
+    "eursek_trend_exposure_21",
+    "kix_trend_exposure_21",
+    "usdsek_trend_exposure_63",
+    "eursek_trend_exposure_63",
+    "kix_trend_exposure_63",
+];
+
+/// Exchange-observed liquidity and closing-pressure features. The source
+/// records are completed-session Nasdaq observations and are used only for a
+/// next-session entry. Missing quotes remain missing rather than being
+/// replaced with a zero spread.
+pub const MICROSTRUCTURE_FEATURE_NAMES: &[&str] = &[
+    "nasdaq_spread_bps_1",
+    "nasdaq_median_spread_bps_20",
+    "nasdaq_spread_ratio_20",
+    "nasdaq_log_median_trades_20",
+    "nasdaq_trades_surge_20",
+    "nasdaq_close_vs_average_1",
+    "nasdaq_log_median_trade_value_20",
+];
+
+/// Historical stock-borrow fee features. IB's FEE_RATE bars are decimal
+/// annual rates (0.01 means 1% per year), not availability or a locate.
+pub const BORROW_FEE_FEATURE_NAMES: &[&str] = &[
+    "ib_borrow_fee_1",
+    "ib_median_borrow_fee_20",
+    "ib_borrow_fee_change_5",
+    "ib_borrow_fee_change_20",
+    "ib_max_borrow_fee_20",
+];
+
+/// Timestamped Nasdaq issuer-news features. The provider category is mapped
+/// to [`CompanyNewsKind`] before entering this crate; no headline text or
+/// future price response is interpreted by the training orchestrator.
+pub const COMPANY_NEWS_FEATURE_NAMES: &[&str] = &[
+    "nasdaq_company_news_30d",
+    "nasdaq_company_news_90d",
+    "nasdaq_days_since_inside_information",
+    "nasdaq_inside_information_30d",
+    "nasdaq_inside_information_90d",
+    "nasdaq_inside_information_reaction_1",
+    "nasdaq_inside_information_reaction_5",
+    "nasdaq_inside_information_reaction_21",
+    "nasdaq_own_shares_news_90d",
+    "nasdaq_management_news_90d",
+    "nasdaq_prospectus_news_90d",
+    "nasdaq_major_shareholder_news_90d",
+    "nasdaq_tender_offer_news_90d",
+];
+
+/// Accounting changes extracted from official issuer-authored Nasdaq report
+/// bodies. Values are admitted only on later decision dates; exact bilingual
+/// labels and current/comparative numeric pairs are parsed in this Rust crate.
+pub const REPORT_TEXT_FEATURE_NAMES: &[&str] = &[
+    "nasdaq_days_since_report_text",
+    "nasdaq_report_sales_growth",
+    "nasdaq_report_order_intake_growth",
+    "nasdaq_report_ebit_growth",
+    "nasdaq_report_operating_margin",
+    "nasdaq_report_operating_margin_change",
+    "nasdaq_report_eps_growth",
+    "nasdaq_report_dividend_growth",
+];
+
+pub const REQUIRED_MACRO_SERIES: &[&str] = &["SEKUSDPMI", "SEKEURPMI", "SEKKIX92"];
+
+/// Causal cross-sectional context calculated from the same decision-date
+/// universe. Sector-relative values are ranked within size bucket; market
+/// regime values stay in economic units so a common regime is not erased by
+/// cross-sectional ranking.
+pub const CONTEXT_FEATURE_NAMES: &[&str] = &[
+    "sector_rel_ret_5",
+    "sector_rel_ret_21",
+    "sector_rel_ret_63",
+    "sector_rel_ret_126",
+    "sector_rel_ret_252",
+    "sector_rel_vol_60",
+    "sector_rel_amihud_20",
+    "sector_rel_volume_surge_20",
+    "market_median_ret_5",
+    "market_median_ret_21",
+    "market_median_ret_63",
+    "market_median_ret_126",
+    "market_median_ret_252",
+    "market_dispersion_ret_21",
+    "market_breadth_positive_21",
+    "market_breadth_positive_126",
+    "market_median_vol_20",
+];
+
+const SECTOR_RELATIVE_SOURCES: &[&str] = &[
+    "ret_5",
+    "ret_21",
+    "ret_63",
+    "ret_126",
+    "ret_252",
+    "vol_60",
+    "amihud_20",
+    "volume_surge_20",
+];
+
+const MARKET_MEDIAN_SOURCES: &[&str] = &["ret_5", "ret_21", "ret_63", "ret_126", "ret_252"];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DailyBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    /// Unadjusted exchange prices. These preserve economically meaningful
+    /// ranges, gaps, prices, and traded notional.
+    pub raw_open: f64,
+    pub raw_high: f64,
+    pub raw_low: f64,
+    pub raw_close: f64,
+    pub volume: f64,
+    /// Split/dividend-adjusted close used only for return-like features.
+    pub adjusted_close: f64,
+}
+
+/// Provider-neutral broad-market close used by the slow direction layer. The
+/// Stockholm adapter supplies OMXSGI EOD levels; no provider type crosses this
+/// feature boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub close: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroObservation {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroSeries {
+    pub series_id: String,
+    pub observations: Vec<MacroObservation>,
+}
+
+/// Provider-neutral completed-session market microstructure observation.
+/// Provider response parsing and units remain owned by `equity-data`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketMicrostructureBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub close: f64,
+    pub average: Option<f64>,
+    pub turnover_sek: f64,
+    pub trades: Option<u64>,
+}
+
+/// Provider-neutral completed-session stock-borrow cost. The IB adapter owns
+/// request semantics and unit decoding; this crate only sees an annual rate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BorrowFeeBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    pub annual_rate: f64,
+}
+
+/// Provider-neutral official index session used by the trained market
+/// direction layer. Features use EOD values through the decision date; labels
+/// use later SOD values so the research action remains executable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketIndexBar {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub start_value: f64,
+    pub end_value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketIndexSeries {
+    pub symbol: String,
+    pub bars: Vec<MarketIndexBar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectionTrainingRow {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    /// OMXSGI next-session SOD to SOD after the declared horizon.
+    pub target: f64,
+    pub entry_value: f64,
+    pub exit_value: f64,
+    pub annualised_volatility_20: f64,
+    /// Final Rust-owned values in [`direction_model_feature_names`] order.
+    pub features: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectionTrainingMatrix {
+    pub features: Vec<String>,
+    pub rows: Vec<DirectionTrainingRow>,
+}
+
+pub fn direction_label_version(horizon_sessions: usize) -> Result<String, String> {
+    if horizon_sessions == 0 {
+        return Err("direction label horizon must be positive".into());
+    }
+    Ok(format!("omxsgi-forward-start-value-{horizon_sessions}-v1"))
+}
+
+pub fn direction_label_horizon(version: &str) -> Option<usize> {
+    version
+        .strip_prefix("omxsgi-forward-start-value-")?
+        .strip_suffix("-v1")?
+        .parse()
+        .ok()
+        .filter(|horizon| *horizon > 0)
+}
+
+pub fn direction_model_feature_names() -> Vec<String> {
+    DIRECTION_RAW_FEATURE_NAMES
+        .iter()
+        .map(|name| format!("x_{name}"))
+        .chain(
+            DIRECTION_RAW_FEATURE_NAMES
+                .iter()
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+/// Build the finalized absolute-return direction matrix. No later observation
+/// can change a row's features: all inputs end at `date`, while only the label
+/// reads the primary index's following SOD values.
+pub fn direction_training_matrix(
+    series: &[MarketIndexSeries],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+) -> Result<DirectionTrainingMatrix, String> {
+    if end < start {
+        return Err("direction matrix end precedes start".into());
+    }
+    if horizon_sessions == 0 {
+        return Err("direction label horizon must be positive".into());
+    }
+    let mut by_symbol = BTreeMap::new();
+    let mut positions = BTreeMap::new();
+    for history in series {
+        validate_market_index_series(history)?;
+        if by_symbol.insert(history.symbol.as_str(), history).is_some() {
+            return Err(format!("duplicate direction index {}", history.symbol));
+        }
+        positions.insert(
+            history.symbol.as_str(),
+            history
+                .bars
+                .iter()
+                .enumerate()
+                .map(|(index, bar)| (bar.date, index))
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+    for symbol in DIRECTION_INDEX_SYMBOLS {
+        if !by_symbol.contains_key(symbol) {
+            return Err(format!("direction index {symbol} is required"));
+        }
+    }
+    let primary = by_symbol["OMXSGI"];
+    let primary_positions = &positions["OMXSGI"];
+    let names = direction_model_feature_names();
+    let mut rows = Vec::new();
+    for index in 252..primary.bars.len() {
+        let decision = primary.bars[index].date;
+        if decision < start || decision > end {
+            continue;
+        }
+        let Some(exit_index) = index.checked_add(1 + horizon_sessions) else {
+            continue;
+        };
+        if exit_index >= primary.bars.len() {
+            continue;
+        }
+        let close = primary.bars[index].end_value;
+        let primary_return = |window| index_return(primary, index, window);
+        let ret_21 = primary_return(21);
+        let ret_63 = primary_return(63);
+        let ret_126 = primary_return(126);
+        let ma50 = index_mean(primary, index, 50);
+        let ma200 = index_mean(primary, index, 200);
+        let mut raw = vec![
+            primary_return(5),
+            ret_21,
+            ret_63,
+            ret_126,
+            primary_return(252),
+            ma50.and_then(|value| finite(close / value - 1.0)),
+            ma50.zip(ma200)
+                .and_then(|(fast, slow)| finite(fast / slow - 1.0)),
+            index_volatility(primary, index, 20),
+            index_volatility(primary, index, 60),
+            index_max_drawdown(primary, index, 126),
+        ];
+        for symbol in ["OMXS30GI", "OMXSBGI"] {
+            let history = by_symbol[symbol];
+            let current = positions[symbol].get(&decision).copied();
+            for (window, market_return) in [(21, ret_21), (63, ret_63), (126, ret_126)] {
+                raw.push(
+                    current
+                        .and_then(|secondary_index| index_return(history, secondary_index, window))
+                        .zip(market_return)
+                        .and_then(|(secondary_return, market_return)| {
+                            finite(secondary_return - market_return)
+                        }),
+                );
+            }
+        }
+        let sector_returns = |window| {
+            DIRECTION_SECTOR_SYMBOLS
+                .iter()
+                .filter_map(|symbol| {
+                    let history = by_symbol[symbol];
+                    let current = positions[symbol].get(&decision).copied()?;
+                    index_return(history, current, window)
+                })
+                .collect::<Vec<_>>()
+        };
+        let sector_21 = sector_returns(21);
+        let sector_63 = sector_returns(63);
+        let sector_126 = sector_returns(126);
+        for values in [&sector_21, &sector_63, &sector_126] {
+            raw.push(index_positive_fraction(values));
+        }
+        for values in [&sector_21, &sector_63, &sector_126] {
+            let mut values = values.clone();
+            raw.push((values.len() >= 4).then(|| median(&mut values)).flatten());
+        }
+        for values in [&sector_21, &sector_63] {
+            raw.push(
+                (values.len() >= 4)
+                    .then(|| standard_deviation(values))
+                    .flatten(),
+            );
+        }
+        if raw.len() != DIRECTION_RAW_FEATURE_NAMES.len() {
+            return Err("direction feature row has the wrong width".into());
+        }
+        let annualised_volatility_20 =
+            raw[7].ok_or_else(|| format!("missing OMXSGI volatility on {decision}"))?;
+        let mut finalized = Vec::with_capacity(names.len());
+        finalized.extend(raw.iter().map(|value| value.unwrap_or(0.0)));
+        finalized.extend(raw.iter().map(|value| f64::from(value.is_none())));
+        if finalized.iter().any(|value| !value.is_finite()) {
+            return Err(format!("non-finite direction feature on {decision}"));
+        }
+        let entry_value = primary.bars[index + 1].start_value;
+        let exit_value = primary.bars[exit_index].start_value;
+        let target = exit_value / entry_value - 1.0;
+        if !target.is_finite() {
+            return Err(format!("non-finite OMXSGI direction label on {decision}"));
+        }
+        debug_assert_eq!(primary_positions[&decision], index);
+        rows.push(DirectionTrainingRow {
+            date: decision,
+            target,
+            entry_value,
+            exit_value,
+            annualised_volatility_20,
+            features: names.iter().cloned().zip(finalized).collect(),
+        });
+    }
+    Ok(DirectionTrainingMatrix {
+        features: names,
+        rows,
+    })
+}
+
+fn validate_market_index_series(series: &MarketIndexSeries) -> Result<(), String> {
+    if series.symbol.trim().is_empty() {
+        return Err("direction index symbol is empty".into());
+    }
+    for bar in &series.bars {
+        if !bar.start_value.is_finite()
+            || !bar.end_value.is_finite()
+            || bar.start_value <= 0.0
+            || bar.end_value <= 0.0
+        {
+            return Err(format!(
+                "direction index {} has invalid values on {}",
+                series.symbol, bar.date
+            ));
+        }
+    }
+    if series
+        .bars
+        .windows(2)
+        .any(|pair| pair[0].date >= pair[1].date)
+    {
+        return Err(format!(
+            "direction index {} must be strictly increasing and unique",
+            series.symbol
+        ));
+    }
+    Ok(())
+}
+
+fn index_return(series: &MarketIndexSeries, index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_sub(window)?;
+    finite(series.bars[index].end_value / series.bars[start].end_value - 1.0)
+}
+
+fn index_mean(series: &MarketIndexSeries, index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_add(1)?.checked_sub(window)?;
+    finite(
+        series.bars[start..=index]
+            .iter()
+            .map(|bar| bar.end_value)
+            .sum::<f64>()
+            / window as f64,
+    )
+}
+
+fn index_volatility(series: &MarketIndexSeries, index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_add(1)?.checked_sub(window)?;
+    if start == 0 {
+        return None;
+    }
+    let returns = (start..=index)
+        .map(|current| (series.bars[current].end_value / series.bars[current - 1].end_value).ln())
+        .collect::<Vec<_>>();
+    finite(standard_deviation(&returns)? * 252.0_f64.sqrt())
+}
+
+fn index_max_drawdown(series: &MarketIndexSeries, index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_add(1)?.checked_sub(window)?;
+    let mut peak = series.bars[start].end_value;
+    let mut drawdown = 0.0_f64;
+    for bar in &series.bars[start..=index] {
+        peak = peak.max(bar.end_value);
+        drawdown = drawdown.min(bar.end_value / peak - 1.0);
+    }
+    finite(drawdown)
+}
+
+fn index_positive_fraction(values: &[f64]) -> Option<f64> {
+    (values.len() >= 4)
+        .then(|| values.iter().filter(|value| **value > 0.0).count() as f64 / values.len() as f64)
+        .and_then(finite)
+}
+
+/// Causal inputs to the shared stateful direction policy. The five component
+/// spreads/returns remain visible so replay reports can explain a score rather
+/// than exposing only a regime label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketTrendObservation {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub version: String,
+    pub score: f64,
+    pub price_vs_ma50: f64,
+    pub ma50_vs_ma200: f64,
+    pub return_63: f64,
+    pub return_126: f64,
+    pub return_252: f64,
+    pub annualised_volatility_20: f64,
+}
+
+/// Produce one observation per sufficiently mature market session. Every
+/// value at `t` uses EOD levels no later than `t`; the resulting decision can
+/// therefore first trade on the next session.
+pub fn market_trend(bars: &[MarketBar]) -> Result<Vec<MarketTrendObservation>, String> {
+    if bars.is_empty() {
+        return Ok(Vec::new());
+    }
+    for bar in bars {
+        if !bar.close.is_finite() || bar.close <= 0.0 {
+            return Err(format!("market bar on {} has an invalid close", bar.date));
+        }
+    }
+    for pair in bars.windows(2) {
+        if pair[0].date >= pair[1].date {
+            return Err("market bars must be strictly increasing and unique".into());
+        }
+    }
+
+    let mut observations = Vec::with_capacity(bars.len().saturating_sub(252));
+    for index in 252..bars.len() {
+        let close = bars[index].close;
+        let ma50 = market_mean(bars, index, 50).expect("50 sessions exist");
+        let ma200 = market_mean(bars, index, 200).expect("200 sessions exist");
+        let return_63 = close / bars[index - 63].close - 1.0;
+        let return_126 = close / bars[index - 126].close - 1.0;
+        let return_252 = close / bars[index - 252].close - 1.0;
+        let price_vs_ma50 = close / ma50 - 1.0;
+        let ma50_vs_ma200 = ma50 / ma200 - 1.0;
+        let components = [
+            price_vs_ma50,
+            ma50_vs_ma200,
+            return_63,
+            return_126,
+            return_252,
+        ];
+        let score =
+            components.iter().map(|value| vote(*value)).sum::<f64>() / components.len() as f64;
+        let log_returns = (index - 19..=index)
+            .map(|current| (bars[current].close / bars[current - 1].close).ln())
+            .collect::<Vec<_>>();
+        let annualised_volatility_20 = standard_deviation(&log_returns)
+            .expect("twenty returns have variance")
+            * 252.0_f64.sqrt();
+        observations.push(MarketTrendObservation {
+            date: bars[index].date,
+            version: MARKET_TREND_VERSION.into(),
+            score,
+            price_vs_ma50,
+            ma50_vs_ma200,
+            return_63,
+            return_126,
+            return_252,
+            annualised_volatility_20,
+        });
+    }
+    Ok(observations)
+}
+
+fn market_mean(bars: &[MarketBar], index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_add(1)?.checked_sub(window)?;
+    finite(bars[start..=index].iter().map(|bar| bar.close).sum::<f64>() / window as f64)
+}
+
+fn vote(value: f64) -> f64 {
+    if value > 0.0 {
+        1.0
+    } else if value < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+impl DailyBar {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.instrument_id.trim().is_empty() {
+            return Err("empty instrument_id".into());
+        }
+        let prices = [
+            self.raw_open,
+            self.raw_high,
+            self.raw_low,
+            self.raw_close,
+            self.adjusted_close,
+        ];
+        if prices
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(format!(
+                "{} on {} has a non-positive/non-finite price",
+                self.instrument_id, self.date
+            ));
+        }
+        if !self.volume.is_finite() || self.volume < 0.0 {
+            return Err(format!(
+                "{} on {} has invalid volume",
+                self.instrument_id, self.date
+            ));
+        }
+        if self.raw_high < self.raw_low
+            || self.raw_open > self.raw_high
+            || self.raw_open < self.raw_low
+            || self.raw_close > self.raw_high
+            || self.raw_close < self.raw_low
+        {
+            return Err(format!(
+                "{} on {} has inconsistent raw OHLC",
+                self.instrument_id, self.date
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeatureRow {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    /// Ordered exactly as [`FEATURE_NAMES`]. Nulls are retained until the
+    /// point-in-time cross-section is normalised.
+    pub values: Vec<Option<f64>>,
+}
+
+impl FeatureRow {
+    pub fn value(&self, name: &str) -> Option<f64> {
+        FEATURE_NAMES
+            .iter()
+            .position(|candidate| *candidate == name.trim_start_matches("x_"))
+            .and_then(|index| self.values.get(index).copied().flatten())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalisedRow {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    /// All ranked `x_` values followed by their binary `m_` missing flags.
+    /// No Python transformation remains.
+    pub values: Vec<f64>,
+}
+
+pub fn model_feature_names() -> Vec<String> {
+    value_feature_names()
+        .into_iter()
+        .map(|name| format!("x_{name}"))
+        .chain(
+            value_feature_names()
+                .into_iter()
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn baseline_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .map(|name| format!("x_{name}"))
+        .chain(FEATURE_NAMES.iter().map(|name| format!("m_{name}")))
+        .collect()
+}
+
+pub fn residual_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn public_short_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PUBLIC_SHORT_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PUBLIC_SHORT_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_report_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(REPORT_EVENT_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(REPORT_EVENT_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn fundamental_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(FUNDAMENTAL_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(FUNDAMENTAL_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_macro_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(MACRO_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(MACRO_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_microstructure_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(MICROSTRUCTURE_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(MICROSTRUCTURE_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_microstructure_borrow_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(MICROSTRUCTURE_FEATURE_NAMES)
+        .chain(BORROW_FEE_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(MICROSTRUCTURE_FEATURE_NAMES)
+                .chain(BORROW_FEE_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_microstructure_borrow_news_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(MICROSTRUCTURE_FEATURE_NAMES)
+        .chain(BORROW_FEE_FEATURE_NAMES)
+        .chain(COMPANY_NEWS_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(MICROSTRUCTURE_FEATURE_NAMES)
+                .chain(BORROW_FEE_FEATURE_NAMES)
+                .chain(COMPANY_NEWS_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+pub fn pdmr_microstructure_borrow_news_report_text_model_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(RESIDUAL_FEATURE_NAMES)
+        .chain(PDMR_FEATURE_NAMES)
+        .chain(MICROSTRUCTURE_FEATURE_NAMES)
+        .chain(BORROW_FEE_FEATURE_NAMES)
+        .chain(COMPANY_NEWS_FEATURE_NAMES)
+        .chain(REPORT_TEXT_FEATURE_NAMES)
+        .map(|name| format!("x_{name}"))
+        .chain(
+            FEATURE_NAMES
+                .iter()
+                .chain(RESIDUAL_FEATURE_NAMES)
+                .chain(PDMR_FEATURE_NAMES)
+                .chain(MICROSTRUCTURE_FEATURE_NAMES)
+                .chain(BORROW_FEE_FEATURE_NAMES)
+                .chain(COMPANY_NEWS_FEATURE_NAMES)
+                .chain(REPORT_TEXT_FEATURE_NAMES)
+                .map(|name| format!("m_{name}")),
+        )
+        .collect()
+}
+
+fn value_feature_names() -> Vec<&'static str> {
+    FEATURE_NAMES
+        .iter()
+        .chain(CONTEXT_FEATURE_NAMES)
+        .copied()
+        .collect()
+}
+
+pub fn validate_selection(names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Err("model selects no Stockholm features".into());
+    }
+    let all: BTreeSet<_> = model_feature_names()
+        .into_iter()
+        .chain(residual_model_feature_names())
+        .chain(public_short_model_feature_names())
+        .chain(pdmr_model_feature_names())
+        .chain(pdmr_report_model_feature_names())
+        .chain(fundamental_model_feature_names())
+        .chain(pdmr_macro_model_feature_names())
+        .chain(pdmr_microstructure_model_feature_names())
+        .chain(pdmr_microstructure_borrow_model_feature_names())
+        .chain(pdmr_microstructure_borrow_news_model_feature_names())
+        .chain(pdmr_microstructure_borrow_news_report_text_model_feature_names())
+        .collect();
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !all.contains(name) {
+            return Err(format!("unknown Stockholm feature {name:?}"));
+        }
+        if !seen.insert(name) {
+            return Err(format!("duplicate Stockholm feature {name:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Calculate trailing rows independently per stable instrument identity.
+/// Sorting is internal; duplicate dates are rejected rather than guessed.
+pub fn daily(bars: &[DailyBar]) -> Result<Vec<FeatureRow>, String> {
+    let mut grouped: BTreeMap<&str, Vec<&DailyBar>> = BTreeMap::new();
+    for bar in bars {
+        bar.validate()?;
+        grouped.entry(&bar.instrument_id).or_default().push(bar);
+    }
+    let mut rows = Vec::with_capacity(bars.len());
+    for (instrument_id, mut history) in grouped {
+        history.sort_by_key(|bar| bar.date);
+        for pair in history.windows(2) {
+            if pair[0].date == pair[1].date {
+                return Err(format!(
+                    "duplicate {} bar on {}",
+                    instrument_id, pair[0].date
+                ));
+            }
+        }
+        for index in 0..history.len() {
+            let bar = history[index];
+            let returns_60 = log_returns(&history, index, 60);
+            let values = vec![
+                simple_return(&history, index, 1),
+                simple_return(&history, index, 5),
+                simple_return(&history, index, 21),
+                simple_return(&history, index, 63),
+                simple_return(&history, index, 126),
+                simple_return(&history, index, 252),
+                skipped_return(&history, index, 21, 5),
+                standard_deviation(&log_returns(&history, index, 20)),
+                standard_deviation(&returns_60),
+                downside_deviation(&returns_60),
+                skew(&returns_60),
+                max_drawdown(&history, index, 126),
+                distance_from_high(&history, index, 252),
+                distance_from_low(&history, index, 252),
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| finite(bar.raw_open / history[previous].raw_close - 1.0)),
+                finite((bar.raw_high - bar.raw_low) / bar.raw_close),
+                close_location(bar),
+                median_notional(&history, index, 20),
+                amihud(&history, index, 20),
+                volume_surge(&history, index, 20),
+            ];
+            debug_assert_eq!(values.len(), FEATURE_NAMES.len());
+            rows.push(FeatureRow {
+                date: bar.date,
+                instrument_id: instrument_id.to_owned(),
+                values,
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.instrument_id.cmp(&b.instrument_id))
+    });
+    Ok(rows)
+}
+
+/// Final point-in-time preprocessing shared by training and inference.
+pub fn normalise_cross_section(rows: &[FeatureRow]) -> Result<Vec<NormalisedRow>, String> {
+    let Some(date) = rows.first().map(|row| row.date) else {
+        return Ok(Vec::new());
+    };
+    if rows.iter().any(|row| row.date != date) {
+        return Err("Stockholm cross-section contains multiple dates".into());
+    }
+    if rows
+        .iter()
+        .any(|row| row.values.len() != FEATURE_NAMES.len())
+    {
+        return Err("Stockholm feature row has the wrong width".into());
+    }
+    let values = rows
+        .iter()
+        .map(|row| row.values.clone())
+        .collect::<Vec<_>>();
+    let normalised = features_common::rank_normalise(&values)?;
+    Ok(rows
+        .iter()
+        .zip(normalised)
+        .map(|(row, mut values)| {
+            values.extend(row.values.iter().map(|value| f64::from(value.is_none())));
+            NormalisedRow {
+                date: row.date,
+                instrument_id: row.instrument_id.clone(),
+                values,
+            }
+        })
+        .collect())
+}
+
+pub const LABEL_VERSION: &str = "forward-adjusted-open-5-v1";
+
+pub fn label_version(horizon_sessions: usize) -> Result<String, String> {
+    if horizon_sessions == 0 {
+        return Err("label horizon must be positive".into());
+    }
+    Ok(format!("forward-adjusted-open-{horizon_sessions}-v1"))
+}
+
+pub fn label_horizon(version: &str) -> Option<usize> {
+    version
+        .strip_prefix("forward-adjusted-open-")?
+        .strip_suffix("-v1")?
+        .parse()
+        .ok()
+        .filter(|horizon| *horizon > 0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UniverseBucket {
+    LargeCap,
+    MidCap,
+    SmallCap,
+    FirstNorthPremier,
+    FirstNorth,
+}
+
+impl UniverseBucket {
+    pub fn is_stockholm_main_market(&self) -> bool {
+        matches!(self, Self::LargeCap | Self::MidCap | Self::SmallCap)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentMeta {
+    pub instrument_id: String,
+    pub symbol: String,
+    pub isin: String,
+    pub sector: String,
+    pub bucket: UniverseBucket,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrossSectionInput {
+    pub meta: InstrumentMeta,
+    pub feature: FeatureRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureSet {
+    Baseline,
+    Context,
+    Residual,
+    ResidualPublicShort,
+    ResidualPdmr,
+    ResidualPdmrReports,
+    ResidualFundamentals,
+    ResidualPdmrMacro,
+    ResidualPdmrMicrostructure,
+    ResidualPdmrMicrostructureBorrow,
+    ResidualPdmrMicrostructureBorrowNews,
+    ResidualPdmrMicrostructureBorrowNewsReportText,
+}
+
+#[derive(Debug, Clone)]
+struct ResidualFeatureRow {
+    date: Date,
+    instrument_id: String,
+    values: Vec<Option<f64>>,
+}
+
+type ExternalFeatureRows = BTreeMap<(String, Date), Vec<Option<f64>>>;
+
+fn residual_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+) -> Result<Vec<NormalisedRow>, String> {
+    let Some(date) = inputs.first().map(|input| input.feature.date) else {
+        return Ok(Vec::new());
+    };
+    let mut by_bucket: BTreeMap<UniverseBucket, Vec<usize>> = BTreeMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        by_bucket
+            .entry(input.meta.bucket.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut output = vec![Vec::new(); inputs.len()];
+    for indexes in by_bucket.values() {
+        let raw = indexes
+            .iter()
+            .map(|index| {
+                let input = &inputs[*index];
+                let extra = residual
+                    .get(&(input.meta.instrument_id.clone(), date))
+                    .ok_or_else(|| {
+                        format!(
+                            "missing residual features for {} on {date}",
+                            input.meta.instrument_id
+                        )
+                    })?;
+                if extra.date != date
+                    || extra.instrument_id != input.meta.instrument_id
+                    || extra.values.len() != RESIDUAL_FEATURE_NAMES.len()
+                {
+                    return Err("invalid Stockholm residual feature row".into());
+                }
+                Ok(input
+                    .feature
+                    .values
+                    .iter()
+                    .chain(&extra.values)
+                    .copied()
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for ((slot, index), values) in indexes
+            .iter()
+            .enumerate()
+            .zip(features_common::rank_normalise(&raw)?)
+        {
+            let mut finalized = values;
+            finalized.extend(raw[slot].iter().map(|value| f64::from(value.is_none())));
+            output[*index] = finalized;
+        }
+    }
+    Ok(inputs
+        .iter()
+        .zip(output)
+        .map(|(input, values)| NormalisedRow {
+            date,
+            instrument_id: input.meta.instrument_id.clone(),
+            values,
+        })
+        .collect())
+}
+
+fn residual_external_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+    external_width: usize,
+    external_name: &str,
+) -> Result<Vec<NormalisedRow>, String> {
+    let Some(date) = inputs.first().map(|input| input.feature.date) else {
+        return Ok(Vec::new());
+    };
+    let mut by_bucket: BTreeMap<UniverseBucket, Vec<usize>> = BTreeMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        by_bucket
+            .entry(input.meta.bucket.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut output = vec![Vec::new(); inputs.len()];
+    for indexes in by_bucket.values() {
+        let raw = indexes
+            .iter()
+            .map(|index| {
+                let input = &inputs[*index];
+                let residual = residual
+                    .get(&(input.meta.instrument_id.clone(), date))
+                    .ok_or_else(|| {
+                        format!(
+                            "missing residual features for {} on {date}",
+                            input.meta.instrument_id
+                        )
+                    })?;
+                let external = external.get(&input.meta.instrument_id).ok_or_else(|| {
+                    format!(
+                        "missing {external_name} features for {} on {date}",
+                        input.meta.instrument_id,
+                    )
+                })?;
+                if residual.values.len() != RESIDUAL_FEATURE_NAMES.len()
+                    || external.len() != external_width
+                {
+                    return Err(format!("invalid Stockholm {external_name} feature row"));
+                }
+                Ok(input
+                    .feature
+                    .values
+                    .iter()
+                    .chain(&residual.values)
+                    .chain(external)
+                    .copied()
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for ((slot, index), values) in indexes
+            .iter()
+            .enumerate()
+            .zip(features_common::rank_normalise(&raw)?)
+        {
+            let mut finalized = values;
+            finalized.extend(raw[slot].iter().map(|value| f64::from(value.is_none())));
+            output[*index] = finalized;
+        }
+    }
+    Ok(inputs
+        .iter()
+        .zip(output)
+        .map(|(input, values)| NormalisedRow {
+            date,
+            instrument_id: input.meta.instrument_id.clone(),
+            values,
+        })
+        .collect())
+}
+
+fn residual_public_short_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    public_short: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        public_short,
+        PUBLIC_SHORT_FEATURE_NAMES.len(),
+        "public-short",
+    )
+}
+
+fn residual_pdmr_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    pdmr: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(inputs, residual, pdmr, PDMR_FEATURE_NAMES.len(), "PDMR")
+}
+
+fn residual_pdmr_report_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len() + REPORT_EVENT_FEATURE_NAMES.len(),
+        "PDMR/report-event",
+    )
+}
+
+fn residual_fundamental_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    fundamentals: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        fundamentals,
+        FUNDAMENTAL_FEATURE_NAMES.len(),
+        "annual-fundamental",
+    )
+}
+
+fn residual_pdmr_macro_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len() + MACRO_FEATURE_NAMES.len(),
+        "PDMR/macro",
+    )
+}
+
+fn residual_pdmr_microstructure_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len() + MICROSTRUCTURE_FEATURE_NAMES.len(),
+        "PDMR/microstructure",
+    )
+}
+
+fn residual_pdmr_microstructure_borrow_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len()
+            + MICROSTRUCTURE_FEATURE_NAMES.len()
+            + BORROW_FEE_FEATURE_NAMES.len(),
+        "PDMR/microstructure/borrow",
+    )
+}
+
+fn residual_pdmr_microstructure_borrow_news_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len()
+            + MICROSTRUCTURE_FEATURE_NAMES.len()
+            + BORROW_FEE_FEATURE_NAMES.len()
+            + COMPANY_NEWS_FEATURE_NAMES.len(),
+        "PDMR/microstructure/borrow/company-news",
+    )
+}
+
+fn residual_pdmr_microstructure_borrow_news_report_text_cross_section(
+    inputs: &[CrossSectionInput],
+    residual: &BTreeMap<(String, Date), ResidualFeatureRow>,
+    external: &BTreeMap<String, Vec<Option<f64>>>,
+) -> Result<Vec<NormalisedRow>, String> {
+    residual_external_cross_section(
+        inputs,
+        residual,
+        external,
+        PDMR_FEATURE_NAMES.len()
+            + MICROSTRUCTURE_FEATURE_NAMES.len()
+            + BORROW_FEE_FEATURE_NAMES.len()
+            + COMPANY_NEWS_FEATURE_NAMES.len()
+            + REPORT_TEXT_FEATURE_NAMES.len(),
+        "PDMR/microstructure/borrow/company-news/report-text",
+    )
+}
+
+/// Provider-neutral public short-position event. `None` represents a
+/// threshold-exit disclosure (`<0.5%`), not a measured zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicShortPositionEvent {
+    pub holder: String,
+    pub isin: String,
+    #[serde(with = "date_serde")]
+    pub position_date: Date,
+    pub position_percent: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+struct PublicShortState {
+    holders: BTreeMap<String, f64>,
+    changes: Vec<(Date, f64)>,
+    event_dates: Vec<Date>,
+}
+
+struct PublicShortCursor<'a> {
+    events: Vec<&'a PublicShortPositionEvent>,
+    next: usize,
+    first_event_date: Date,
+    states: BTreeMap<String, PublicShortState>,
+}
+
+impl<'a> PublicShortCursor<'a> {
+    fn new(events: &'a [PublicShortPositionEvent]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("public-short feature set requires position events".into());
+        }
+        for event in events {
+            if event.holder.trim().is_empty() || event.isin.trim().is_empty() {
+                return Err("public-short event has an empty holder or ISIN".into());
+            }
+            if event
+                .position_percent
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err("public-short event has an invalid position".into());
+            }
+        }
+        let mut sorted = events.iter().collect::<Vec<_>>();
+        sorted.sort_by(|a, b| {
+            a.position_date
+                .cmp(&b.position_date)
+                .then_with(|| a.isin.cmp(&b.isin))
+                .then_with(|| a.holder.cmp(&b.holder))
+        });
+        Ok(Self {
+            first_event_date: sorted[0].position_date,
+            events: sorted,
+            next: 0,
+            states: BTreeMap::new(),
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len() && self.events[self.next].position_date < decision_date
+        {
+            let event = self.events[self.next];
+            let state = self.states.entry(event.isin.clone()).or_default();
+            let old = state.holders.get(&event.holder).copied().unwrap_or(0.0);
+            let new = event.position_percent.unwrap_or(0.0);
+            if event.position_percent.is_some() {
+                state.holders.insert(event.holder.clone(), new);
+            } else {
+                state.holders.remove(&event.holder);
+            }
+            state.changes.push((event.position_date, new - old));
+            state.event_dates.push(event.position_date);
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, isin: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_event_date {
+            return vec![None; PUBLIC_SHORT_FEATURE_NAMES.len()];
+        }
+        let Some(state) = self.states.get(isin) else {
+            // Once the register exists, this means no holder has crossed the
+            // public threshold, which is observable zero disclosed demand.
+            return vec![Some(0.0), Some(0.0), Some(0.0), Some(0.0), None, Some(0.0)];
+        };
+        let since_30 = decision_date - time::Duration::days(30);
+        let since_90 = decision_date - time::Duration::days(90);
+        let change_30 = state
+            .changes
+            .iter()
+            .filter(|(date, _)| *date >= since_30)
+            .map(|(_, change)| change)
+            .sum::<f64>();
+        let change_90 = state
+            .changes
+            .iter()
+            .filter(|(date, _)| *date >= since_90)
+            .map(|(_, change)| change)
+            .sum::<f64>();
+        let last_event = state.event_dates.last().copied();
+        let events_30 = state
+            .event_dates
+            .iter()
+            .filter(|date| **date >= since_30)
+            .count() as f64;
+        vec![
+            Some(state.holders.values().sum()),
+            Some(state.holders.len() as f64),
+            finite(change_30),
+            finite(change_90),
+            last_event.map(|date| (decision_date - date).whole_days() as f64),
+            Some(events_30),
+        ]
+    }
+}
+
+/// Provider-neutral FI PDMR transaction. Availability is always controlled by
+/// `publication_date`; `transaction_date` is descriptive and must never move
+/// a filing into an earlier feature row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdmrTransactionEvent {
+    #[serde(with = "date_serde")]
+    pub publication_date: Date,
+    #[serde(with = "date_serde")]
+    pub transaction_date: Date,
+    pub pdmr: String,
+    pub isin: String,
+    pub initial_notification: bool,
+    pub linked_to_share_option_programme: bool,
+    pub nature: String,
+    pub instrument_type: String,
+    pub volume: Option<f64>,
+    pub unit: String,
+    pub price: Option<f64>,
+    pub currency: String,
+}
+
+impl PdmrTransactionEvent {
+    fn direction(&self) -> Option<f64> {
+        if !self.initial_notification
+            || self.linked_to_share_option_programme
+            || !self.instrument_type.trim().eq_ignore_ascii_case("share")
+            || !self.unit.trim().eq_ignore_ascii_case("quantity")
+        {
+            return None;
+        }
+        let sign = if self.nature.trim().eq_ignore_ascii_case("acquisition") {
+            1.0
+        } else if self.nature.trim().eq_ignore_ascii_case("disposal") {
+            -1.0
+        } else {
+            return None;
+        };
+        self.volume
+            .filter(|value| value.is_finite() && *value > 0.0)?;
+        self.price
+            .filter(|value| value.is_finite() && *value > 0.0)?;
+        Some(sign)
+    }
+
+    fn signed_sek_value(&self) -> Option<f64> {
+        if !self.currency.trim().eq_ignore_ascii_case("sek") {
+            return None;
+        }
+        let sign = self.direction()?;
+        let volume = self.volume?;
+        let price = self.price?;
+        finite(sign * volume * price)
+    }
+}
+
+struct PdmrCursor<'a> {
+    events: Vec<&'a PdmrTransactionEvent>,
+    next: usize,
+    first_publication_date: Date,
+    by_isin: BTreeMap<String, Vec<&'a PdmrTransactionEvent>>,
+}
+
+impl<'a> PdmrCursor<'a> {
+    fn new(events: &'a [PdmrTransactionEvent]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("PDMR feature set requires transaction events".into());
+        }
+        for event in events {
+            if event.isin.trim().is_empty() {
+                return Err("PDMR event has an empty ISIN".into());
+            }
+            if event
+                .volume
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+                || event
+                    .price
+                    .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err("PDMR event has an invalid volume or price".into());
+            }
+        }
+        let mut sorted = events.iter().collect::<Vec<_>>();
+        sorted.sort_by(|a, b| {
+            a.publication_date
+                .cmp(&b.publication_date)
+                .then_with(|| a.isin.cmp(&b.isin))
+                .then_with(|| a.pdmr.cmp(&b.pdmr))
+        });
+        Ok(Self {
+            first_publication_date: sorted[0].publication_date,
+            events: sorted,
+            next: 0,
+            by_isin: BTreeMap::new(),
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len()
+            && self.events[self.next].publication_date < decision_date
+        {
+            let event = self.events[self.next];
+            if event.direction().is_some() {
+                self.by_isin
+                    .entry(event.isin.clone())
+                    .or_default()
+                    .push(event);
+            }
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, isin: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_publication_date {
+            return vec![None; PDMR_FEATURE_NAMES.len()];
+        }
+        let Some(events) = self.by_isin.get(isin) else {
+            return vec![
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                None,
+            ];
+        };
+        let since_30 = decision_date - time::Duration::days(30);
+        let since_90 = decision_date - time::Duration::days(90);
+        let mut net_30 = 0.0;
+        let mut net_90 = 0.0;
+        let mut buys_90 = 0.0;
+        let mut sells_90 = 0.0;
+        let mut transactions_30 = 0_usize;
+        let mut buyers_90 = BTreeSet::new();
+        let mut last_buy = None;
+        for event in events.iter().rev() {
+            if event.publication_date < since_90 {
+                break;
+            }
+            let direction = event
+                .direction()
+                .expect("PDMR cursor contains only qualifying transactions");
+            if let Some(value) = event.signed_sek_value() {
+                net_90 += value;
+                if value > 0.0 {
+                    buys_90 += value;
+                } else {
+                    sells_90 -= value;
+                }
+                if event.publication_date >= since_30 {
+                    net_30 += value;
+                }
+            }
+            if direction > 0.0 {
+                if !event.pdmr.trim().is_empty() {
+                    buyers_90.insert(event.pdmr.trim().to_lowercase());
+                }
+                last_buy.get_or_insert(event.publication_date);
+            }
+            if event.publication_date >= since_30 {
+                transactions_30 += 1;
+            }
+        }
+        if last_buy.is_none() {
+            last_buy = events.iter().rev().find_map(|event| {
+                (event.direction().is_some_and(|direction| direction > 0.0))
+                    .then_some(event.publication_date)
+            });
+        }
+        vec![
+            finite(net_30),
+            finite(net_90),
+            finite(buys_90),
+            finite(sells_90),
+            Some(transactions_30 as f64),
+            Some(buyers_90.len() as f64),
+            last_buy.map(|date| (decision_date - date).whole_days() as f64),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanyNewsKind {
+    InsideInformation,
+    OwnShares,
+    Management,
+    Prospectus,
+    MajorShareholder,
+    TenderOffer,
+    Other,
+}
+
+/// Provider-neutral Nasdaq issuer disclosure after venue/category decoding
+/// and issuer-name mapping have been resolved by the data adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanyNewsEvent {
+    pub instrument_id: String,
+    #[serde(with = "date_serde")]
+    pub publication_date: Date,
+    pub publication_key: String,
+    pub after_market_close: bool,
+    pub kind: CompanyNewsKind,
+}
+
+/// Provider-neutral official financial-report body. HTTP/HTML decoding is a
+/// shared equity-data responsibility; this crate alone owns the fixed numeric
+/// interpretation used by training and inference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinancialReportTextEvent {
+    pub instrument_id: String,
+    #[serde(with = "date_serde")]
+    pub publication_date: Date,
+    /// Provider publication timestamp, used to deduplicate translations of
+    /// one economic release without consulting future returns.
+    pub publication_key: String,
+    pub language: String,
+    pub body_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportTextMetricCoverage {
+    pub deduplicated_events: usize,
+    pub events_with_any_metric: usize,
+    pub by_feature: BTreeMap<String, usize>,
+}
+
+pub fn report_text_metric_coverage(
+    events: &[FinancialReportTextEvent],
+) -> Result<ReportTextMetricCoverage, String> {
+    let cursor = FinancialReportTextCursor::new(events)?;
+    let mut by_feature = REPORT_TEXT_FEATURE_NAMES[1..]
+        .iter()
+        .map(|name| ((*name).to_owned(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut events_with_any_metric = 0;
+    for event in &cursor.events {
+        if event.metrics.iter().any(Option::is_some) {
+            events_with_any_metric += 1;
+        }
+        for (name, value) in REPORT_TEXT_FEATURE_NAMES[1..].iter().zip(&event.metrics) {
+            if value.is_some() {
+                *by_feature.get_mut(*name).expect("coverage name exists") += 1;
+            }
+        }
+    }
+    Ok(ReportTextMetricCoverage {
+        deduplicated_events: cursor.events.len(),
+        events_with_any_metric,
+        by_feature,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedReportText {
+    instrument_id: String,
+    publication_date: Date,
+    publication_key: String,
+    language: String,
+    metrics: Vec<Option<f64>>,
+}
+
+struct FinancialReportTextCursor {
+    events: Vec<ExtractedReportText>,
+    next: usize,
+    first_publication_date: Date,
+    latest_by_instrument: BTreeMap<String, ExtractedReportText>,
+}
+
+impl FinancialReportTextCursor {
+    fn new(events: &[FinancialReportTextEvent]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("report-text feature set requires official report bodies".into());
+        }
+        if events.iter().any(|event| {
+            event.instrument_id.trim().is_empty()
+                || event.publication_key.trim().is_empty()
+                || event.body_text.trim().is_empty()
+        }) {
+            return Err("report-text event has an empty instrument, key, or body".into());
+        }
+        let mut deduplicated = BTreeMap::<(String, String), ExtractedReportText>::new();
+        for event in events {
+            let candidate = ExtractedReportText {
+                instrument_id: event.instrument_id.clone(),
+                publication_date: event.publication_date,
+                publication_key: event.publication_key.clone(),
+                language: event.language.clone(),
+                metrics: extract_report_text_metrics(&event.body_text),
+            };
+            let key = (
+                candidate.instrument_id.clone(),
+                candidate.publication_key.clone(),
+            );
+            let candidate_coverage = candidate.metrics.iter().flatten().count();
+            let replace = deduplicated.get(&key).is_none_or(|current| {
+                let current_coverage = current.metrics.iter().flatten().count();
+                candidate_coverage > current_coverage
+                    || (candidate_coverage == current_coverage
+                        && candidate.language == "en"
+                        && current.language != "en")
+            });
+            if replace {
+                deduplicated.insert(key, candidate);
+            }
+        }
+        let mut events = deduplicated.into_values().collect::<Vec<_>>();
+        events.sort_by(|a, b| {
+            a.publication_date
+                .cmp(&b.publication_date)
+                .then_with(|| a.instrument_id.cmp(&b.instrument_id))
+                .then_with(|| a.publication_key.cmp(&b.publication_key))
+        });
+        Ok(Self {
+            first_publication_date: events[0].publication_date,
+            events,
+            next: 0,
+            latest_by_instrument: BTreeMap::new(),
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len()
+            && self.events[self.next].publication_date < decision_date
+        {
+            let event = self.events[self.next].clone();
+            self.latest_by_instrument
+                .insert(event.instrument_id.clone(), event);
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, instrument_id: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_publication_date {
+            return vec![None; REPORT_TEXT_FEATURE_NAMES.len()];
+        }
+        let Some(event) = self.latest_by_instrument.get(instrument_id) else {
+            return vec![None; REPORT_TEXT_FEATURE_NAMES.len()];
+        };
+        let mut values = vec![Some(
+            (decision_date - event.publication_date).whole_days() as f64
+        )];
+        values.extend(event.metrics.iter().copied());
+        debug_assert_eq!(values.len(), REPORT_TEXT_FEATURE_NAMES.len());
+        values
+    }
+}
+
+fn extract_report_text_metrics(text: &str) -> Vec<Option<f64>> {
+    let sales = report_metric_pair(text, &REPORT_SALES_PAIR).and_then(report_growth);
+    let order_intake = report_metric_pair(text, &REPORT_ORDER_INTAKE_PAIR).and_then(report_growth);
+    let ebit = report_metric_pair(text, &REPORT_EBIT_PAIR).and_then(report_growth);
+    let margin_pair = report_metric_pair(text, &REPORT_MARGIN_PAIR);
+    let margin = margin_pair.and_then(|(current, _)| {
+        (current.is_finite() && current.abs() <= 100.0).then_some(current / 100.0)
+    });
+    let margin_change = margin_pair.and_then(|(current, prior)| {
+        let change = (current - prior) / 100.0;
+        (change.is_finite() && change.abs() <= 1.0).then_some(change)
+    });
+    let eps = report_metric_pair(text, &REPORT_EPS_PAIR).and_then(report_growth);
+    let dividend = report_metric_pair(text, &REPORT_DIVIDEND_PAIR).and_then(report_growth);
+    vec![
+        sales,
+        order_intake,
+        ebit,
+        margin,
+        margin_change,
+        eps,
+        dividend,
+    ]
+}
+
+static REPORT_SALES_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| report_pair_regex(&["net sales", "revenue", "nettoomsättning"]));
+static REPORT_ORDER_INTAKE_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| report_pair_regex(&["order intake", "orderingång"]));
+static REPORT_EBIT_PAIR: LazyLock<Regex> = LazyLock::new(|| {
+    report_pair_regex(&[
+        "adjusted ebit",
+        "ebit",
+        "operating profit",
+        "rörelseresultat",
+    ])
+});
+static REPORT_MARGIN_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| report_pair_regex(&["ebit margin", "operating margin", "rörelsemarginal"]));
+static REPORT_EPS_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| report_pair_regex(&["earnings per share", "resultat per aktie"]));
+static REPORT_DIVIDEND_PAIR: LazyLock<Regex> = LazyLock::new(|| {
+    report_pair_regex(&[
+        "dividend per share",
+        "utdelning per aktie",
+        "dividend",
+        "utdelning",
+    ])
+});
+
+fn report_pair_regex(labels: &[&str]) -> Regex {
+    let labels = labels
+        .iter()
+        .map(|label| regex::escape(label))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(
+        r"(?is)(?:{labels})[^0-9+\-−]{{0,80}}([+\-−]?[0-9][0-9 .,]*?)\s*\(\s*([+\-−]?[0-9][0-9 .,]*?)\s*\)"
+    );
+    Regex::new(&pattern).expect("fixed report-pair regex is valid")
+}
+
+fn report_metric_pair(text: &str, regex: &Regex) -> Option<(f64, f64)> {
+    let captures = regex.captures(text)?;
+    Some((
+        parse_report_number(captures.get(1)?.as_str())?,
+        parse_report_number(captures.get(2)?.as_str())?,
+    ))
+}
+
+fn parse_report_number(value: &str) -> Option<f64> {
+    let mut value = value
+        .replace('−', "-")
+        .replace(['\u{a0}', ' '], "")
+        .trim()
+        .to_owned();
+    if value.contains(',') && value.contains('.') {
+        if value.rfind(',')? > value.rfind('.')? {
+            value = value.replace('.', "").replace(',', ".");
+        } else {
+            value = value.replace(',', "");
+        }
+    } else {
+        value = value.replace(',', ".");
+    }
+    value.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn report_growth((current, prior): (f64, f64)) -> Option<f64> {
+    if !current.is_finite() || !prior.is_finite() || prior.abs() < 1e-12 {
+        return None;
+    }
+    let change = (current - prior) / prior.abs();
+    (change.is_finite() && (-10.0..=10.0).contains(&change)).then_some(change)
+}
+
+struct CompanyNewsCursor<'a> {
+    events: Vec<&'a CompanyNewsEvent>,
+    next: usize,
+    first_publication_date: Date,
+    by_instrument: BTreeMap<String, Vec<&'a CompanyNewsEvent>>,
+    histories: BTreeMap<String, Vec<&'a DailyBar>>,
+}
+
+impl<'a> CompanyNewsCursor<'a> {
+    fn new(events: &'a [CompanyNewsEvent], bars: &'a [DailyBar]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("company-news feature set requires disclosure events".into());
+        }
+        if events.iter().any(|event| {
+            event.instrument_id.trim().is_empty() || event.publication_key.trim().is_empty()
+        }) {
+            return Err("company-news event has an empty instrument or publication key".into());
+        }
+        let mut sorted = events.iter().collect::<Vec<_>>();
+        sorted.sort_by(|a, b| {
+            a.publication_date
+                .cmp(&b.publication_date)
+                .then_with(|| a.instrument_id.cmp(&b.instrument_id))
+                .then_with(|| a.publication_key.cmp(&b.publication_key))
+        });
+        sorted.dedup_by(|right, left| {
+            left.instrument_id == right.instrument_id
+                && left.publication_key == right.publication_key
+        });
+        let mut histories: BTreeMap<String, Vec<&DailyBar>> = BTreeMap::new();
+        for bar in bars {
+            histories
+                .entry(bar.instrument_id.clone())
+                .or_default()
+                .push(bar);
+        }
+        for history in histories.values_mut() {
+            history.sort_by_key(|bar| bar.date);
+        }
+        Ok(Self {
+            first_publication_date: sorted[0].publication_date,
+            events: sorted,
+            next: 0,
+            by_instrument: BTreeMap::new(),
+            histories,
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len()
+            && self.events[self.next].publication_date < decision_date
+        {
+            let event = self.events[self.next];
+            self.by_instrument
+                .entry(event.instrument_id.clone())
+                .or_default()
+                .push(event);
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, instrument_id: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_publication_date {
+            return vec![None; COMPANY_NEWS_FEATURE_NAMES.len()];
+        }
+        let Some(events) = self.by_instrument.get(instrument_id) else {
+            return vec![
+                Some(0.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+                Some(0.0),
+                None,
+                None,
+                None,
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+            ];
+        };
+        let since_30 = decision_date - time::Duration::days(30);
+        let since_90 = decision_date - time::Duration::days(90);
+        let count = |kind: CompanyNewsKind| {
+            events
+                .iter()
+                .filter(|event| event.kind == kind && event.publication_date >= since_90)
+                .count() as f64
+        };
+        let latest_inside = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == CompanyNewsKind::InsideInformation);
+        let history = self.histories.get(instrument_id);
+        vec![
+            Some(
+                events
+                    .iter()
+                    .filter(|event| event.publication_date >= since_30)
+                    .count() as f64,
+            ),
+            Some(
+                events
+                    .iter()
+                    .filter(|event| event.publication_date >= since_90)
+                    .count() as f64,
+            ),
+            latest_inside.map(|event| (decision_date - event.publication_date).whole_days() as f64),
+            Some(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == CompanyNewsKind::InsideInformation
+                            && event.publication_date >= since_30
+                    })
+                    .count() as f64,
+            ),
+            Some(count(CompanyNewsKind::InsideInformation)),
+            history.and_then(|history| {
+                latest_inside
+                    .and_then(|event| company_news_reaction(history, event, decision_date, 1))
+            }),
+            history.and_then(|history| {
+                latest_inside
+                    .and_then(|event| company_news_reaction(history, event, decision_date, 5))
+            }),
+            history.and_then(|history| {
+                latest_inside
+                    .and_then(|event| company_news_reaction(history, event, decision_date, 21))
+            }),
+            Some(count(CompanyNewsKind::OwnShares)),
+            Some(count(CompanyNewsKind::Management)),
+            Some(count(CompanyNewsKind::Prospectus)),
+            Some(count(CompanyNewsKind::MajorShareholder)),
+            Some(count(CompanyNewsKind::TenderOffer)),
+        ]
+    }
+}
+
+fn company_news_reaction(
+    history: &[&DailyBar],
+    event: &CompanyNewsEvent,
+    decision_date: Date,
+    horizon_sessions: usize,
+) -> Option<f64> {
+    let baseline_end = if event.after_market_close {
+        history.partition_point(|bar| bar.date <= event.publication_date)
+    } else {
+        history.partition_point(|bar| bar.date < event.publication_date)
+    };
+    let baseline_index = baseline_end.checked_sub(1)?;
+    let current_end = history.partition_point(|bar| bar.date <= decision_date);
+    let current_index = current_end.checked_sub(1)?;
+    if current_index <= baseline_index {
+        return None;
+    }
+    let reaction_index = baseline_index
+        .checked_add(horizon_sessions)?
+        .min(current_index);
+    finite(history[reaction_index].adjusted_close / history[baseline_index].adjusted_close - 1.0)
+}
+
+/// Provider-neutral official financial-report disclosure after issuer-name
+/// mapping has been resolved by the data adapter. `publication_key` preserves
+/// the provider timestamp so translations can be deduplicated as one event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinancialReportEvent {
+    pub instrument_id: String,
+    #[serde(with = "date_serde")]
+    pub publication_date: Date,
+    pub publication_key: String,
+    pub after_market_close: bool,
+}
+
+struct FinancialReportCursor<'a> {
+    events: Vec<&'a FinancialReportEvent>,
+    next: usize,
+    first_publication_date: Date,
+    by_instrument: BTreeMap<String, Vec<&'a FinancialReportEvent>>,
+    histories: BTreeMap<String, Vec<&'a DailyBar>>,
+}
+
+impl<'a> FinancialReportCursor<'a> {
+    fn new(events: &'a [FinancialReportEvent], bars: &'a [DailyBar]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("report-event feature set requires disclosure events".into());
+        }
+        if events.iter().any(|event| {
+            event.instrument_id.trim().is_empty() || event.publication_key.trim().is_empty()
+        }) {
+            return Err("financial-report event has an empty instrument or publication key".into());
+        }
+        let mut sorted = events.iter().collect::<Vec<_>>();
+        sorted.sort_by(|a, b| {
+            a.publication_date
+                .cmp(&b.publication_date)
+                .then_with(|| a.instrument_id.cmp(&b.instrument_id))
+                .then_with(|| a.publication_key.cmp(&b.publication_key))
+        });
+        sorted.dedup_by(|right, left| {
+            left.instrument_id == right.instrument_id
+                && left.publication_key == right.publication_key
+        });
+        let mut histories: BTreeMap<String, Vec<&DailyBar>> = BTreeMap::new();
+        for bar in bars {
+            histories
+                .entry(bar.instrument_id.clone())
+                .or_default()
+                .push(bar);
+        }
+        for history in histories.values_mut() {
+            history.sort_by_key(|bar| bar.date);
+        }
+        Ok(Self {
+            first_publication_date: sorted[0].publication_date,
+            events: sorted,
+            next: 0,
+            by_instrument: BTreeMap::new(),
+            histories,
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len()
+            && self.events[self.next].publication_date < decision_date
+        {
+            let event = self.events[self.next];
+            self.by_instrument
+                .entry(event.instrument_id.clone())
+                .or_default()
+                .push(event);
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, instrument_id: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_publication_date {
+            return vec![None; REPORT_EVENT_FEATURE_NAMES.len()];
+        }
+        let Some(events) = self.by_instrument.get(instrument_id) else {
+            return vec![None, Some(0.0), Some(0.0), None, None, None];
+        };
+        let latest = events
+            .last()
+            .expect("financial-report instrument contains an event");
+        let since_30 = decision_date - time::Duration::days(30);
+        let since_90 = decision_date - time::Duration::days(90);
+        let history = self.histories.get(instrument_id);
+        vec![
+            Some((decision_date - latest.publication_date).whole_days() as f64),
+            Some(
+                events
+                    .iter()
+                    .filter(|event| event.publication_date >= since_30)
+                    .count() as f64,
+            ),
+            Some(
+                events
+                    .iter()
+                    .filter(|event| event.publication_date >= since_90)
+                    .count() as f64,
+            ),
+            history.and_then(|history| report_reaction(history, latest, decision_date, 1)),
+            history.and_then(|history| report_reaction(history, latest, decision_date, 5)),
+            history.and_then(|history| report_reaction(history, latest, decision_date, 21)),
+        ]
+    }
+}
+
+fn report_reaction(
+    history: &[&DailyBar],
+    event: &FinancialReportEvent,
+    decision_date: Date,
+    horizon_sessions: usize,
+) -> Option<f64> {
+    let baseline_end = if event.after_market_close {
+        history.partition_point(|bar| bar.date <= event.publication_date)
+    } else {
+        history.partition_point(|bar| bar.date < event.publication_date)
+    };
+    let baseline_index = baseline_end.checked_sub(1)?;
+    let current_end = history.partition_point(|bar| bar.date <= decision_date);
+    let current_index = current_end.checked_sub(1)?;
+    if current_index <= baseline_index {
+        return None;
+    }
+    let reaction_index = baseline_index
+        .checked_add(horizon_sessions)?
+        .min(current_index);
+    finite(history[reaction_index].adjusted_close / history[baseline_index].adjusted_close - 1.0)
+}
+
+/// Provider-neutral annual statement event. Provider taxonomy decoding and
+/// issuer mapping must be completed before this boundary; feature ratios and
+/// the decision-date price join remain owned by this crate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnualFundamentalEvent {
+    pub instrument_id: String,
+    #[serde(with = "date_serde")]
+    pub available_date: Date,
+    #[serde(with = "date_serde")]
+    pub report_period_end: Date,
+    pub filing_key: String,
+    pub reporting_currency: Option<String>,
+    pub revenue: Option<f64>,
+    pub prior_revenue: Option<f64>,
+    pub operating_profit: Option<f64>,
+    pub net_income: Option<f64>,
+    pub prior_net_income: Option<f64>,
+    pub assets: Option<f64>,
+    pub prior_assets: Option<f64>,
+    pub equity: Option<f64>,
+    pub prior_equity: Option<f64>,
+    pub cash: Option<f64>,
+    pub operating_cash_flow: Option<f64>,
+    pub current_assets: Option<f64>,
+    pub current_liabilities: Option<f64>,
+    pub basic_eps: Option<f64>,
+    pub weighted_average_shares: Option<f64>,
+}
+
+struct AnnualFundamentalCursor<'a> {
+    events: Vec<&'a AnnualFundamentalEvent>,
+    next: usize,
+    first_available_date: Date,
+    by_instrument: BTreeMap<String, Vec<&'a AnnualFundamentalEvent>>,
+    histories: BTreeMap<String, Vec<&'a DailyBar>>,
+}
+
+impl<'a> AnnualFundamentalCursor<'a> {
+    fn new(events: &'a [AnnualFundamentalEvent], bars: &'a [DailyBar]) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("annual-fundamental feature set requires events".into());
+        }
+        for event in events {
+            if event.instrument_id.trim().is_empty()
+                || event.filing_key.trim().is_empty()
+                || event.available_date <= event.report_period_end
+            {
+                return Err("annual-fundamental event has invalid identity or dates".into());
+            }
+            let values = [
+                event.revenue,
+                event.prior_revenue,
+                event.operating_profit,
+                event.net_income,
+                event.prior_net_income,
+                event.assets,
+                event.prior_assets,
+                event.equity,
+                event.prior_equity,
+                event.cash,
+                event.operating_cash_flow,
+                event.current_assets,
+                event.current_liabilities,
+                event.basic_eps,
+                event.weighted_average_shares,
+            ];
+            if values.into_iter().flatten().any(|value| !value.is_finite()) {
+                return Err("annual-fundamental event has a non-finite value".into());
+            }
+        }
+        let mut sorted = events.iter().collect::<Vec<_>>();
+        sorted.sort_by(|left, right| {
+            left.available_date
+                .cmp(&right.available_date)
+                .then_with(|| left.instrument_id.cmp(&right.instrument_id))
+                .then_with(|| left.report_period_end.cmp(&right.report_period_end))
+                .then_with(|| left.filing_key.cmp(&right.filing_key))
+        });
+        sorted.dedup_by(|right, left| {
+            left.instrument_id == right.instrument_id && left.filing_key == right.filing_key
+        });
+        let mut histories: BTreeMap<String, Vec<&DailyBar>> = BTreeMap::new();
+        for bar in bars {
+            histories
+                .entry(bar.instrument_id.clone())
+                .or_default()
+                .push(bar);
+        }
+        for history in histories.values_mut() {
+            history.sort_by_key(|bar| bar.date);
+        }
+        Ok(Self {
+            first_available_date: sorted[0].available_date,
+            events: sorted,
+            next: 0,
+            by_instrument: BTreeMap::new(),
+            histories,
+        })
+    }
+
+    fn advance_before(&mut self, decision_date: Date) {
+        while self.next < self.events.len() && self.events[self.next].available_date < decision_date
+        {
+            let event = self.events[self.next];
+            self.by_instrument
+                .entry(event.instrument_id.clone())
+                .or_default()
+                .push(event);
+            self.next += 1;
+        }
+    }
+
+    fn values(&self, instrument_id: &str, decision_date: Date) -> Vec<Option<f64>> {
+        if decision_date <= self.first_available_date {
+            return vec![None; FUNDAMENTAL_FEATURE_NAMES.len()];
+        }
+        let Some(event) = self
+            .by_instrument
+            .get(instrument_id)
+            .and_then(|events| events.last())
+            .copied()
+        else {
+            return vec![None; FUNDAMENTAL_FEATURE_NAMES.len()];
+        };
+        let price = self.histories.get(instrument_id).and_then(|history| {
+            let end = history.partition_point(|bar| bar.date <= decision_date);
+            end.checked_sub(1).map(|index| history[index].raw_close)
+        });
+        let market_value =
+            price.and_then(|price| safe_ratio(price * event.weighted_average_shares?, 1.0));
+        let sek = event
+            .reporting_currency
+            .as_deref()
+            .is_some_and(|currency| currency == "iso4217:SEK");
+        vec![
+            Some((decision_date - event.available_date).whole_days() as f64),
+            ratio(event.equity, event.assets),
+            ratio(event.cash, event.assets),
+            ratio(event.operating_cash_flow, event.assets),
+            ratio(
+                event
+                    .net_income
+                    .zip(event.operating_cash_flow)
+                    .map(|(income, cash)| income - cash),
+                event.assets,
+            ),
+            ratio(event.operating_profit, event.revenue),
+            ratio(event.net_income, event.revenue),
+            growth(event.revenue, event.prior_revenue),
+            ratio(
+                event
+                    .net_income
+                    .zip(event.prior_net_income)
+                    .map(|(current, prior)| current - prior),
+                event.assets,
+            ),
+            growth(event.assets, event.prior_assets),
+            growth(event.equity, event.prior_equity),
+            ratio(event.current_assets, event.current_liabilities),
+            sek.then(|| ratio(event.basic_eps, price)).flatten(),
+            sek.then(|| ratio(event.equity, market_value)).flatten(),
+            sek.then(|| ratio(event.revenue, market_value)).flatten(),
+        ]
+    }
+}
+
+fn ratio(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+    safe_ratio(numerator?, denominator?)
+}
+
+fn safe_ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    (numerator.is_finite() && denominator.is_finite() && denominator > 0.0)
+        .then(|| numerator / denominator)
+        .filter(|value| value.is_finite())
+}
+
+fn growth(current: Option<f64>, prior: Option<f64>) -> Option<f64> {
+    safe_ratio(current?, prior?).and_then(|ratio| finite(ratio - 1.0))
+}
+
+/// Produce the complete model input contract for one decision date. This is
+/// shared by matrix construction and future live inference: all inputs are
+/// trailing per-instrument values or aggregates of the contemporaneous
+/// decision-date cross-section.
+pub fn model_cross_section(inputs: &[CrossSectionInput]) -> Result<Vec<NormalisedRow>, String> {
+    let Some(date) = inputs.first().map(|input| input.feature.date) else {
+        return Ok(Vec::new());
+    };
+    if inputs.iter().any(|input| {
+        input.feature.date != date
+            || input.feature.instrument_id != input.meta.instrument_id
+            || input.feature.values.len() != FEATURE_NAMES.len()
+    }) {
+        return Err("invalid Stockholm contextual cross-section".into());
+    }
+    let source_indexes = SECTOR_RELATIVE_SOURCES
+        .iter()
+        .map(|name| feature_index(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut sector_values: BTreeMap<(&str, usize), Vec<f64>> = BTreeMap::new();
+    for input in inputs {
+        for source in &source_indexes {
+            if let Some(value) = input.feature.values[*source].filter(|value| value.is_finite()) {
+                sector_values
+                    .entry((input.meta.sector.as_str(), *source))
+                    .or_default()
+                    .push(value);
+            }
+        }
+    }
+    let sector_medians = sector_values
+        .into_iter()
+        .filter_map(|(key, mut values)| {
+            (values.len() >= 3)
+                .then(|| median(&mut values).map(|value| (key, value)))
+                .flatten()
+        })
+        .collect::<BTreeMap<_, _>>();
+    let sector_relative = inputs
+        .iter()
+        .map(|input| {
+            source_indexes
+                .iter()
+                .map(|source| {
+                    let value = input.feature.values[*source]?;
+                    let sector = sector_medians.get(&(input.meta.sector.as_str(), *source))?;
+                    finite(value - sector)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let market = market_context(inputs)?;
+    let mut by_bucket: BTreeMap<UniverseBucket, Vec<usize>> = BTreeMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        by_bucket
+            .entry(input.meta.bucket.clone())
+            .or_default()
+            .push(index);
+    }
+    let value_width = FEATURE_NAMES.len() + CONTEXT_FEATURE_NAMES.len();
+    let mut output = vec![vec![0.0; value_width * 2]; inputs.len()];
+    for indexes in by_bucket.values() {
+        let base_raw = indexes
+            .iter()
+            .map(|index| inputs[*index].feature.values.clone())
+            .collect::<Vec<_>>();
+        let relative_raw = indexes
+            .iter()
+            .map(|index| sector_relative[*index].clone())
+            .collect::<Vec<_>>();
+        let base_ranked = features_common::rank_normalise(&base_raw)?;
+        let relative_ranked = features_common::rank_normalise(&relative_raw)?;
+        for ((index, base), relative) in indexes.iter().zip(base_ranked).zip(relative_ranked) {
+            let mut values = base;
+            values.extend(relative);
+            values.extend(market.iter().map(|value| value.unwrap_or(0.0)));
+            let mut missing = inputs[*index]
+                .feature
+                .values
+                .iter()
+                .map(|value| f64::from(value.is_none()))
+                .collect::<Vec<_>>();
+            missing.extend(
+                sector_relative[*index]
+                    .iter()
+                    .map(|value| f64::from(value.is_none())),
+            );
+            missing.extend(market.iter().map(|value| f64::from(value.is_none())));
+            values.extend(missing);
+            output[*index] = values;
+        }
+    }
+    Ok(inputs
+        .iter()
+        .zip(output)
+        .map(|(input, values)| NormalisedRow {
+            date,
+            instrument_id: input.meta.instrument_id.clone(),
+            values,
+        })
+        .collect())
+}
+
+fn baseline_cross_section(inputs: &[CrossSectionInput]) -> Result<Vec<NormalisedRow>, String> {
+    let Some(date) = inputs.first().map(|input| input.feature.date) else {
+        return Ok(Vec::new());
+    };
+    let mut by_bucket: BTreeMap<UniverseBucket, Vec<usize>> = BTreeMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        by_bucket
+            .entry(input.meta.bucket.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut output = vec![Vec::new(); inputs.len()];
+    for indexes in by_bucket.values() {
+        let raw = indexes
+            .iter()
+            .map(|index| inputs[*index].feature.values.clone())
+            .collect::<Vec<_>>();
+        for (index, mut values) in indexes.iter().zip(features_common::rank_normalise(&raw)?) {
+            values.extend(
+                inputs[*index]
+                    .feature
+                    .values
+                    .iter()
+                    .map(|value| f64::from(value.is_none())),
+            );
+            output[*index] = values;
+        }
+    }
+    Ok(inputs
+        .iter()
+        .zip(output)
+        .map(|(input, values)| NormalisedRow {
+            date,
+            instrument_id: input.meta.instrument_id.clone(),
+            values,
+        })
+        .collect())
+}
+
+/// Build trailing residual-risk inputs from the complete eligible universe.
+/// All factor returns on date `t` use adjusted closes no later than `t`.
+fn residual_features(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+) -> Result<BTreeMap<(String, Date), ResidualFeatureRow>, String> {
+    let meta = instruments
+        .iter()
+        .filter(|instrument| instrument.bucket.is_stockholm_main_market())
+        .map(|instrument| (instrument.instrument_id.as_str(), instrument))
+        .collect::<BTreeMap<_, _>>();
+    let mut grouped: BTreeMap<&str, Vec<&DailyBar>> = BTreeMap::new();
+    for bar in bars {
+        if meta.contains_key(bar.instrument_id.as_str()) {
+            grouped.entry(&bar.instrument_id).or_default().push(bar);
+        }
+    }
+    for history in grouped.values_mut() {
+        history.sort_by_key(|bar| bar.date);
+    }
+
+    let mut market_members: BTreeMap<Date, Vec<f64>> = BTreeMap::new();
+    let mut sector_members: BTreeMap<(String, Date), Vec<f64>> = BTreeMap::new();
+    for (instrument_id, history) in &grouped {
+        let instrument = meta[instrument_id];
+        for pair in history.windows(2) {
+            let value = pair[1].adjusted_close / pair[0].adjusted_close - 1.0;
+            if value.is_finite() && value > -1.0 {
+                market_members.entry(pair[1].date).or_default().push(value);
+                sector_members
+                    .entry((instrument.sector.clone(), pair[1].date))
+                    .or_default()
+                    .push(value);
+            }
+        }
+    }
+    let market = market_members
+        .into_iter()
+        .filter_map(|(date, values)| {
+            (values.len() >= 20)
+                .then(|| finite(values.iter().sum::<f64>() / values.len() as f64))
+                .flatten()
+                .map(|value| (date, value))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let sector = sector_members
+        .into_iter()
+        .filter_map(|(key, values)| {
+            (values.len() >= 3)
+                .then(|| finite(values.iter().sum::<f64>() / values.len() as f64))
+                .flatten()
+                .map(|value| (key, value))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut output = BTreeMap::new();
+    for (instrument_id, history) in grouped {
+        let instrument = meta[instrument_id];
+        for index in 0..history.len() {
+            let beta_rows =
+                aligned_factor_returns(&history, index, 252, &instrument.sector, &market, &sector);
+            let beta_252 = beta_rows.as_deref().and_then(market_beta);
+            let idio_vol_60 =
+                aligned_factor_returns(&history, index, 60, &instrument.sector, &market, &sector)
+                    .as_deref()
+                    .and_then(two_factor_residual_volatility);
+            let log_adv_sek_20 = median_notional(&history, index, 20)
+                .filter(|value| *value > 0.0)
+                .and_then(|value| finite(value.ln()));
+            let log_adv_sek_60 = median_notional(&history, index, 60)
+                .filter(|value| *value > 0.0)
+                .and_then(|value| finite(value.ln()));
+            let range_frac_14 = trailing_mean(&history, index, 14, |bar| {
+                finite((bar.raw_high - bar.raw_low) / bar.raw_close)
+            });
+            let close_location_5 = trailing_mean(&history, index, 5, close_location);
+            let market_return_21 =
+                factor_return(&history, index, 21, |date| market.get(&date).copied());
+            let market_return_126 =
+                factor_return(&history, index, 126, |date| market.get(&date).copied());
+            let sector_return_21 = factor_return(&history, index, 21, |date| {
+                sector.get(&(instrument.sector.clone(), date)).copied()
+            });
+            let sector_return_126 = factor_return(&history, index, 126, |date| {
+                sector.get(&(instrument.sector.clone(), date)).copied()
+            });
+            let stock_return_21 = simple_return(&history, index, 21);
+            let stock_return_126 = simple_return(&history, index, 126);
+            let values = vec![
+                beta_252,
+                idio_vol_60,
+                log_adv_sek_20,
+                log_adv_sek_60,
+                amihud(&history, index, 60),
+                range_frac_14,
+                close_location_5,
+                residual_return(stock_return_21, market_return_21, beta_252),
+                residual_return(stock_return_126, market_return_126, beta_252),
+                relative_return(stock_return_21, sector_return_21),
+                relative_return(stock_return_126, sector_return_126),
+            ];
+            debug_assert_eq!(values.len(), RESIDUAL_FEATURE_NAMES.len());
+            let row = ResidualFeatureRow {
+                date: history[index].date,
+                instrument_id: instrument_id.to_owned(),
+                values,
+            };
+            output.insert((instrument_id.to_owned(), row.date), row);
+        }
+    }
+    Ok(output)
+}
+
+fn macro_features(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    series: &[MacroSeries],
+) -> Result<ExternalFeatureRows, String> {
+    let mut by_id = BTreeMap::new();
+    for input in series {
+        if by_id.insert(input.series_id.as_str(), input).is_some() {
+            return Err(format!("duplicate macro series {:?}", input.series_id));
+        }
+        if input.observations.is_empty()
+            || input
+                .observations
+                .iter()
+                .any(|observation| !observation.value.is_finite())
+            || input
+                .observations
+                .windows(2)
+                .any(|pair| pair[0].date >= pair[1].date)
+        {
+            return Err(format!("invalid macro series {:?}", input.series_id));
+        }
+    }
+    let required = REQUIRED_MACRO_SERIES
+        .iter()
+        .map(|id| {
+            let series = by_id
+                .get(id)
+                .copied()
+                .ok_or_else(|| format!("missing required macro series {id}"))?;
+            if series
+                .observations
+                .iter()
+                .any(|observation| observation.value <= 0.0)
+            {
+                return Err(format!(
+                    "required log-return macro series {id} contains a non-positive value"
+                ));
+            }
+            Ok(series)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let main_market = instruments
+        .iter()
+        .filter(|instrument| instrument.bucket.is_stockholm_main_market())
+        .map(|instrument| instrument.instrument_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut grouped: BTreeMap<&str, Vec<&DailyBar>> = BTreeMap::new();
+    for bar in bars {
+        if main_market.contains(bar.instrument_id.as_str()) {
+            grouped.entry(&bar.instrument_id).or_default().push(bar);
+        }
+    }
+    let mut output = BTreeMap::new();
+    for (instrument_id, mut history) in grouped {
+        history.sort_by_key(|bar| bar.date);
+        let levels = history
+            .iter()
+            .map(|bar| {
+                required
+                    .iter()
+                    .map(|series| macro_level_on_or_before(&series.observations, bar.date))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for index in 0..history.len() {
+            let betas = (0..required.len())
+                .map(|series_index| macro_beta(&history, &levels, index, series_index, 126))
+                .collect::<Vec<_>>();
+            let mut values = betas.clone();
+            for window in [21, 63] {
+                for (series_index, beta) in betas.iter().copied().enumerate() {
+                    values.push(
+                        beta.zip(macro_return(&levels, index, series_index, window))
+                            .and_then(|(beta, change)| finite(beta * change)),
+                    );
+                }
+            }
+            debug_assert_eq!(values.len(), MACRO_FEATURE_NAMES.len());
+            output.insert((instrument_id.to_owned(), history[index].date), values);
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Debug)]
+struct MicrostructureFeatureRows {
+    features: ExternalFeatureRows,
+    median_spread_bps_20: BTreeMap<(String, Date), f64>,
+}
+
+fn microstructure_features(
+    observations: &[MarketMicrostructureBar],
+) -> Result<MicrostructureFeatureRows, String> {
+    let mut grouped: BTreeMap<&str, Vec<&MarketMicrostructureBar>> = BTreeMap::new();
+    for observation in observations {
+        if observation.instrument_id.trim().is_empty()
+            || !observation.close.is_finite()
+            || observation.close <= 0.0
+            || !observation.turnover_sek.is_finite()
+            || observation.turnover_sek < 0.0
+            || observation
+                .bid
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            || observation
+                .ask
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            || observation
+                .average
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            || observation
+                .bid
+                .zip(observation.ask)
+                .is_some_and(|(bid, ask)| bid > ask)
+        {
+            return Err(format!(
+                "invalid market microstructure observation for {} on {}",
+                observation.instrument_id, observation.date
+            ));
+        }
+        grouped
+            .entry(&observation.instrument_id)
+            .or_default()
+            .push(observation);
+    }
+
+    let mut output = BTreeMap::new();
+    let mut median_spread_bps_20 = BTreeMap::new();
+    for (instrument_id, mut history) in grouped {
+        history.sort_by_key(|bar| bar.date);
+        if history.windows(2).any(|pair| pair[0].date >= pair[1].date) {
+            return Err(format!(
+                "market microstructure history for {instrument_id} is not unique"
+            ));
+        }
+        for index in 0..history.len() {
+            let current_spread = closing_spread_bps(history[index]);
+            let window_start = index.saturating_add(1).saturating_sub(20);
+            let window = &history[window_start..=index];
+            let mut spreads = window
+                .iter()
+                .filter_map(|bar| closing_spread_bps(bar))
+                .collect::<Vec<_>>();
+            let median_spread = (spreads.len() >= 10)
+                .then(|| median(&mut spreads))
+                .flatten();
+            let spread_ratio = current_spread
+                .zip(median_spread)
+                .and_then(|(current, baseline)| safe_ratio(current, baseline));
+            let mut trades = window
+                .iter()
+                .filter_map(|bar| bar.trades.map(|value| value as f64))
+                .filter(|value| *value > 0.0)
+                .collect::<Vec<_>>();
+            let median_trades = (trades.len() >= 10).then(|| median(&mut trades)).flatten();
+            let log_median_trades = median_trades.and_then(|value| finite(value.ln()));
+            let trades_surge = history[index]
+                .trades
+                .map(|value| value as f64)
+                .zip(median_trades)
+                .and_then(|(current, baseline)| safe_ratio(current, baseline));
+            let close_vs_average = history[index]
+                .average
+                .and_then(|average| safe_ratio(history[index].close, average))
+                .and_then(|ratio| finite(ratio - 1.0));
+            let mut trade_values = window
+                .iter()
+                .filter_map(|bar| {
+                    let trades = bar.trades? as f64;
+                    (trades > 0.0 && bar.turnover_sek > 0.0).then(|| bar.turnover_sek / trades)
+                })
+                .collect::<Vec<_>>();
+            let log_median_trade_value = (trade_values.len() >= 10)
+                .then(|| median(&mut trade_values))
+                .flatten()
+                .filter(|value| *value > 0.0)
+                .and_then(|value| finite(value.ln()));
+            let values = vec![
+                current_spread,
+                median_spread,
+                spread_ratio,
+                log_median_trades,
+                trades_surge,
+                close_vs_average,
+                log_median_trade_value,
+            ];
+            debug_assert_eq!(values.len(), MICROSTRUCTURE_FEATURE_NAMES.len());
+            let key = (instrument_id.to_owned(), history[index].date);
+            if let Some(spread) = median_spread {
+                median_spread_bps_20.insert(key.clone(), spread);
+            }
+            output.insert(key, values);
+        }
+    }
+    Ok(MicrostructureFeatureRows {
+        features: output,
+        median_spread_bps_20,
+    })
+}
+
+fn closing_spread_bps(bar: &MarketMicrostructureBar) -> Option<f64> {
+    let (bid, ask) = bar.bid.zip(bar.ask)?;
+    let midpoint = (bid + ask) / 2.0;
+    (ask >= bid && midpoint > 0.0)
+        .then(|| (ask - bid) / midpoint * 10_000.0)
+        .and_then(finite)
+}
+
+fn borrow_fee_features(observations: &[BorrowFeeBar]) -> Result<ExternalFeatureRows, String> {
+    let mut grouped: BTreeMap<&str, Vec<&BorrowFeeBar>> = BTreeMap::new();
+    for observation in observations {
+        if observation.instrument_id.trim().is_empty()
+            || !observation.annual_rate.is_finite()
+            || observation.annual_rate < 0.0
+        {
+            return Err(format!(
+                "invalid borrow-fee observation for {} on {}",
+                observation.instrument_id, observation.date
+            ));
+        }
+        grouped
+            .entry(&observation.instrument_id)
+            .or_default()
+            .push(observation);
+    }
+
+    let mut output = BTreeMap::new();
+    for (instrument_id, mut history) in grouped {
+        history.sort_by_key(|bar| bar.date);
+        if history.windows(2).any(|pair| pair[0].date >= pair[1].date) {
+            return Err(format!(
+                "borrow-fee history for {instrument_id} is not unique"
+            ));
+        }
+        for index in 0..history.len() {
+            let current = history[index].annual_rate;
+            let start = index.saturating_add(1).saturating_sub(20);
+            let mut window = history[start..=index]
+                .iter()
+                .map(|bar| bar.annual_rate)
+                .collect::<Vec<_>>();
+            let median_20 = (window.len() >= 10).then(|| median(&mut window)).flatten();
+            let change_5 = index
+                .checked_sub(5)
+                .and_then(|prior| finite(current - history[prior].annual_rate));
+            let change_20 = index
+                .checked_sub(20)
+                .and_then(|prior| finite(current - history[prior].annual_rate));
+            let max_20 = (window.len() >= 10)
+                .then(|| window.into_iter().reduce(f64::max))
+                .flatten();
+            let values = vec![Some(current), median_20, change_5, change_20, max_20];
+            debug_assert_eq!(values.len(), BORROW_FEE_FEATURE_NAMES.len());
+            output.insert((instrument_id.to_owned(), history[index].date), values);
+        }
+    }
+    Ok(output)
+}
+
+fn macro_level_on_or_before(observations: &[MacroObservation], date: Date) -> Option<f64> {
+    let end = observations.partition_point(|observation| observation.date <= date);
+    end.checked_sub(1).map(|index| observations[index].value)
+}
+
+fn macro_return(
+    levels: &[Vec<Option<f64>>],
+    index: usize,
+    series_index: usize,
+    window: usize,
+) -> Option<f64> {
+    let start = index.checked_sub(window)?;
+    let current = levels[index][series_index]?;
+    let prior = levels[start][series_index]?;
+    finite(current / prior - 1.0)
+}
+
+fn macro_beta(
+    history: &[&DailyBar],
+    levels: &[Vec<Option<f64>>],
+    index: usize,
+    series_index: usize,
+    window: usize,
+) -> Option<f64> {
+    let start = index.checked_sub(window)?;
+    let rows = (start + 1..=index)
+        .filter_map(|current| {
+            let macro_current = levels[current][series_index]?;
+            let macro_prior = levels[current - 1][series_index]?;
+            let macro_return = (macro_current / macro_prior).ln();
+            let stock_return =
+                (history[current].adjusted_close / history[current - 1].adjusted_close).ln();
+            (macro_return.is_finite() && stock_return.is_finite())
+                .then_some((macro_return, stock_return))
+        })
+        .collect::<Vec<_>>();
+    if rows.len() < 80 {
+        return None;
+    }
+    let macro_mean = rows.iter().map(|row| row.0).sum::<f64>() / rows.len() as f64;
+    let stock_mean = rows.iter().map(|row| row.1).sum::<f64>() / rows.len() as f64;
+    let variance = rows
+        .iter()
+        .map(|row| (row.0 - macro_mean).powi(2))
+        .sum::<f64>();
+    if variance <= f64::EPSILON {
+        return None;
+    }
+    finite(
+        rows.iter()
+            .map(|row| (row.0 - macro_mean) * (row.1 - stock_mean))
+            .sum::<f64>()
+            / variance,
+    )
+}
+
+/// (stock log return, market log return, sector-minus-market log return).
+fn aligned_factor_returns(
+    history: &[&DailyBar],
+    index: usize,
+    window: usize,
+    sector_name: &str,
+    market: &BTreeMap<Date, f64>,
+    sectors: &BTreeMap<(String, Date), f64>,
+) -> Option<Vec<(f64, f64, f64)>> {
+    let start = index.checked_sub(window)?;
+    let rows = (start + 1..=index)
+        .map(|current| {
+            let date = history[current].date;
+            let stock =
+                (history[current].adjusted_close / history[current - 1].adjusted_close).ln();
+            let market = market.get(&date)?.ln_1p();
+            let sector = sectors.get(&(sector_name.to_owned(), date))?.ln_1p();
+            (stock.is_finite() && market.is_finite() && sector.is_finite()).then_some((
+                stock,
+                market,
+                sector - market,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (rows.len() == window).then_some(rows)
+}
+
+fn market_beta(rows: &[(f64, f64, f64)]) -> Option<f64> {
+    let stock_mean = rows.iter().map(|row| row.0).sum::<f64>() / rows.len() as f64;
+    let market_mean = rows.iter().map(|row| row.1).sum::<f64>() / rows.len() as f64;
+    let covariance = rows
+        .iter()
+        .map(|row| (row.0 - stock_mean) * (row.1 - market_mean))
+        .sum::<f64>();
+    let variance = rows
+        .iter()
+        .map(|row| (row.1 - market_mean).powi(2))
+        .sum::<f64>();
+    (variance > f64::EPSILON)
+        .then(|| finite(covariance / variance))
+        .flatten()
+}
+
+fn two_factor_residual_volatility(rows: &[(f64, f64, f64)]) -> Option<f64> {
+    if rows.len() < 3 {
+        return None;
+    }
+    let means = (
+        rows.iter().map(|row| row.0).sum::<f64>() / rows.len() as f64,
+        rows.iter().map(|row| row.1).sum::<f64>() / rows.len() as f64,
+        rows.iter().map(|row| row.2).sum::<f64>() / rows.len() as f64,
+    );
+    let centered = rows
+        .iter()
+        .map(|row| (row.0 - means.0, row.1 - means.1, row.2 - means.2))
+        .collect::<Vec<_>>();
+    let mm = centered.iter().map(|row| row.1 * row.1).sum::<f64>();
+    let ss = centered.iter().map(|row| row.2 * row.2).sum::<f64>();
+    let ms = centered.iter().map(|row| row.1 * row.2).sum::<f64>();
+    let ym = centered.iter().map(|row| row.0 * row.1).sum::<f64>();
+    let ys = centered.iter().map(|row| row.0 * row.2).sum::<f64>();
+    let determinant = mm * ss - ms * ms;
+    if determinant <= f64::EPSILON {
+        return None;
+    }
+    let beta_market = (ym * ss - ys * ms) / determinant;
+    let beta_sector = (ys * mm - ym * ms) / determinant;
+    standard_deviation(
+        &centered
+            .iter()
+            .map(|row| row.0 - beta_market * row.1 - beta_sector * row.2)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn trailing_mean<F>(history: &[&DailyBar], index: usize, window: usize, value: F) -> Option<f64>
+where
+    F: Fn(&DailyBar) -> Option<f64>,
+{
+    let values = trailing(history, index, window)?
+        .iter()
+        .map(|bar| value(bar))
+        .collect::<Option<Vec<_>>>()?;
+    finite(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn factor_return<F>(history: &[&DailyBar], index: usize, window: usize, value: F) -> Option<f64>
+where
+    F: Fn(Date) -> Option<f64>,
+{
+    let start = index.checked_sub(window)?;
+    let total = (start + 1..=index)
+        .map(|current| value(history[current].date).and_then(|value| finite(value.ln_1p())))
+        .collect::<Option<Vec<_>>>()?
+        .iter()
+        .sum::<f64>();
+    finite(total.exp() - 1.0)
+}
+
+fn residual_return(stock: Option<f64>, market: Option<f64>, beta: Option<f64>) -> Option<f64> {
+    finite(stock? - beta? * market?)
+}
+
+fn relative_return(stock: Option<f64>, sector: Option<f64>) -> Option<f64> {
+    finite(stock? - sector?)
+}
+
+fn market_context(inputs: &[CrossSectionInput]) -> Result<Vec<Option<f64>>, String> {
+    let mut output = Vec::new();
+    for name in MARKET_MEDIAN_SOURCES {
+        let index = feature_index(name)?;
+        let mut values = inputs
+            .iter()
+            .filter_map(|input| input.feature.values[index])
+            .collect::<Vec<_>>();
+        output.push((values.len() >= 20).then(|| median(&mut values)).flatten());
+    }
+    let ret21 = measured_feature(inputs, "ret_21")?;
+    output.push(
+        (ret21.len() >= 20)
+            .then(|| standard_deviation(&ret21))
+            .flatten(),
+    );
+    output.push(positive_fraction(&measured_feature(inputs, "ret_21")?));
+    output.push(positive_fraction(&measured_feature(inputs, "ret_126")?));
+    let mut vol20 = measured_feature(inputs, "vol_20")?;
+    output.push((vol20.len() >= 20).then(|| median(&mut vol20)).flatten());
+    debug_assert_eq!(
+        output.len(),
+        CONTEXT_FEATURE_NAMES.len() - source_indexes_len()
+    );
+    Ok(output)
+}
+
+fn source_indexes_len() -> usize {
+    SECTOR_RELATIVE_SOURCES.len()
+}
+
+fn measured_feature(inputs: &[CrossSectionInput], name: &str) -> Result<Vec<f64>, String> {
+    let index = feature_index(name)?;
+    Ok(inputs
+        .iter()
+        .filter_map(|input| input.feature.values[index].filter(|value| value.is_finite()))
+        .collect())
+}
+
+fn positive_fraction(values: &[f64]) -> Option<f64> {
+    if values.len() < 20 {
+        None
+    } else {
+        finite(values.iter().filter(|value| **value > 0.0).count() as f64 / values.len() as f64)
+    }
+}
+
+fn feature_index(name: &str) -> Result<usize, String> {
+    FEATURE_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .ok_or_else(|| format!("unknown base feature {name:?}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrainingRow {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub instrument_id: String,
+    pub symbol: String,
+    pub isin: String,
+    pub sector: String,
+    pub bucket: UniverseBucket,
+    /// Adjusted next-session open to adjusted open after `horizon_sessions`.
+    pub target: f64,
+    /// Equal-weight return of the complete eligible decision-date cross-section
+    /// over the identical executable holding interval. Rust calculates this
+    /// label component before Python sees the matrix.
+    #[serde(default)]
+    pub market_target: Option<f64>,
+    /// Stock-selection target centered within the eligible decision date.
+    /// This is a secondary label; raw `target` remains the economic P&L truth.
+    #[serde(default)]
+    pub relative_target: Option<f64>,
+    /// Absolute return divided by decision-time daily volatility. Retained for
+    /// compatibility with the original direction-preserving research arm; the
+    /// value is finalized in Rust and Python may only fit it.
+    #[serde(default)]
+    pub return_per_risk_target: Option<f64>,
+    /// Relative stock-selection return divided by decision-time daily
+    /// volatility, then centered inside the decision-date cross-section.
+    /// Inference multiplies the fitted score by the same row's volatility
+    /// exactly once before applying return-unit cost gates.
+    #[serde(default)]
+    pub relative_return_per_risk_target: Option<f64>,
+    /// Average cross-sectional rank of the forward return mapped to [-1, 1].
+    /// This robust selection label is finalized here so Python never ranks or
+    /// otherwise transforms outcomes.
+    #[serde(default)]
+    pub relative_rank_target: Option<f64>,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub adv20_sek: f64,
+    pub vol60: f64,
+    /// Decision-session annual stock-borrow fee as a decimal rate. Missing
+    /// history uses the backtest's conservative fixed fallback.
+    #[serde(default)]
+    pub borrow_fee_annualized: Option<f64>,
+    /// Median of up to 20 causal Nasdaq closing bid/ask spreads, in basis
+    /// points, requiring at least ten observed sessions through this decision
+    /// date. It is execution-cost context, not a model input; missing history
+    /// uses the backtest's disclosed spread fallback.
+    #[serde(default)]
+    pub median_closing_spread_bps_20: Option<f64>,
+    /// Each decision date has total training weight one.
+    pub sample_weight: f64,
+    pub features: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrainingMatrix {
+    pub features: Vec<String>,
+    pub rows: Vec<TrainingRow>,
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    meta: InstrumentMeta,
+    feature: FeatureRow,
+    target: f64,
+    entry_price: f64,
+    exit_price: f64,
+    adv20_sek: f64,
+    vol60: f64,
+}
+
+/// Construct the final ordered matrix and labels in Rust. Bars after a row's
+/// decision date are used only for its declared label, never for its features.
+pub fn training_matrix(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_feature_set(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        true,
+    )
+}
+
+pub fn training_matrix_for_feature_set(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    include_context: bool,
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        if include_context {
+            FeatureSet::Context
+        } else {
+            FeatureSet::Baseline
+        },
+    )
+}
+
+pub fn training_matrix_for_named_feature_set(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_public_shorts(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_public_shorts(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_external_events(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        public_short_events,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_external_events(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+    pdmr_events: &[PdmrTransactionEvent],
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_all_events(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        public_short_events,
+        pdmr_events,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_all_events(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+    pdmr_events: &[PdmrTransactionEvent],
+    report_events: &[FinancialReportEvent],
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_fundamentals(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        public_short_events,
+        pdmr_events,
+        report_events,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_fundamentals(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+    pdmr_events: &[PdmrTransactionEvent],
+    report_events: &[FinancialReportEvent],
+    fundamental_events: &[AnnualFundamentalEvent],
+) -> Result<TrainingMatrix, String> {
+    training_matrix_for_named_feature_set_with_all_sources(
+        bars,
+        instruments,
+        start,
+        end,
+        horizon_sessions,
+        min_adv20_sek,
+        feature_set,
+        public_short_events,
+        pdmr_events,
+        report_events,
+        fundamental_events,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn training_matrix_for_named_feature_set_with_all_sources(
+    bars: &[DailyBar],
+    instruments: &[InstrumentMeta],
+    start: Date,
+    end: Date,
+    horizon_sessions: usize,
+    min_adv20_sek: f64,
+    feature_set: FeatureSet,
+    public_short_events: &[PublicShortPositionEvent],
+    pdmr_events: &[PdmrTransactionEvent],
+    report_events: &[FinancialReportEvent],
+    fundamental_events: &[AnnualFundamentalEvent],
+    macro_series: &[MacroSeries],
+    microstructure: &[MarketMicrostructureBar],
+    borrow_fees: &[BorrowFeeBar],
+    company_news_events: &[CompanyNewsEvent],
+    report_text_events: &[FinancialReportTextEvent],
+) -> Result<TrainingMatrix, String> {
+    if end < start {
+        return Err("matrix end precedes start".into());
+    }
+    if horizon_sessions == 0 {
+        return Err("label horizon must be positive".into());
+    }
+    if !min_adv20_sek.is_finite() || min_adv20_sek < 0.0 {
+        return Err("minimum ADV must be finite and non-negative".into());
+    }
+    let meta: BTreeMap<_, _> = instruments
+        .iter()
+        .filter(|instrument| instrument.bucket.is_stockholm_main_market())
+        .cloned()
+        .map(|instrument| (instrument.instrument_id.clone(), instrument))
+        .collect();
+    let features = daily(bars)?;
+    let residual = if matches!(
+        feature_set,
+        FeatureSet::Residual
+            | FeatureSet::ResidualPublicShort
+            | FeatureSet::ResidualPdmr
+            | FeatureSet::ResidualPdmrReports
+            | FeatureSet::ResidualFundamentals
+            | FeatureSet::ResidualPdmrMacro
+            | FeatureSet::ResidualPdmrMicrostructure
+            | FeatureSet::ResidualPdmrMicrostructureBorrow
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+    ) {
+        residual_features(bars, instruments)?
+    } else {
+        BTreeMap::new()
+    };
+    let macro_values = if feature_set == FeatureSet::ResidualPdmrMacro {
+        macro_features(bars, instruments, macro_series)?
+    } else {
+        BTreeMap::new()
+    };
+    let microstructure_rows = if matches!(
+        feature_set,
+        FeatureSet::ResidualPdmrMicrostructure
+            | FeatureSet::ResidualPdmrMicrostructureBorrow
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+    ) {
+        microstructure_features(microstructure)?
+    } else {
+        MicrostructureFeatureRows {
+            features: BTreeMap::new(),
+            median_spread_bps_20: BTreeMap::new(),
+        }
+    };
+    let microstructure_values = &microstructure_rows.features;
+    let borrow_fee_values = if matches!(
+        feature_set,
+        FeatureSet::ResidualPdmrMicrostructureBorrow
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNews
+            | FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText
+    ) {
+        borrow_fee_features(borrow_fees)?
+    } else {
+        BTreeMap::new()
+    };
+    let by_feature: BTreeMap<_, _> = features
+        .into_iter()
+        .map(|row| ((row.instrument_id.clone(), row.date), row))
+        .collect();
+    let mut grouped: BTreeMap<&str, Vec<&DailyBar>> = BTreeMap::new();
+    for bar in bars {
+        grouped.entry(&bar.instrument_id).or_default().push(bar);
+    }
+    let adv_index = FEATURE_NAMES
+        .iter()
+        .position(|name| *name == "median_traded_notional_20")
+        .expect("catalog contains ADV");
+    let vol_index = FEATURE_NAMES
+        .iter()
+        .position(|name| *name == "vol_60")
+        .expect("catalog contains volatility");
+    let slow_index = FEATURE_NAMES
+        .iter()
+        .position(|name| *name == "ret_252")
+        .expect("catalog contains slow history gate");
+    let mut candidates: BTreeMap<Date, Vec<Candidate>> = BTreeMap::new();
+    for (instrument_id, mut history) in grouped {
+        let Some(instrument) = meta.get(instrument_id) else {
+            continue;
+        };
+        history.sort_by_key(|bar| bar.date);
+        for index in 0..history.len() {
+            let decision = history[index].date;
+            if decision < start || decision > end {
+                continue;
+            }
+            let Some(exit_index) = index.checked_add(1 + horizon_sessions) else {
+                continue;
+            };
+            if exit_index >= history.len() {
+                continue;
+            }
+            let feature = by_feature
+                .get(&(instrument_id.to_owned(), decision))
+                .ok_or_else(|| {
+                    format!("missing computed feature for {instrument_id} {decision}")
+                })?;
+            let Some(adv20_sek) = feature.values[adv_index] else {
+                continue;
+            };
+            let Some(vol60) = feature.values[vol_index] else {
+                continue;
+            };
+            if feature.values[slow_index].is_none() || adv20_sek < min_adv20_sek {
+                continue;
+            }
+            let entry = adjusted_open(history[index + 1]);
+            let exit = adjusted_open(history[exit_index]);
+            let target = exit / entry - 1.0;
+            if !entry.is_finite()
+                || !exit.is_finite()
+                || !target.is_finite()
+                || entry <= 0.0
+                || exit <= 0.0
+            {
+                continue;
+            }
+            candidates.entry(decision).or_default().push(Candidate {
+                meta: instrument.clone(),
+                feature: feature.clone(),
+                target,
+                entry_price: entry,
+                exit_price: exit,
+                adv20_sek,
+                vol60,
+            });
+        }
+    }
+    let names = match feature_set {
+        FeatureSet::Baseline => baseline_model_feature_names(),
+        FeatureSet::Context => model_feature_names(),
+        FeatureSet::Residual => residual_model_feature_names(),
+        FeatureSet::ResidualPublicShort => public_short_model_feature_names(),
+        FeatureSet::ResidualPdmr => pdmr_model_feature_names(),
+        FeatureSet::ResidualPdmrReports => pdmr_report_model_feature_names(),
+        FeatureSet::ResidualFundamentals => fundamental_model_feature_names(),
+        FeatureSet::ResidualPdmrMacro => pdmr_macro_model_feature_names(),
+        FeatureSet::ResidualPdmrMicrostructure => pdmr_microstructure_model_feature_names(),
+        FeatureSet::ResidualPdmrMicrostructureBorrow => {
+            pdmr_microstructure_borrow_model_feature_names()
+        }
+        FeatureSet::ResidualPdmrMicrostructureBorrowNews => {
+            pdmr_microstructure_borrow_news_model_feature_names()
+        }
+        FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
+            pdmr_microstructure_borrow_news_report_text_model_feature_names()
+        }
+    };
+    let mut public_short_cursor = (feature_set == FeatureSet::ResidualPublicShort)
+        .then(|| PublicShortCursor::new(public_short_events))
+        .transpose()?;
+    let mut pdmr_cursor = (feature_set == FeatureSet::ResidualPdmr)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    if feature_set == FeatureSet::ResidualPdmrReports && pdmr_events.is_empty() {
+        return Err("residual-pdmr-reports requires PDMR events".into());
+    }
+    let mut combined_pdmr_cursor = (feature_set == FeatureSet::ResidualPdmrReports)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut report_cursor = (feature_set == FeatureSet::ResidualPdmrReports)
+        .then(|| FinancialReportCursor::new(report_events, bars))
+        .transpose()?;
+    let mut fundamental_cursor = (feature_set == FeatureSet::ResidualFundamentals)
+        .then(|| AnnualFundamentalCursor::new(fundamental_events, bars))
+        .transpose()?;
+    let mut macro_pdmr_cursor = (feature_set == FeatureSet::ResidualPdmrMacro)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut microstructure_pdmr_cursor = (feature_set == FeatureSet::ResidualPdmrMicrostructure)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut microstructure_borrow_pdmr_cursor = (feature_set
+        == FeatureSet::ResidualPdmrMicrostructureBorrow)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut news_pdmr_cursor = (feature_set == FeatureSet::ResidualPdmrMicrostructureBorrowNews)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut company_news_cursor = (feature_set == FeatureSet::ResidualPdmrMicrostructureBorrowNews)
+        .then(|| CompanyNewsCursor::new(company_news_events, bars))
+        .transpose()?;
+    let mut report_text_pdmr_cursor = (feature_set
+        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+        .then(|| PdmrCursor::new(pdmr_events))
+        .transpose()?;
+    let mut report_text_news_cursor = (feature_set
+        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+        .then(|| CompanyNewsCursor::new(company_news_events, bars))
+        .transpose()?;
+    let mut report_text_cursor = (feature_set
+        == FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText)
+        .then(|| FinancialReportTextCursor::new(report_text_events))
+        .transpose()?;
+    let mut rows = Vec::new();
+    for (date, mut group) in candidates {
+        let mut bucket_counts = BTreeMap::new();
+        for candidate in &group {
+            *bucket_counts
+                .entry(candidate.meta.bucket.clone())
+                .or_insert(0_usize) += 1;
+        }
+        group.retain(|candidate| bucket_counts[&candidate.meta.bucket] >= 5);
+        if group.is_empty() {
+            continue;
+        }
+        let market_target =
+            group.iter().map(|candidate| candidate.target).sum::<f64>() / group.len() as f64;
+        let context = group
+            .iter()
+            .map(|candidate| CrossSectionInput {
+                meta: candidate.meta.clone(),
+                feature: candidate.feature.clone(),
+            })
+            .collect::<Vec<_>>();
+        let public_short = if let Some(cursor) = &mut public_short_cursor {
+            cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.meta.instrument_id.clone(),
+                        cursor.values(&candidate.meta.isin, date),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr = if let Some(cursor) = &mut pdmr_cursor {
+            cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.meta.instrument_id.clone(),
+                        cursor.values(&candidate.meta.isin, date),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr_reports = if let (Some(pdmr_cursor), Some(report_cursor)) =
+            (&mut combined_pdmr_cursor, &mut report_cursor)
+        {
+            pdmr_cursor.advance_before(date);
+            report_cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    let mut values = pdmr_cursor.values(&candidate.meta.isin, date);
+                    values.extend(report_cursor.values(&candidate.meta.instrument_id, date));
+                    (candidate.meta.instrument_id.clone(), values)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let fundamentals = if let Some(cursor) = &mut fundamental_cursor {
+            cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.meta.instrument_id.clone(),
+                        cursor.values(&candidate.meta.instrument_id, date),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr_macro = if let Some(cursor) = &mut macro_pdmr_cursor {
+            cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    let mut values = cursor.values(&candidate.meta.isin, date);
+                    let macro_row = macro_values
+                        .get(&(candidate.meta.instrument_id.clone(), date))
+                        .cloned()
+                        .unwrap_or_else(|| vec![None; MACRO_FEATURE_NAMES.len()]);
+                    values.extend(macro_row);
+                    (candidate.meta.instrument_id.clone(), values)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr_microstructure = if let Some(cursor) = &mut microstructure_pdmr_cursor {
+            cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    let mut values = cursor.values(&candidate.meta.isin, date);
+                    let microstructure_row = microstructure_values
+                        .get(&(candidate.meta.instrument_id.clone(), date))
+                        .cloned()
+                        .unwrap_or_else(|| vec![None; MICROSTRUCTURE_FEATURE_NAMES.len()]);
+                    values.extend(microstructure_row);
+                    (candidate.meta.instrument_id.clone(), values)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr_microstructure_borrow =
+            if let Some(cursor) = &mut microstructure_borrow_pdmr_cursor {
+                cursor.advance_before(date);
+                group
+                    .iter()
+                    .map(|candidate| {
+                        let key = (candidate.meta.instrument_id.clone(), date);
+                        let mut values = cursor.values(&candidate.meta.isin, date);
+                        let microstructure_row = microstructure_values
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| vec![None; MICROSTRUCTURE_FEATURE_NAMES.len()]);
+                        values.extend(microstructure_row);
+                        let borrow_row = borrow_fee_values
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| vec![None; BORROW_FEE_FEATURE_NAMES.len()]);
+                        values.extend(borrow_row);
+                        (candidate.meta.instrument_id.clone(), values)
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+        let pdmr_microstructure_borrow_news = if let (Some(pdmr_cursor), Some(news_cursor)) =
+            (&mut news_pdmr_cursor, &mut company_news_cursor)
+        {
+            pdmr_cursor.advance_before(date);
+            news_cursor.advance_before(date);
+            group
+                .iter()
+                .map(|candidate| {
+                    let key = (candidate.meta.instrument_id.clone(), date);
+                    let mut values = pdmr_cursor.values(&candidate.meta.isin, date);
+                    let microstructure_row = microstructure_values
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| vec![None; MICROSTRUCTURE_FEATURE_NAMES.len()]);
+                    values.extend(microstructure_row);
+                    let borrow_row = borrow_fee_values
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| vec![None; BORROW_FEE_FEATURE_NAMES.len()]);
+                    values.extend(borrow_row);
+                    values.extend(news_cursor.values(&candidate.meta.instrument_id, date));
+                    (candidate.meta.instrument_id.clone(), values)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let pdmr_microstructure_borrow_news_report_text =
+            if let (Some(pdmr_cursor), Some(news_cursor), Some(report_text_cursor)) = (
+                &mut report_text_pdmr_cursor,
+                &mut report_text_news_cursor,
+                &mut report_text_cursor,
+            ) {
+                pdmr_cursor.advance_before(date);
+                news_cursor.advance_before(date);
+                report_text_cursor.advance_before(date);
+                group
+                    .iter()
+                    .map(|candidate| {
+                        let key = (candidate.meta.instrument_id.clone(), date);
+                        let mut values = pdmr_cursor.values(&candidate.meta.isin, date);
+                        let microstructure_row = microstructure_values
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| vec![None; MICROSTRUCTURE_FEATURE_NAMES.len()]);
+                        values.extend(microstructure_row);
+                        let borrow_row = borrow_fee_values
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| vec![None; BORROW_FEE_FEATURE_NAMES.len()]);
+                        values.extend(borrow_row);
+                        values.extend(news_cursor.values(&candidate.meta.instrument_id, date));
+                        values
+                            .extend(report_text_cursor.values(&candidate.meta.instrument_id, date));
+                        (candidate.meta.instrument_id.clone(), values)
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+        let normalised = match feature_set {
+            FeatureSet::Baseline => baseline_cross_section(&context)?,
+            FeatureSet::Context => model_cross_section(&context)?,
+            FeatureSet::Residual => residual_cross_section(&context, &residual)?,
+            FeatureSet::ResidualPublicShort => {
+                residual_public_short_cross_section(&context, &residual, &public_short)?
+            }
+            FeatureSet::ResidualPdmr => residual_pdmr_cross_section(&context, &residual, &pdmr)?,
+            FeatureSet::ResidualPdmrReports => {
+                residual_pdmr_report_cross_section(&context, &residual, &pdmr_reports)?
+            }
+            FeatureSet::ResidualFundamentals => {
+                residual_fundamental_cross_section(&context, &residual, &fundamentals)?
+            }
+            FeatureSet::ResidualPdmrMacro => {
+                residual_pdmr_macro_cross_section(&context, &residual, &pdmr_macro)?
+            }
+            FeatureSet::ResidualPdmrMicrostructure => residual_pdmr_microstructure_cross_section(
+                &context,
+                &residual,
+                &pdmr_microstructure,
+            )?,
+            FeatureSet::ResidualPdmrMicrostructureBorrow => {
+                residual_pdmr_microstructure_borrow_cross_section(
+                    &context,
+                    &residual,
+                    &pdmr_microstructure_borrow,
+                )?
+            }
+            FeatureSet::ResidualPdmrMicrostructureBorrowNews => {
+                residual_pdmr_microstructure_borrow_news_cross_section(
+                    &context,
+                    &residual,
+                    &pdmr_microstructure_borrow_news,
+                )?
+            }
+            FeatureSet::ResidualPdmrMicrostructureBorrowNewsReportText => {
+                residual_pdmr_microstructure_borrow_news_report_text_cross_section(
+                    &context,
+                    &residual,
+                    &pdmr_microstructure_borrow_news_report_text,
+                )?
+            }
+        };
+        let ranked_targets = features_common::rank_normalise(
+            &group
+                .iter()
+                .map(|candidate| vec![Some(candidate.target)])
+                .collect::<Vec<_>>(),
+        )?;
+        let relative_risk_mean = group
+            .iter()
+            .map(|candidate| (candidate.target - market_target) / candidate.vol60)
+            .sum::<f64>()
+            / group.len() as f64;
+        for ((candidate, values), ranked_target) in
+            group.into_iter().zip(normalised).zip(ranked_targets)
+        {
+            if values.values.len() != names.len() {
+                return Err("Stockholm contextual model row has the wrong width".into());
+            }
+            let borrow_fee_annualized = borrow_fee_values
+                .get(&(candidate.meta.instrument_id.clone(), date))
+                .and_then(|values| values.first().copied().flatten());
+            let median_closing_spread_bps_20 = microstructure_rows
+                .median_spread_bps_20
+                .get(&(candidate.meta.instrument_id.clone(), date))
+                .copied();
+            let relative_target = candidate.target - market_target;
+            rows.push(TrainingRow {
+                date: candidate.feature.date,
+                instrument_id: candidate.meta.instrument_id,
+                symbol: candidate.meta.symbol,
+                isin: candidate.meta.isin,
+                sector: candidate.meta.sector,
+                bucket: candidate.meta.bucket,
+                target: candidate.target,
+                market_target: Some(market_target),
+                relative_target: Some(relative_target),
+                return_per_risk_target: finite(candidate.target / candidate.vol60),
+                relative_return_per_risk_target: finite(
+                    relative_target / candidate.vol60 - relative_risk_mean,
+                ),
+                relative_rank_target: ranked_target.first().copied(),
+                entry_price: candidate.entry_price,
+                exit_price: candidate.exit_price,
+                adv20_sek: candidate.adv20_sek,
+                vol60: candidate.vol60,
+                borrow_fee_annualized,
+                median_closing_spread_bps_20,
+                sample_weight: 0.0,
+                features: names.iter().cloned().zip(values.values).collect(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.instrument_id.cmp(&b.instrument_id))
+    });
+    let mut start_index = 0;
+    while start_index < rows.len() {
+        let date = rows[start_index].date;
+        let mut end_index = start_index + 1;
+        while end_index < rows.len() && rows[end_index].date == date {
+            end_index += 1;
+        }
+        let weight = 1.0 / (end_index - start_index) as f64;
+        for row in &mut rows[start_index..end_index] {
+            row.sample_weight = weight;
+        }
+        start_index = end_index;
+    }
+    Ok(TrainingMatrix {
+        features: names,
+        rows,
+    })
+}
+
+fn adjusted_open(bar: &DailyBar) -> f64 {
+    bar.raw_open * bar.adjusted_close / bar.raw_close
+}
+
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+mod date_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::Date;
+
+    pub fn serialize<S: Serializer>(date: &Date, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&date.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Date, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let format = time::macros::format_description!("[year]-[month]-[day]");
+        Date::parse(&value, format).map_err(serde::de::Error::custom)
+    }
+}
+
+fn simple_return(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    index.checked_sub(window).and_then(|start| {
+        finite(history[index].adjusted_close / history[start].adjusted_close - 1.0)
+    })
+}
+
+fn skipped_return(
+    history: &[&DailyBar],
+    index: usize,
+    lookback: usize,
+    skip: usize,
+) -> Option<f64> {
+    let start = index.checked_sub(lookback)?;
+    let end = index.checked_sub(skip)?;
+    finite(history[end].adjusted_close / history[start].adjusted_close - 1.0)
+}
+
+fn log_returns(history: &[&DailyBar], index: usize, window: usize) -> Vec<f64> {
+    let Some(start) = index.checked_sub(window) else {
+        return Vec::new();
+    };
+    (start + 1..=index)
+        .filter_map(|i| finite((history[i].adjusted_close / history[i - 1].adjusted_close).ln()))
+        .collect()
+}
+
+fn standard_deviation(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    finite(
+        (values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / values.len() as f64)
+            .sqrt(),
+    )
+}
+
+fn downside_deviation(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    finite(
+        (values
+            .iter()
+            .map(|value| value.min(0.0).powi(2))
+            .sum::<f64>()
+            / values.len() as f64)
+            .sqrt(),
+    )
+}
+
+fn skew(values: &[f64]) -> Option<f64> {
+    let deviation = standard_deviation(values)?;
+    if deviation <= f64::EPSILON {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    finite(
+        values
+            .iter()
+            .map(|value| ((value - mean) / deviation).powi(3))
+            .sum::<f64>()
+            / values.len() as f64,
+    )
+}
+
+fn trailing<'a>(
+    history: &'a [&DailyBar],
+    index: usize,
+    window: usize,
+) -> Option<&'a [&'a DailyBar]> {
+    let start = index.checked_add(1)?.checked_sub(window)?;
+    Some(&history[start..=index])
+}
+
+fn max_drawdown(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let bars = trailing(history, index, window)?;
+    let mut peak = bars[0].adjusted_close;
+    let mut drawdown = 0.0_f64;
+    for bar in bars {
+        peak = peak.max(bar.adjusted_close);
+        drawdown = drawdown.min(bar.adjusted_close / peak - 1.0);
+    }
+    finite(drawdown)
+}
+
+fn distance_from_high(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let bars = trailing(history, index, window)?;
+    let high = bars
+        .iter()
+        .map(|bar| bar.adjusted_close)
+        .fold(f64::NEG_INFINITY, f64::max);
+    finite(history[index].adjusted_close / high - 1.0)
+}
+
+fn distance_from_low(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let bars = trailing(history, index, window)?;
+    let low = bars
+        .iter()
+        .map(|bar| bar.adjusted_close)
+        .fold(f64::INFINITY, f64::min);
+    finite(history[index].adjusted_close / low - 1.0)
+}
+
+fn close_location(bar: &DailyBar) -> Option<f64> {
+    let width = bar.raw_high - bar.raw_low;
+    if width <= f64::EPSILON {
+        return Some(0.0);
+    }
+    finite(2.0 * (bar.raw_close - bar.raw_low) / width - 1.0)
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        finite((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        finite(values[middle])
+    }
+}
+
+fn median_notional(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let mut notionals = trailing(history, index, window)?
+        .iter()
+        .map(|bar| bar.raw_close * bar.volume)
+        .collect::<Vec<_>>();
+    median(&mut notionals)
+}
+
+fn amihud(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_sub(window)?;
+    let mut total = 0.0;
+    for i in start + 1..=index {
+        let notional = history[i].raw_close * history[i].volume;
+        if notional <= 0.0 {
+            return None;
+        }
+        total += (history[i].adjusted_close / history[i - 1].adjusted_close - 1.0).abs() / notional;
+    }
+    finite(total / window as f64 * 1_000_000.0)
+}
+
+fn volume_surge(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
+    let start = index.checked_sub(window)?;
+    let mut prior = history[start..index]
+        .iter()
+        .map(|bar| bar.volume)
+        .collect::<Vec<_>>();
+    let baseline = median(&mut prior)?;
+    if baseline <= 0.0 {
+        return None;
+    }
+    finite(history[index].volume / baseline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::{Duration, Month};
+
+    fn bars(instrument: &str, count: usize, scale: f64) -> Vec<DailyBar> {
+        let start = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        let mut previous = 100.0 * scale;
+        (0..count)
+            .map(|index| {
+                let open = previous * (1.0 + (index as f64 * 0.17).sin() * 0.002);
+                let close = open * (1.0 + (index as f64 * 0.31).cos() * 0.01);
+                previous = close;
+                DailyBar {
+                    date: start + Duration::days(index as i64),
+                    instrument_id: instrument.into(),
+                    raw_open: open,
+                    raw_high: open.max(close) * 1.005,
+                    raw_low: open.min(close) * 0.995,
+                    raw_close: close,
+                    volume: 10_000.0 + index as f64,
+                    adjusted_close: close,
+                }
+            })
+            .collect()
+    }
+
+    fn microstructure_bars(instrument: &str, count: usize) -> Vec<MarketMicrostructureBar> {
+        let start = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        (0..count)
+            .map(|index| {
+                let close = 100.0 + index as f64;
+                MarketMicrostructureBar {
+                    date: start + Duration::days(index as i64),
+                    instrument_id: instrument.into(),
+                    bid: Some(close - 0.05),
+                    ask: Some(close + 0.05),
+                    close,
+                    average: Some(close - 0.1),
+                    turnover_sek: 1_000_000.0 + index as f64 * 10_000.0,
+                    trades: Some(1_000 + index as u64),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn microstructure_features_are_trailing_and_ignore_future_rows() {
+        let full = microstructure_bars("TX1", 30);
+        let through_twenty = full[..20].to_vec();
+        let date = through_twenty.last().unwrap().date;
+        let prefix = microstructure_features(&through_twenty).unwrap();
+        let complete = microstructure_features(&full).unwrap();
+        let key = &("TX1".into(), date);
+        let prefix_row = &prefix.features[key];
+        assert_eq!(prefix_row, &complete.features[key]);
+        assert_eq!(
+            prefix.median_spread_bps_20[key],
+            complete.median_spread_bps_20[key]
+        );
+        assert_eq!(prefix_row.len(), MICROSTRUCTURE_FEATURE_NAMES.len());
+        assert!(prefix_row.iter().all(Option::is_some));
+        assert!(prefix_row[0].unwrap() > 0.0);
+    }
+
+    #[test]
+    fn borrow_fee_features_are_trailing_and_keep_decimal_annual_rates() {
+        let start = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        let full = (0..30)
+            .map(|index| BorrowFeeBar {
+                date: start + Duration::days(index),
+                instrument_id: "TX1".into(),
+                annual_rate: 0.01 + index as f64 / 10_000.0,
+            })
+            .collect::<Vec<_>>();
+        let prefix = borrow_fee_features(&full[..21]).unwrap();
+        let complete = borrow_fee_features(&full).unwrap();
+        let date = full[20].date;
+        let row = &prefix[&("TX1".into(), date)];
+        assert_eq!(row, &complete[&("TX1".into(), date)]);
+        assert_eq!(row.len(), BORROW_FEE_FEATURE_NAMES.len());
+        assert_eq!(row[0], Some(0.012));
+        assert!(row.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn public_short_events_are_strictly_asof_and_threshold_exits_are_not_zero_fills() {
+        let event_date = Date::from_calendar_date(2024, Month::January, 10).unwrap();
+        let events = vec![
+            PublicShortPositionEvent {
+                holder: "Fund A".into(),
+                isin: "SE0000000001".into(),
+                position_date: event_date,
+                position_percent: Some(0.7),
+            },
+            PublicShortPositionEvent {
+                holder: "Fund A".into(),
+                isin: "SE0000000001".into(),
+                position_date: event_date + Duration::days(10),
+                position_percent: Some(1.0),
+            },
+            PublicShortPositionEvent {
+                holder: "Fund A".into(),
+                isin: "SE0000000001".into(),
+                position_date: event_date + Duration::days(45),
+                position_percent: None,
+            },
+        ];
+        let mut cursor = PublicShortCursor::new(&events).unwrap();
+
+        cursor.advance_before(event_date);
+        assert_eq!(
+            cursor.values("SE0000000001", event_date),
+            vec![None; PUBLIC_SHORT_FEATURE_NAMES.len()]
+        );
+        cursor.advance_before(event_date + Duration::days(1));
+        assert_eq!(
+            cursor.values("SE0000000001", event_date + Duration::days(1))[0],
+            Some(0.7)
+        );
+        assert_eq!(
+            cursor.values("SE0000000002", event_date + Duration::days(1)),
+            vec![Some(0.0), Some(0.0), Some(0.0), Some(0.0), None, Some(0.0)]
+        );
+        cursor.advance_before(event_date + Duration::days(10));
+        assert_eq!(
+            cursor.values("SE0000000001", event_date + Duration::days(10))[0],
+            Some(0.7),
+            "same-day changes must not enter the decision"
+        );
+        cursor.advance_before(event_date + Duration::days(46));
+        let after_exit = cursor.values("SE0000000001", event_date + Duration::days(46));
+        assert_eq!(after_exit[0], Some(0.0));
+        assert_eq!(after_exit[1], Some(0.0));
+        assert_eq!(after_exit[2], Some(-1.0));
+    }
+
+    #[test]
+    fn pdmr_features_use_publication_date_and_ignore_non_initial_filings() {
+        let published = Date::from_calendar_date(2024, Month::January, 10).unwrap();
+        let event = |publication_date, nature: &str, initial_notification, value: f64| {
+            PdmrTransactionEvent {
+                publication_date,
+                transaction_date: published - Duration::days(5),
+                pdmr: "Manager A".into(),
+                isin: "SE0000000001".into(),
+                initial_notification,
+                linked_to_share_option_programme: false,
+                nature: nature.into(),
+                instrument_type: "Share".into(),
+                volume: Some(value / 10.0),
+                unit: "Quantity".into(),
+                price: Some(10.0),
+                currency: "SEK".into(),
+            }
+        };
+        let mut foreign = event(published + Duration::days(3), "Acquisition", true, 2_000.0);
+        foreign.pdmr = "Manager B".into();
+        foreign.currency = "CAD".into();
+        let events = vec![
+            event(published, "Acquisition", true, 1_000.0),
+            event(published + Duration::days(1), "Acquisition", false, 2_000.0),
+            foreign,
+            event(published + Duration::days(5), "Disposal", true, 500.0),
+        ];
+        let mut cursor = PdmrCursor::new(&events).unwrap();
+
+        cursor.advance_before(published);
+        assert_eq!(
+            cursor.values("SE0000000001", published),
+            vec![None; PDMR_FEATURE_NAMES.len()],
+            "trade date must not make the filing available before publication"
+        );
+        cursor.advance_before(published + Duration::days(1));
+        assert_eq!(
+            cursor.values("SE0000000001", published + Duration::days(1))[0],
+            Some(1_000.0)
+        );
+        cursor.advance_before(published + Duration::days(5));
+        assert_eq!(
+            cursor.values("SE0000000001", published + Duration::days(5))[0],
+            Some(1_000.0),
+            "same-day filings and amendment rows must not enter the decision"
+        );
+        cursor.advance_before(published + Duration::days(6));
+        let values = cursor.values("SE0000000001", published + Duration::days(6));
+        assert_eq!(values[0], Some(500.0));
+        assert_eq!(values[1], Some(500.0));
+        assert_eq!(values[2], Some(1_000.0));
+        assert_eq!(values[3], Some(500.0));
+        assert_eq!(values[4], Some(3.0));
+        assert_eq!(values[5], Some(2.0));
+        assert_eq!(values[6], Some(3.0));
+        assert_eq!(
+            cursor.values("SE0000000002", published + Duration::days(6)),
+            vec![
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn financial_report_features_are_strictly_asof_and_deduplicate_translations() {
+        let history = bars("I1", 50, 1.0);
+        let published = history[10].date;
+        let event = FinancialReportEvent {
+            instrument_id: "I1".into(),
+            publication_date: published,
+            publication_key: "2024-01-11 18:00:00".into(),
+            after_market_close: true,
+        };
+        let events = vec![event.clone(), event];
+        let mut full = FinancialReportCursor::new(&events, &history).unwrap();
+        full.advance_before(published);
+        assert_eq!(
+            full.values("I1", published),
+            vec![None; REPORT_EVENT_FEATURE_NAMES.len()]
+        );
+        let next = history[11].date;
+        full.advance_before(next);
+        let values = full.values("I1", next);
+        assert_eq!(values[0], Some(1.0));
+        assert_eq!(values[1], Some(1.0));
+        assert_eq!(values[2], Some(1.0));
+        assert!(
+            (values[3].unwrap() - (history[11].adjusted_close / history[10].adjusted_close - 1.0))
+                .abs()
+                < 1e-12
+        );
+
+        let prefix_history = history[..15].to_vec();
+        let mut prefix = FinancialReportCursor::new(&events, &prefix_history).unwrap();
+        prefix.advance_before(history[14].date);
+        full.advance_before(history[14].date);
+        assert_eq!(
+            prefix.values("I1", history[14].date),
+            full.values("I1", history[14].date),
+            "future prices must not change an earlier report reaction"
+        );
+    }
+
+    #[test]
+    fn company_news_features_are_strictly_asof_and_prefix_invariant() {
+        let history = bars("I1", 50, 1.0);
+        let published = history[10].date;
+        let event = CompanyNewsEvent {
+            instrument_id: "I1".into(),
+            publication_date: published,
+            publication_key: "123".into(),
+            after_market_close: true,
+            kind: CompanyNewsKind::InsideInformation,
+        };
+        let events = vec![event.clone(), event];
+        let mut full = CompanyNewsCursor::new(&events, &history).unwrap();
+        full.advance_before(published);
+        assert_eq!(
+            full.values("I1", published),
+            vec![None; COMPANY_NEWS_FEATURE_NAMES.len()]
+        );
+        let next = history[11].date;
+        full.advance_before(next);
+        let values = full.values("I1", next);
+        assert_eq!(values.len(), COMPANY_NEWS_FEATURE_NAMES.len());
+        assert_eq!(values[0], Some(1.0));
+        assert_eq!(values[1], Some(1.0));
+        assert_eq!(values[2], Some(1.0));
+        assert_eq!(values[3], Some(1.0));
+        assert_eq!(values[4], Some(1.0));
+        assert!(
+            (values[5].unwrap() - (history[11].adjusted_close / history[10].adjusted_close - 1.0))
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(values[8..], [Some(0.0); 5]);
+
+        let prefix_history = history[..15].to_vec();
+        let mut prefix = CompanyNewsCursor::new(&events, &prefix_history).unwrap();
+        prefix.advance_before(history[14].date);
+        full.advance_before(history[14].date);
+        assert_eq!(
+            prefix.values("I1", history[14].date),
+            full.values("I1", history[14].date),
+            "future prices must not change an earlier company-news reaction"
+        );
+    }
+
+    #[test]
+    fn report_text_metrics_are_bilingual_rust_owned_and_strictly_asof() {
+        let published = Date::from_calendar_date(2024, Month::January, 10).unwrap();
+        let body = concat!(
+            "Net sales for the quarter amounted to SEK 414 (405) million. ",
+            "EBIT amounted to SEK 66 (63) million. ",
+            "EBIT margin amounted to 15.9 (15.5) percent. ",
+            "Earnings per share amounted to SEK 0.49 (0.46)."
+        );
+        let event = FinancialReportTextEvent {
+            instrument_id: "I1".into(),
+            publication_date: published,
+            publication_key: "2024-01-10 07:00:00".into(),
+            language: "en".into(),
+            body_text: body.into(),
+        };
+        let mut cursor = FinancialReportTextCursor::new(&[event.clone(), event]).unwrap();
+        cursor.advance_before(published);
+        assert_eq!(
+            cursor.values("I1", published),
+            vec![None; REPORT_TEXT_FEATURE_NAMES.len()]
+        );
+        let decision = published + Duration::days(1);
+        cursor.advance_before(decision);
+        let values = cursor.values("I1", decision);
+        assert_eq!(values.len(), REPORT_TEXT_FEATURE_NAMES.len());
+        assert_eq!(values[0], Some(1.0));
+        assert!((values[1].unwrap() - (414.0 / 405.0 - 1.0)).abs() < 1e-12);
+        assert_eq!(values[2], None);
+        assert!((values[3].unwrap() - (66.0 / 63.0 - 1.0)).abs() < 1e-12);
+        assert!((values[4].unwrap() - 0.159).abs() < 1e-12);
+        assert!((values[5].unwrap() - 0.004).abs() < 1e-12);
+        assert!((values[6].unwrap() - (0.49 / 0.46 - 1.0)).abs() < 1e-12);
+
+        let swedish = extract_report_text_metrics(
+            "Nettoomsättning 2 018 (1 925) MSEK. Rörelseresultat 422 (357) MSEK. Rörelsemarginal 20,9 (18,6) procent.",
+        );
+        assert!((swedish[0].unwrap() - (2018.0 / 1925.0 - 1.0)).abs() < 1e-12);
+        assert!((swedish[2].unwrap() - (422.0 / 357.0 - 1.0)).abs() < 1e-12);
+        assert!((swedish[3].unwrap() - 0.209).abs() < 1e-12);
+    }
+
+    #[test]
+    fn annual_fundamentals_are_strictly_asof_and_ratios_are_rust_owned() {
+        let history = bars("I1", 50, 1.0);
+        let available = history[10].date;
+        let event = AnnualFundamentalEvent {
+            instrument_id: "I1".into(),
+            available_date: available,
+            report_period_end: available - Duration::days(10),
+            filing_key: "filing-1".into(),
+            reporting_currency: Some("iso4217:SEK".into()),
+            revenue: Some(400.0),
+            prior_revenue: Some(320.0),
+            operating_profit: Some(60.0),
+            net_income: Some(50.0),
+            prior_net_income: Some(30.0),
+            assets: Some(1_000.0),
+            prior_assets: Some(900.0),
+            equity: Some(500.0),
+            prior_equity: Some(450.0),
+            cash: Some(100.0),
+            operating_cash_flow: Some(80.0),
+            current_assets: Some(300.0),
+            current_liabilities: Some(150.0),
+            basic_eps: Some(5.0),
+            weighted_average_shares: Some(10.0),
+        };
+        let events = [event];
+        let mut cursor = AnnualFundamentalCursor::new(&events, &history).unwrap();
+        cursor.advance_before(available);
+        assert_eq!(
+            cursor.values("I1", available),
+            vec![None; FUNDAMENTAL_FEATURE_NAMES.len()]
+        );
+        let decision = history[11].date;
+        cursor.advance_before(decision);
+        let values = cursor.values("I1", decision);
+        assert_eq!(values[0], Some(1.0));
+        assert_eq!(values[1], Some(0.5));
+        assert_eq!(values[2], Some(0.1));
+        assert_eq!(values[3], Some(0.08));
+        assert_eq!(values[4], Some(-0.03));
+        assert_eq!(values[7], Some(0.25));
+        assert_eq!(values[11], Some(2.0));
+        assert_eq!(
+            cursor.values("I2", decision),
+            vec![None; FUNDAMENTAL_FEATURE_NAMES.len()]
+        );
+    }
+
+    #[test]
+    fn macro_exposure_features_are_causal_and_require_declared_series() {
+        let history = bars("I1", 300, 1.0);
+        let instrument = InstrumentMeta {
+            instrument_id: "I1".into(),
+            symbol: "I1".into(),
+            isin: "SE0000000001".into(),
+            sector: "Industrials".into(),
+            bucket: UniverseBucket::LargeCap,
+        };
+        let series = REQUIRED_MACRO_SERIES
+            .iter()
+            .enumerate()
+            .map(|(series_index, series_id)| MacroSeries {
+                series_id: (*series_id).into(),
+                observations: history
+                    .iter()
+                    .enumerate()
+                    .map(|(index, bar)| MacroObservation {
+                        date: bar.date,
+                        value: 10.0
+                            * (1.0
+                                + (index as f64 * (0.07 + series_index as f64 * 0.01)).sin()
+                                    * 0.02),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let full = macro_features(&history, std::slice::from_ref(&instrument), &series).unwrap();
+        let decision = history[220].date;
+        let full_row = full.get(&("I1".into(), decision)).unwrap();
+        assert_eq!(full_row.len(), MACRO_FEATURE_NAMES.len());
+        assert!(full_row.iter().all(Option::is_some));
+
+        let prefix =
+            macro_features(&history[..=220], std::slice::from_ref(&instrument), &series).unwrap();
+        assert_eq!(
+            prefix.get(&("I1".into(), decision)),
+            Some(full_row),
+            "future stock bars must not alter earlier FX exposure"
+        );
+        assert!(macro_features(&history, &[instrument], &series[..2]).is_err());
+    }
+
+    fn market_bars(count: usize, daily_return: f64) -> Vec<MarketBar> {
+        let start = Date::from_calendar_date(2020, Month::January, 1).unwrap();
+        (0..count)
+            .scan(100.0, |close, index| {
+                if index > 0 {
+                    *close *= 1.0 + daily_return;
+                }
+                Some(MarketBar {
+                    date: start + Duration::days(index as i64),
+                    close: *close,
+                })
+            })
+            .collect()
+    }
+
+    fn market_index_series(symbol: &str, count: usize, daily_return: f64) -> MarketIndexSeries {
+        let start = Date::from_calendar_date(2020, Month::January, 1).unwrap();
+        let bars = (0..count)
+            .scan(100.0, |value, index| {
+                if index > 0 {
+                    *value *= 1.0 + daily_return;
+                }
+                Some(MarketIndexBar {
+                    date: start + Duration::days(index as i64),
+                    start_value: *value,
+                    end_value: *value * (1.0 + daily_return / 3.0),
+                })
+            })
+            .collect();
+        MarketIndexSeries {
+            symbol: symbol.into(),
+            bars,
+        }
+    }
+
+    fn direction_indexes(count: usize, sector_start: usize) -> Vec<MarketIndexSeries> {
+        DIRECTION_INDEX_SYMBOLS
+            .iter()
+            .enumerate()
+            .map(|(index, symbol)| {
+                let mut series =
+                    market_index_series(symbol, count, 0.0005 + index as f64 * 0.000_01);
+                if DIRECTION_SECTOR_SYMBOLS.contains(symbol) {
+                    series.bars.drain(..sector_start.min(series.bars.len()));
+                }
+                series
+            })
+            .collect()
+    }
+
+    #[test]
+    fn market_trend_is_causal_and_prefix_invariant() {
+        let bars = market_bars(320, 0.001);
+        let full = market_trend(&bars).unwrap();
+        let prefix = market_trend(&bars[..300]).unwrap();
+        assert_eq!(prefix, full[..prefix.len()]);
+        assert_eq!(full.first().unwrap().date, bars[252].date);
+        assert!(full.iter().all(|observation| observation.score == 1.0));
+    }
+
+    #[test]
+    fn market_trend_detects_a_broad_decline_and_rejects_bad_ordering() {
+        let mut bars = market_bars(300, -0.001);
+        let observations = market_trend(&bars).unwrap();
+        assert!(observations
+            .iter()
+            .all(|observation| observation.score == -1.0));
+        bars.swap(10, 11);
+        assert!(market_trend(&bars).is_err());
+    }
+
+    #[test]
+    fn direction_matrix_is_causal_and_uses_forward_sod_label() {
+        let indexes = direction_indexes(480, 300);
+        let primary = indexes
+            .iter()
+            .find(|series| series.symbol == "OMXSGI")
+            .unwrap();
+        let full =
+            direction_training_matrix(&indexes, primary.bars[252].date, primary.bars[470].date, 20)
+                .unwrap();
+        assert_eq!(full.features, direction_model_feature_names());
+        assert_eq!(full.rows[0].date, primary.bars[252].date);
+        assert_eq!(full.rows[0].entry_value, primary.bars[253].start_value);
+        assert_eq!(full.rows[0].exit_value, primary.bars[273].start_value);
+        assert!(
+            (full.rows[0].target
+                - (primary.bars[273].start_value / primary.bars[253].start_value - 1.0))
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            full.rows[0].features["m_sector_breadth_positive_21"], 1.0,
+            "early sector history must be marked missing rather than backfilled"
+        );
+        assert_eq!(
+            full.rows.last().unwrap().features["m_sector_breadth_positive_126"],
+            0.0
+        );
+
+        let cutoff = primary.bars[420].date;
+        let prefix_indexes = indexes
+            .iter()
+            .cloned()
+            .map(|mut series| {
+                series.bars.retain(|bar| bar.date <= cutoff);
+                series
+            })
+            .collect::<Vec<_>>();
+        let prefix = direction_training_matrix(
+            &prefix_indexes,
+            primary.bars[252].date,
+            primary.bars[470].date,
+            20,
+        )
+        .unwrap();
+        assert_eq!(prefix.rows, full.rows[..prefix.rows.len()]);
+    }
+
+    #[test]
+    fn direction_matrix_requires_the_declared_official_indexes() {
+        let mut indexes = direction_indexes(300, 0);
+        indexes.retain(|series| series.symbol != "OMXSBGI");
+        let start = indexes[0].bars[252].date;
+        let end = indexes[0].bars[270].date;
+        assert!(direction_training_matrix(&indexes, start, end, 5)
+            .unwrap_err()
+            .contains("OMXSBGI"));
+    }
+
+    #[test]
+    fn features_are_prefix_invariant() {
+        let input = bars("SE0000115446", 300, 1.0);
+        let full = daily(&input).unwrap();
+        let prefix = daily(&input[..260]).unwrap();
+        assert_eq!(prefix, full[..260]);
+    }
+
+    #[test]
+    fn adjusted_returns_do_not_use_raw_discontinuities() {
+        let mut input = bars("SE0000115446", 30, 1.0);
+        input[29].raw_close *= 0.5;
+        input[29].raw_open *= 0.5;
+        input[29].raw_high *= 0.5;
+        input[29].raw_low *= 0.5;
+        let rows = daily(&input).unwrap();
+        let last = rows.last().unwrap();
+        let expected = input[29].adjusted_close / input[28].adjusted_close - 1.0;
+        assert!((last.value("ret_1").unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cross_section_is_rust_ranked() {
+        let mut a = daily(&bars("A", 30, 1.0)).unwrap().pop().unwrap();
+        let mut b = a.clone();
+        b.instrument_id = "B".into();
+        let ret = FEATURE_NAMES
+            .iter()
+            .position(|name| *name == "ret_21")
+            .unwrap();
+        a.values[ret] = Some(-0.1);
+        b.values[ret] = Some(0.2);
+        let out = normalise_cross_section(&[a, b]).unwrap();
+        assert_eq!(out[0].values[ret], -1.0);
+        assert_eq!(out[1].values[ret], 1.0);
+    }
+
+    #[test]
+    fn feature_selection_is_versioned_and_closed() {
+        validate_selection(&["x_ret_21".into()]).unwrap();
+        validate_selection(&["x_sector_rel_ret_21".into()]).unwrap();
+        validate_selection(&["x_market_breadth_positive_21".into()]).unwrap();
+        validate_selection(&["x_market_resid_ret_126".into()]).unwrap();
+        assert!(validate_selection(&["ret_21".into()]).is_err());
+        assert!(validate_selection(&["x_made_up".into()]).is_err());
+    }
+
+    #[test]
+    fn residual_features_are_causal_and_finalized_in_rust() {
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..20 {
+            let id = format!("R{index}");
+            let mut history = bars(&id, 330, 1.0 + index as f64 / 100.0);
+            // Give the two sectors distinct but causal return paths so the
+            // market/sector factor regression is identified.
+            for (day, bar) in history.iter_mut().enumerate() {
+                let tilt = 1.0
+                    + ((day as f64 * 0.07 + index as f64 * 0.13).sin() * (index as f64 - 9.5)
+                        / 10_000.0);
+                bar.raw_open *= tilt;
+                bar.raw_high *= tilt;
+                bar.raw_low *= tilt;
+                bar.raw_close *= tilt;
+                bar.adjusted_close *= tilt;
+            }
+            all_bars.extend(history);
+            instruments.push(InstrumentMeta {
+                instrument_id: id,
+                symbol: format!("RS{index}"),
+                isin: format!("SE{index:010}"),
+                sector: if index < 10 { "A" } else { "B" }.into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        let cutoff =
+            Date::from_calendar_date(2024, Month::January, 1).unwrap() + Duration::days(299);
+        let prefix_bars = all_bars
+            .iter()
+            .filter(|bar| bar.date <= cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let full = residual_features(&all_bars, &instruments).unwrap();
+        let prefix = residual_features(&prefix_bars, &instruments).unwrap();
+        assert_eq!(
+            prefix.get(&("R0".into(), cutoff)).unwrap().values,
+            full.get(&("R0".into(), cutoff)).unwrap().values
+        );
+
+        let matrix = training_matrix_for_named_feature_set(
+            &all_bars,
+            &instruments,
+            cutoff,
+            cutoff + Duration::days(20),
+            5,
+            0.0,
+            FeatureSet::Residual,
+        )
+        .unwrap();
+        assert!(!matrix.rows.is_empty());
+        assert_eq!(matrix.features, residual_model_feature_names());
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| row.features.len() == residual_model_feature_names().len()));
+        assert!(matrix.rows.iter().all(|row| {
+            let absolute = row.return_per_risk_target.unwrap();
+            (absolute * row.vol60 - row.target).abs() < 1e-12
+        }));
+        for date in matrix
+            .rows
+            .iter()
+            .map(|row| row.date)
+            .collect::<BTreeSet<_>>()
+        {
+            let ranks = matrix
+                .rows
+                .iter()
+                .filter(|row| row.date == date)
+                .map(|row| row.relative_rank_target.unwrap())
+                .collect::<Vec<_>>();
+            assert!(ranks.iter().all(|rank| (-1.0..=1.0).contains(rank)));
+            assert!(ranks.iter().sum::<f64>().abs() < 1e-10);
+            let relative_risk = matrix
+                .rows
+                .iter()
+                .filter(|row| row.date == date)
+                .map(|row| row.relative_return_per_risk_target.unwrap())
+                .sum::<f64>();
+            assert!(relative_risk.abs() < 1e-10);
+        }
+        let beta_missing = matrix
+            .features
+            .iter()
+            .position(|name| name == "m_beta_252")
+            .unwrap();
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| { row.features[&matrix.features[beta_missing]] == 0.0 }));
+    }
+
+    #[test]
+    fn contextual_model_rows_are_entirely_rust_owned() {
+        let template = daily(&bars("A", 300, 1.0)).unwrap().pop().unwrap();
+        let ret21 = feature_index("ret_21").unwrap();
+        let inputs = (0..20)
+            .map(|index| {
+                let id = format!("I{index}");
+                let mut feature = template.clone();
+                feature.instrument_id.clone_from(&id);
+                feature.values[ret21] = Some(index as f64 / 100.0 - 0.05);
+                CrossSectionInput {
+                    meta: InstrumentMeta {
+                        instrument_id: id,
+                        symbol: format!("S{index}"),
+                        isin: format!("SE{index:010}"),
+                        sector: if index < 10 { "A" } else { "B" }.into(),
+                        bucket: UniverseBucket::LargeCap,
+                    },
+                    feature,
+                }
+            })
+            .collect::<Vec<_>>();
+        let output = model_cross_section(&inputs).unwrap();
+        assert_eq!(output.len(), inputs.len());
+        assert!(output
+            .iter()
+            .all(|row| row.values.len() == model_feature_names().len()));
+        let names = model_feature_names();
+        let breadth = names
+            .iter()
+            .position(|name| name == "x_market_breadth_positive_21")
+            .unwrap();
+        assert!(output
+            .iter()
+            .all(|row| (row.values[breadth] - 0.7).abs() < 1e-12));
+    }
+
+    #[test]
+    fn training_matrix_excludes_first_north() {
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..12 {
+            let id = format!("I{index}");
+            all_bars.extend(bars(&id, 300, 1.0 + index as f64 / 100.0));
+            instruments.push(InstrumentMeta {
+                instrument_id: id,
+                symbol: format!("S{index}"),
+                isin: format!("SE{index:010}"),
+                sector: "Industrials".into(),
+                bucket: if index < 6 {
+                    UniverseBucket::LargeCap
+                } else {
+                    UniverseBucket::FirstNorth
+                },
+            });
+        }
+        let start = all_bars[260].date;
+        let end = all_bars[290].date;
+        let matrix = training_matrix(&all_bars, &instruments, start, end, 5, 0.0).unwrap();
+        assert!(!matrix.rows.is_empty());
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| row.bucket.is_stockholm_main_market()));
+        for rows in matrix.rows.chunk_by(|left, right| left.date == right.date) {
+            let relative_sum = rows
+                .iter()
+                .map(|row| row.relative_target.unwrap())
+                .sum::<f64>();
+            assert!(relative_sum.abs() < 1e-10);
+            assert!(rows.iter().all(|row| {
+                (row.market_target.unwrap() + row.relative_target.unwrap() - row.target).abs()
+                    < 1e-12
+            }));
+        }
+    }
+}

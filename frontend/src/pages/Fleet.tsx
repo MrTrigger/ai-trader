@@ -3,7 +3,7 @@ import type { Overview } from "../api/types";
 import { Card, Heart, Pill } from "../components/Card";
 import { Spark } from "../components/Spark";
 import { execution } from "../components/RouteChain";
-import { activity } from "../lib/activity";
+import { activity, unackSeconds as unack } from "../lib/activity";
 import { FeedStatus } from "../components/FeedStatus";
 import { money, num, signed, stamp, tone } from "../lib/format";
 
@@ -67,6 +67,14 @@ export function Fleet({ ov, onRefresh }: { ov: Overview; onRefresh: () => void }
                     const act = activity({
                       enabled: b.enabled,
                       control: st.control_state,
+                      // The card used to omit this, so a control word nothing
+                      // had answered still rendered green here even while the
+                      // bot's own page called it out.
+                      unackSeconds: unack({
+                        control: st.control_state,
+                        setAt: st.control_set_at,
+                        heartbeatAgeSeconds: st.heartbeat_age_seconds,
+                      }),
                       feed: st.feed,
                     });
                     return <Pill tone={act.tone}>{act.label}</Pill>;

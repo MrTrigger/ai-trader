@@ -68,6 +68,60 @@ export const STOP_GRACE_S = 30;
  */
 export const APPLY_GRACE_S = 120;
 
+/**
+ * How long the operator's control word has gone unacknowledged, or `undefined`
+ * once the bot has taken it up.
+ *
+ * This lived inline in the bot page, which had two consequences and both of
+ * them were lies on the screen. The fleet card never computed it at all, so
+ * every card with a `running` control was green whatever was happening. And
+ * the page's version could only tell by comparing the control's timestamp
+ * against the bot's last publish — so when there had NEVER been a publish, the
+ * comparison was impossible and the code read that as acknowledged. A bot in
+ * the cluster that had never once started drew a green RUNNING pill next to
+ * its own "no heartbeat", and next to a red panel saying nothing had ever run
+ * it. Never published is the strongest evidence there is that nothing has
+ * taken the control up; it must fail closed, not open.
+ */
+export function unackSeconds(a: {
+  /** The control word: running | halted | stopped. */
+  control?: string | null;
+  /** When the operator set it (ISO 8601). */
+  setAt?: string | null;
+  /** The state the bot itself last published, if it publishes one. */
+  publishedState?: string | null;
+  /** Age of that publish. `null`/absent means it has never published. */
+  heartbeatAgeSeconds?: number | null;
+  now?: number;
+}): number | undefined {
+  if (!a.control || !a.setAt) return undefined;
+  const setAt = Date.parse(a.setAt);
+  if (Number.isNaN(setAt)) return undefined;
+  const now = a.now ?? Date.now();
+
+  // Ask the bot first: a published state naming the control's outcome IS the
+  // acknowledgement, and needs no clocks.
+  const semanticAck =
+    a.control === "running"
+      ? a.publishedState === "running"
+      : a.control === "stopped" || a.control === "halted"
+        ? a.publishedState === "halted"
+        : false;
+  if (semanticAck) return undefined;
+
+  const pending = now - setAt;
+  // Never published: nothing can have taken this up.
+  if (a.heartbeatAgeSeconds == null) return Math.max(0, pending / 1000);
+
+  // Timestamp fallback, with a margin WIDER than its own noise. The ack
+  // publish lands ~0.3s after set_at (the control is pushed), but the
+  // heartbeat age is an integer, so now-minus-age carries up to a second of
+  // rounding — more than the gap being measured. Without the margin, an
+  // acknowledged Stop could read as pending on a coin flip.
+  const lastPublish = now - a.heartbeatAgeSeconds * 1000;
+  return setAt > lastPublish + 2_000 ? Math.max(0, pending / 1000) : undefined;
+}
+
 export function activity(a: {
   enabled?: boolean;
   /** The canonical control word: running | halted | stopped. */

@@ -18,6 +18,8 @@
 //! Everything here is offline-compiled and gated on `ib-check` against the
 //! operator's Gateway before any order path is trusted.
 
+pub mod stocks;
+
 use async_trait::async_trait;
 use ibapi::contracts::Contract;
 use ibapi::orders::{Action, ExecutionFilter, Executions, Order};
@@ -34,6 +36,63 @@ use venue::{
 /// call the venue unreachable. Generous: the Gateway answers in ms.
 const READ_TIMEOUT_S: u64 = 15;
 
+/// Broker connection and account identity shared by every IB consumer.
+///
+/// Instrument selection, data requests, and order policy are deliberately not
+/// part of this type. A futures venue and an equities data collector may share
+/// one Gateway without either importing the other's bot logic.
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    pub host: String,
+    pub port: u16,
+    pub client_id: i32,
+    /// Required and verified after connecting. Never infer the account from
+    /// whichever session happens to be open in Gateway.
+    pub account: String,
+}
+
+impl GatewayConfig {
+    pub fn from_env(live: bool, client_id: i32) -> Result<Self, String> {
+        // Host and port describe the Gateway process, not the account type.
+        // Whether that Gateway is expected to hold a paper or live account is
+        // selected independently below and verified after connecting.
+        let host = std::env::var("IB_GATEWAY_HOST")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".into());
+        let port_value = std::env::var("IB_GATEWAY_PORT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "4002".into());
+        let port: u16 = port_value
+            .parse()
+            .map_err(|e| format!("bad IB gateway port {port_value:?}: {e}"))?;
+        let account_key = if live {
+            "IB_LIVE_ACCOUNT"
+        } else {
+            "IB_PAPER_ACCOUNT"
+        };
+        let account = std::env::var(account_key).unwrap_or_default();
+        if account.is_empty() {
+            return Err(
+                "IB account not configured (IB_PAPER_ACCOUNT / IB_LIVE_ACCOUNT in .env) — \
+                 refusing whichever account the Gateway happens to hold"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            host,
+            port,
+            client_id,
+            account,
+        })
+    }
+
+    fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IbConfig {
     pub host: String,
@@ -49,40 +108,10 @@ pub struct IbConfig {
 }
 
 impl IbConfig {
-    /// From the environment, per .env section 7. `live` selects the
-    /// IB_LIVE_* block; default is the paper block.
+    /// From the environment, per .env section 7. `live` selects the expected
+    /// live account; both modes connect through the shared Gateway endpoint.
     pub fn from_env(live: bool) -> Result<Self, String> {
-        let pick = |paper: &str, live_k: &str| {
-            std::env::var(if live { live_k } else { paper }).unwrap_or_default()
-        };
-        let host = {
-            let h = pick("IB_PAPER_HOST", "IB_LIVE_HOST");
-            if h.is_empty() {
-                "127.0.0.1".into()
-            } else {
-                h
-            }
-        };
-        let port: u16 = {
-            let p = pick("IB_PAPER_PORT", "IB_LIVE_PORT");
-            if p.is_empty() {
-                if live {
-                    4001
-                } else {
-                    4002
-                }
-            } else {
-                p.parse().map_err(|e| format!("bad IB port {p:?}: {e}"))?
-            }
-        };
-        let account = pick("IB_PAPER_ACCOUNT", "IB_LIVE_ACCOUNT");
-        if account.is_empty() {
-            return Err(
-                "IB account not configured (IB_PAPER_ACCOUNT / IB_LIVE_ACCOUNT in .env) — \
-                 refusing to trade whichever account the Gateway happens to hold"
-                    .into(),
-            );
-        }
+        let gateway = GatewayConfig::from_env(live, 9)?;
         let yes = |k: &str| {
             matches!(
                 std::env::var(k).unwrap_or_default().to_lowercase().as_str(),
@@ -90,19 +119,28 @@ impl IbConfig {
             )
         };
         Ok(Self {
-            host,
-            port,
+            host: gateway.host,
+            port: gateway.port,
             // The trading loop's id. Every other purpose that connects to the
             // same Gateway must take a different one: IB refuses a duplicate,
             // and it can hold a just-disconnected id reserved for a while, so
             // two phases of one deployment sharing an id fail intermittently
             // and only under load. 8 is the ib-check probe, 7 is backfill.
-            client_id: 9,
-            account,
+            client_id: gateway.client_id,
+            account: gateway.account,
             symbol: std::env::var("IB_SYMBOL").unwrap_or_else(|_| "MNQ".into()),
             allow_orders: yes("IB_ALLOW_ORDERS"),
             allow_live: yes("IB_ALLOW_LIVE"),
         })
+    }
+
+    pub fn gateway_config(&self) -> GatewayConfig {
+        GatewayConfig {
+            host: self.host.clone(),
+            port: self.port,
+            client_id: self.client_id,
+            account: self.account.clone(),
+        }
     }
 }
 
@@ -120,6 +158,37 @@ pub struct IbVenue {
 
 fn unreachable_err<E: std::fmt::Display>(e: E) -> VenueError {
     VenueError::Unreachable(e.to_string())
+}
+
+/// Connect and prove account identity once for every IB adapter/data source.
+/// The returned boolean is the broker's paper-account classification.
+async fn connect_verified(cfg: &GatewayConfig) -> Result<(Client, bool), VenueError> {
+    let addr = cfg.address();
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(READ_TIMEOUT_S),
+        Client::connect(&addr, cfg.client_id),
+    )
+    .await
+    .map_err(|_| {
+        VenueError::Unreachable(format!(
+            "timed out connecting to IB Gateway at {addr} after {READ_TIMEOUT_S}s"
+        ))
+    })?
+    .map_err(|e| {
+        VenueError::Unreachable(format!(
+            "cannot connect to IB Gateway at {addr}: {e}. Checklist: Gateway \
+             running? API enabled? correct IB_GATEWAY_HOST/IB_GATEWAY_PORT?"
+        ))
+    })?;
+    let accounts = client.managed_accounts().await.map_err(unreachable_err)?;
+    if !accounts.iter().any(|a| a == &cfg.account) {
+        return Err(VenueError::Unreachable(format!(
+            "the Gateway does not hold account {:?} (it holds {:?}) — wrong Gateway \
+             or wrong environment",
+            cfg.account, accounts
+        )));
+    }
+    Ok((client, cfg.account.starts_with('D')))
 }
 
 fn dec(x: f64) -> Decimal {
@@ -148,23 +217,7 @@ impl IbVenue {
     /// Connect, verify the configured account, resolve the front month, and
     /// decide the arming state. Read paths work regardless of arming.
     pub async fn connect(cfg: IbConfig) -> Result<Self, VenueError> {
-        let addr = format!("{}:{}", cfg.host, cfg.port);
-        let client = Client::connect(&addr, cfg.client_id).await.map_err(|e| {
-            VenueError::Unreachable(format!(
-                "cannot connect to IB Gateway at {addr}: {e}. Checklist: Gateway \
-                 running? API enabled? correct port (4001 live / 4002 paper)?"
-            ))
-        })?;
-
-        let accounts = client.managed_accounts().await.map_err(unreachable_err)?;
-        if !accounts.iter().any(|a| a == &cfg.account) {
-            return Err(VenueError::Unreachable(format!(
-                "the Gateway does not hold account {:?} (it holds {:?}) — wrong Gateway \
-                 or wrong .env",
-                cfg.account, accounts
-            )));
-        }
-        let paper = cfg.account.starts_with('D');
+        let (client, paper) = connect_verified(&cfg.gateway_config()).await?;
         let armed = cfg.allow_orders && (paper || cfg.allow_live);
 
         // Resolve the front month: every listed expiry, keep the nearest one

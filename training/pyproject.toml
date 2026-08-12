@@ -1,7 +1,7 @@
 [project]
 name = "ai-trader-training"
 version = "0.1.0"
-description = "LightGBM fitting only; all inputs and targets are finalized by Rust"
+description = "Model fitting only; all inputs and targets are finalized by Rust"
 requires-python = ">=3.12"
 dependencies = [
     "lightgbm>=4.0",
@@ -16,4 +16,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["train"]
+py-modules = ["summarize_stockholm", "train", "train_stockholm", "train_stockholm_direction", "walk_forward_stockholm", "walk_forward_stockholm_direction"]

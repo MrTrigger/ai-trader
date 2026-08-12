@@ -19,3 +19,4 @@
 # The rendered research view is derived from the committed record.
 docs/research/*.html
 data/models/
+.claude/worktrees/

@@ -1,0 +1,20 @@
+[package]
+name = "stockholm-portfolio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+equity-data = { workspace = true }
+features-stockholm = { workspace = true }
+ib = { path = "../ib" }
+lightgbm-json = { workspace = true }
+portfolio-construction = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+time = { workspace = true, features = ["macros"] }
+
+[[bin]]
+name = "stockholm-portfolio"
+path = "src/main.rs"

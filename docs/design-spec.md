@@ -900,6 +900,11 @@ an argument, and it does not currently have one.
 
 ### 9.1 What Phase 6 inherits, and what it doesn't
 
+The concrete Nasdaq Stockholm long/short design is specified in
+[`stockholm-portfolio-design.md`](stockholm-portfolio-design.md). It resolves
+the universe, data, feature, short-borrow, cadence, construction, and evidence
+contracts while retaining the interfaces and gates below.
+
 The equities book reuses **everything above the interfaces**: the run loop, the Plan artifact, the
 risk layer, both constructors, the cost model, reconciliation, the executor, the reporting, and
 every gate. That is the payoff for §4 existing.

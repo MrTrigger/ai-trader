@@ -1,0 +1,16 @@
+[package]
+name = "equity-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+calamine = "0.30"
+csv = "1"
+encoding_rs = "0.8"
+rayon = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+scraper = { version = "0.22", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["macros"] }

@@ -482,6 +482,19 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
                                     v["spawn"] = serde_json::json!({ "spawned": false, "error": e })
                                 }
                             }
+                        } else if state == "stopped" {
+                            // A bot already in its heartbeat loop owns the
+                            // flatten-and-exit sequence. A pre-loop launcher
+                            // (IB readiness/warmup) cannot observe control and
+                            // must be stopped here so its Gateway lease cannot
+                            // outlive the requested bot state.
+                            match fleet::terminate_silent_launch(&id) {
+                                Ok(stop) => v["launcher_stop"] = stop,
+                                Err(e) => {
+                                    v["launcher_stop"] =
+                                        serde_json::json!({ "terminated": false, "error": e })
+                                }
+                            }
                         }
                         json(&mut stream, 200, &serde_json::to_vec(&v).unwrap())
                     }

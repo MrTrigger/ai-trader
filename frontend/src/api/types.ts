@@ -43,6 +43,7 @@ export const Status = z.object({
   halted: z.unknown().optional(),
   kill_switch: z.boolean().nullable().optional(),
   control_state: z.string().optional(),
+  control_set_at: z.string().optional(),
   heartbeat_age_seconds: z.number().nullable().optional(),
   net_total: z.number().nullable().optional(),
   trades_total: z.number().nullable().optional(),

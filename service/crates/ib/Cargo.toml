@@ -9,5 +9,7 @@ ibapi = { version = "3", default-features = false, features = ["async"] }
 venue = { workspace = true }
 async-trait = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "macros"] }
 tokio = { workspace = true, features = ["time", "sync"] }

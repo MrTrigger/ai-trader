@@ -11,7 +11,7 @@ import { LogModal } from "../components/LogModal";
 import { RunModal, type Run } from "../components/RunModal";
 import { LocalConsole } from "../components/LocalConsole";
 import { money, num, signed, stamp, tone } from "../lib/format";
-import { activity } from "../lib/activity";
+import { activity, unackSeconds as unack } from "../lib/activity";
 
 /** What a run did, in the space of a table row. */
 function summarise(r: Record<string, unknown>): string {
@@ -41,33 +41,14 @@ export function BotPage({ id, d, onRefresh }: { id: string; d: BotDetail; onRefr
   const sleeves = Object.entries(det.sleeves ?? {});
   const feed = det.feed;
   const ctl = d.controls as { state?: string; set_at?: string } | null;
-  // Has the bot seen the control yet? Its last publish is now minus the
-  // heartbeat age; if the operator set the word after that, it has not.
-  // Has the bot seen the control? Ask the bot first: its published state
-  // naming the control's outcome IS the acknowledgement, no clocks needed.
-  // (Only the botstate contract publishes this; the runner path falls
-  // through to timestamps.)
-  const semanticAck =
-    ctl?.state === "running"
-      ? st.state === "running"
-      : ctl?.state === "stopped" || ctl?.state === "halted"
-        ? st.state === "halted"
-        : false;
-  const lastPublish =
-    d.heartbeat_age_seconds != null ? Date.now() - d.heartbeat_age_seconds * 1000 : null;
-  // Timestamp fallback, with a margin WIDER than its own noise. The ack
-  // publish lands ~0.3s after set_at (the control is pushed), but
-  // heartbeat_age_seconds is an integer, so now-minus-age carries up to a
-  // second of rounding — more than the gap being measured. Without the
-  // margin, an acknowledged Stop could read as pending on a coin flip and
-  // go red at the 30s grace until the next periodic publish rescued it.
-  const unackSeconds =
-    !semanticAck &&
-    ctl?.set_at &&
-    lastPublish != null &&
-    Date.parse(ctl.set_at) > lastPublish + 2_000
-      ? Math.max(0, (Date.now() - Date.parse(ctl.set_at)) / 1000)
-      : undefined;
+  // Has the bot seen the control yet? lib/activity owns that question, so the
+  // fleet card and this page cannot answer it differently — which they did.
+  const unackSeconds = unack({
+    control: ctl?.state,
+    setAt: ctl?.set_at,
+    publishedState: st.state,
+    heartbeatAgeSeconds: d.heartbeat_age_seconds,
+  });
   // What it is doing, which is not what it was told (the control word) and
   // not what it is wired to do (the route chain). See lib/activity.
   const act = activity({ enabled: d.enabled, control: ctl?.state, unackSeconds, feed });

@@ -1,11 +1,11 @@
 [package]
-name = "features-crypto"
+name = "features-stockholm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 features-common = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+regex = "1"
 serde = { workspace = true }
-serde_json = { workspace = true }
+time = { workspace = true, features = ["macros"] }

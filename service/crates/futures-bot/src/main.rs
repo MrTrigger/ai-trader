@@ -404,8 +404,11 @@ async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
         Err(e) if e.contains("account not configured") => {
             // The probe's job is discovery: connect anyway, report what the
             // Gateway holds, and continue with it if it is unambiguous.
-            let host = std::env::var("IB_PAPER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-            let port: u16 = std::env::var("IB_PAPER_PORT")
+            let host = std::env::var("IB_GATEWAY_HOST")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let port: u16 = std::env::var("IB_GATEWAY_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(4002);
@@ -416,13 +419,23 @@ async fn ib_check(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             let accounts = client.managed_accounts().await.map_err(|e| e.to_string())?;
             println!("gateway holds account(s): {accounts:?}");
             let [only] = accounts.as_slice() else {
+                let account_key = if live {
+                    "IB_LIVE_ACCOUNT"
+                } else {
+                    "IB_PAPER_ACCOUNT"
+                };
                 return Err(format!(
-                    "{e}. Set IB_PAPER_ACCOUNT to one of {accounts:?} in .env."
+                    "{e}. Set {account_key} to one of {accounts:?} in .env."
                 ));
             };
-            println!("using {only} for this probe — set IB_PAPER_ACCOUNT in .env to keep it");
+            let account_key = if live {
+                "IB_LIVE_ACCOUNT"
+            } else {
+                "IB_PAPER_ACCOUNT"
+            };
+            println!("using {only} for this probe — set {account_key} in .env to keep it");
             drop(client);
-            std::env::set_var("IB_PAPER_ACCOUNT", only);
+            std::env::set_var(account_key, only);
             ib::IbConfig::from_env(live)?
         }
         Err(e) => return Err(e),

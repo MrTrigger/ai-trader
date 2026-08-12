@@ -1190,10 +1190,17 @@ async fn the_plan_is_kept_beside_the_run_that_executed_it() {
     let ledger = Ledger::open(&dir);
     let plan = standard_plan("2026-08-01T00:00:00Z");
 
-    runner(&venue, &clock, &store, &ledger, controls, Schedule::default())
-        .run(&plan)
-        .await
-        .expect("the run completes");
+    runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await
+    .expect("the run completes");
 
     let kept = dir.join("plans").join(format!("{}.json", plan.plan_id));
     let text = std::fs::read_to_string(&kept).expect("the plan was kept");
@@ -1216,9 +1223,16 @@ async fn a_refused_plan_is_kept_too() {
     // An absent control file means halted, which refuses before anything runs.
     let controls = dir.join("no-such-controls.json");
 
-    let refused = runner(&venue, &clock, &store, &ledger, controls, Schedule::default())
-        .run(&plan)
-        .await;
+    let refused = runner(
+        &venue,
+        &clock,
+        &store,
+        &ledger,
+        controls,
+        Schedule::default(),
+    )
+    .run(&plan)
+    .await;
     assert!(refused.is_err(), "a halted bot refuses the plan");
     assert!(
         dir.join("plans")
