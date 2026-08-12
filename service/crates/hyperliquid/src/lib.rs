@@ -47,6 +47,36 @@ use venue::{
     Side, VenueAdapter, VenueError,
 };
 
+/// Time-in-force, spelled the way the venue spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tif {
+    /// Rest until cancelled.
+    Gtc,
+    /// Fill what crosses now, cancel the remainder.
+    Ioc,
+    /// Add-liquidity-only: refused rather than allowed to take. The maker order.
+    Alo,
+}
+
+impl Tif {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tif::Gtc => "Gtc",
+            Tif::Ioc => "Ioc",
+            Tif::Alo => "Alo",
+        }
+    }
+}
+
+/// Execution options beyond what `plan::OrderType` can express.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderOpts {
+    pub tif: Tif,
+    /// May only shrink an existing position — never grow or flip it. What
+    /// makes a stop-exit safe to fire twice.
+    pub reduce_only: bool,
+}
+
 /// How the adapter was configured, and therefore what it may do.
 pub struct Hyperliquid {
     info: Info,
@@ -141,6 +171,39 @@ impl Hyperliquid {
     /// reason a first live order is rejected.
     pub fn agent_address(&self) -> Option<&str> {
         self.agent.as_ref().map(|a| a.address())
+    }
+
+    /// Place an order with explicit execution options. The scalper's path.
+    ///
+    /// `order.limit_price = None` keeps the market-order behavior of the trait
+    /// method: an aggressive limit capped at mark ±5%.
+    pub async fn place_order_opts(
+        &self,
+        order: &OrderRequest,
+        opts: OrderOpts,
+    ) -> Result<OrderAck, VenueError> {
+        let index = self.asset_index(&order.asset).await?;
+        let is_buy = matches!(order.side, Side::Buy);
+        let limit_px = match order.limit_price {
+            Some(p) => p,
+            None => {
+                let mark = self.mark_price(&order.asset).await?;
+                let slip = Decimal::new(5, 2);
+                if is_buy {
+                    mark * (Decimal::ONE + slip)
+                } else {
+                    mark * (Decimal::ONE - slip)
+                }
+            }
+        };
+        let action = order_action(index, is_buy, limit_px, order.qty, opts, &order.client_order_id);
+        let res = self.exchange(action).await?;
+        let statuses = res.statuses().map_err(VenueError::Unreachable)?;
+        let first = statuses
+            .into_iter()
+            .next()
+            .ok_or_else(|| VenueError::Unreachable("the venue accepted nothing".into()))?;
+        ack_from_status(first, &order.client_order_id)
     }
 
     fn agent_or_refuse(&self) -> Result<&Agent, VenueError> {
@@ -250,54 +313,11 @@ impl VenueAdapter for Hyperliquid {
     }
 
     async fn place_order(&self, order: &OrderRequest) -> Result<OrderAck, VenueError> {
-        let index = self.asset_index(&order.asset).await?;
-        let is_buy = matches!(order.side, Side::Buy);
-
-        // A market order is sent as an aggressive limit — Hyperliquid has no
-        // unconditional market type, and an "IOC at whatever" would be a blank
-        // cheque. The cap is the mark moved 5% against us: wide enough to cross
-        // a normal book, narrow enough that a broken feed or a flash move
-        // cannot fill us anywhere.
-        let limit_px = match order.limit_price {
-            Some(p) => p,
-            None => {
-                let mark = self.mark_price(&order.asset).await?;
-                let slip = Decimal::new(5, 2);
-                if is_buy {
-                    mark * (Decimal::ONE + slip)
-                } else {
-                    mark * (Decimal::ONE - slip)
-                }
-            }
+        let opts = OrderOpts {
+            tif: if order.limit_price.is_some() { Tif::Gtc } else { Tif::Ioc },
+            reduce_only: false,
         };
-
-        let tif = if order.limit_price.is_some() {
-            "Gtc"
-        } else {
-            "Ioc"
-        };
-        let action = serde_json::json!({
-            "type": "order",
-            "orders": [{
-                "a": index,
-                "b": is_buy,
-                "p": px_string(limit_px),
-                "s": order.qty.normalize().to_string(),
-                "r": false,
-                "t": {"limit": {"tif": tif}},
-                "c": cloid(&order.client_order_id),
-            }],
-            "grouping": "na",
-        });
-
-        let res = self.exchange(action).await?;
-        let statuses = res.statuses().map_err(VenueError::Unreachable)?;
-        let first = statuses
-            .into_iter()
-            .next()
-            .ok_or_else(|| VenueError::Unreachable("the venue accepted nothing".into()))?;
-
-        ack_from_status(first, &order.client_order_id)
+        self.place_order_opts(order, opts).await
     }
 
     async fn cancel_order(&self, venue_order_id: &str) -> Result<(), VenueError> {
@@ -375,6 +395,29 @@ fn cloid(id: &str) -> String {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     )
+}
+
+fn order_action(
+    index: u32,
+    is_buy: bool,
+    limit_px: Decimal,
+    qty: Decimal,
+    opts: OrderOpts,
+    client_order_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "order",
+        "orders": [{
+            "a": index,
+            "b": is_buy,
+            "p": px_string(limit_px),
+            "s": qty.normalize().to_string(),
+            "r": opts.reduce_only,
+            "t": {"limit": {"tif": opts.tif.as_str()}},
+            "c": cloid(client_order_id),
+        }],
+        "grouping": "na",
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,5 +629,33 @@ mod tests {
         let other = VenueError::Rejected { message: "Insufficient margin".into() };
         assert!(!is_post_only_rejection(&other));
         assert!(!is_post_only_rejection(&VenueError::Unreachable("timeout".into())));
+    }
+
+    #[test]
+    fn the_order_action_carries_tif_and_reduce_only() {
+        let a = order_action(
+            7,
+            true,
+            "64520.1".parse().unwrap(),
+            "0.4".parse().unwrap(),
+            OrderOpts { tif: Tif::Alo, reduce_only: true },
+            "my-id",
+        );
+        let o = &a["orders"][0];
+        assert_eq!(o["a"], 7);
+        assert_eq!(o["b"], true);
+        assert_eq!(o["p"], "64520");
+        assert_eq!(o["s"], "0.4");
+        assert_eq!(o["r"], true);
+        assert_eq!(o["t"]["limit"]["tif"], "Alo");
+        assert_eq!(o["c"], serde_json::json!(cloid("my-id")));
+        assert_eq!(a["grouping"], "na");
+    }
+
+    #[test]
+    fn every_tif_spells_itself_the_way_the_venue_does() {
+        assert_eq!(Tif::Gtc.as_str(), "Gtc");
+        assert_eq!(Tif::Ioc.as_str(), "Ioc");
+        assert_eq!(Tif::Alo.as_str(), "Alo");
     }
 }
