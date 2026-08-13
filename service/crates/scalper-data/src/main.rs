@@ -1,6 +1,8 @@
 mod binance_um;
 mod books;
 mod costs;
+mod gate;
+mod matrix;
 mod universe;
 
 use std::collections::BTreeMap;
@@ -49,16 +51,35 @@ usage: scalper-data <command>
       List the top N candidates by day volume from Hyperliquid, excluding any
       in --exclude. Writes {data-root}/scalper-universe.json and prints a table
       with a NO-BINANCE marker on unmapped coins.
+
+  training-matrix --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--stride 5] [--horizons 15,30,60]
+      Build the trainer's JSONL matrix: for each universe candidate with a
+      Binance UM listing, read 1m bars from {data-root}/perp (store key =
+      coin.to_uppercase()), compute features-scalper's feature set (BTC
+      context from store key BTC - a hard requirement, since btc_ret_5 and
+      rel_ret_5 need it), join with forward returns at the given horizons,
+      keep every --stride-th fully-warm row, and write a manifest line
+      followed by one JSON row per line to --out. A candidate with no bars
+      in the store is skipped with a warning, not a fatal error. Prints
+      per-asset row counts.
+
+  gate --matrix <path> --folds <path/folds.json> --costs <path> [--threshold-mult 1.5] [--notional 5000] --out <path>
+      Walk-forward gate: for each fold in folds.json, load fold-N.json (a
+      LightGBM JSON dump), predict every matrix row in that fold's test
+      window via lightgbm-json, and simulate a threshold-gated long/short
+      strategy net of measured round-trip costs from the plan-2 cost summary.
+      Stitches per-fold daily P&L into one series and reports the
+      annualized Sharpe gate (>= 2.0 to PASS) to --out.
 ";
 
-fn get(args: &[String], name: &str) -> Option<String> {
+pub(crate) fn get(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|v| v == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
 
-fn need(args: &[String], name: &str) -> Result<String, String> {
+pub(crate) fn need(args: &[String], name: &str) -> Result<String, String> {
     get(args, name).ok_or_else(|| format!("{name} is required"))
 }
 
@@ -439,6 +460,141 @@ async fn cmd_universe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `--horizons` / `--stride` defaults: a scalper cares about the next
+/// 15-60 minutes, and a 5-minute stride keeps adjacent training rows from
+/// sharing almost all of their trailing-window inputs.
+const DEFAULT_HORIZONS: &str = "15,30,60";
+const DEFAULT_STRIDE: usize = 5;
+
+#[derive(serde::Serialize)]
+struct Manifest<'a> {
+    kind: &'static str,
+    feature_set_version: &'static str,
+    features: &'a [&'static str],
+    horizons_min: &'a [i64],
+    stride_min: usize,
+    assets: &'a [String],
+}
+
+fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let universe_path = PathBuf::from(need(args, "--universe")?);
+    let start = parse_date(&need(args, "--start")?)?;
+    let end = parse_date(&need(args, "--end")?)?;
+    if start >= end {
+        return Err("--start must precede --end".into());
+    }
+    let out_path = PathBuf::from(need(args, "--out")?);
+    let stride: usize = match get(args, "--stride") {
+        Some(v) => v.parse().map_err(|e| format!("bad --stride: {e}"))?,
+        None => DEFAULT_STRIDE,
+    };
+    let horizons: Vec<i64> = get(args, "--horizons")
+        .unwrap_or_else(|| DEFAULT_HORIZONS.to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<i64>()
+                .map_err(|e| format!("bad --horizons value {v:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if horizons.is_empty() {
+        return Err("--horizons produced no values".into());
+    }
+
+    let text = std::fs::read_to_string(&universe_path)
+        .map_err(|e| format!("{}: {e}", universe_path.display()))?;
+    let candidates: Vec<universe::Candidate> =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", universe_path.display()))?;
+
+    let perp_root = root.join("perp");
+
+    // BTC context (btc_ret_5, rel_ret_5) is required for every asset's
+    // feature row, including BTC's own - so this is a hard failure, not a
+    // skip-with-warning like a missing per-asset store dir below.
+    let btc_bars = store::read_asset(&perp_root, 60, "BTC")?;
+    if btc_bars.is_empty() {
+        return Err(format!(
+            "no BTC bars in {} - BTC context (btc_ret_5, rel_ret_5) is required for every \
+             asset's feature row; pull-binance-perp --assets BTC first",
+            perp_root.display()
+        ));
+    }
+
+    let start_ts = start.timestamp();
+    let end_ts = end.timestamp();
+
+    let mut assets: Vec<String> = Vec::new();
+    let mut all_rows: Vec<matrix::MatrixRow> = Vec::new();
+
+    for candidate in &candidates {
+        if candidate.binance_um.is_none() {
+            continue;
+        }
+        let store_key = candidate.coin.to_uppercase();
+        let bars = store::read_asset(&perp_root, 60, &store_key)?;
+        if bars.is_empty() {
+            println!(
+                "{}: skipped (no bars in {})",
+                candidate.coin,
+                perp_root.display()
+            );
+            continue;
+        }
+
+        let feature_rows = features_scalper::compute(&bars, &btc_bars)?;
+        let fwd = matrix::forward_returns_bps(&bars, &horizons);
+        let mut rows = matrix::matrix_rows(&feature_rows, &fwd, stride, &candidate.coin);
+        rows.retain(|r| r.ts >= start_ts && r.ts < end_ts);
+
+        println!("{}: {} rows", candidate.coin, rows.len());
+        assets.push(candidate.coin.clone());
+        all_rows.extend(rows);
+    }
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut file =
+        std::fs::File::create(&out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let manifest = Manifest {
+        kind: "manifest",
+        feature_set_version: features_scalper::FEATURE_SET_VERSION,
+        features: &features_scalper::FEATURE_NAMES,
+        horizons_min: &horizons,
+        stride_min: stride,
+        assets: &assets,
+    };
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&manifest).map_err(|e| e.to_string())?
+    )
+    .map_err(|e| format!("{}: {e}", out_path.display()))?;
+    // Rows are written one asset block at a time (the order `all_rows` was
+    // built in above), ts ascending within each block. That order carries
+    // no meaning for training: the trainer shuffles/splits by time itself.
+    for row in &all_rows {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(row).map_err(|e| e.to_string())?
+        )
+        .map_err(|e| format!("{}: {e}", out_path.display()))?;
+    }
+
+    println!(
+        "wrote {} rows for {} asset(s) to {}",
+        all_rows.len(),
+        assets.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -482,6 +638,8 @@ fn main() -> ExitCode {
             runtime.block_on(cmd_universe(&args[1..]))
         }
         Some("summarize-costs") => cmd_summarize_costs(&args[1..]),
+        Some("training-matrix") => cmd_training_matrix(&args[1..]),
+        Some("gate") => gate::cmd_gate(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -542,6 +700,94 @@ mod tests {
             err.contains("spot store"),
             "expected the guard's error to mention the spot store, got: {err}"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn synthetic_bars(asset: &str, base: DateTime<Utc>, n: i64) -> Vec<features_crypto::Bar> {
+        (0..n)
+            .map(|i| {
+                let ts = base + chrono::Duration::minutes(i);
+                let close = 100.0 + i as f64 * 0.01;
+                features_crypto::Bar {
+                    ts_utc: ts,
+                    asset: asset.to_string(),
+                    interval_s: 60,
+                    open: close * 0.999,
+                    high: close * 1.001,
+                    low: close * 0.998,
+                    close,
+                    volume: 5.0,
+                    quote_volume: Some(close * 5.0),
+                    trades: Some(10),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn training_matrix_skips_a_universe_candidate_with_no_bars_in_the_store() {
+        use chrono::TimeZone;
+
+        let root = std::env::temp_dir().join(format!(
+            "scalper-training-matrix-{}-{}",
+            std::process::id(),
+            "skip-warn"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let perp_root = root.join("perp");
+        let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        store::write(&perp_root, &synthetic_bars("BTC", base, 300)).unwrap();
+        store::write(&perp_root, &synthetic_bars("KTEST", base, 300)).unwrap();
+        // "KMISSING" deliberately has no bars written anywhere: its
+        // asset=KMISSING directory never gets created, exercising the
+        // skip-with-warning path rather than a hard error.
+
+        let universe_path = root.join("scalper-universe.json");
+        let universe_json = serde_json::json!([
+            {"coin": "BTC", "day_volume_usd": 3.0, "binance_um": "BTCUSDT"},
+            {"coin": "kTEST", "day_volume_usd": 2.0, "binance_um": "TESTUSDT"},
+            {"coin": "kMISSING", "day_volume_usd": 1.0, "binance_um": "MISSINGUSDT"},
+        ]);
+        std::fs::write(
+            &universe_path,
+            serde_json::to_string(&universe_json).unwrap(),
+        )
+        .unwrap();
+
+        let out_path = root.join("matrix.jsonl");
+        let args = vec![
+            "--data-root".to_string(),
+            root.to_string_lossy().to_string(),
+            "--universe".to_string(),
+            universe_path.to_string_lossy().to_string(),
+            "--start".to_string(),
+            "2026-06-01".to_string(),
+            "--end".to_string(),
+            "2026-06-02".to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+            "--stride".to_string(),
+            "5".to_string(),
+            "--horizons".to_string(),
+            "15".to_string(),
+        ];
+        cmd_training_matrix(&args).expect("a missing store dir must be a warning, not a failure");
+
+        let content = std::fs::read_to_string(&out_path).unwrap();
+        let mut lines = content.lines();
+        let manifest: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(manifest["kind"], "manifest");
+        assert_eq!(manifest["assets"], serde_json::json!(["BTC", "kTEST"]));
+
+        let rows: Vec<matrix::MatrixRow> =
+            lines.map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(!rows.is_empty(), "kTEST has enough bars to be fully warm");
+        assert!(rows.iter().any(|r| r.asset == "kTEST"));
+        assert!(rows.iter().all(|r| r.asset == "BTC" || r.asset == "kTEST"));
+        assert!(rows.iter().all(|r| r.features.len() == 26));
 
         std::fs::remove_dir_all(&root).ok();
     }

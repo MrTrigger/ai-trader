@@ -1038,6 +1038,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "features-scalper"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "features-crypto",
+ "serde",
+]
+
+[[package]]
 name = "features-stockholm"
 version = "0.1.0"
 dependencies = [
@@ -3170,7 +3179,9 @@ dependencies = [
  "chrono",
  "crypto-portfolio",
  "features-crypto",
+ "features-scalper",
  "hyperliquid",
+ "lightgbm-json",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,0 +1,10 @@
+[package]
+name = "features-scalper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+features-crypto = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+serde = { workspace = true }
