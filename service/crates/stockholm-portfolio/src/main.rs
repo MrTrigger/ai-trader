@@ -199,6 +199,36 @@ usage: stockholm-portfolio <command>
       --trained-direction-diagnostic, a loud, explicit research/diagnostics
       opt-in.
 
+  shadow-score --matrix <jsonl> --model <json> --out <jsonl>
+              [--benchmark <json>]
+              [--allocation-mode directional|overlay]
+              [--core-weight 1] [--overlay-net-cap 0]
+              [--core-tracking-cost-bps 10]
+              [--max-gross 1 (directional) | 0.6 (overlay)]
+              [--max-positions 20 (directional) | 40 per sleeve (overlay)]
+              [--position-weight 0.05 (directional) | 0.015 (overlay)]
+              [--min-position-weight 0] [--ranking edge|edge_volatility]
+              [--sizing equal|conviction|inverse_volatility|edge_volatility]
+              [--reference-edge 0.01] [--reference-volatility 0.02]
+              [--cost-multiple 1]
+      Task 16 shadow forward logging: score the single most recent decision
+      date in --matrix with the frozen --model and the same overlay
+      constructor --allocation-mode overlay uses in `backtest`, then append
+      one JSON line to --out. No orders, no state mutation, deterministic --
+      each call starts from flat, so there is no incumbent book to carry
+      between sessions. --out is append-only: if its last recorded row's date
+      is already >= the date being scored, the command refuses to write,
+      rather than rewrite or duplicate a day's evidence. --allocation-mode
+      overlay requires --benchmark, to price the index core on the scored
+      date, and switches the same three defaults `backtest`'s overlay mode
+      does (see `backtest` above). The matrix/model consistency gate is the
+      same one `backtest` enforces: a model trained under an old feature-set
+      version is refused against a matrix built under the binary's current
+      one, and vice versa. Frozen models predate the current feature-set
+      version, so shadow-score will refuse them against a freshly built
+      matrix until Phase 1 retrains under the current version -- this is
+      correct, not a bug; see docs/stockholm-portfolio-status.md.
+
   direction-backtest --matrix <jsonl> --model <json>
                      --start YYYY-MM-DD --end YYYY-MM-DD --out <json>
                      [--max-gross 1]
@@ -2951,6 +2981,198 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Read every row of a matrix, regardless of date, plus its manifest header.
+/// Unlike `load_matrix` (used by `backtest`/`diagnose_features`, which take
+/// an explicit `--start`/`--end` replay window), `shadow-score` scores
+/// whichever date is most recent in the file, so it must see the whole file
+/// to find that date.
+fn read_matrix_all(path: &Path) -> Result<(MatrixManifest, Vec<TrainingRow>), String> {
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+    let first = lines
+        .next()
+        .ok_or("empty matrix")?
+        .map_err(|error| error.to_string())?;
+    let manifest = serde_json::from_str(&first).map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    for line in lines {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).map_err(|error| error.to_string())?);
+    }
+    Ok((manifest, rows))
+}
+
+/// The date of the last row already recorded in an append-only shadow log, if
+/// any. `None` for a log that does not exist yet or is empty.
+fn last_shadow_log_date(path: &Path) -> Result<Option<Date>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut last = None;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: stockholm_portfolio::ShadowScoreRecord = serde_json::from_str(&line)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        last = Some(record.date);
+    }
+    Ok(last)
+}
+
+/// Task 16 shadow forward logging: score the most recent decision date in
+/// `--matrix` and append one line to the append-only `--out` log. See the
+/// `shadow-score` usage block for the full contract.
+fn run_shadow_score(args: &[String]) -> Result<(), String> {
+    let matrix_path = PathBuf::from(need(args, "--matrix")?);
+    let model = stockholm_portfolio::Model::load(Path::new(&need(args, "--model")?))?;
+    let (manifest, rows) = read_matrix_all(&matrix_path)?;
+    if !model_agrees_with_matrix(
+        &model.features,
+        &model.feature_set_version,
+        &model.survivorship_status,
+        &manifest.features,
+        &manifest.feature_set_version,
+        &manifest.survivorship_status,
+    ) {
+        return Err("matrix/model/runtime contracts differ".into());
+    }
+    let scored_date = rows
+        .iter()
+        .map(|row| row.date)
+        .max()
+        .ok_or("shadow-score matrix has no rows")?;
+
+    let multiple = number(args, "--cost-multiple", 1.0_f64)?;
+    if !multiple.is_finite() || multiple <= 0.0 {
+        return Err("--cost-multiple must be finite and positive".into());
+    }
+    let mut costs = stockholm_portfolio::CostConfig::default();
+    costs.market_friction_multiple = multiple;
+    costs.round_trip_bps = costs.round_trip_commission_bps
+        + multiple * (costs.round_trip_impact_bps + costs.fallback_spread_bps);
+
+    let benchmark = get(args, "--benchmark")
+        .map(|path| equity_data::load_benchmark(Path::new(&path)))
+        .transpose()?;
+    let benchmark_close = benchmark.as_ref().and_then(|history| {
+        history
+            .bars
+            .iter()
+            .find(|bar| bar.date == scored_date)
+            .map(|bar| bar.end_value)
+    });
+
+    let sizing = get(args, "--sizing")
+        .unwrap_or_else(|| "equal".into())
+        .parse()?;
+    let ranking = get(args, "--ranking")
+        .unwrap_or_else(|| "edge".into())
+        .parse()?;
+
+    // Same overlay-mode wiring and defaults `run_backtest` uses (Task 14/15):
+    // peeking at the raw flag only decides which default applies before the
+    // `AllocationMode` enum is built; an explicit flag, in either mode,
+    // always wins.
+    let overlay_mode = is_overlay_mode(args);
+    let max_gross = if let Some(value) = get(args, "--max-gross") {
+        value
+            .parse::<f64>()
+            .map_err(|error| format!("bad --max-gross: {error}"))?
+    } else if overlay_mode {
+        0.6
+    } else {
+        1.0
+    };
+    let allocation_budget = portfolio_construction::Budget::gross_only(max_gross)?;
+    let allocation_mode = match get(args, "--allocation-mode").as_deref() {
+        None | Some("directional") => stockholm_portfolio::AllocationMode::Directional,
+        Some("overlay") => stockholm_portfolio::AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: number(args, "--core-weight", 1.0_f64)?,
+                overlay_gross: max_gross,
+                overlay_net_cap: number(args, "--overlay-net-cap", 0.0_f64)?,
+            },
+            core_tracking_cost_bps: number(args, "--core-tracking-cost-bps", 10.0_f64)?,
+        },
+        Some(value) => {
+            return Err(format!(
+                "unsupported --allocation-mode {value:?}; expected directional or overlay"
+            ));
+        }
+    };
+    let max_positions =
+        overlay_aware_number(args, "--max-positions", overlay_mode, 20_usize, 40_usize)?;
+    let position_weight = overlay_aware_number(
+        args,
+        "--position-weight",
+        overlay_mode,
+        0.05_f64,
+        0.015_f64,
+    )?;
+
+    let record = stockholm_portfolio::shadow_score(
+        &model,
+        &rows,
+        &stockholm_portfolio::ShadowScoreConfig {
+            ranking,
+            sizing,
+            allocation_mode,
+            allocation_budget,
+            max_positions,
+            position_weight,
+            min_position_weight: number(args, "--min-position-weight", 0.0_f64)?,
+            reference_edge: number(args, "--reference-edge", 0.01_f64)?,
+            reference_volatility: number(args, "--reference-volatility", 0.02_f64)?,
+            costs,
+            benchmark_close,
+        },
+    )?;
+
+    let path = PathBuf::from(need(args, "--out")?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    // Append-only idempotency guard: a log that already holds a row on or
+    // after the date being scored is left untouched. A rerun of the same
+    // day, or an out-of-order matrix, must never rewrite or duplicate a
+    // day's already-recorded evidence.
+    if let Some(last_date) = last_shadow_log_date(&path)? {
+        if record.date <= last_date {
+            return Err(format!(
+                "{} already holds a row for {last_date}, which is on or after the scored date \
+                 {}; refusing to append out of order",
+                path.display(),
+                record.date
+            ));
+        }
+    }
+    let mut line = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .map_err(|error| error.to_string())?;
+    println!(
+        "shadow-score {} ({} candidates, {} allocated) -> {}",
+        record.date,
+        record.candidates.len(),
+        record.allocation.weights.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
     let paths = repeated(args, "--phase");
     if paths.is_empty() {
@@ -3143,6 +3365,7 @@ fn main() -> ExitCode {
         Some("fixed-momentum-backtest") => run_fixed_momentum_backtest(&args[1..]),
         Some("direction-training-matrix") => direction_matrix(&args[1..]),
         Some("backtest") => run_backtest(&args[1..]),
+        Some("shadow-score") => run_shadow_score(&args[1..]),
         Some("direction-backtest") => run_direction_backtest(&args[1..]),
         Some("summarize-direction") => summarize_direction(&args[1..]),
         Some("summarize-rebalance-phases") => summarize_rebalance_phases(&args[1..]),
@@ -3373,5 +3596,240 @@ mod matrix_model_agreement_tests {
             "fs-rust-stockholm-1",
             "SURVIVORSHIP_CONTAMINATED",
         ));
+    }
+}
+
+/// Task 16: `shadow-score` CLI-level tests. These exercise `run_shadow_score`
+/// end to end against tiny fixture files on disk — the append-only guard is
+/// a filesystem contract (what is already on disk decides whether a write is
+/// allowed), so it is tested through the CLI entry point rather than through
+/// `stockholm_portfolio::shadow_score`, which is pure and never touches disk.
+#[cfg(test)]
+mod shadow_score_cli_tests {
+    use super::*;
+
+    /// A feature-set version this binary does not currently mint, so
+    /// `Model::load`'s exact-feature-list check does not apply and the
+    /// fixture only needs to agree with itself (old-on-old, exactly the
+    /// consistency `model_agrees_with_matrix` requires).
+    const FIXTURE_FEATURE_SET_VERSION: &str = "fs-shadow-score-test-1";
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "stockholm-shadow-score-test-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write_fixture_model(path: &Path) {
+        let model = serde_json::json!({
+            "format_version": stockholm_portfolio::FORMAT_VERSION,
+            "model_version": stockholm_portfolio::MODEL_VERSION,
+            "feature_set_version": FIXTURE_FEATURE_SET_VERSION,
+            "label_version": "forward-adjusted-open-5-v1",
+            "trained_through": "2023-12-31",
+            "trained_at": "fixture",
+            "n_rows": 1,
+            "n_dates": 1,
+            "features": ["x_ret_1"],
+            "survivorship_status": "SURVIVORSHIP_CONTAMINATED",
+            "model_family": "lightgbm",
+            "reward": "absolute_return",
+            "objective": "l2",
+            "ensemble_seeds": 1,
+            "tree_info": [{
+                "tree_index": 0,
+                "num_leaves": 1,
+                "num_cat": 0,
+                "shrinkage": 1.0,
+                "tree_structure": { "leaf_value": 0.05 },
+            }],
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&model).unwrap()).unwrap();
+    }
+
+    /// One row per date in `dates`, on a distinct instrument so a
+    /// multi-date fixture never accidentally collapses to one candidate.
+    fn write_fixture_matrix(path: &Path, dates: &[&str]) {
+        let manifest = serde_json::json!({
+            "kind": "stockholm_training_manifest",
+            "feature_set_version": FIXTURE_FEATURE_SET_VERSION,
+            "label_version": "forward-adjusted-open-5-v1",
+            "features": ["x_ret_1"],
+            "horizon_sessions": 5,
+            "min_adv20_sek": 1_000_000.0,
+            "survivorship_status": "SURVIVORSHIP_CONTAMINATED",
+            "universe_source": "fixture",
+            "history_source": "fixture",
+        });
+        let mut file = std::fs::File::create(path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&manifest).unwrap()).unwrap();
+        for (index, date) in dates.iter().enumerate() {
+            let row = serde_json::json!({
+                "date": date,
+                "instrument_id": format!("TX{index}"),
+                "symbol": format!("SYM{index}"),
+                "isin": "SE0000000000",
+                "sector": "Industrials",
+                "bucket": "large_cap",
+                "target": null,
+                "entry_price": null,
+                "exit_price": null,
+                "adv20_sek": 10_000_000.0,
+                "vol60": 0.02,
+                "sample_weight": 1.0,
+                "features": { "x_ret_1": 0.1 },
+            });
+            writeln!(file, "{}", serde_json::to_string(&row).unwrap()).unwrap();
+        }
+    }
+
+    fn read_lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A single scoring call must emit exactly one parseable JSON line
+    /// carrying the fields the shadow-forward-logging job promises.
+    #[test]
+    fn shadow_score_emits_one_parseable_line_with_the_promised_fields() {
+        let dir = unique_temp_dir();
+        let model_path = dir.join("model.json");
+        let matrix_path = dir.join("matrix.jsonl");
+        let out_path = dir.join("scores.jsonl");
+        write_fixture_model(&model_path);
+        write_fixture_matrix(&matrix_path, &["2024-01-02"]);
+
+        run_shadow_score(&[
+            "--matrix".into(),
+            matrix_path.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .expect("shadow-score should succeed against a consistent old-on-old fixture");
+
+        let lines = read_lines(&out_path);
+        assert_eq!(lines.len(), 1);
+        let record: stockholm_portfolio::ShadowScoreRecord =
+            serde_json::from_str(&lines[0]).expect("line must be parseable JSON");
+        assert_eq!(record.date.to_string(), "2024-01-02");
+        assert_eq!(record.feature_set_version, FIXTURE_FEATURE_SET_VERSION);
+        assert_eq!(record.candidates.len(), 1);
+        assert_eq!(record.candidates[0].id, "TX0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Running the job on two later, increasing sessions appends two lines
+    /// and never rewrites the first.
+    #[test]
+    fn shadow_score_run_twice_on_different_dates_appends_two_lines() {
+        let dir = unique_temp_dir();
+        let model_path = dir.join("model.json");
+        let out_path = dir.join("scores.jsonl");
+        write_fixture_model(&model_path);
+
+        let day1 = dir.join("matrix-day1.jsonl");
+        write_fixture_matrix(&day1, &["2024-01-02"]);
+        run_shadow_score(&[
+            "--matrix".into(),
+            day1.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let day2 = dir.join("matrix-day2.jsonl");
+        write_fixture_matrix(&day2, &["2024-01-03"]);
+        run_shadow_score(&[
+            "--matrix".into(),
+            day2.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let lines = read_lines(&out_path);
+        assert_eq!(lines.len(), 2, "two runs on two dates must append two lines");
+        let first: stockholm_portfolio::ShadowScoreRecord =
+            serde_json::from_str(&lines[0]).unwrap();
+        let second: stockholm_portfolio::ShadowScoreRecord =
+            serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first.date.to_string(), "2024-01-02");
+        assert_eq!(second.date.to_string(), "2024-01-03");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The append-only guard: a matrix whose most recent date does not
+    /// strictly advance past the log's last row must be refused, and the
+    /// log must be left exactly as it was.
+    #[test]
+    fn shadow_score_refuses_to_append_a_date_not_after_the_last_logged_row() {
+        let dir = unique_temp_dir();
+        let model_path = dir.join("model.json");
+        let out_path = dir.join("scores.jsonl");
+        write_fixture_model(&model_path);
+
+        let day2 = dir.join("matrix-day2.jsonl");
+        write_fixture_matrix(&day2, &["2024-01-03"]);
+        run_shadow_score(&[
+            "--matrix".into(),
+            day2.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let before = read_lines(&out_path);
+
+        // Same date again: a rerun of an already-logged session.
+        let rerun = run_shadow_score(&[
+            "--matrix".into(),
+            day2.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ]);
+        assert!(rerun.is_err(), "rerunning the same date must be refused");
+
+        // An earlier date: an out-of-order matrix.
+        let day1 = dir.join("matrix-day1.jsonl");
+        write_fixture_matrix(&day1, &["2024-01-02"]);
+        let out_of_order = run_shadow_score(&[
+            "--matrix".into(),
+            day1.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ]);
+        assert!(
+            out_of_order.is_err(),
+            "an earlier date than the log's last row must be refused"
+        );
+
+        let after = read_lines(&out_path);
+        assert_eq!(before, after, "a refused append must leave the log untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

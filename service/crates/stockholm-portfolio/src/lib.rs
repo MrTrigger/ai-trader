@@ -2842,6 +2842,298 @@ pub fn backtest(
     })
 }
 
+/// Configuration for a single-session forward score (Task 16, shadow forward
+/// logging): the same per-period portfolio construction `backtest` runs at
+/// one rebalance, but for exactly the most recent date in the matrix it is
+/// given, starting from flat (no incumbent book carried between calls) and
+/// requiring no realized outcome -- a live decision date has none yet.
+#[derive(Debug, Clone)]
+pub struct ShadowScoreConfig {
+    pub ranking: portfolio_construction::RankingMethod,
+    pub sizing: portfolio_construction::SizingMethod,
+    pub allocation_mode: AllocationMode,
+    /// Used only in `AllocationMode::Directional`; the overlay's own budget
+    /// comes from `allocation_mode` itself.
+    pub allocation_budget: portfolio_construction::Budget,
+    pub max_positions: usize,
+    pub position_weight: f64,
+    pub min_position_weight: f64,
+    pub reference_edge: f64,
+    pub reference_volatility: f64,
+    pub costs: CostConfig,
+    /// The benchmark's close on the scored date. Required, and used only to
+    /// price the index core, when `allocation_mode` is `Overlay` -- same
+    /// requirement `backtest` enforces for a full replay.
+    pub benchmark_close: Option<f64>,
+}
+
+/// One instrument's forecast for the scored date, independent of whether it
+/// cleared its cost hurdle or was admitted into `ShadowAllocation`. Reporting
+/// the whole scored cross-section, not just the winners, is what makes the
+/// shadow log usable evidence about calibration later, not just about the
+/// names that happened to get funded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowCandidateScore {
+    pub id: String,
+    pub symbol: String,
+    /// `Model::predict`'s raw return-space forecast, before any cost or
+    /// margin hurdle.
+    pub prediction: f64,
+    /// Predicted return net of round-trip execution/borrow cost and the
+    /// safety margin, on whichever side (`side`) clears the higher edge.
+    pub edge: f64,
+    pub side: Direction,
+}
+
+/// The proposed book for the scored date: a fixed index core (overlay mode
+/// only) plus signed per-name weights. Nothing here is an order -- it is what
+/// the frozen model and overlay constructor would have proposed, recorded for
+/// later comparison against what actually happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowAllocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_weight: Option<f64>,
+    pub weights: BTreeMap<String, f64>,
+}
+
+/// One append-only shadow-log row: the frozen model and overlay constructor's
+/// complete, deterministic answer for one Stockholm session. Produced by
+/// `shadow_score`, which touches no disk and mutates no state; the caller
+/// alone decides whether, and where, this gets appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowScoreRecord {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub model_id: String,
+    pub feature_set_version: String,
+    pub survivorship_status: String,
+    pub candidates: Vec<ShadowCandidateScore>,
+    pub allocation: ShadowAllocation,
+    /// Total modeled one-way cost of establishing `allocation` from flat, as
+    /// a fraction of NAV: commission, impact and spread on every leg, plus
+    /// short availability and one holding period of borrow on the short
+    /// leg. Modeled only -- there is no fill and no order.
+    pub modeled_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_close: Option<f64>,
+    /// Survivorship status and other caveats the model/matrix already carry,
+    /// echoed here so a reader of the log never has to cross-reference the
+    /// model file to know what this row's evidence is and is not.
+    pub disclosures: Vec<String>,
+}
+
+/// Score exactly the most recent date in `rows` with `model`, then run the
+/// Task 14/15 overlay-construction pipeline over the resulting candidates.
+/// Pure and deterministic: same inputs, same output, no I/O.
+pub fn shadow_score(
+    model: &Model,
+    rows: &[TrainingRow],
+    config: &ShadowScoreConfig,
+) -> Result<ShadowScoreRecord, String> {
+    if config.max_positions == 0 {
+        return Err("max positions must be positive".into());
+    }
+    if !config.position_weight.is_finite()
+        || config.position_weight <= 0.0
+        || config.position_weight > 1.0
+    {
+        return Err("maximum position weight must be finite and in (0, 1]".into());
+    }
+    if !matches!(model.reward.as_str(), "absolute_return" | "return_per_risk") {
+        return Err(format!(
+            "shadow-score supports only a direct absolute-return-style model; {:?} requires a \
+             market-return forecast this job does not build",
+            model.reward
+        ));
+    }
+    let overlay_budget = match config.allocation_mode {
+        AllocationMode::Directional => None,
+        AllocationMode::Overlay { budget, .. } => {
+            budget.validate()?;
+            if config.benchmark_close.is_none() {
+                return Err(
+                    "the index-core overlay mode requires a benchmark close to price the core"
+                        .into(),
+                );
+            }
+            Some(budget)
+        }
+    };
+    let scored_date = rows
+        .iter()
+        .map(|row| row.date)
+        .max()
+        .ok_or("shadow-score matrix has no rows")?;
+    let day_rows = rows
+        .iter()
+        .filter(|row| row.date == scored_date)
+        .collect::<Vec<_>>();
+    let model_horizon = features_stockholm::label_horizon(&model.label_version).ok_or_else(|| {
+        format!("unsupported Stockholm label version {:?}", model.label_version)
+    })?;
+
+    let mut candidates = Vec::with_capacity(day_rows.len());
+    let mut cost_by_id: BTreeMap<String, (ExecutionCost, f64)> = BTreeMap::new();
+    let mut volatility_by_id: BTreeMap<String, f64> = BTreeMap::new();
+    for row in &day_rows {
+        let prediction = model.predict(row)?;
+        let cost = execution_cost(row, &config.costs)?;
+        let long_cost = cost.total_bps() / 10_000.0;
+        let borrow_cost = holding_borrow_cost(row, model_horizon, &config.costs)?;
+        let short_cost =
+            (cost.total_bps() + config.costs.short_availability_bps) / 10_000.0 + borrow_cost;
+        let margin = config.costs.safety_margin_bps / 10_000.0;
+        let long_edge = prediction - long_cost - margin;
+        let short_edge = -prediction - short_cost - margin;
+        let (side, edge) = if long_edge >= short_edge {
+            (Direction::Long, long_edge)
+        } else {
+            (Direction::Short, short_edge)
+        };
+        cost_by_id.insert(row.instrument_id.clone(), (cost, borrow_cost));
+        volatility_by_id.insert(row.instrument_id.clone(), row.vol60);
+        candidates.push(ShadowCandidateScore {
+            id: row.instrument_id.clone(),
+            symbol: row.symbol.clone(),
+            prediction,
+            edge,
+            side,
+        });
+    }
+
+    let construction_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.edge > 0.0)
+        .map(|candidate| portfolio_construction::Candidate {
+            id: candidate.id.clone(),
+            direction: match candidate.side {
+                Direction::Long => portfolio_construction::Direction::Long,
+                Direction::Short => portfolio_construction::Direction::Short,
+            },
+            edge: candidate.edge,
+            volatility: volatility_by_id[&candidate.id],
+        })
+        .collect::<Vec<_>>();
+    // Every call starts from flat: there is no prior shadow position to
+    // retain, so the retention buffer has nothing to do and its width is set
+    // equal to max_positions (the minimum `buffered_ranked_ids` accepts).
+    let no_incumbents: BTreeMap<String, portfolio_construction::Direction> = BTreeMap::new();
+    let ranked = if overlay_budget.is_some() {
+        // Per-sleeve caps, exactly as `backtest`'s overlay mode: long and
+        // short candidates are ranked and admitted independently so one-sided
+        // edges cannot crowd out the other sleeve.
+        let (long_candidates, short_candidates): (Vec<_>, Vec<_>) = construction_candidates
+            .into_iter()
+            .partition(|candidate| candidate.direction == portfolio_construction::Direction::Long);
+        let mut ranked = portfolio_construction::buffered_ranked_ids(
+            &long_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?;
+        ranked.extend(portfolio_construction::buffered_ranked_ids(
+            &short_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?);
+        ranked
+    } else {
+        portfolio_construction::buffered_ranked_ids(
+            &construction_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?
+    };
+
+    let by_candidate_id = candidates
+        .iter()
+        .map(|candidate| (candidate.id.clone(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let selected = ranked
+        .iter()
+        .map(|id| {
+            let candidate = by_candidate_id[id];
+            portfolio_construction::Candidate {
+                id: id.clone(),
+                direction: match candidate.side {
+                    Direction::Long => portfolio_construction::Direction::Long,
+                    Direction::Short => portfolio_construction::Direction::Short,
+                },
+                edge: candidate.edge,
+                volatility: volatility_by_id[id],
+            }
+        })
+        .collect::<Vec<_>>();
+    let proposals = portfolio_construction::propose(
+        &selected,
+        &portfolio_construction::SizingConfig {
+            method: config.sizing,
+            unit_abs_weight: config.position_weight,
+            min_abs_weight: config.min_position_weight,
+            max_abs_weight: config.position_weight,
+            reference_edge: config.reference_edge,
+            reference_volatility: config.reference_volatility,
+        },
+    )?;
+    let (core_weight, weights) = match overlay_budget {
+        Some(budget) => {
+            let overlay = portfolio_construction::allocate_overlay(&proposals, &budget)?;
+            (Some(overlay.core_weight), overlay.overlay.weights)
+        }
+        None => (
+            None,
+            portfolio_construction::allocate(&proposals, config.allocation_budget)?.weights,
+        ),
+    };
+
+    // Cost of establishing `weights` from flat: one-way (half of the
+    // round-trip figure `execution_cost` carries), same accounting
+    // `backtest` uses for a period's entry leg, plus the short-only
+    // availability penalty and one holding period of borrow.
+    let mut modeled_cost = 0.0;
+    for (id, weight) in &weights {
+        let (cost, borrow_cost) = &cost_by_id[id];
+        let mut amount = weight.abs() * cost.total_bps() / 20_000.0;
+        if *weight < 0.0 {
+            amount += weight.abs() * config.costs.short_availability_bps / 10_000.0;
+            amount += weight.abs() * borrow_cost;
+        }
+        modeled_cost += amount;
+    }
+
+    let disclosures = vec![
+        format!("survivorship_status={}", model.survivorship_status),
+        format!("model_trained_through={}", model.trained_through),
+        format!("model_feature_set_version={}", model.feature_set_version),
+        "no-orders, no-state-mutation forward score for policy evidence only; this row is never \
+         tuned against"
+            .to_string(),
+    ];
+
+    Ok(ShadowScoreRecord {
+        date: scored_date,
+        model_id: model.model_id.clone(),
+        feature_set_version: model.feature_set_version.clone(),
+        survivorship_status: model.survivorship_status.clone(),
+        candidates,
+        allocation: ShadowAllocation {
+            core_weight,
+            weights,
+        },
+        modeled_cost,
+        benchmark_close: config.benchmark_close,
+        disclosures,
+    })
+}
+
 /// Split a finished overlay replay into its two legs.
 ///
 /// The overlay's t-stat is against zero, not against the index: the core
@@ -7425,5 +7717,172 @@ mod tests {
             shorts, 2,
             "the short sleeve must fill its own cap, unstarved by the longs"
         );
+    }
+
+    fn shadow_config(allocation_mode: AllocationMode) -> ShadowScoreConfig {
+        ShadowScoreConfig {
+            ranking: portfolio_construction::RankingMethod::Edge,
+            sizing: portfolio_construction::SizingMethod::Equal,
+            allocation_mode,
+            allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+            max_positions: 5,
+            position_weight: 0.05,
+            min_position_weight: 0.0,
+            reference_edge: 0.01,
+            reference_volatility: 0.02,
+            costs: zero_execution_costs(),
+            benchmark_close: None,
+        }
+    }
+
+    /// Task 16: only the most recent date in the matrix is a live decision --
+    /// an earlier session's cross-section must not leak into the score.
+    #[test]
+    fn shadow_score_scores_only_the_last_date() {
+        let mut earlier = row(day("2024-01-02"));
+        earlier.instrument_id = "OLD1".into();
+        let mut later = row(day("2024-01-03"));
+        later.instrument_id = "NEW1".into();
+        let rows = [earlier, later];
+
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.date, day("2024-01-03"));
+        assert_eq!(record.candidates.len(), 1);
+        assert_eq!(record.candidates[0].id, "NEW1");
+    }
+
+    /// A directional score has no core leg: every krona of the allocation
+    /// comes from candidates, exactly like `backtest`'s directional mode.
+    #[test]
+    fn shadow_score_directional_allocates_a_cleared_candidate() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.candidates.len(), 1);
+        assert!(matches!(record.candidates[0].side, Direction::Long));
+        assert!((record.candidates[0].prediction - 0.02).abs() < 1e-9);
+        assert_eq!(record.allocation.core_weight, None);
+        let weight = record.allocation.weights.get("TX1").copied().unwrap();
+        assert!((weight - 0.05).abs() < 1e-9, "weight was {weight}");
+        assert_eq!(
+            record.modeled_cost, 0.0,
+            "zero execution costs must model zero cost"
+        );
+    }
+
+    /// The overlay mode prices a fixed index core; without a close to price
+    /// it from, the score cannot be built at all (same requirement `backtest`
+    /// enforces for a replay).
+    #[test]
+    fn shadow_score_overlay_requires_a_benchmark_close() {
+        let rows = [row(day("2024-01-02"))];
+        let overlay_mode = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.6,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let error = shadow_score(&constant_model(0.02), &rows, &shadow_config(overlay_mode))
+            .unwrap_err();
+        assert!(
+            error.contains("benchmark close"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// With a benchmark close supplied, overlay mode reports the fixed core
+    /// weight alongside the overlay's own per-name weights.
+    #[test]
+    fn shadow_score_overlay_reports_core_and_overlay_weights() {
+        let rows = [row(day("2024-01-02"))];
+        let overlay_mode = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.6,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let mut config = shadow_config(overlay_mode);
+        config.benchmark_close = Some(2500.0);
+        let record = shadow_score(&constant_model(0.02), &rows, &config).unwrap();
+
+        assert_eq!(record.allocation.core_weight, Some(1.0));
+        assert!(record.allocation.weights.contains_key("TX1"));
+        assert_eq!(record.benchmark_close, Some(2500.0));
+    }
+
+    /// A candidate that cannot clear its cost-plus-margin hurdle on either
+    /// side is still reported (the log is evidence about the whole
+    /// cross-section, not just what got funded) but never allocated.
+    #[test]
+    fn shadow_score_reports_but_does_not_allocate_a_negative_edge_candidate() {
+        let mut costs = zero_execution_costs();
+        costs.safety_margin_bps = 1_000.0; // 10% -- swamps a 2% prediction both ways.
+        let rows = [row(day("2024-01-02"))];
+        let mut config = shadow_config(AllocationMode::Directional);
+        config.costs = costs;
+
+        let record = shadow_score(&constant_model(0.02), &rows, &config).unwrap();
+
+        assert_eq!(record.candidates.len(), 1);
+        assert!(record.allocation.weights.is_empty());
+        assert_eq!(record.modeled_cost, 0.0);
+    }
+
+    /// The record self-documents the model's survivorship caveat so a reader
+    /// of the append-only log never has to cross-reference the model file.
+    #[test]
+    fn shadow_score_disclosures_echo_survivorship_status() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.survivorship_status, "SURVIVORSHIP_CONTAMINATED");
+        assert!(
+            record
+                .disclosures
+                .iter()
+                .any(|line| line.contains("SURVIVORSHIP_CONTAMINATED")),
+            "disclosures did not echo survivorship status: {:?}",
+            record.disclosures
+        );
+    }
+
+    /// One line, parseable JSON, with every field the shadow-forward-logging
+    /// job promises: this is the acceptance shape Task 16 asks for.
+    #[test]
+    fn shadow_score_record_round_trips_through_json() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        let line = serde_json::to_string(&record).unwrap();
+        assert!(!line.contains('\n'), "must serialize to a single line");
+        let decoded: ShadowScoreRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.date, record.date);
+        assert_eq!(decoded.model_id, record.model_id);
+        assert_eq!(decoded.feature_set_version, record.feature_set_version);
     }
 }

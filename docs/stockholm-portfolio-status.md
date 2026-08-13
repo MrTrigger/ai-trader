@@ -413,6 +413,86 @@ Full artifacts: `var/stockholm-remediation/task15/{netcap0,netcap01}/` (80
 phase reports, 4 fold summaries, 1 fold-folds report per variant), scripts
 `run_fold.sh`, `smoke.sh`, `smoke_fold1.sh` beside them.
 
+## 2026-08-13 Task 16: shadow forward logging
+
+**Policy.** `bin/stockholm-shadow.sh` scores one Stockholm session a day with
+the frozen lean model and the Task 14/15 overlay constructor, and appends the
+result as one JSON line to an append-only log
+(`var/stockholm/shadow-log/scores.jsonl` in the main checkout;
+`SHADOW_LOG_ROOT` overrides the root elsewhere). The log is **never tuned
+against** — no model, feature, or constructor decision may be selected,
+adjusted, or justified by looking at what it says — and nothing ever rewrites
+a row: the `shadow-score` subcommand refuses to write when the log's last
+recorded date is already on or after the date being scored. That refusal is
+the whole append-only guarantee; there is no separate mechanism enforcing it.
+This is deliberate and important: every other number in this document is
+either training data or a backtest replayed against data the strategy has
+already been shaped against (directly, by fitting on it, or indirectly, by
+choosing feature/reward/constructor variants that scored well on it). The
+shadow log is the only source of genuinely untouched forward evidence this
+project will have, and Phase 2's eventual promotion case rests partly on it
+existing and staying honest from as early as possible.
+
+**Mechanics.** A new `stockholm-portfolio shadow-score` subcommand takes a
+matrix, a model, and the same overlay-mode flags `backtest` accepts (same
+Task 14/15 defaults), scores exactly the matrix's most recent decision date
+— no realized outcome is required, so a live, still-open date works — and
+writes one line containing: the scored date; which model artifact scored it
+(`model_id`, `feature_set_version`); every scored candidate's id, raw
+prediction, cost-and-margin-adjusted edge, and side; the resulting allocation
+(index core weight plus per-name overlay weights); the modeled one-way cost
+of establishing that allocation from flat; the benchmark close; and a
+disclosures list echoing the model's survivorship status. It makes no network
+call, places no order, and mutates no state beyond the one line it appends —
+same call, same inputs, same output, every time. `bin/stockholm-shadow.sh`
+wraps it: refresh the day's live-contract matrix (`training-matrix` against
+whatever the data-root's collection step last left there), then
+`shadow-score`, with per-day stderr captured to
+`$SHADOW_LOG_ROOT/logs/<date>.log`. No timer is installed; the script header
+documents a systemd-timer/cron line for after the 17:30 Stockholm close.
+
+**Why it produces no real rows yet.** Every frozen fold model
+(`baseline-membership-prenorm-v2`, used here) was trained under
+`feature_set_version` `fs-rust-stockholm-1`, which predates the Task 5
+membership correction and every version bump since (the binary's current
+baseline version is `fs-rust-stockholm-17`). `shadow-score` enforces the
+identical model/matrix consistency gate `backtest` does (Task 15): a matrix
+freshly built by `training-matrix` today carries the current version, so it
+is correctly **refused** against every model that currently exists. This was
+verified directly, twice:
+
+- Against the frozen historical matrix
+  (`research-public/training-20-baseline-measured-execution-membership-prenorm-v2.jsonl`,
+  itself `fs-rust-stockholm-1`) the frozen fold-4 model **succeeds**: one
+  line for the matrix's last date (2026-07-08, since the matrix predates
+  today), 278 candidates scored, 44 allocated, `core_weight` 1.0 — proof the
+  subcommand, the overlay wiring, and the append-only guard all work.
+  Re-running the identical command was correctly refused (`already holds a
+  row for 2026-07-08, which is on or after the scored date 2026-07-08`).
+- Against a matrix freshly built by `training-matrix` from the same
+  data-root (`fs-rust-stockholm-17`), the same frozen model was correctly
+  **refused** (`matrix/model/runtime contracts differ`) — the version gate
+  doing exactly its job, not a defect.
+
+So today, `bin/stockholm-shadow.sh` runs end to end as a **plumbing check**:
+it will build a fresh matrix and then hit that refusal, exit non-zero, and
+leave the log untouched — the same loud, correct failure a stale-data cycle
+gets in `bin/cycle.sh`. Real forward evidence starts accruing only once
+Phase 1 rebuilds the training matrices and retrains under the current
+feature-set version (see Open issues below); at that point the same model
+version on both sides of the gate lets the daily row through, and the log
+starts growing one genuinely untouched observation per Stockholm session.
+Nothing about the gate should be loosened to produce rows sooner — a
+shadow-log row scored by a model that cannot see its own matrix's feature
+semantics would not be forward evidence, it would be noise wearing the
+append-only log's credibility.
+
+Implementation: `stockholm_portfolio::shadow_score` (crates/stockholm-portfolio/src/lib.rs)
+and its CLI wrapper `run_shadow_score` (`src/main.rs`); tests in both files'
+`#[cfg(test)]` modules cover the scoring math, the overlay/directional
+allocation split, and — at the CLI level, since it is a filesystem contract —
+the append-only refusal on both a same-date rerun and an out-of-order matrix.
+
 ## Current verdict
 
 The strongest corrected development result is the lean LightGBM stock model
@@ -881,9 +961,15 @@ source of NQ trades does not exist automatically in daily Stockholm bars.
 
 ### P1 — research that can still be informative
 
-1. Preserve a genuinely untouched future interval. Log shadow scores,
-   allocations, modeled costs, and benchmark returns prospectively without
-   sending orders. Do not tune from each day's result.
+1. Preserve a genuinely untouched future interval. **Mechanically done (Task
+   16, see the dated section above):** `bin/stockholm-shadow.sh` and
+   `stockholm-portfolio shadow-score` log shadow scores, allocations, modeled
+   costs, and benchmark closes to an append-only file prospectively, without
+   sending orders, and refuse to rewrite a day once logged. It produces no
+   real rows yet — every frozen model predates the current feature-set
+   version, so the consistency gate correctly refuses it against a freshly
+   built matrix — until P0's data work lets Phase 1 rebuild the matrices and
+   retrain. Do not tune from each day's result once it does.
 2. After P0, predeclare one mechanism-level test using information not already
    exhausted: quarterly earnings change/post-report drift, industry-relative
    residual selection, or another economically motivated event mechanism.
