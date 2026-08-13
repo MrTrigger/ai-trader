@@ -98,3 +98,22 @@ Both scripts follow `bin/cycle.sh`'s conventions exactly: bash, `set -euo pipefa
 - [ ] **Step 1:** Write both scripts; `bash -n` both; run `bin/scalper-record.sh 3 30 10` for a live 30-second smoke (needs the release or debug binary built — build if absent) and confirm rows appended to `data/books/<today>.jsonl`; run `bin/scalper-pull.sh 2` and confirm it pulls without error for the mapped universe coins (universe file must exist — run `scalper-data universe --data-root data --top 25` first if absent).
 - [ ] **Step 2:** Update the runbook's §1/§2 cron examples to invoke the scripts.
 - [ ] **Step 3:** Commit — `Start the evidence clock from cron`
+
+---
+
+### Task 3: Daily-archive fallback for the open month (plan amendment)
+
+Discovered by Task 2's smoke: Binance publishes MONTHLY archive zips only after a month closes, so `pull-binance-perp` can never fetch the current month — a nightly cron would lag up to a month. Binance also publishes per-day files: `https://data.binance.vision/data/futures/um/daily/klines/{SYMBOL}/1m/{SYMBOL}-1m-{YYYY-MM-DD}.zip`, same CSV schema.
+
+**Files:**
+- Modify: `crates/scalper-data/src/binance_um.rs`, `crates/scalper-data/src/main.rs`
+
+**Interfaces:**
+- `pub async fn fetch_um_day(client: &reqwest::Client, symbol: &str, date: chrono::NaiveDate) -> Result<Option<Vec<u8>>, String>` — `None` on 404 (today's file publishes with a lag; missing-day 404 is normal near now).
+- `pub fn open_month_days(year: i32, month: u32, today_utc: chrono::NaiveDate) -> Vec<chrono::NaiveDate>` — pure: the days of (year, month) from the 1st through `min(month_end, today_utc)`; empty if the month is entirely in the future.
+- `cmd_pull_binance_perp` rule change: for each enumerated month, if the month is the CURRENT UTC month (or later), skip the monthly fetch and iterate `open_month_days`, fetching daily zips (each parsed with the existing `parse_um_klines_zip`, same `[start,end)` window), writing per day, printing `BTC 2026-08-13: 1440 bars` / `… skipped (404: not yet published)` lines. Past months keep the monthly path unchanged. `parse_um_klines_zip` needs no changes.
+
+- [ ] **Step 1: Failing tests** — `open_month_days` covering: mid-month today (1st..today), today in a later month (full month), month entirely in the future (empty), today = the 1st (one day). Plus a URL-shape test if the URL builder is a separate function.
+- [ ] **Step 2-4: fail → implement → pass**, full workspace green.
+- [ ] **Step 5: Live check** — `bin/scalper-pull.sh 2` now reports real bar counts for yesterday (and possibly a 404-skip for today's not-yet-published file), not all-404s.
+- [ ] **Step 6: Commit** — `Pull the open month from the daily archive`
