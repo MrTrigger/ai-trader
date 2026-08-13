@@ -6,7 +6,7 @@
 > **It does not, and cannot, claim the >= 2.0 Sharpe gate.** The gate decision
 > requires at least four weeks of recorded order-book costs and the full
 > mapped candidate universe (see `docs/superpowers/plans/2026-08-13-crypto-scalper-plan-3-signal-research.md`,
-> Task 6). Here we have five assets, a ten-minute cost sample standing in for
+> Task 6). Here we have six assets, a ten-minute cost sample standing in for
 > four-plus weeks, and one six-month period. No result below should be read as
 > evidence for or against the strategy.
 
@@ -128,7 +128,7 @@ later summarized).
 
 ## Per-horizon results
 
-**These numbers are plumbing output, not evidence.** Five assets (one
+**These numbers are plumbing output, not evidence.** Six assets (one
 of them, kPEPE, with only two months of history), a 10-minute cost sample
 standing in for four-plus weeks, and a single six-month period is not a
 gate-eligible run under any reading of the protocol.

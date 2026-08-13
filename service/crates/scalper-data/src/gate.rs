@@ -579,7 +579,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         "NO-TRADES"
     } else {
         match overall_sharpe {
-            Some(s) if s >= GATE_THRESHOLD => "PASS",
+            Some(s) if s > GATE_THRESHOLD => "PASS",
             _ => "FAIL",
         }
     };
