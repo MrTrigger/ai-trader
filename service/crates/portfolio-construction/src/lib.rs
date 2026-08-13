@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use time::Date;
 
 const EPSILON: f64 = 1e-12;
 
@@ -410,10 +411,101 @@ pub struct Allocation {
     pub diagnostics: AllocationDiagnostics,
 }
 
+/// Combine equal-capital rebalance phases on the calendar rather than on the
+/// period index. Each input is one phase's daily `(session, NAV)` series; the
+/// output is the combined book's daily NAV over the sessions every phase covers.
+///
+/// Averaging phase returns by period index treats phase `j`'s period `k` as
+/// simultaneous with phase `j+1`'s period `k`, but those periods span different
+/// sessions. The average then behaves like a moving average of overlapping
+/// windows: it suppresses variance while preserving the mean, and any
+/// annualisation of the smoothed series reports a Sharpe no phase earned. Keying
+/// on the session date removes that smoothing entirely — when every phase holds
+/// the same book the combined series is that book's own path.
+///
+/// Capital is split equally at the first common session, so every phase is
+/// normalised to NAV 1.0 there and the combined book is thereafter held without
+/// transfers between phases. Sessions before that (a phase's own ramp-up) and
+/// after the earliest-ending phase are outside the window in which all phases
+/// are invested, so they are excluded; inside the window the phases' session
+/// grids must agree exactly, and a gap is an error rather than a silent
+/// realignment of one phase's NAV onto another phase's dates.
+pub fn equal_weight_phase_daily_navs(
+    phases: &[Vec<(Date, f64)>],
+) -> Result<Vec<(Date, f64)>, String> {
+    if phases.is_empty() || phases.iter().any(Vec::is_empty) {
+        return Err("rebalance phases must be non-empty".into());
+    }
+    for phase in phases {
+        if phase.iter().any(|(_, nav)| !nav.is_finite() || *nav <= 0.0) {
+            return Err("rebalance phase NAVs must be finite and positive".into());
+        }
+        if phase.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err("rebalance phase marks must be strictly ordered by session".into());
+        }
+    }
+    let start = phases
+        .iter()
+        .map(|phase| phase[0].0)
+        .max()
+        .expect("non-empty phases");
+    let end = phases
+        .iter()
+        .map(|phase| phase[phase.len() - 1].0)
+        .min()
+        .expect("non-empty phases");
+    if start > end {
+        return Err("rebalance phases have no overlapping session window".into());
+    }
+    let windows = phases
+        .iter()
+        .map(|phase| {
+            phase
+                .iter()
+                .filter(|(date, _)| *date >= start && *date <= end)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let reference = &windows[0];
+    for (index, window) in windows.iter().enumerate().skip(1) {
+        if window.len() != reference.len() {
+            return Err(format!(
+                "phase {index} covers {} sessions between {start} and {end}, phase 0 covers {}",
+                window.len(),
+                reference.len()
+            ));
+        }
+        if let Some((_, (date, _))) = window
+            .iter()
+            .zip(reference)
+            .enumerate()
+            .find(|(_, (mine, theirs))| mine.0 != theirs.0)
+        {
+            return Err(format!("phase {index} has no {} session", date.0));
+        }
+    }
+    let base = windows.iter().map(|window| window[0].1).collect::<Vec<_>>();
+    Ok((0..reference.len())
+        .map(|index| {
+            let nav = windows
+                .iter()
+                .zip(&base)
+                .map(|(window, opening)| window[index].1 / opening)
+                .sum::<f64>()
+                / windows.len() as f64;
+            (reference[index].0, nav)
+        })
+        .collect())
+}
+
 /// Combine equal-capital rebalance phases without selecting a favourable
 /// calendar alignment. Each input is a complete return series for one phase;
 /// only the common complete prefix is used, so a partial terminal holding can
 /// never receive extra weight.
+#[deprecated(
+    note = "averages phases by period index, which smooths overlapping holding windows and inflates annualised Sharpe; use equal_weight_phase_daily_navs. Retained only to summarise reports predating daily NAV marks."
+)]
 pub fn equal_weight_phase_returns(phases: &[Vec<f64>]) -> Result<Vec<f64>, String> {
     if phases.is_empty() || phases.iter().any(Vec::is_empty) {
         return Err("rebalance phases must be non-empty".into());
@@ -701,7 +793,11 @@ fn scale_down(value: f64, maximum: f64) -> f64 {
 }
 
 fn normalise_zero(value: f64) -> f64 {
-    if value.abs() <= EPSILON { 0.0 } else { value }
+    if value.abs() <= EPSILON {
+        0.0
+    } else {
+        value
+    }
 }
 
 fn validate_sizing(config: &SizingConfig) -> Result<(), String> {
@@ -879,11 +975,9 @@ mod tests {
         let mut config = DirectionConfig::baseline(1.0).unwrap();
         config.exit_threshold = config.enter_threshold;
         assert!(config.validate().is_err());
-        assert!(
-            DirectionState::default()
-                .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
-                .is_err()
-        );
+        assert!(DirectionState::default()
+            .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
+            .is_err());
     }
 
     #[test]
@@ -1088,9 +1182,189 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn equal_weight_phases_use_only_the_common_complete_prefix() {
         let combined =
             equal_weight_phase_returns(&[vec![0.10, -0.05, 0.20], vec![0.00, 0.05]]).unwrap();
         assert_eq!(combined, [0.05, 0.0]);
+    }
+
+    /// A deterministic, mean-positive daily return path with enough dispersion
+    /// that overlapping-window averaging visibly flattens it.
+    fn daily_return_path(sessions: usize) -> Vec<f64> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..sessions)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let uniform = (state >> 11) as f64 / (1_u64 << 53) as f64;
+                0.0006 + 0.02 * (uniform - 0.5)
+            })
+            .collect()
+    }
+
+    fn session(index: usize) -> Date {
+        // A synthetic contiguous session grid; only ordering and equality matter.
+        Date::from_ordinal_date(2024, 1).expect("valid ordinal date")
+            + time::Duration::days(index as i64)
+    }
+
+    /// Build one phase's daily `(date, nav)` series over `sessions[start..end]`,
+    /// holding the common asset and paying `rebalance_cost` on every session
+    /// where this phase rebalances.
+    fn phase_marks(
+        path: &[f64],
+        first_session: usize,
+        last_session: usize,
+        offset: usize,
+        cadence: usize,
+        rebalance_cost: f64,
+    ) -> Vec<(Date, f64)> {
+        let mut nav = 1.0;
+        (first_session..=last_session)
+            .map(|index| {
+                nav *= 1.0 + path[index];
+                if index % cadence == offset % cadence {
+                    nav *= 1.0 - rebalance_cost;
+                }
+                (session(index), nav)
+            })
+            .collect()
+    }
+
+    fn daily_returns(navs: &[(Date, f64)]) -> Vec<f64> {
+        navs.windows(2)
+            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+            .collect()
+    }
+
+    fn annualised_sharpe(returns: &[f64], periods_per_year: f64) -> f64 {
+        let average = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns
+            .iter()
+            .map(|value| (value - average).powi(2))
+            .sum::<f64>()
+            / returns.len() as f64;
+        average * periods_per_year / (variance.sqrt() * periods_per_year.sqrt())
+    }
+
+    /// Period returns as the legacy index-averaging path sees them: each phase's
+    /// own non-overlapping holding-period returns, taken off the same NAV path.
+    fn phase_period_returns(navs: &[(Date, f64)], cadence: usize) -> Vec<f64> {
+        navs.iter()
+            .step_by(cadence)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+            .collect()
+    }
+
+    #[test]
+    fn calendar_aligned_phases_do_not_smooth_a_common_daily_path() {
+        let path = daily_return_path(260);
+        let phases = (0..20)
+            .map(|offset| phase_marks(&path, offset, 250, offset, 20, 0.0))
+            .collect::<Vec<_>>();
+        let combined = equal_weight_phase_daily_navs(&phases).unwrap();
+
+        // The combined window starts at the last phase's first mark.
+        assert_eq!(combined[0], (session(19), 1.0));
+        assert_eq!(combined.last().unwrap().0, session(250));
+        let combined_returns = daily_returns(&combined);
+        let expected = &path[20..=250];
+        assert_eq!(combined_returns.len(), expected.len());
+        for (actual, wanted) in combined_returns.iter().zip(expected) {
+            assert!(
+                (actual - wanted).abs() < 1e-12,
+                "combined daily return {actual} is not the common path's {wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_phases_keep_the_single_phase_sharpe() {
+        let path = daily_return_path(200);
+        let single = phase_marks(&path, 0, 199, 0, 20, 0.0);
+        let phases = vec![single.clone(); 20];
+        let combined = equal_weight_phase_daily_navs(&phases).unwrap();
+        assert_eq!(combined.len(), single.len());
+        let combined_sharpe = annualised_sharpe(&daily_returns(&combined), 252.0);
+        let single_sharpe = annualised_sharpe(&daily_returns(&single), 252.0);
+        assert!(
+            (combined_sharpe - single_sharpe).abs() < 1e-9,
+            "combined Sharpe {combined_sharpe} differs from the single-phase {single_sharpe}"
+        );
+    }
+
+    #[test]
+    fn combining_one_asset_cannot_beat_the_best_phase_sharpe() {
+        // Long enough that a phase's Sharpe cannot win by sampling luck alone:
+        // with only a couple of dozen holding periods the best of twenty phases
+        // is dominated by estimation noise, which would hide the smoothing.
+        let path = daily_return_path(2020);
+        let cadence = 20;
+        let phases = (0..cadence)
+            .map(|offset| phase_marks(&path, offset, 2000, offset, cadence, 0.0015))
+            .collect::<Vec<_>>();
+
+        let best_phase_sharpe = phases
+            .iter()
+            .map(|phase| annualised_sharpe(&daily_returns(phase), 252.0))
+            .fold(f64::MIN, f64::max);
+        let combined_sharpe = annualised_sharpe(
+            &daily_returns(&equal_weight_phase_daily_navs(&phases).unwrap()),
+            252.0,
+        );
+        assert!(
+            combined_sharpe <= best_phase_sharpe + 1e-6,
+            "calendar-aligned Sharpe {combined_sharpe} exceeds the best phase's {best_phase_sharpe}"
+        );
+
+        // The defect this replaces: averaging by period index across phases whose
+        // period k spans different sessions smooths the series and manufactures
+        // a Sharpe no single phase earned.
+        #[allow(deprecated)]
+        let smoothed = equal_weight_phase_returns(
+            &phases
+                .iter()
+                .map(|phase| phase_period_returns(phase, cadence))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let periods_per_year = 252.0 / cadence as f64;
+        let smoothed_sharpe = annualised_sharpe(&smoothed, periods_per_year);
+        let best_phase_period_sharpe = phases
+            .iter()
+            .map(|phase| annualised_sharpe(&phase_period_returns(phase, cadence), periods_per_year))
+            .fold(f64::MIN, f64::max);
+        assert!(
+            smoothed_sharpe > best_phase_period_sharpe,
+            "period-index averaging was expected to inflate Sharpe ({smoothed_sharpe} vs {best_phase_period_sharpe})"
+        );
+    }
+
+    #[test]
+    fn a_session_missing_from_one_phase_is_an_error_not_a_silent_truncation() {
+        let path = daily_return_path(60);
+        let mut phases = (0..3)
+            .map(|offset| phase_marks(&path, offset, 50, offset, 20, 0.0))
+            .collect::<Vec<_>>();
+        phases[1].remove(20);
+        let error = equal_weight_phase_daily_navs(&phases).unwrap_err();
+        assert!(
+            error.contains("session"),
+            "expected a session-mismatch error, got {error}"
+        );
+    }
+
+    #[test]
+    fn phases_without_a_shared_window_are_rejected() {
+        let path = daily_return_path(60);
+        let early = phase_marks(&path, 0, 20, 0, 20, 0.0);
+        let late = phase_marks(&path, 30, 50, 0, 20, 0.0);
+        assert!(equal_weight_phase_daily_navs(&[early, late])
+            .unwrap_err()
+            .contains("overlap"));
     }
 }

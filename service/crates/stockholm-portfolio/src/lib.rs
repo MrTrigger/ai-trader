@@ -1254,7 +1254,7 @@ fn fixed_direction_score(row: &DirectionTrainingRow) -> Result<f64, String> {
 }
 
 fn direction_performance(returns: &[f64], cadence: usize) -> DirectionPerformance {
-    let metrics = return_metrics(returns, cadence);
+    let metrics = return_metrics(returns, sessions_per_year(cadence));
     DirectionPerformance {
         periods: returns.len(),
         total_return: metrics.total_return,
@@ -1456,6 +1456,11 @@ pub struct BacktestResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebalancePhasePerformance {
     pub periods: usize,
+    /// Observations per year in the series these statistics come from: 252 for a
+    /// daily NAV series, 252/cadence for a holding-period series. Annualised
+    /// figures are meaningless without it.
+    #[serde(default)]
+    pub periods_per_year: f64,
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
@@ -1492,10 +1497,37 @@ pub struct RebalancePhaseSummary {
     pub cadence_sessions: usize,
     pub phase_count: usize,
     pub common_complete_periods: usize,
+    /// How the phases were combined into one book. `calendar_aligned_daily_nav`
+    /// keys every phase's daily NAV on the session date;
+    /// `legacy_period_index_average` averages phase returns by period index and
+    /// therefore smooths overlapping holding windows — it survives only for
+    /// reports that predate daily NAV marks.
+    #[serde(default = "legacy_combination_method")]
+    pub combination_method: String,
+    /// The first and last session of the window in which every phase is
+    /// invested. Narrower than `start`/`end`, which are the replay's own bounds.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_date"
+    )]
+    pub combined_start: Option<Date>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_date"
+    )]
+    pub combined_end: Option<Date>,
     pub performance: RebalancePhasePerformance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_performance: Option<RebalancePhasePerformance>,
+    /// The benchmark cannot ride the daily NAV grid until the index itself is
+    /// marked daily, so it discloses its own combination separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_combination_method: Option<String>,
     pub phase_diagnostics: Vec<RebalancePhaseDiagnostic>,
+    /// The combined book's return series at the frequency
+    /// `performance.periods_per_year` names.
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
@@ -1523,16 +1555,52 @@ pub struct RebalancePhaseFoldSummary {
     pub positive_folds: usize,
     pub cadence_sessions: usize,
     pub phase_count: usize,
+    #[serde(default = "legacy_combination_method")]
+    pub combination_method: String,
     pub target_sharpe: f64,
     pub performance: RebalancePhasePerformance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_performance: Option<RebalancePhasePerformance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_combination_method: Option<String>,
     pub fold_diagnostics: Vec<RebalancePhaseFoldDiagnostic>,
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
     pub passed: bool,
     pub disclosures: Vec<String>,
+}
+
+/// Phases combined on the calendar: every phase's daily NAV keyed on its session
+/// date, so overlapping holding windows are never averaged against each other.
+pub const CALENDAR_ALIGNED_DAILY_NAV: &str = "calendar_aligned_daily_nav";
+
+/// Phase returns averaged by period index. Phase `j`'s period `k` covers
+/// different sessions than phase `j+1`'s, so the average smooths overlapping
+/// windows and inflates any annualised Sharpe taken from it. Only reports
+/// written before daily NAV marks existed can be summarised this way.
+pub const LEGACY_PERIOD_INDEX_AVERAGE: &str = "legacy_period_index_average";
+
+/// The benchmark is one continuously held index in every phase, so no averaging
+/// across phases is meaningful: the lowest-offset phase's own series is the
+/// combined book's benchmark path, sampled at holding-period frequency.
+pub const SINGLE_PHASE_INDEX_PATH: &str = "single_phase_index_path";
+
+fn legacy_combination_method() -> String {
+    LEGACY_PERIOD_INDEX_AVERAGE.into()
+}
+
+/// Session returns of one phase's daily NAV marks. The replay opens at NAV 1.0,
+/// so the first mark is itself a return and anchors the series.
+fn daily_returns(navs: &[(Date, f64)]) -> Vec<f64> {
+    let mut previous = 1.0;
+    navs.iter()
+        .map(|(_, nav)| {
+            let value = nav / previous - 1.0;
+            previous = *nav;
+            value
+        })
+        .collect()
 }
 
 fn default_budget() -> portfolio_construction::Budget {
@@ -2372,17 +2440,53 @@ pub fn summarize_rebalance_phases(
     if !ordered.iter().all(same_contract) {
         return Err("rebalance phase report contracts differ".into());
     }
-    let return_series = ordered
+    let daily_navs = ordered
         .iter()
         .map(|report| {
             report
                 .steps
                 .iter()
-                .map(|step| step.period_return)
+                .flat_map(|step| step.daily_marks.iter().map(|mark| (mark.date, mark.nav)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let period_returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+    let marked = daily_navs.iter().filter(|phase| !phase.is_empty()).count();
+    if marked != 0 && marked != daily_navs.len() {
+        return Err(format!(
+            "{marked} of {} phases carry daily NAV marks; combine either all or none",
+            daily_navs.len()
+        ));
+    }
+    let calendar_aligned = marked == daily_navs.len();
+
+    // The combined book's own return series, at whichever frequency the phase
+    // reports can support. The combined path is normalised to 1.0 on its first
+    // session, so that session's return is genuinely outside the window every
+    // phase shares and is not dropped by accident.
+    let (period_returns, combined_start, combined_end, periods_per_year) = if calendar_aligned {
+        let combined = portfolio_construction::equal_weight_phase_daily_navs(&daily_navs)?;
+        let returns = combined
+            .windows(2)
+            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+            .collect::<Vec<_>>();
+        let start = combined.first().map(|(date, _)| *date);
+        let end = combined.last().map(|(date, _)| *date);
+        (returns, start, end, SESSIONS_PER_YEAR)
+    } else {
+        let return_series = ordered
+            .iter()
+            .map(|report| {
+                report
+                    .steps
+                    .iter()
+                    .map(|step| step.period_return)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        #[allow(deprecated)]
+        let returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+        (returns, None, None, sessions_per_year(cadence))
+    };
     let benchmark_presence = ordered
         .iter()
         .map(|report| report.benchmark.is_some())
@@ -2390,42 +2494,83 @@ pub fn summarize_rebalance_phases(
     if benchmark_presence.len() != 1 {
         return Err("benchmark attribution is present in only some phases".into());
     }
-    let benchmark_period_returns = if *benchmark_presence
+    let has_benchmark = *benchmark_presence
         .first()
-        .expect("reports establish benchmark presence")
-    {
-        let phases = ordered
+        .expect("reports establish benchmark presence");
+    let phase_benchmark_returns = |report: &BacktestResult| {
+        report
+            .steps
             .iter()
-            .map(|report| {
-                report
-                    .steps
-                    .iter()
-                    .map(|step| {
-                        step.benchmark_period_return
-                            .ok_or_else(|| "phase step lacks benchmark return".to_owned())
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+            .map(|step| {
+                step.benchmark_period_return
+                    .ok_or_else(|| "phase step lacks benchmark return".to_owned())
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        portfolio_construction::equal_weight_phase_returns(&phases)?
-    } else {
-        Vec::new()
+            .collect::<Result<Vec<_>, String>>()
     };
-    let performance = phase_performance(&period_returns, cadence);
+    // Every phase holds the same index continuously, so the equal-capital
+    // combined benchmark book is that index — there is nothing to average, and
+    // averaging overlapping windows is the defect being removed here. Until the
+    // index itself is marked daily the benchmark stays on holding-period
+    // frequency, which `benchmark_combination_method` and `periods_per_year`
+    // both state outright.
+    let (benchmark_period_returns, benchmark_combination_method) =
+        match (has_benchmark, calendar_aligned) {
+            (false, _) => (Vec::new(), None),
+            (true, true) => (
+                phase_benchmark_returns(ordered[0])?,
+                Some(SINGLE_PHASE_INDEX_PATH.to_owned()),
+            ),
+            (true, false) => {
+                let phases = ordered
+                    .iter()
+                    .map(|report| phase_benchmark_returns(report))
+                    .collect::<Result<Vec<_>, String>>()?;
+                #[allow(deprecated)]
+                let returns = portfolio_construction::equal_weight_phase_returns(&phases)?;
+                (returns, Some(LEGACY_PERIOD_INDEX_AVERAGE.to_owned()))
+            }
+        };
+    let performance = phase_performance(&period_returns, periods_per_year);
     let benchmark_performance = (!benchmark_period_returns.is_empty())
-        .then(|| phase_performance(&benchmark_period_returns, cadence));
+        .then(|| phase_performance(&benchmark_period_returns, sessions_per_year(cadence)));
+    // Phase diagnostics exist to be compared with the combined result — an
+    // aggregate that beats every one of its parts is the smoothing artefact
+    // this fix removes — so they are measured at the same frequency.
     let phase_diagnostics = ordered
         .iter()
-        .map(|report| RebalancePhaseDiagnostic {
-            offset_sessions: report.rebalance_offset_sessions,
-            periods: report.metrics.periods,
-            total_return: report.metrics.total_return,
-            sharpe: report.metrics.sharpe,
-            max_drawdown: report.metrics.max_drawdown,
-            mean_rank_ic: report
-                .diagnostics
-                .as_ref()
-                .map_or(0.0, |diagnostics| diagnostics.mean_rank_ic),
+        .zip(&daily_navs)
+        .map(|(report, navs)| {
+            // The phase's replay opens at NAV 1.0, so its first mark already
+            // carries a session's return: the series has to start there or the
+            // diagnostic would silently drop one session.
+            let (periods, total_return, sharpe, max_drawdown) = if calendar_aligned {
+                let returns = daily_returns(navs);
+                let values = return_metrics(&returns, SESSIONS_PER_YEAR);
+                (
+                    returns.len(),
+                    values.total_return,
+                    values.sharpe,
+                    values.max_drawdown,
+                )
+            } else {
+                (
+                    report.metrics.periods,
+                    report.metrics.total_return,
+                    report.metrics.sharpe,
+                    report.metrics.max_drawdown,
+                )
+            };
+            RebalancePhaseDiagnostic {
+                offset_sessions: report.rebalance_offset_sessions,
+                periods,
+                total_return,
+                sharpe,
+                max_drawdown,
+                mean_rank_ic: report
+                    .diagnostics
+                    .as_ref()
+                    .map_or(0.0, |diagnostics| diagnostics.mean_rank_ic),
+            }
         })
         .collect();
     Ok(RebalancePhaseSummary {
@@ -2441,18 +2586,40 @@ pub fn summarize_rebalance_phases(
         cadence_sessions: cadence,
         phase_count: ordered.len(),
         common_complete_periods: period_returns.len(),
+        combination_method: if calendar_aligned {
+            CALENDAR_ALIGNED_DAILY_NAV.into()
+        } else {
+            LEGACY_PERIOD_INDEX_AVERAGE.into()
+        },
+        combined_start,
+        combined_end,
         performance,
         benchmark_performance,
+        benchmark_combination_method,
         phase_diagnostics,
         period_returns,
         benchmark_period_returns,
-        disclosures: vec![
-            "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".into(),
-            "Only the common complete prefix across phases is aggregated, so incomplete terminal holdings are discarded.".into(),
-            "Overlapping phase holdings are one combined portfolio, not independent observations; annualisation remains tied to the original holding cadence.".into(),
-            "SURVIVORSHIP_CONTAMINATED research data cannot authorize paper or live capital regardless of this result.".into(),
-        ],
+        disclosures: phase_disclosures(calendar_aligned, has_benchmark),
     })
+}
+
+fn phase_disclosures(calendar_aligned: bool, has_benchmark: bool) -> Vec<String> {
+    let mut disclosures = vec![
+        "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".to_owned(),
+    ];
+    if calendar_aligned {
+        disclosures.push("Phases are combined on the session date from each phase's daily NAV marks, so no two overlapping holding windows are averaged against each other. Performance is measured on daily returns and annualised over 252 sessions.".into());
+        disclosures.push("Capital is split equally at the first session every phase is invested in and the combined book is then held without transfers between phases; sessions before that and after the earliest-ending phase lie outside combined_start..combined_end and are excluded.".into());
+        if has_benchmark {
+            disclosures.push("Every phase holds the same index continuously, so the benchmark is reported from the lowest-offset phase's own holding-period series rather than averaged across phases. Its annualisation is 252/cadence, not 252: benchmark and portfolio Sharpe are not measured at the same frequency until the index is marked daily.".into());
+        }
+    } else {
+        disclosures.push("These phase reports carry no daily NAV marks, so phases are averaged by period index. Phase j's period k spans different sessions than phase j+1's, so the average smooths overlapping windows and its annualised volatility is understated and its Sharpe overstated. Rerun the phases with daily marks before citing this number.".into());
+        disclosures.push("Only the common complete prefix across phases is aggregated, so incomplete terminal holdings are discarded.".into());
+        disclosures.push("Overlapping phase holdings are one combined portfolio, not independent observations; annualisation remains tied to the original holding cadence.".into());
+    }
+    disclosures.push("SURVIVORSHIP_CONTAMINATED research data cannot authorize paper or live capital regardless of this result.".into());
+    disclosures
 }
 
 pub fn summarize_rebalance_phase_folds(
@@ -2478,6 +2645,28 @@ pub fn summarize_rebalance_phase_folds(
     }) {
         return Err("rebalance-phase fold contracts differ".into());
     }
+    // Concatenating a daily fold onto a holding-period fold would produce one
+    // series with two meanings and no annualisation that fits both.
+    if ordered
+        .iter()
+        .any(|fold| fold.combination_method != first.combination_method)
+    {
+        return Err("rebalance-phase folds combine their phases differently".into());
+    }
+    // A fold's last daily mark falls after its declared end — the terminal book
+    // is still priced — so non-overlapping fold bounds do not by themselves
+    // prove the daily series do not share a session.
+    if let Some(overlap) = ordered.windows(2).find(|pair| {
+        matches!(
+            (pair[0].combined_end, pair[1].combined_start),
+            (Some(earlier), Some(later)) if earlier >= later
+        )
+    }) {
+        return Err(format!(
+            "fold ending {} and fold starting {} share sessions in their combined windows",
+            overlap[0].end, overlap[1].start
+        ));
+    }
     let benchmark_presence = ordered
         .iter()
         .map(|fold| fold.benchmark_performance.is_some())
@@ -2485,6 +2674,11 @@ pub fn summarize_rebalance_phase_folds(
     if benchmark_presence.len() != 1 {
         return Err("benchmark attribution is present in only some phase folds".into());
     }
+    let periods_per_year = if first.combination_method == CALENDAR_ALIGNED_DAILY_NAV {
+        SESSIONS_PER_YEAR
+    } else {
+        sessions_per_year(first.cadence_sessions)
+    };
     let period_returns = ordered
         .iter()
         .flat_map(|fold| fold.period_returns.iter().copied())
@@ -2493,9 +2687,13 @@ pub fn summarize_rebalance_phase_folds(
         .iter()
         .flat_map(|fold| fold.benchmark_period_returns.iter().copied())
         .collect::<Vec<_>>();
-    let performance = phase_performance(&period_returns, first.cadence_sessions);
-    let benchmark_performance = (!benchmark_period_returns.is_empty())
-        .then(|| phase_performance(&benchmark_period_returns, first.cadence_sessions));
+    let performance = phase_performance(&period_returns, periods_per_year);
+    let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
+        phase_performance(
+            &benchmark_period_returns,
+            sessions_per_year(first.cadence_sessions),
+        )
+    });
     let fold_diagnostics = ordered
         .iter()
         .map(|fold| RebalancePhaseFoldDiagnostic {
@@ -2524,24 +2722,33 @@ pub fn summarize_rebalance_phase_folds(
         positive_folds,
         cadence_sessions: first.cadence_sessions,
         phase_count: first.phase_count,
+        combination_method: first.combination_method.clone(),
         target_sharpe,
         performance,
         benchmark_performance,
+        benchmark_combination_method: first.benchmark_combination_method.clone(),
         fold_diagnostics,
         period_returns,
         benchmark_period_returns,
         passed,
-        disclosures: vec![
-            "Fold returns are concatenated only after every calendar phase is equal-weighted within each strictly forward fold.".into(),
-            "The phase combination removes arbitrary rebalance alignment but cannot correct survivorship bias or unstable alpha.".into(),
-        ],
+        disclosures: {
+            let mut disclosures = vec![
+                "Fold returns are concatenated only after every calendar phase is equal-weighted within each strictly forward fold.".to_owned(),
+                "The phase combination removes arbitrary rebalance alignment but cannot correct survivorship bias or unstable alpha.".to_owned(),
+            ];
+            if first.combination_method != CALENDAR_ALIGNED_DAILY_NAV {
+                disclosures.push("These folds averaged their phases by period index, which smooths overlapping holding windows and overstates Sharpe. Rerun the phases with daily NAV marks before citing this number.".into());
+            }
+            disclosures
+        },
     })
 }
 
-fn phase_performance(returns: &[f64], cadence: usize) -> RebalancePhasePerformance {
-    let values = return_metrics(returns, cadence);
+fn phase_performance(returns: &[f64], periods_per_year: f64) -> RebalancePhasePerformance {
+    let values = return_metrics(returns, periods_per_year);
     RebalancePhasePerformance {
         periods: returns.len(),
+        periods_per_year,
         total_return: values.total_return,
         annualised_return: values.annualised_return,
         annualised_volatility: values.annualised_volatility,
@@ -2597,7 +2804,7 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
         .iter()
         .map(|(_, period_return)| *period_return)
         .collect::<Vec<_>>();
-    let metrics = return_metrics(&returns, cadence);
+    let metrics = return_metrics(&returns, sessions_per_year(cadence));
     let periods = attributed.len();
     let regime_count = |regime| {
         attributed
@@ -2740,8 +2947,8 @@ fn selection_layer_metrics(
         .iter()
         .map(|step| step.gross_return_before_costs)
         .collect::<Vec<_>>();
-    let net = return_metrics(&net_returns, cadence);
-    let gross = return_metrics(&gross_returns, cadence);
+    let net = return_metrics(&net_returns, sessions_per_year(cadence));
+    let gross = return_metrics(&gross_returns, sessions_per_year(cadence));
     Ok(Some(SelectionLayerMetrics {
         periods: steps.len(),
         total_return: net.total_return,
@@ -3063,7 +3270,7 @@ fn fixed_momentum_performance(
 
 fn fixed_momentum_metrics(steps: &[FixedMomentumStep], cadence: usize) -> Metrics {
     let returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
-    let values = return_metrics(&returns, cadence);
+    let values = return_metrics(&returns, sessions_per_year(cadence));
     Metrics {
         periods: steps.len(),
         total_return: values.total_return,
@@ -3264,7 +3471,7 @@ fn benchmark_comparison_from_returns(
     if portfolio_returns.len() != benchmark_returns.len() {
         return Err("portfolio and benchmark return counts differ".into());
     }
-    let benchmark_stats = return_metrics(benchmark_returns, cadence);
+    let benchmark_stats = return_metrics(benchmark_returns, sessions_per_year(cadence));
     let active = portfolio_returns
         .iter()
         .zip(benchmark_returns)
@@ -3321,8 +3528,21 @@ struct ReturnMetrics {
     max_drawdown: f64,
 }
 
-fn return_metrics(returns: &[f64], cadence: usize) -> ReturnMetrics {
-    let periods_per_year = 252.0 / cadence as f64;
+/// Trading sessions per year, the constant every annualisation in this crate
+/// shares.
+const SESSIONS_PER_YEAR: f64 = 252.0;
+
+/// Observations per year for a series sampled once every `cadence` sessions.
+fn sessions_per_year(cadence: usize) -> f64 {
+    SESSIONS_PER_YEAR / cadence as f64
+}
+
+/// `periods_per_year` is the observation frequency of `returns`, not a property
+/// of the strategy: a holding-period series sampled every `cadence` sessions
+/// uses `252/cadence`, while a daily NAV series uses 252. Passing it explicitly
+/// is what keeps a daily series from being annualised as if each observation
+/// were a whole holding period.
+fn return_metrics(returns: &[f64], periods_per_year: f64) -> ReturnMetrics {
     let total_nav = returns.iter().fold(1.0, |nav, value| nav * (1.0 + value));
     let total_return = total_nav - 1.0;
     let annualised_volatility = population_std(returns) * periods_per_year.sqrt();
@@ -3473,6 +3693,28 @@ mod date_serde {
         let value = String::deserialize(deserializer)?;
         let format = time::macros::format_description!("[year]-[month]-[day]");
         Date::parse(&value, format).map_err(serde::de::Error::custom)
+    }
+}
+
+mod optional_date {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::Date;
+
+    pub fn serialize<S: Serializer>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error> {
+        match date {
+            Some(value) => serializer.serialize_str(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Date>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        let format = time::macros::format_description!("[year]-[month]-[day]");
+        value
+            .map(|text| Date::parse(&text, format).map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 
@@ -3955,7 +4197,10 @@ mod tests {
         mark_prices
             .insert_history(
                 "TX1",
-                sessions.iter().copied().zip([98.0, 110.0, 105.0, 118.0, 121.0]),
+                sessions
+                    .iter()
+                    .copied()
+                    .zip([98.0, 110.0, 105.0, 118.0, 121.0]),
             )
             .unwrap();
         mark_prices
@@ -4024,6 +4269,144 @@ mod tests {
         assert!((compounded - 1.0 - step.period_return).abs() < 1e-12);
     }
 
+    /// Fifteen sessions of one instrument at hand-set prices, replayed once per
+    /// rebalance offset. Both phases hold the same asset throughout, which is
+    /// the case where a combined result that beats every phase can only be an
+    /// artefact of the combination.
+    fn two_phase_replay(with_marks: bool) -> Vec<BacktestResult> {
+        let sessions = [
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-08",
+            "2024-01-09",
+            "2024-01-10",
+            "2024-01-11",
+            "2024-01-12",
+            "2024-01-15",
+            "2024-01-16",
+            "2024-01-17",
+            "2024-01-18",
+            "2024-01-19",
+            "2024-01-22",
+        ]
+        .map(day);
+        let prices = [
+            100.0, 101.0, 99.5, 102.0, 103.5, 101.0, 100.5, 104.0, 102.5, 105.0, 103.0, 106.5,
+            104.5, 107.0, 105.0,
+        ];
+        let cadence = 2;
+        // Decisions are taken on the first eleven sessions; the book is bought at
+        // the next session's price and sold `cadence` sessions later.
+        let rows = (0..11)
+            .map(|index| {
+                let mut row = row(sessions[index]);
+                row.entry_price = prices[index + 1];
+                row.exit_price = prices[index + 1 + cadence];
+                row.target = row.exit_price / row.entry_price - 1.0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut mark_prices = MarkPrices::default();
+        mark_prices
+            .insert_history("TX1", sessions.iter().copied().zip(prices))
+            .unwrap();
+        (0..cadence)
+            .map(|offset| {
+                backtest(
+                    &constant_model(0.02),
+                    &rows,
+                    &BacktestConfig {
+                        start: sessions[0],
+                        end: sessions[10],
+                        cadence_sessions: cadence,
+                        rebalance_offset_sessions: offset,
+                        model_horizon_sessions: cadence,
+                        prediction_horizon_scale: 1.0,
+                        max_positions: 1,
+                        retention_rank: 1,
+                        max_sector_gross: None,
+                        ranking: portfolio_construction::RankingMethod::Edge,
+                        sizing: portfolio_construction::SizingMethod::Equal,
+                        allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                        position_weight: 1.0,
+                        min_position_weight: 0.0,
+                        reference_edge: 0.01,
+                        reference_volatility: 0.02,
+                        direction_config: None,
+                        prediction_composition: PredictionComposition::Direct,
+                        market_return_forecasts: None,
+                        market_forecast_model_id: None,
+                        costs: zero_execution_costs(),
+                        benchmark: None,
+                        mark_prices: with_marks.then(|| mark_prices.clone()),
+                    },
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn daily_marks_combine_phases_on_the_calendar_at_daily_frequency() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
+        assert_eq!(summary.combination_method, CALENDAR_ALIGNED_DAILY_NAV);
+        assert_eq!(summary.performance.periods_per_year, SESSIONS_PER_YEAR);
+        // Offset 0 marks 2024-01-03..01-18 and offset 1 marks 01-04..01-17, so
+        // both phases are invested over the ten sessions in between.
+        assert_eq!(summary.combined_start, Some(day("2024-01-04")));
+        assert_eq!(summary.combined_end, Some(day("2024-01-17")));
+        assert_eq!(summary.period_returns.len(), 9);
+        assert_eq!(summary.common_complete_periods, 9);
+        assert!(summary.benchmark_combination_method.is_none());
+    }
+
+    #[test]
+    fn daily_phase_diagnostics_still_reconcile_with_each_phase_report() {
+        let phases = two_phase_replay(true);
+        let summary = summarize_rebalance_phases(&phases).unwrap();
+        for (diagnostic, report) in summary.phase_diagnostics.iter().zip(&phases) {
+            // Re-measuring a phase daily may not quietly restate what it earned:
+            // the mark path opens at NAV 1.0 and closes on the phase's own NAV.
+            assert!(
+                (diagnostic.total_return - report.metrics.total_return).abs() < 1e-12,
+                "phase {} daily total return {} differs from its report's {}",
+                diagnostic.offset_sessions,
+                diagnostic.total_return,
+                report.metrics.total_return
+            );
+            assert_eq!(
+                diagnostic.periods,
+                report.steps.iter().map(|step| step.daily_marks.len()).sum::<usize>()
+            );
+        }
+    }
+
+    #[test]
+    fn phases_without_daily_marks_disclose_the_legacy_period_index_average() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        assert_eq!(summary.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
+        assert_eq!(summary.performance.periods_per_year, 126.0);
+        assert_eq!(summary.combined_start, None);
+        assert!(summary
+            .disclosures
+            .iter()
+            .any(|line| line.contains("no daily NAV marks")));
+    }
+
+    #[test]
+    fn phases_may_not_mix_marked_and_unmarked_reports() {
+        let marked = two_phase_replay(true);
+        let unmarked = two_phase_replay(false);
+        let error =
+            summarize_rebalance_phases(&[marked[0].clone(), unmarked[1].clone()]).unwrap_err();
+        assert!(
+            error.contains("daily NAV marks"),
+            "expected a mixed-marks error, got {error}"
+        );
+    }
+
     #[test]
     fn frozen_reports_without_daily_marks_stay_readable() {
         let step: Step = serde_json::from_str(
@@ -4042,7 +4425,8 @@ mod tests {
         )
         .unwrap();
         assert!(step.daily_marks.is_empty());
-        let round_trip: Step = serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
+        let round_trip: Step =
+            serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
         assert!(round_trip.daily_marks.is_empty());
     }
 

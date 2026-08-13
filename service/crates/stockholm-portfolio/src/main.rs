@@ -2568,7 +2568,10 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             for history in &histories {
                 prices.insert_history(
                     &history.instrument.orderbook_id,
-                    history.bars.iter().map(|bar| (bar.date, bar.adjusted_close)),
+                    history
+                        .bars
+                        .iter()
+                        .map(|bar| (bar.date, bar.adjusted_close)),
                 )?;
             }
             Some(prices)
@@ -2669,14 +2672,21 @@ fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
     bytes.push(b'\n');
     std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     println!(
-        "{} equal-weight phases, {} periods: return {:.2}%, Sharpe {:.2}, max DD {:.2}% -> {}",
+        "{} equal-weight phases combined by {}, {} observations at {:.1}/yr: return {:.2}%, Sharpe {:.2}, max DD {:.2}% -> {}",
         summary.phase_count,
+        summary.combination_method,
         summary.performance.periods,
+        summary.performance.periods_per_year,
         summary.performance.total_return * 100.0,
         summary.performance.sharpe,
         summary.performance.max_drawdown * 100.0,
         path.display(),
     );
+    if summary.combination_method != stockholm_portfolio::CALENDAR_ALIGNED_DAILY_NAV {
+        eprintln!(
+            "warning: these phase reports carry no daily NAV marks, so overlapping holding windows were averaged by period index and the Sharpe above is overstated. Rerun the phases with --bars-root."
+        );
+    }
     Ok(())
 }
 
@@ -2701,15 +2711,21 @@ fn summarize_rebalance_phase_folds(args: &[String]) -> Result<(), String> {
     bytes.push(b'\n');
     std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     println!(
-        "{} folds, {} equal-weight phases: return {:.2}%, Sharpe {:.2}, max DD {:.2}%, passed={} -> {}",
+        "{} folds, {} equal-weight phases combined by {}: return {:.2}%, Sharpe {:.2}, max DD {:.2}%, passed={} -> {}",
         summary.folds,
         summary.phase_count,
+        summary.combination_method,
         summary.performance.total_return * 100.0,
         summary.performance.sharpe,
         summary.performance.max_drawdown * 100.0,
         summary.passed,
         path.display(),
     );
+    if summary.combination_method != stockholm_portfolio::CALENDAR_ALIGNED_DAILY_NAV {
+        eprintln!(
+            "warning: these folds averaged their phases by period index; the Sharpe above is overstated. Rerun the phases with --bars-root."
+        );
+    }
     Ok(())
 }
 
