@@ -6,9 +6,11 @@
 #
 # Defaults: top=25, seconds=3600, interval=10 - one hour of 10-second
 # snapshots across the live top-25 markets, matching a plain hourly cron
-# tick. Each invocation records for exactly `seconds` and exits; the next
-# cron tick starts the next one, so a hung recorder is replaced within the
-# hour instead of silently stopping coverage for the rest of the day.
+# tick. Each invocation stops starting new rounds once `seconds` has
+# elapsed (an in-flight round is allowed to finish, so it can overrun by up
+# to one round) and then exits; the next cron tick starts the next one, so
+# a hung recorder is replaced within the hour instead of silently stopping
+# coverage for the rest of the day.
 #
 # Cron it:
 #   0 * * * *  cd /path/to/ai-trader && bin/scalper-record.sh >> var/live/scalper-record.log 2>&1

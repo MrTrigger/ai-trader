@@ -34,12 +34,14 @@ usage: scalper-data <command>
       universe use the shared data/ root.
 
   record-books --data-root <dir> --seconds N --interval N [--assets A,B | --top N]
-      Poll Hyperliquid L2 books at --interval seconds for --seconds total and
-      append one JSON line per snapshot per coin to
-      {data-root}/books/{YYYY-MM-DD}.jsonl (UTC day, flushed every round).
-      --top N picks the N largest markets by day_volume_usd() instead of a
-      fixed --assets list. A coin's fetch or book error is a warning, not a
-      reason to stop the run.
+      Poll Hyperliquid L2 books at --interval seconds and append one JSON
+      line per snapshot per coin to {data-root}/books/{YYYY-MM-DD}.jsonl
+      (UTC day, flushed every round). The run is bounded by wall clock, not
+      round count: no new round starts once --seconds has elapsed, but an
+      in-flight round is allowed to finish, so a run can overrun --seconds
+      by up to one round's fetch latency. --top N picks the N largest
+      markets by day_volume_usd() instead of a fixed --assets list. A
+      coin's fetch or book error is a warning, not a reason to stop the run.
 
   summarize-costs --data-root <dir> --start YYYY-MM-DD --end YYYY-MM-DD [--notionals 1000,5000,20000]
       Read every {data-root}/books/{YYYY-MM-DD}.jsonl in [--start, --end]
@@ -320,13 +322,24 @@ async fn cmd_record_books(args: &[String]) -> Result<(), String> {
     let books_dir = root.join("books");
     std::fs::create_dir_all(&books_dir).map_err(|e| e.to_string())?;
 
-    let rounds = (seconds / interval).max(1);
+    let total = std::time::Duration::from_secs(seconds);
+    let interval_dur = std::time::Duration::from_secs(interval);
+    let approx_rounds = (seconds / interval).max(1);
     println!(
-        "recording {} coin(s) every {interval}s for {seconds}s ({rounds} rounds)",
+        "recording {} coin(s) every {interval}s for up to {seconds}s (~{approx_rounds} rounds)",
         coins.len()
     );
 
-    for round in 0..rounds {
+    // Bounded by wall clock, not round count: fetch latency is additive per
+    // round, so a fixed round count drifts the run arbitrarily long past
+    // --seconds (see docs/scalper-research.md for the incident this fixed).
+    // The guarantee is "no new round starts after the deadline" - an
+    // in-flight round always finishes, so the process can still overrun
+    // --seconds by up to one round's fetch latency.
+    let started = std::time::Instant::now();
+    while started.elapsed() < total {
+        let round_started = std::time::Instant::now();
+
         // Recomputed every round rather than once up front: a run that
         // straddles UTC midnight should roll onto the next day's file, not
         // keep appending to yesterday's.
@@ -359,12 +372,25 @@ async fn cmd_record_books(args: &[String]) -> Result<(), String> {
         }
         file.flush().map_err(|e| format!("{}: {e}", path.display()))?;
 
-        if round + 1 < rounds {
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let sleep_for = next_sleep(interval_dur, round_started.elapsed());
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
         }
     }
     println!("done");
     Ok(())
+}
+
+/// The pacing decision between rounds: sleep only the remainder of
+/// `interval` after a round took `round_elapsed`, so cadence self-corrects
+/// instead of drifting when fetch latency eats into the interval. A round
+/// that overran the interval entirely sleeps zero rather than going
+/// negative.
+fn next_sleep(
+    interval: std::time::Duration,
+    round_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    interval.saturating_sub(round_elapsed)
 }
 
 /// `--notionals` default: round dollar sizes spanning a scalper's likely
@@ -710,6 +736,28 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_sleep_sleeps_the_remainder_of_the_interval() {
+        assert_eq!(
+            next_sleep(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(3)
+            ),
+            std::time::Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn next_sleep_sleeps_zero_when_the_round_overran_the_interval() {
+        assert_eq!(
+            next_sleep(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(12)
+            ),
+            std::time::Duration::from_secs(0)
+        );
+    }
 
     #[test]
     fn resolve_asset_reads_the_k_prefix_before_uppercasing_the_store_key() {
