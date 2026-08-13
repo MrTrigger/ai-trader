@@ -110,7 +110,26 @@ pub fn load_model(
     Ok(art.model.tree_info)
 }
 
-/// Per-asset threshold-gated long/short simulation.
+/// Per-asset threshold-gated long/short simulation, ignorant of any position
+/// held before `preds` starts - convenience wrapper over
+/// `simulate_with_state` for callers (and tests) that only ever see one
+/// contiguous batch of predictions. The walk-forward gate does NOT use this
+/// directly: it must carry hold state across fold seams, see
+/// `simulate_with_state`. (This crate has no lib target, so `pub` doesn't
+/// exempt it from `dead_code` once `cmd_gate` stops calling it directly -
+/// the tests are its only caller, which is the point of keeping it.)
+#[allow(dead_code)]
+pub fn simulate(
+    preds: &[Pred],
+    round_trip_bps: &BTreeMap<String, f64>,
+    horizon_min: i64,
+    threshold_mult: f64,
+) -> Vec<Trade> {
+    simulate_with_state(preds, round_trip_bps, horizon_min, threshold_mult, &BTreeMap::new()).0
+}
+
+/// Per-asset threshold-gated long/short simulation, carrying and returning
+/// per-asset hold state (`asset -> ts the position becomes flat again`).
 ///
 /// `preds` need not arrive pre-sorted - this sorts a copy by (asset, ts)
 /// itself so a caller's ordering mistake can't silently corrupt the hold
@@ -125,17 +144,25 @@ pub fn load_model(
 /// flat_after`), so at most one open position per asset at a time. Net
 /// trade bps = the realized `fwd_bps` on the entry row (correctly signed
 /// for the side) minus the round-trip cost - both sides pay it once.
-pub fn simulate(
+///
+/// `carry` seeds `flat_after` for assets already holding a position when
+/// `preds` starts (e.g. the walk-forward gate stitching fold k+1's
+/// predictions onto fold k's open positions) - the live bot has one
+/// continuous position per asset, and the simulation has to model that
+/// instead of forgetting every open position at each fold boundary. Assets
+/// not in `carry` start flat, same as `simulate`.
+pub fn simulate_with_state(
     preds: &[Pred],
     round_trip_bps: &BTreeMap<String, f64>,
     horizon_min: i64,
     threshold_mult: f64,
-) -> Vec<Trade> {
+    carry: &BTreeMap<String, i64>,
+) -> (Vec<Trade>, BTreeMap<String, i64>) {
     let mut sorted: Vec<&Pred> = preds.iter().collect();
     sorted.sort_by(|a, b| (a.asset.as_str(), a.ts).cmp(&(b.asset.as_str(), b.ts)));
 
     let hold_secs = horizon_min * 60;
-    let mut flat_after: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut flat_after: BTreeMap<String, i64> = carry.clone();
     let mut trades = Vec::new();
 
     for p in sorted {
@@ -161,9 +188,9 @@ pub fn simulate(
             side,
             net_bps,
         });
-        flat_after.insert(p.asset.as_str(), p.ts + hold_secs);
+        flat_after.insert(p.asset.clone(), p.ts + hold_secs);
     }
-    trades
+    (trades, flat_after)
 }
 
 /// UTC calendar date a unix timestamp falls on.
@@ -252,6 +279,45 @@ struct FoldSpec {
     test_start_ts: i64,
     test_end_ts: i64,
     model: String,
+}
+
+/// Sort `folds` by `test_start_ts` (the order the gate must process them in
+/// to carry hold state correctly, whatever order they appear in the file)
+/// and check for a REAL ts-window overlap: `next.test_start_ts <
+/// prev.test_end_ts`.
+///
+/// This is deliberately not "no two folds may zero-fill the same calendar
+/// day" - a fold's test window almost never starts at UTC midnight (feature
+/// warmup eats the first ~65 minutes of the matrix), so every contiguous
+/// fold pair shares one boundary calendar day via `daily_returns_bps`'s
+/// zero-fill. That sharing is expected and handled by `merge_daily`, not an
+/// error condition.
+fn validate_no_ts_overlap(folds: &[FoldSpec]) -> Result<Vec<&FoldSpec>, String> {
+    let mut ordered: Vec<&FoldSpec> = folds.iter().collect();
+    ordered.sort_by_key(|f| f.test_start_ts);
+    for pair in ordered.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        if next.test_start_ts < prev.test_end_ts {
+            return Err(format!(
+                "fold {} test window [{}, {}) overlaps fold {}'s [{}, {}) - folds.json is not a \
+                 valid walk-forward split",
+                next.i, next.test_start_ts, next.test_end_ts, prev.i, prev.test_start_ts, prev.test_end_ts
+            ));
+        }
+    }
+    Ok(ordered)
+}
+
+/// Fold daily maps into the stitched series ADDITIVELY, not by insertion.
+/// Fold prediction windows are disjoint half-open ranges (enforced by
+/// `validate_no_ts_overlap`), so a day two folds both zero-fill can only
+/// ever contribute `0.0 + 0.0`, `0.0 + trade`, or (if trades from both
+/// folds land on the shared boundary day) `trade + trade` - never a
+/// double-count of the same trade.
+fn merge_daily(stitched: &mut BTreeMap<NaiveDate, f64>, fold_daily: &BTreeMap<NaiveDate, f64>) {
+    for (day, bps) in fold_daily {
+        *stitched.entry(*day).or_insert(0.0) += *bps;
+    }
 }
 
 /// The training matrix: manifest feature order plus every row. Reuses
@@ -411,11 +477,21 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         );
     }
 
-    let mut fold_reports = Vec::with_capacity(folds_doc.folds.len());
+    // Chronological order (not file order) is what makes the hold-state
+    // carry below correct, and doubles as the real-overlap check.
+    let ordered_folds = validate_no_ts_overlap(&folds_doc.folds)?;
+
+    let mut fold_reports = Vec::with_capacity(ordered_folds.len());
     let mut all_trades: Vec<Trade> = Vec::new();
     let mut stitched_daily: BTreeMap<NaiveDate, f64> = BTreeMap::new();
+    // Per-asset "flat again at this ts", carried across fold seams so a
+    // position opened near the end of fold k can't be silently re-opened by
+    // fold k+1's predictions inside the same hold window - the live bot has
+    // one continuous position per asset, not one that forgets on every
+    // fold's first row.
+    let mut hold_state: BTreeMap<String, i64> = BTreeMap::new();
 
-    for fold in &folds_doc.folds {
+    for fold in &ordered_folds {
         let model_path = folds_dir.join(&fold.model);
         let trees = load_model(&model_path, &matrix.features)?;
 
@@ -451,7 +527,14 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             });
         }
 
-        let trades = simulate(&preds, &round_trip, folds_doc.horizon_min, threshold_mult);
+        let (trades, next_state) = simulate_with_state(
+            &preds,
+            &round_trip,
+            folds_doc.horizon_min,
+            threshold_mult,
+            &hold_state,
+        );
+        hold_state = next_state;
         let daily = daily_returns_bps(&trades, n_assets, (fold.test_start_ts, fold.test_end_ts));
         let sharpe = annualized_sharpe(&daily);
 
@@ -463,18 +546,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             sharpe,
         });
 
-        // Fold test windows come from a single walk-forward split and never
-        // overlap, so merging their daily maps can't silently clobber a day
-        // two folds both claim.
-        for (day, bps) in &daily {
-            if stitched_daily.insert(*day, *bps).is_some() {
-                return Err(format!(
-                    "fold {} test window overlaps a previous fold's day {day} - folds.json is \
-                     not a valid walk-forward split",
-                    fold.i
-                ));
-            }
-        }
+        merge_daily(&mut stitched_daily, &daily);
         all_trades.extend(trades);
     }
 
@@ -646,5 +718,106 @@ mod tests {
         );
         let flat: BTreeMap<_, _> = daily.keys().map(|d| (*d, 0.0)).collect();
         assert!(annualized_sharpe(&flat).is_none());
+    }
+
+    fn fold_spec(i: usize, test_start_ts: i64, test_end_ts: i64) -> FoldSpec {
+        FoldSpec {
+            i,
+            train_start_ts: 0,
+            train_end_ts: test_start_ts,
+            test_start_ts,
+            test_end_ts,
+            model: format!("fold-{i}.json"),
+        }
+    }
+
+    /// Real folds are never midnight-aligned (feature warmup eats the
+    /// matrix's first ~65 minutes), so a contiguous fold pair's calendar
+    /// days always share one boundary day via `daily_returns_bps`'s
+    /// zero-fill. Stitching must sum that shared day, not treat it as an
+    /// overlap error.
+    #[test]
+    fn stitching_sums_across_a_midday_fold_boundary() {
+        let day = 86_400i64;
+        let boundary = (5 * day) / 2; // 2.5 days - lands mid-day, not at midnight
+        let folds = [fold_spec(0, 0, boundary), fold_spec(1, boundary, 5 * day)];
+
+        let ordered = validate_no_ts_overlap(&folds)
+            .expect("contiguous half-open windows must not be flagged as overlapping");
+        assert_eq!(ordered.len(), 2);
+
+        // Both trades land on day 2 (the shared boundary day): one from
+        // each fold's window.
+        let trade_a = Trade {
+            asset: "A".into(),
+            entry_ts: 200_000,
+            side: 1,
+            net_bps: 7.0,
+        };
+        let trade_b = Trade {
+            asset: "A".into(),
+            entry_ts: 220_000,
+            side: 1,
+            net_bps: 11.0,
+        };
+        assert_eq!(date_of(trade_a.entry_ts), date_of(trade_b.entry_ts));
+
+        let daily_a = daily_returns_bps(std::slice::from_ref(&trade_a), 1, (0, boundary));
+        let daily_b = daily_returns_bps(std::slice::from_ref(&trade_b), 1, (boundary, 5 * day));
+
+        let mut stitched: BTreeMap<NaiveDate, f64> = BTreeMap::new();
+        merge_daily(&mut stitched, &daily_a);
+        merge_daily(&mut stitched, &daily_b);
+
+        // Days 0..4 inclusive - one entry per calendar day, not one per
+        // fold's zero-filled span (which would double-count the boundary).
+        assert_eq!(stitched.len(), 5);
+        let boundary_day = date_of(trade_a.entry_ts);
+        assert!(
+            (stitched[&boundary_day] - (trade_a.net_bps + trade_b.net_bps)).abs() < 1e-9,
+            "boundary day must sum both folds' contributions, got {}",
+            stitched[&boundary_day]
+        );
+    }
+
+    #[test]
+    fn genuine_ts_overlap_between_folds_still_errors() {
+        let day = 86_400i64;
+        // fold_b starts well before fold_a's test window ends - a real
+        // overlap, not just a shared calendar day.
+        let folds = [
+            fold_spec(0, 0, (5 * day) / 2),
+            fold_spec(1, 200_000, 5 * day),
+        ];
+        assert!(validate_no_ts_overlap(&folds).is_err());
+    }
+
+    /// The live bot holds one continuous position per asset; the
+    /// walk-forward gate simulating fold-by-fold must not let a position
+    /// opened near the end of fold k get silently re-opened by fold k+1's
+    /// predictions that fall inside the same hold window.
+    #[test]
+    fn hold_state_carries_across_a_fold_seam() {
+        let e = 100_000i64; // fold k's test_end_ts (arbitrary)
+        let costs = BTreeMap::from([("A".to_string(), 10.0)]);
+
+        let preds_k = vec![pred("A", e - 60, 100.0, 8.0)];
+        let (trades_k, state) =
+            simulate_with_state(&preds_k, &costs, 30, 1.5, &BTreeMap::new());
+        assert_eq!(trades_k.len(), 1);
+        assert_eq!(trades_k[0].entry_ts, e - 60);
+
+        let hold_ends = (e - 60) + 30 * 60; // flat again at e + 1740
+        let preds_k1 = vec![
+            pred("A", e + 300, 1_000.0, 8.0),      // still inside the carried hold window
+            pred("A", hold_ends + 1, 1_000.0, 8.0), // first eligible entry
+        ];
+        let (trades_k1, _) = simulate_with_state(&preds_k1, &costs, 30, 1.5, &state);
+        assert_eq!(
+            trades_k1.len(),
+            1,
+            "the row inside the carried hold window must not re-enter"
+        );
+        assert_eq!(trades_k1[0].entry_ts, hold_ends + 1);
     }
 }
