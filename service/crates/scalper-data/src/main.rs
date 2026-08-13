@@ -1,3 +1,4 @@
+mod binance_micro;
 mod binance_um;
 mod books;
 mod costs;
@@ -32,6 +33,20 @@ usage: scalper-data <command>
       Expects its own root (use --data-root data/perp), separate from the
       frozen bot's daily spot store; record-books, summarize-costs, and
       universe use the shared data/ root.
+
+  pull-binance-micro --data-root <dir> --assets BTC,ETH,... --start YYYY-MM-DD --end YYYY-MM-DD [--sources book,flow,funding,metrics]
+      Bulk-load Binance UM microstructure archives (bookDepth, aggTrades,
+      fundingRate, metrics - all free at data.binance.vision) into
+      {data-root}/binance-micro/, keyed by BINANCE SYMBOL (not the HL store
+      key - the matrix layer joins the two via the universe file). bookDepth
+      downsamples to one snapshot per minute (last <= minute close, ±0.2%
+      and ±1.0% bands only); aggTrades is streamed into per-minute
+      spread/taker-flow aggregates and the raw trade tape is never stored;
+      fundingRate merges into one append-safe-by-ts file per symbol;
+      metrics rows pass through as-is. 404-vs-error discipline identical to
+      pull-binance-perp. Assets with no UM listing are skipped with a
+      warning. --sources restricts which of the four archives to pull
+      (default: all).
 
   record-books --data-root <dir> --seconds N --interval N [--assets A,B | --top N]
       Poll Hyperliquid L2 books at --interval seconds and append one JSON
@@ -260,6 +275,201 @@ fn record_fetch(
                 store::write(root, &bars)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// `--sources` default: pull every microstructure source. Order matches the
+/// plan's product list and the order rows print in.
+const DEFAULT_MICRO_SOURCES: &str = "book,flow,funding,metrics";
+
+fn parse_micro_sources(args: &[String]) -> Result<Vec<String>, String> {
+    let raw = get(args, "--sources").unwrap_or_else(|| DEFAULT_MICRO_SOURCES.to_string());
+    let sources: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect();
+    for s in &sources {
+        if !["book", "flow", "funding", "metrics"].contains(&s.as_str()) {
+            return Err(format!(
+                "unknown --sources value {s:?} (expected book, flow, funding, metrics)"
+            ));
+        }
+    }
+    if sources.is_empty() {
+        return Err("--sources produced no values".into());
+    }
+    Ok(sources)
+}
+
+/// Overwrite `path` with one JSON line per row, creating parent
+/// directories as needed. Used for the daily book/flow/metrics files, which
+/// are wholly regenerated from that day's archive each pull (no merge
+/// needed - the source day is immutable once published).
+fn write_jsonl<T: serde::Serialize>(path: &std::path::Path, rows: &[T]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file =
+        std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for row in rows {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(row).map_err(|e| e.to_string())?
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Read a symbol's existing funding file (if any) so a fresh pull can merge
+/// into it rather than clobbering earlier months. A missing file is an
+/// empty history, not an error.
+fn read_funding_jsonl(
+    path: &std::path::Path,
+) -> Result<Vec<binance_micro::FundingRow>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(|e| format!("{}: {e}", path.display())))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let assets = need(args, "--assets")?
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if assets.is_empty() {
+        return Err("no assets given".into());
+    }
+    let start = parse_date(&need(args, "--start")?)?;
+    let end = parse_date(&need(args, "--end")?)?;
+    if start >= end {
+        return Err("--start must precede --end".into());
+    }
+    let sources = parse_micro_sources(args)?;
+
+    // aggTrades days can run tens of MB compressed for a busy symbol - a
+    // longer timeout than the perp puller's, since a slow connection
+    // shouldn't abort a download that would otherwise succeed.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .user_agent("ai-trader-rust/0.1 (public archive)")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let micro_root = root.join("binance-micro");
+    let days = binance_micro::days(start, end);
+    let month_list = months(start, end);
+
+    let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for asset in &assets {
+        let (store_asset, symbol) = resolve_asset(asset);
+        let Some(symbol) = symbol else {
+            println!("{store_asset}: skipped (not listed on Binance UM)");
+            continue;
+        };
+
+        if sources.iter().any(|s| s == "book") {
+            for &day in &days {
+                let bytes =
+                    binance_micro::fetch_daily(&client, binance_micro::KIND_BOOK_DEPTH, &symbol, day)
+                        .await?;
+                match bytes {
+                    None => println!("{symbol} book {day}: skipped (404: not yet published)"),
+                    Some(bytes) => {
+                        let rows = binance_micro::parse_book_depth_zip(&bytes, &symbol)?;
+                        println!("{symbol} book {day}: {} minute(s)", rows.len());
+                        let path = micro_root.join("book").join(&symbol).join(format!("{day}.jsonl"));
+                        write_jsonl(&path, &rows)?;
+                        *totals.entry("book").or_default() += rows.len();
+                    }
+                }
+            }
+        }
+
+        if sources.iter().any(|s| s == "flow") {
+            for &day in &days {
+                let bytes =
+                    binance_micro::fetch_daily(&client, binance_micro::KIND_AGG_TRADES, &symbol, day)
+                        .await?;
+                match bytes {
+                    None => println!("{symbol} flow {day}: skipped (404: not yet published)"),
+                    Some(bytes) => {
+                        let rows = binance_micro::parse_agg_trades_zip(&bytes, &symbol)?;
+                        println!("{symbol} flow {day}: {} minute(s)", rows.len());
+                        let path = micro_root.join("flow").join(&symbol).join(format!("{day}.jsonl"));
+                        write_jsonl(&path, &rows)?;
+                        *totals.entry("flow").or_default() += rows.len();
+                    }
+                }
+            }
+        }
+
+        if sources.iter().any(|s| s == "metrics") {
+            for &day in &days {
+                let bytes =
+                    binance_micro::fetch_daily(&client, binance_micro::KIND_METRICS, &symbol, day)
+                        .await?;
+                match bytes {
+                    None => println!("{symbol} metrics {day}: skipped (404: not yet published)"),
+                    Some(bytes) => {
+                        let rows = binance_micro::parse_metrics_zip(&bytes, &symbol)?;
+                        println!("{symbol} metrics {day}: {} row(s)", rows.len());
+                        let path =
+                            micro_root.join("metrics").join(&symbol).join(format!("{day}.jsonl"));
+                        write_jsonl(&path, &rows)?;
+                        *totals.entry("metrics").or_default() += rows.len();
+                    }
+                }
+            }
+        }
+
+        if sources.iter().any(|s| s == "funding") {
+            let path = micro_root.join("funding").join(format!("{symbol}.jsonl"));
+            let mut existing = read_funding_jsonl(&path)?;
+            for &(year, month) in &month_list {
+                let bytes = binance_micro::fetch_monthly(
+                    &client,
+                    binance_micro::KIND_FUNDING_RATE,
+                    &symbol,
+                    year,
+                    month,
+                )
+                .await?;
+                match bytes {
+                    None => println!(
+                        "{symbol} funding {year:04}-{month:02}: skipped (404: not listed)"
+                    ),
+                    Some(bytes) => {
+                        let rows = binance_micro::parse_funding_rate_zip(&bytes, &symbol)?;
+                        println!(
+                            "{symbol} funding {year:04}-{month:02}: {} row(s)",
+                            rows.len()
+                        );
+                        existing = binance_micro::merge_funding_rows(existing, rows);
+                    }
+                }
+            }
+            write_jsonl(&path, &existing)?;
+            *totals.entry("funding").or_default() += existing.len();
+        }
+    }
+
+    for (source, n) in &totals {
+        println!("{source}: {n} row(s) total");
     }
     Ok(())
 }
@@ -688,6 +898,19 @@ fn main() -> ExitCode {
                 }
             };
             runtime.block_on(cmd_pull_binance_perp(&args[1..]))
+        }
+        Some("pull-binance-micro") => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(cmd_pull_binance_micro(&args[1..]))
         }
         Some("record-books") => {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
