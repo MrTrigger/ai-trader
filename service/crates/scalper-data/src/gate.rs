@@ -310,28 +310,53 @@ fn date_of(ts: i64) -> NaiveDate {
 /// giving up - the pre-registered "nearest PRIOR day within 14 days" rule.
 const COST_LOOKBACK_DAYS: i64 = 14;
 
+/// `2*fee_taker_bps + spread_bps_p75 + 2*impact_bps` for one already-known
+/// `DayCost`.
+fn round_trip_formula(fee_taker_bps: f64, dc: &DayCost, impact_bps: f64) -> f64 {
+    2.0 * fee_taker_bps + dc.spread_bps_p75 + 2.0 * impact_bps
+}
+
 /// Resolve `asset`'s round-trip cost for entry `day` from its time-varying
-/// Binance day costs: `2*fee_taker_bps + spread_bps_p75 + 2*impact_bps`,
-/// looked up by trying `day` itself, then walking backward day-by-day up to
-/// `COST_LOOKBACK_DAYS` - the pre-registered fallback rule. A day whose
-/// `DayCost` exists but carries a `None` `impact_bps` (book too thin to
-/// absorb the notional the costs were built for) is treated exactly like a
-/// missing day: the walk keeps going rather than stopping and returning
-/// early on a day it can't actually price. `None` when no usable day turns
-/// up in the window at all (no `day_costs` for the asset, or every day in
-/// the window is missing/thin) - the asset is untradeable on this entry
-/// day.
+/// Binance day costs, per the pre-registered rule: the prior-day fallback
+/// exists ONLY for a day with NO cost data at all, never for a day that WAS
+/// measured and found thin.
+///
+/// So: if `day` itself has a `DayCost` entry, that entry decides the
+/// outcome outright, with no fallback - `Some` if its `impact_bps` is
+/// `Some` (the book was measured and could absorb the notional), `None` if
+/// `impact_bps` is `None` (the book was measured and was too thin). A
+/// measured-and-thin entry day is untradeable on ITS OWN evidence; walking
+/// back to a calmer prior day would paper over the one piece of information
+/// this whole mechanism exists to surface - that today's book couldn't take
+/// the clip.
+///
+/// Only when `day` has NO entry at all does the walk kick in: backward
+/// day-by-day up to `COST_LOOKBACK_DAYS`, returning the nearest prior day
+/// that itself has a usable (`impact_bps: Some`) entry - a thin prior day
+/// encountered along the way is skipped exactly like an absent one (there
+/// is no impact number to price a walk with either way), so the walk keeps
+/// going rather than stopping on it. `None` when no usable day turns up
+/// anywhere in the window (no `day_costs` for the asset at all, the entry
+/// day is thin, or every prior day in the window is itself missing/thin) -
+/// the asset is untradeable on this entry day.
 pub(crate) fn resolve_round_trip(
     day_costs: Option<&BTreeMap<NaiveDate, DayCost>>,
     day: NaiveDate,
     fee_taker_bps: f64,
 ) -> Option<f64> {
     let day_costs = day_costs?;
-    for offset in 0..=COST_LOOKBACK_DAYS {
+
+    if let Some(dc) = day_costs.get(&day) {
+        return dc
+            .impact_bps
+            .map(|impact| round_trip_formula(fee_taker_bps, dc, impact));
+    }
+
+    for offset in 1..=COST_LOOKBACK_DAYS {
         let d = day - chrono::Duration::days(offset);
         if let Some(dc) = day_costs.get(&d) {
             if let Some(impact) = dc.impact_bps {
-                return Some(2.0 * fee_taker_bps + dc.spread_bps_p75 + 2.0 * impact);
+                return Some(round_trip_formula(fee_taker_bps, dc, impact));
             }
         }
     }
@@ -691,14 +716,19 @@ struct OverallReport {
     /// predictions combined, not one model's. See `FoldReport::rank_ic` for
     /// the per-model number.
     rank_ic: Option<f64>,
-    /// `threshold_mult * round_trip_bps` per asset. Under `--binance-costs`
-    /// the round-trip cost varies day to day, so this is the MEAN round-trip
-    /// across every day that asset actually had a resolved cost - a
-    /// representative number for a NO-TRADES report to explain itself
-    /// against, not the exact threshold on any one day (see the per-trade
-    /// `daily_returns_bps` for what actually got charged). Under `--costs`
-    /// the cost is the same every day, so the mean IS the exact number, same
-    /// as before this field grew a day dimension underneath it.
+    /// `threshold_mult * round_trip_bps` per asset. Under `--costs` this is
+    /// `threshold_mult` times the exact flat per-asset round-trip
+    /// `compute_round_trip_bps` produced - bit-for-bit what it always was,
+    /// not derived from `round_trip_by_asset_day`'s day-keyed copies of that
+    /// same number (summing N identical floats and dividing back by N can
+    /// drift by ULPs off the direct value, which would have been a silent
+    /// regression for this field). Under `--binance-costs` the round-trip
+    /// cost genuinely varies day to day, so there IS no single exact number;
+    /// this reports the MEAN round-trip across every day that asset actually
+    /// had a resolved cost instead - a representative number for a
+    /// NO-TRADES report to explain itself against, not the exact threshold
+    /// on any one day (see the per-trade `daily_returns_bps` for what
+    /// actually got charged).
     threshold_bps_by_asset: BTreeMap<String, f64>,
     /// `total_trades * 2 * notional / test_span_days * 30` - the volume this
     /// trade rate implies over 30 days, which is what the protocol's fee
@@ -837,10 +867,22 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     // one simulation code path can serve both from here on.
     let mut round_trip_by_asset_day: BTreeMap<String, BTreeMap<NaiveDate, f64>> = BTreeMap::new();
     let mut excluded_thin_books: Vec<String> = Vec::new();
-    let mut days_without_costs: BTreeMap<String, usize> = BTreeMap::new();
     let fee_bps_used: Option<f64>;
     let costs_path_str: Option<String>;
     let binance_costs_path_str: Option<String>;
+    // Whether a per-asset day is untradeable due to cost data is only a
+    // meaningful per-day diagnostic under `--binance-costs` (see
+    // `Report::days_without_costs`'s doc comment) - `--costs`'s flat number
+    // is either tradable every day or excluded outright
+    // (`excluded_thin_books`), so this stays `false` and `days_without_costs`
+    // stays empty for that path.
+    let is_binance_mode = binance_costs_path.is_some();
+    // `threshold_mult * round_trip_bps` per asset, computed from whichever
+    // cost source is exact for that path - see `OverallReport
+    // ::threshold_bps_by_asset`'s doc comment for why this can't just be
+    // derived from `round_trip_by_asset_day` uniformly (a mean-of-N-copies
+    // of the plan-2 flat cost would drift by ULPs off the direct value).
+    let threshold_bps_by_asset: BTreeMap<String, f64>;
 
     if let Some(costs_path) = &costs_path {
         let costs: BTreeMap<String, CostSummary> = {
@@ -850,6 +892,10 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         };
         let (flat_round_trip, excluded) = compute_round_trip_bps(&assets, &costs, &notional);
         excluded_thin_books = excluded;
+        threshold_bps_by_asset = flat_round_trip
+            .iter()
+            .map(|(asset, rt)| (asset.clone(), threshold_mult * rt))
+            .collect();
         for (asset, rt) in &flat_round_trip {
             let by_day: BTreeMap<NaiveDate, f64> = days_span.iter().map(|&d| (d, *rt)).collect();
             if !by_day.is_empty() {
@@ -889,24 +935,22 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         for asset in &assets {
             let day_costs = binance_costs.get(asset);
             let mut by_day = BTreeMap::new();
-            let mut missing = BTreeSet::new();
             for &day in &days_span {
-                match resolve_round_trip(day_costs, day, fee_taker) {
-                    Some(rt) => {
-                        by_day.insert(day, rt);
-                    }
-                    None => {
-                        missing.insert(day);
-                    }
+                if let Some(rt) = resolve_round_trip(day_costs, day, fee_taker) {
+                    by_day.insert(day, rt);
                 }
             }
             if !by_day.is_empty() {
                 round_trip_by_asset_day.insert(asset.clone(), by_day);
             }
-            if !missing.is_empty() {
-                days_without_costs.insert(asset.clone(), missing.len());
-            }
         }
+        threshold_bps_by_asset = round_trip_by_asset_day
+            .iter()
+            .map(|(asset, by_day)| {
+                let mean = by_day.values().sum::<f64>() / by_day.len() as f64;
+                (asset.clone(), threshold_mult * mean)
+            })
+            .collect();
         fee_bps_used = Some(fee_taker);
         costs_path_str = None;
         binance_costs_path_str = Some(binance_costs_path.display().to_string());
@@ -1007,6 +1051,35 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         all_preds.extend(preds);
     }
 
+    // Per asset, how many DISTINCT calendar days among its actual
+    // predictions had no resolvable round-trip cost (dropped by
+    // `simulate_with_state_by_day`'s lookup, not merely a day the asset
+    // never had a row on at all) - the useful diagnostic per
+    // `Report::days_without_costs`'s doc comment. Computed from `all_preds`
+    // rather than swept over `days_span`, and only under `--binance-costs`:
+    // under `--costs` every tradable asset's flat cost covers every day in
+    // `days_span` by construction, so this would otherwise stay empty
+    // anyway, but skipping it avoids miscounting an entirely-excluded
+    // thin-book asset's preds as "days without costs" when
+    // `excluded_thin_books` already reports it.
+    let mut days_without_costs: BTreeMap<String, usize> = BTreeMap::new();
+    if is_binance_mode {
+        let mut dropped_days: BTreeMap<String, BTreeSet<NaiveDate>> = BTreeMap::new();
+        for p in &all_preds {
+            let day = date_of(p.ts);
+            let has_cost = round_trip_by_asset_day
+                .get(p.asset.as_str())
+                .is_some_and(|by_day| by_day.contains_key(&day));
+            if !has_cost {
+                dropped_days.entry(p.asset.clone()).or_default().insert(day);
+            }
+        }
+        days_without_costs = dropped_days
+            .into_iter()
+            .map(|(asset, days)| (asset, days.len()))
+            .collect();
+    }
+
     let mut per_asset_acc: BTreeMap<String, (usize, f64, usize)> = BTreeMap::new();
     for trade in &all_trades {
         let entry = per_asset_acc.entry(trade.asset.clone()).or_default();
@@ -1068,13 +1141,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             gate_threshold: GATE_THRESHOLD,
             ic: pearson_ic(&all_preds),
             rank_ic: rank_ic(&all_preds),
-            threshold_bps_by_asset: round_trip_by_asset_day
-                .iter()
-                .map(|(asset, by_day)| {
-                    let mean = by_day.values().sum::<f64>() / by_day.len() as f64;
-                    (asset.clone(), threshold_mult * mean)
-                })
-                .collect(),
+            threshold_bps_by_asset,
             projected_30d_volume_usd: projected_30d_volume_usd(
                 n_trades_total,
                 notional_usd,
@@ -1547,12 +1614,39 @@ mod tests {
     }
 
     #[test]
-    fn resolve_round_trip_treats_a_thin_impact_day_exactly_like_a_missing_day() {
-        // d(5) exists but is thin (impact None) - the walk must keep going
-        // past it to d(4), not stop and report untradeable.
+    fn resolve_round_trip_treats_a_thin_entry_day_as_untradeable_with_no_fallback() {
+        // d(5) is the entry day and HAS a DayCost entry, but it's thin
+        // (impact None). The pre-registered rule reserves the prior-day
+        // walk for a day with NO cost data at all - a measured-and-thin
+        // entry day must report untradeable outright, even though a calmer
+        // prior day (d(4)) exists right next to it.
         let costs = BTreeMap::from([
             (d(5), day_cost(5.0, None)),
             (d(4), day_cost(6.0, Some(1.0))),
+        ]);
+        assert!(
+            resolve_round_trip(Some(&costs), d(5), 3.0).is_none(),
+            "a thin entry day must not fall back to a calmer prior day"
+        );
+    }
+
+    #[test]
+    fn resolve_round_trip_entry_day_absent_still_falls_back_to_an_ok_prior_day() {
+        // d(5) has no entry at all (as opposed to a present-but-thin one) -
+        // this IS the case the prior-day fallback exists for.
+        let costs = BTreeMap::from([(d(3), day_cost(4.0, Some(1.0)))]);
+        let got = resolve_round_trip(Some(&costs), d(5), 3.0).unwrap();
+        assert!((got - 12.0).abs() < 1e-9, "got {got}"); // 2*3 + 4 + 2*1
+    }
+
+    #[test]
+    fn resolve_round_trip_falls_back_past_a_thin_prior_day_too() {
+        // Entry day d(5) is absent; the nearest prior day d(4) IS present
+        // but thin - the walk must not stop there (there's no impact number
+        // to price from a thin day either), it must keep going to d(3).
+        let costs = BTreeMap::from([
+            (d(4), day_cost(5.0, None)),
+            (d(3), day_cost(6.0, Some(1.0))),
         ]);
         let got = resolve_round_trip(Some(&costs), d(5), 3.0).unwrap();
         assert!((got - 14.0).abs() < 1e-9, "got {got}"); // 2*3 + 6 + 2*1
@@ -1698,6 +1792,124 @@ mod tests {
         assert!(err2.contains("--fee-maker-bps"), "got: {err2}");
     }
 
+    /// Regression for a mean-of-N-identical-copies drift: under `--costs`,
+    /// `overall.threshold_bps_by_asset` must be built from the flat
+    /// per-asset round-trip directly (bit-exact, the same number this field
+    /// always reported before it grew a day dimension underneath it), not
+    /// from averaging `round_trip_by_asset_day`'s day-keyed copies of that
+    /// same value back down - summing ten copies of a non-round float and
+    /// dividing by ten does not always reproduce the float exactly.
+    #[test]
+    fn threshold_bps_by_asset_is_bit_exact_under_the_costs_path() {
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-gate-threshold-exactness-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest",
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "horizons_min": [15],
+            "stride_min": 1,
+            "assets": ["BTC"],
+        });
+        let row = serde_json::json!({
+            "ts": 600, "asset": "BTC", "features": features, "fwd_bps": {"15": 1.0},
+        });
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row}\n")).unwrap();
+
+        // A ten-day test window - enough days_span entries that a naive
+        // sum-then-divide mean of ten identical floats is likely to drift
+        // from the value a single multiply produces.
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0, "train_start_ts": 0, "train_end_ts": 0,
+                    "test_start_ts": 0, "test_end_ts": 10 * 86_400,
+                    "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let model = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION,
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "model": { "tree_info": [{
+                "tree_index": 0, "num_leaves": 1, "num_cat": 0, "shrinkage": 1.0,
+                "tree_structure": { "leaf_value": 0.0 },
+            }] },
+        });
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
+
+        // A deliberately non-round cost summary - the kind of value where
+        // ULP drift from a sum-then-divide mean would actually show up.
+        let spread_median = 3.333_333_333_333_f64;
+        let cross = 1.234_567_891_234_f64;
+        let costs_path = dir.join("costs.json");
+        std::fs::write(
+            &costs_path,
+            serde_json::to_string(&serde_json::json!({
+                "BTC": {
+                    "samples": 10,
+                    "spread_bps_median": spread_median,
+                    "spread_bps_p75": 4.0,
+                    "cross_bps": {"5000": cross},
+                    "top_depth_usd_median": 1000.0,
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out_path = dir.join("report.json");
+        let args = vec![
+            "--matrix".to_string(),
+            matrix_path.to_string_lossy().to_string(),
+            "--folds".to_string(),
+            folds_path.to_string_lossy().to_string(),
+            "--costs".to_string(),
+            costs_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+        ];
+        cmd_gate(&args).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rt = 2.0 * (TAKER_FEE_BPS + spread_median / 2.0 + cross);
+        let expected = DEFAULT_THRESHOLD_MULT * rt;
+        let got = report["overall"]["threshold_bps_by_asset"]["BTC"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "the --costs path's threshold must be bit-exact, not a drifted mean"
+        );
+    }
+
     /// Full wiring, end to end: a two-row matrix (one asset, two calendar
     /// days a day apart), a single fold spanning both days, and a
     /// `--binance-costs` file with a `DayCost` for day 0 only - day 1 must
@@ -1838,5 +2050,121 @@ mod tests {
             .unwrap();
         // Both trades net fwd_bps(20) - round_trip(15) = 5 each -> 10 total.
         assert!((net_bps_a - 10.0).abs() < 1e-9, "got {net_bps_a}");
+    }
+
+    /// `days_without_costs` must count DISTINCT days the asset actually had
+    /// a dropped prediction on, not every calendar day in the fold's whole
+    /// test span regardless of whether the asset had a row there at all. A
+    /// fold spanning 25 days with cost data anchored at day 0 (so BTC has
+    /// SOME tradable days via the 14-day fallback, days 0-14, keeping the
+    /// asset out of "no tradable assets") but a single BTC prediction on
+    /// day 20 - 6 days past the fallback's reach - must report exactly 1,
+    /// not the ~10 unresolvable days_span entries a days_span-driven sweep
+    /// would have produced before this fix.
+    #[test]
+    fn days_without_costs_counts_dropped_prediction_days_not_the_whole_span() {
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-gate-days-without-costs-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest",
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "horizons_min": [15],
+            "stride_min": 1,
+            "assets": ["BTC"],
+        });
+        // The lone BTC row: day 20, well past day 0's 14-day fallback reach.
+        let ts = 20 * 86_400i64 + 600;
+        let row = serde_json::json!({
+            "ts": ts, "asset": "BTC", "features": features, "fwd_bps": {"15": 1.0},
+        });
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row}\n")).unwrap();
+
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0, "train_start_ts": 0, "train_end_ts": 0,
+                    "test_start_ts": 0, "test_end_ts": 25 * 86_400,
+                    "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let model = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION,
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "model": { "tree_info": [{
+                "tree_index": 0, "num_leaves": 1, "num_cat": 0, "shrinkage": 1.0,
+                "tree_structure": { "leaf_value": 100.0 },
+            }] },
+        });
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
+
+        // Only day 0 has cost data - BTC is tradable on days 0-14 via the
+        // fallback (keeping it out of "no tradable assets"), but day 20 is
+        // 6 days beyond that reach.
+        let binance_costs_path = dir.join("costs-daily.json");
+        std::fs::write(
+            &binance_costs_path,
+            serde_json::to_string(&serde_json::json!({
+                "BTC": { "1970-01-01": { "spread_bps_p75": 5.0, "impact_bps": 2.0, "samples": 50 } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out_path = dir.join("report.json");
+        let args = vec![
+            "--matrix".to_string(),
+            matrix_path.to_string_lossy().to_string(),
+            "--folds".to_string(),
+            folds_path.to_string_lossy().to_string(),
+            "--binance-costs".to_string(),
+            binance_costs_path.to_string_lossy().to_string(),
+            "--fee-taker-bps".to_string(),
+            "3.0".to_string(),
+            "--fee-maker-bps".to_string(),
+            "1.5".to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+        ];
+        cmd_gate(&args).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            report["overall"]["n_trades"], 0,
+            "the only prediction had no cost"
+        );
+        let count = report["days_without_costs"]["BTC"].as_u64().unwrap();
+        assert_eq!(
+            count, 1,
+            "must count the one day BTC actually had a dropped prediction on, not the span"
+        );
     }
 }

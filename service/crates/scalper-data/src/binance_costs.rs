@@ -58,11 +58,25 @@ pub(crate) fn impact_bps(notional: f64, bid_02: f64, ask_02: f64) -> Option<f64>
 
 /// One day's `DayCost` from that day's already-loaded book/flow minute
 /// rows, or `None` when the day has no spread samples at all - nothing to
-/// report, so the day is simply absent from the output (the gate's
-/// day-lookup fallback treats an absent day the same as a thin one).
+/// report, so the day is simply absent from the output. That absence
+/// matters downstream: `gate::resolve_round_trip` treats an ABSENT day
+/// (this function returned `None`, so no entry ever reaches the output
+/// JSON) as the only case eligible for its prior-day fallback. A day that
+/// DOES appear below with `impact_bps: None` is not eligible for that
+/// fallback at all - the entry exists, so the gate takes it as the final
+/// word on that day, untradeable, no substitution from a calmer day.
+///
 /// `impact_bps` is priced off the day's MEDIAN ±0.2% band notional on each
 /// side, not the mean - a single unusually deep or thin snapshot shouldn't
-/// dominate a whole day's depth estimate.
+/// dominate a whole day's depth estimate. Two different situations both
+/// collapse into that same `impact_bps: None`, deliberately and
+/// conservatively: no book coverage AT ALL that day (the book file is
+/// missing or empty, `bid_02`/`ask_02` end up with no samples), and book
+/// coverage that WAS present but too thin to absorb `--notional` (see
+/// `impact_bps` above). Both mean the same thing to a trader - "there is no
+/// evidence this book could have absorbed the clip today" - so neither
+/// should be distinguishable from the other, and neither should be able to
+/// borrow a neighboring day's number.
 pub(crate) fn day_cost(book: &[BookMinute], flow: &[FlowMinute], notional: f64) -> Option<DayCost> {
     let spreads: Vec<f64> = flow.iter().filter_map(|m| m.spread_bps_med).collect();
     if spreads.is_empty() {
