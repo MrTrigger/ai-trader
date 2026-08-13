@@ -154,6 +154,9 @@ usage: stockholm-portfolio <command>
            [--ranking edge|edge_volatility]
            [--sizing equal|conviction|inverse_volatility|edge_volatility]
            [--max-gross 1] [--target-net <N>] [--direction-overlay]
+           [--allocation-mode directional|overlay]
+           [--core-weight 1] [--overlay-net-cap 0]
+           [--core-tracking-cost-bps 10]
            [--market-forecast-matrix <jsonl> --market-forecast-model <json>
             --trained-direction-diagnostic]
            [--position-weight 0.05] [--min-position-weight 0]
@@ -169,6 +172,14 @@ usage: stockholm-portfolio <command>
       Sharpe is computed, for both the portfolio and any benchmark.
       --direction-overlay sizes gross/net exposure off the fixed five-vote
       OMX trend state only; it is an optional drawdown guard, off by default.
+      --allocation-mode overlay replaces the directional book with a fixed
+      index core (--core-weight of the OMXSGI leg, charged only
+      --core-tracking-cost-bps a year for an OMXS30 futures roll or ETF fee)
+      plus a self-funding long/short overlay bounded by --max-gross and
+      --overlay-net-cap. Its floor is the index minus that tracking cost, and
+      the report attributes core and overlay separately, with the overlay's
+      alpha t-stat taken against zero. It requires --benchmark and cannot be
+      combined with --direction-overlay, --target-net or --max-sector-gross.
       Trained direction forecasts (--market-forecast-matrix/-model) are
       retired from every promotable configuration - every tested variant
       lost to controls on the available sample - and additionally require
@@ -2588,6 +2599,38 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     if direction_overlay && get(args, "--target-net").is_some() {
         return Err("--target-net and --direction-overlay are mutually exclusive".into());
     }
+    // `directional` is the historical book: every krona of exposure comes from
+    // candidates. `overlay` holds the index as a floor and lets the candidates
+    // trade a self-funding long/short book on top of it.
+    let allocation_mode = match get(args, "--allocation-mode").as_deref() {
+        None | Some("directional") => stockholm_portfolio::AllocationMode::Directional,
+        Some("overlay") => {
+            if get(args, "--target-net").is_some() {
+                return Err(
+                    "--target-net sizes a directional book; the overlay's net is bounded by --overlay-net-cap"
+                        .into(),
+                );
+            }
+            stockholm_portfolio::AllocationMode::Overlay {
+                budget: portfolio_construction::OverlayBudget {
+                    core_weight: number(args, "--core-weight", 1.0_f64)?,
+                    // The overlay spends the same gross budget flag the
+                    // directional book does; in overlay mode it caps the
+                    // overlay alone, on top of the core.
+                    overlay_gross: max_gross,
+                    // Zero by default: a self-funding overlay is not there to
+                    // add market exposure the core already carries.
+                    overlay_net_cap: number(args, "--overlay-net-cap", 0.0_f64)?,
+                },
+                core_tracking_cost_bps: number(args, "--core-tracking-cost-bps", 10.0_f64)?,
+            }
+        }
+        Some(value) => {
+            return Err(format!(
+                "unsupported --allocation-mode {value:?}; expected directional or overlay"
+            ));
+        }
+    };
     let direction_config = direction_overlay
         .then(|| portfolio_construction::DirectionConfig::baseline(max_gross))
         .transpose()?;
@@ -2726,6 +2769,7 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             ranking,
             sizing,
             allocation_budget,
+            allocation_mode,
             position_weight: number(args, "--position-weight", 0.05_f64)?,
             min_position_weight: number(args, "--min-position-weight", 0.0_f64)?,
             reference_edge: number(args, "--reference-edge", 0.01_f64)?,
@@ -2766,6 +2810,23 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             benchmark.sharpe_se,
             benchmark.portfolio_minus_benchmark_total_return * 100.0,
             benchmark.beta,
+        );
+    }
+    if let Some(overlay) = &result.overlay_attribution {
+        println!(
+            "core {:.2}x contributed {:+.2}pp (tracking -{:.2}pp at {:.1} bp/yr), overlay contributed {:+.2}pp, overlay alpha t {}",
+            overlay.core_weight,
+            overlay.core_return * 100.0,
+            overlay.core_tracking_cost * 100.0,
+            overlay.core_tracking_cost_bps,
+            overlay.overlay_return * 100.0,
+            overlay
+                .overlay_alpha_tstat
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| overlay
+                    .overlay_alpha_tstat_status
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".into())),
         );
     }
     if let Some(direction) = &result.direction_metrics {

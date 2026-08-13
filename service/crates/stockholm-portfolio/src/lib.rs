@@ -788,6 +788,17 @@ pub struct Step {
     /// and disclosed in `DirectionLayerMetrics`.
     #[serde(default)]
     pub direction_market_return: Option<f64>,
+    /// The index core's contribution to `period_return` in
+    /// `AllocationMode::Overlay`: `core_weight × (benchmark_period_return −
+    /// tracking accrual)`. `None` in a directional replay, which has no core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_return: Option<f64>,
+    /// The self-funding overlay's contribution to `period_return`, already net
+    /// of its execution and borrow costs. `core_return + overlay_return`
+    /// reconstructs `period_return` exactly. `None` in a directional replay,
+    /// where `period_return` is the whole book.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_return: Option<f64>,
     pub turnover: f64,
     pub long_pnl: f64,
     pub short_pnl: f64,
@@ -1514,6 +1525,13 @@ pub struct BacktestResult {
     pub sizing: portfolio_construction::SizingMethod,
     #[serde(default = "default_budget")]
     pub allocation_budget: portfolio_construction::Budget,
+    /// Directional book, or index core plus self-funding overlay. Frozen
+    /// reports predate the field and are all directional.
+    #[serde(default)]
+    pub allocation_mode: AllocationMode,
+    /// Two-leg attribution, present only in `AllocationMode::Overlay`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_attribution: Option<OverlayAttribution>,
     #[serde(default = "default_reference_edge")]
     pub reference_edge: f64,
     #[serde(default = "default_reference_volatility")]
@@ -1873,6 +1891,60 @@ impl MarkPrices {
     }
 }
 
+/// How a replay turns ranked candidates into a book.
+///
+/// The two modes answer different questions. `Directional` asks whether the
+/// candidate pipeline alone can carry a portfolio; `Overlay` holds the index
+/// as a floor and asks whether the candidates add anything on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AllocationMode {
+    /// The historical mode: every krona of exposure comes from candidate
+    /// positions sized under `BacktestConfig::allocation_budget`.
+    #[default]
+    Directional,
+    /// A fixed index core plus a self-funding long/short overlay. The core is
+    /// never reduced by overlay activity, so the book's floor is the index
+    /// less the core's own tracking cost.
+    Overlay {
+        budget: portfolio_construction::OverlayBudget,
+        /// Annual basis-point cost of holding the index core, accrued at
+        /// `cadence/252` per holding period and per session inside it. It
+        /// stands for a futures roll or an ETF's total expense ratio; the core
+        /// is charged nothing else.
+        core_tracking_cost_bps: f64,
+    },
+}
+
+/// Attribution of an index-core-plus-overlay replay into its two legs.
+///
+/// `core_return` and `overlay_return` are sums of per-period contributions,
+/// not compounded paths: the two legs add to each period's `period_return`, so
+/// their sums add to the sum of period returns. Compounding them separately
+/// would produce two numbers that no longer reconcile with anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayAttribution {
+    pub periods: usize,
+    pub core_weight: f64,
+    pub core_tracking_cost_bps: f64,
+    /// Summed core-leg contributions: `core_weight × (index period return −
+    /// tracking accrual)` over every period.
+    pub core_return: f64,
+    /// Summed overlay contributions, net of the overlay's execution and borrow
+    /// costs. The core pays none of these.
+    pub overlay_return: f64,
+    /// Total tracking cost charged to the core over the replay.
+    pub core_tracking_cost: f64,
+    /// The overlay's per-period return tested against zero rather than against
+    /// the index: the core already carries the index, so the overlay's whole
+    /// job is to be positive on its own. Same sample-standard-error statistic
+    /// `active_tstat` uses.
+    #[serde(default)]
+    pub overlay_alpha_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_alpha_tstat_status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
     pub start: Date,
@@ -1892,6 +1964,10 @@ pub struct BacktestConfig {
     pub ranking: portfolio_construction::RankingMethod,
     pub sizing: portfolio_construction::SizingMethod,
     pub allocation_budget: portfolio_construction::Budget,
+    /// Directional book, or index core plus self-funding overlay. In overlay
+    /// mode `allocation_budget` is unused: the overlay's own gross and net caps
+    /// come from `AllocationMode::Overlay::budget`.
+    pub allocation_mode: AllocationMode,
     /// Maximum absolute single-name weight.
     pub position_weight: f64,
     /// Positions below this absolute weight are uneconomic and left as cash.
@@ -1930,6 +2006,19 @@ struct Candidate<'a> {
     market_return_prediction: Option<f64>,
     edge: f64,
     execution_cost: ExecutionCost,
+}
+
+/// The resolved index core of an overlay replay: a fixed weight in the
+/// benchmark plus the tracking cost that weight accrues.
+#[derive(Debug, Clone, Copy)]
+struct IndexCore {
+    weight: f64,
+    budget: portfolio_construction::OverlayBudget,
+    tracking_cost_bps: f64,
+    /// Tracking cost accrued by one unit of core over a single session.
+    session_tracking_cost: f64,
+    /// Tracking cost accrued by one unit of core over a whole holding period.
+    period_tracking_cost: f64,
 }
 
 pub fn backtest(
@@ -1977,6 +2066,45 @@ pub fn backtest(
         return Err("maximum position weight must be finite and in (0, 1]".into());
     }
     fallback_budget.validate()?;
+    // The index core, if this replay has one, plus its per-period and
+    // per-session tracking accruals. `None` is the historical directional book.
+    let core = match config.allocation_mode {
+        AllocationMode::Directional => None,
+        AllocationMode::Overlay {
+            budget,
+            core_tracking_cost_bps,
+        } => {
+            budget.validate()?;
+            if !core_tracking_cost_bps.is_finite() || core_tracking_cost_bps < 0.0 {
+                return Err("core tracking cost must be finite and non-negative".into());
+            }
+            if config.benchmark.is_none() {
+                return Err(
+                    "the index-core overlay mode requires benchmark history to price its core"
+                        .into(),
+                );
+            }
+            if config.direction_config.is_some() {
+                return Err(
+                    "the index core already holds the market; a direction-timing overlay on top of it is a second, contradictory answer to the same question"
+                        .into(),
+                );
+            }
+            if max_sector_gross.is_some() {
+                return Err(
+                    "the overlay allocator enforces a net cap and has no sector group cap".into(),
+                );
+            }
+            Some(IndexCore {
+                weight: budget.core_weight,
+                budget,
+                tracking_cost_bps: core_tracking_cost_bps,
+                session_tracking_cost: core_tracking_cost_bps / 10_000.0 / 252.0,
+                period_tracking_cost: core_tracking_cost_bps / 10_000.0 * cadence_sessions as f64
+                    / 252.0,
+            })
+        }
+    };
     if let Some(direction) = config.direction_config {
         direction.validate()?;
         if config.benchmark.is_none() {
@@ -2250,15 +2378,19 @@ pub fn backtest(
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let allocation = if let Some(maximum) = max_sector_gross {
-            portfolio_construction::allocate_with_group_cap(
+        let allocation = match (core, max_sector_gross) {
+            // The core is kept out of `weights` entirely, so no overlay
+            // instrument id can collide with the benchmark position.
+            (Some(core), _) => {
+                portfolio_construction::allocate_overlay(&proposals, &core.budget)?.overlay
+            }
+            (None, Some(maximum)) => portfolio_construction::allocate_with_group_cap(
                 &proposals,
                 allocation_budget,
                 &groups,
                 maximum,
-            )?
-        } else {
-            portfolio_construction::allocate(&proposals, allocation_budget)?
+            )?,
+            (None, None) => portfolio_construction::allocate(&proposals, allocation_budget)?,
         };
         let weights = &allocation.weights;
         let target: BTreeMap<_, _> = candidates
@@ -2401,8 +2533,31 @@ pub fn backtest(
                 pnl,
             });
         }
-        let gross = positions.iter().map(|position| position.weight.abs()).sum();
-        let period_return = long_pnl + short_pnl;
+        // The index leg is resolved before the book is marked: in overlay mode
+        // the core's own daily path comes from these same index closes.
+        let benchmark_period = config
+            .benchmark
+            .as_ref()
+            .map(|history| benchmark_period(history, date, cadence_sessions))
+            .transpose()?;
+        let benchmark_period_return = benchmark_period.as_ref().map(|period| period.value);
+        // Everything the candidate pipeline earned, net of its own costs. In
+        // overlay mode this is the overlay leg alone; the core is added below.
+        let candidate_return = long_pnl + short_pnl;
+        let core_leg = core.map(|core| {
+            let period = benchmark_period
+                .as_ref()
+                .expect("overlay mode validated a benchmark");
+            CoreLeg {
+                weight: core.weight,
+                entry_close: period.entry_close,
+                marks: &period.marks,
+                session_tracking_cost: core.session_tracking_cost,
+                period_return: core.weight * (period.value - core.period_tracking_cost),
+            }
+        });
+        let core_return = core_leg.as_ref().map(|leg| leg.period_return);
+        let period_return = candidate_return + core_return.unwrap_or(0.0);
         let daily_marks = config
             .mark_prices
             .as_ref()
@@ -2413,6 +2568,7 @@ pub fn backtest(
                     cadence_sessions,
                     selected_dates.get(date_index + 1).copied(),
                     &held,
+                    core_leg.as_ref(),
                     nav,
                     entry_leg_costs,
                     period_return,
@@ -2421,15 +2577,19 @@ pub fn backtest(
             .transpose()?
             .unwrap_or_default();
         nav *= 1.0 + period_return;
-        let benchmark_period = config
-            .benchmark
-            .as_ref()
-            .map(|history| benchmark_period(history, date, cadence_sessions))
-            .transpose()?;
-        let (benchmark_period_return, benchmark_daily_marks) = match benchmark_period {
-            Some((value, marks)) => (Some(value), marks),
-            None => (None, Vec::new()),
-        };
+        // The core is a real position in the book, so it counts toward both
+        // exposures; it is deliberately not an entry in `positions`, which
+        // holds overlay instruments only.
+        let core_weight = core.map(|core| core.weight).unwrap_or(0.0);
+        let gross = core_weight
+            + positions
+                .iter()
+                .map(|position| position.weight.abs())
+                .sum::<f64>();
+        net += core_weight;
+        let benchmark_daily_marks = benchmark_period
+            .map(|period| period.marks)
+            .unwrap_or_default();
         let direction_market_return = direction.as_ref().map(|attribution| {
             attribution.decision.budget.target_net.unwrap_or(0.0)
                 * benchmark_period_return.unwrap_or(0.0)
@@ -2448,6 +2608,8 @@ pub fn backtest(
             direction,
             market_return_prediction,
             direction_market_return,
+            core_return,
+            overlay_return: core.map(|_| candidate_return),
             turnover,
             long_pnl,
             short_pnl,
@@ -2462,6 +2624,7 @@ pub fn backtest(
         previous = target;
     }
     let metrics = metrics(&steps, cadence_sessions, config.risk_free_annual);
+    let overlay_attribution = core.map(|core| overlay_attribution(&steps, &core));
     let diagnostics = prediction_diagnostics(&diagnostic_blocks);
     let direction_metrics = direction_layer_metrics(&steps, cadence_sessions);
     let selection_layer = selection_layer_metrics(
@@ -2493,6 +2656,16 @@ pub fn backtest(
     ];
     if config.direction_config.is_some() {
         disclosures.push("The standalone direction-layer series applies smoothed target net exposure to OMXSGI before execution costs; it diagnoses timing only and cannot be treated as a tradable net result.".into());
+    }
+    if let Some(core) = core {
+        disclosures.push(format!(
+            "The index core holds {:.2} units of the OMXSGI gross-index leg and is charged a {:.1} bp annual tracking cost accrued at cadence/252 per period. The core is not charged spread, commission or impact: it stands for a continuously held OMXS30 futures or ETF position whose roll and management costs are that tracking charge. Implementing the core against real futures or ETF fills is later production work and is not represented by this replay.",
+            core.weight, core.tracking_cost_bps,
+        ));
+        disclosures.push(format!(
+            "The overlay is self-funding on top of the core: its gross is capped at {:.2} and its net at {:.2}, and `overlay_alpha_tstat` tests its per-period return against zero rather than against the index, because the core already owns the index exposure. Overlay positions are charged exactly the execution and borrow costs a directional replay charges.",
+            core.budget.overlay_gross, core.budget.overlay_net_cap,
+        ));
     }
     if (config.prediction_horizon_scale - 1.0).abs() > f64::EPSILON {
         disclosures.push(format!(
@@ -2561,6 +2734,8 @@ pub fn backtest(
         ranking,
         sizing,
         allocation_budget: fallback_budget,
+        allocation_mode: config.allocation_mode,
+        overlay_attribution,
         reference_edge: config.reference_edge,
         reference_volatility: config.reference_volatility,
         min_position_weight: config.min_position_weight,
@@ -2583,6 +2758,59 @@ pub fn backtest(
     })
 }
 
+/// Split a finished overlay replay into its two legs.
+///
+/// The overlay's t-stat is against zero, not against the index: the core
+/// already holds the index, so the only question left for the overlay is
+/// whether it is positive on its own. It reuses `active_tstat` against a zero
+/// series so the statistic is literally the same one the active-return gate
+/// uses, sample standard error and all.
+fn overlay_attribution(steps: &[Step], core: &IndexCore) -> OverlayAttribution {
+    let overlay_returns = steps
+        .iter()
+        .map(|step| step.overlay_return.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let zero = vec![0.0; overlay_returns.len()];
+    let overlay_alpha_tstat = active_tstat(&overlay_returns, &zero);
+    let overlay_alpha_tstat_status = overlay_alpha_tstat.is_none().then(|| {
+        if overlay_returns.len() < 2 {
+            TOO_FEW_ACTIVE_OBSERVATIONS.to_owned()
+        } else {
+            NO_ACTIVE_DISPERSION.to_owned()
+        }
+    });
+    OverlayAttribution {
+        periods: steps.len(),
+        core_weight: core.weight,
+        core_tracking_cost_bps: core.tracking_cost_bps,
+        core_return: steps
+            .iter()
+            .map(|step| step.core_return.unwrap_or(0.0))
+            .sum(),
+        overlay_return: overlay_returns.iter().sum(),
+        core_tracking_cost: core.weight * core.period_tracking_cost * steps.len() as f64,
+        overlay_alpha_tstat,
+        overlay_alpha_tstat_status,
+    }
+}
+
+/// One holding period of the index core, resolved from the index leg the
+/// report already computes.
+#[derive(Debug, Clone)]
+struct CoreLeg<'a> {
+    weight: f64,
+    /// The decision session's index close, which every mark is measured from.
+    entry_close: f64,
+    /// The index's close on every session from the one after the decision
+    /// session through the exit session.
+    marks: &'a [BenchmarkMark],
+    /// Tracking cost one unit of core accrues per session.
+    session_tracking_cost: f64,
+    /// The core's whole contribution to this period's return:
+    /// `weight × (index return − period tracking cost)`.
+    period_return: f64,
+}
+
 /// Mark the open book at every session of one holding period, one NAV per
 /// session so phases can later be combined on calendar dates.
 ///
@@ -2597,6 +2825,10 @@ pub fn backtest(
 /// Entry-leg costs are charged on the first marked session; the exit leg is
 /// already inside `period_return` and therefore lands on the rebalance session
 /// alone.
+///
+/// An index core, when present, is marked from the same index closes the
+/// benchmark leg uses, with its tracking cost accrued one session at a time so
+/// the daily path never carries a whole period's charge on one date.
 #[allow(clippy::too_many_arguments)]
 fn daily_nav_marks(
     prices: &MarkPrices,
@@ -2604,6 +2836,7 @@ fn daily_nav_marks(
     cadence_sessions: usize,
     next_decision_date: Option<Date>,
     held: &[(String, f64, f64)],
+    core: Option<&CoreLeg<'_>>,
     opening_nav: f64,
     entry_leg_costs: f64,
     period_return: f64,
@@ -2611,11 +2844,36 @@ fn daily_nav_marks(
     if !prices.is_session(date) {
         return Err(format!("mark prices have no {date} exchange session"));
     }
+    if let Some(core) = core {
+        if core.marks.len() != cadence_sessions {
+            return Err(format!(
+                "the index core has {} marked sessions after {date} but the replay holds {cadence_sessions}",
+                core.marks.len()
+            ));
+        }
+        if !core.entry_close.is_finite() || core.entry_close <= 0.0 {
+            return Err(format!(
+                "the index has a non-positive close on {date} to mark the core against"
+            ));
+        }
+    }
     let mut marks = Vec::with_capacity(cadence_sessions);
     for session in 1..=cadence_sessions {
         let mark_date = prices
             .session_after(date, session)
             .ok_or_else(|| format!("mark prices end before session {session} after {date}"))?;
+        // A core marked on different sessions than the book it is combined
+        // with would silently misdate the combined NAV, so the two calendars
+        // must agree session by session, not just at the period's end.
+        if let Some(core) = core {
+            let index_mark = core.marks[session - 1];
+            if index_mark.date != mark_date {
+                return Err(format!(
+                    "the index core's session {session} after {date} falls on {}, but the book is marked on {mark_date}",
+                    index_mark.date
+                ));
+            }
+        }
         let value = if session == cadence_sessions {
             period_return
         } else {
@@ -2630,6 +2888,12 @@ fn daily_nav_marks(
                     format!("mark prices have no {instrument_id} close through {mark_date}")
                 })?;
                 marked_return += weight * (close / entry_price - 1.0);
+            }
+            if let Some(core) = core {
+                marked_return += core.weight
+                    * (core.marks[session - 1].close / core.entry_close
+                        - 1.0
+                        - core.session_tracking_cost * session as f64);
             }
             marked_return - entry_leg_costs
         };
@@ -3840,12 +4104,12 @@ pub fn add_benchmark(
 ) -> Result<BacktestResult, String> {
     let mut nav = 1.0;
     for step in &mut result.steps {
-        let (value, marks) = benchmark_period(history, step.date, result.cadence_sessions)?;
-        nav *= 1.0 + value;
-        step.benchmark_period_return = Some(value);
+        let period = benchmark_period(history, step.date, result.cadence_sessions)?;
+        nav *= 1.0 + period.value;
+        step.benchmark_period_return = Some(period.value);
         step.benchmark_nav = Some(nav);
-        step.active_return = Some(step.period_return - value);
-        step.benchmark_daily_marks = marks;
+        step.active_return = Some(step.period_return - period.value);
+        step.benchmark_daily_marks = period.marks;
     }
     result.benchmark = Some(benchmark_comparison(
         &result.steps,
@@ -3866,7 +4130,20 @@ fn benchmark_return(
     decision_date: Date,
     horizon: usize,
 ) -> Result<f64, String> {
-    Ok(benchmark_period(history, decision_date, horizon)?.0)
+    Ok(benchmark_period(history, decision_date, horizon)?.value)
+}
+
+/// One holding period of the index leg.
+#[derive(Debug, Clone)]
+struct BenchmarkPeriod {
+    /// Close-to-close return over the holding period.
+    value: f64,
+    /// The decision session's official close, the level every mark inside the
+    /// period is measured against.
+    entry_close: f64,
+    /// That period's closing level on every session after the decision session
+    /// through the exit session.
+    marks: Vec<BenchmarkMark>,
 }
 
 /// One holding period of the index leg: the return from the decision session's
@@ -3883,7 +4160,7 @@ fn benchmark_period(
     history: &BenchmarkHistory,
     decision_date: Date,
     horizon: usize,
-) -> Result<(f64, Vec<BenchmarkMark>), String> {
+) -> Result<BenchmarkPeriod, String> {
     if history
         .bars
         .windows(2)
@@ -3928,7 +4205,11 @@ fn benchmark_period(
             close: bar.end_value,
         })
         .collect();
-    Ok((value, marks))
+    Ok(BenchmarkPeriod {
+        value,
+        entry_close: entry.end_value,
+        marks,
+    })
 }
 
 fn benchmark_comparison(
@@ -4458,8 +4739,7 @@ mod tests {
 
     fn population_std(values: &[f64]) -> f64 {
         let mean = values.iter().sum::<f64>() / values.len() as f64;
-        let variance =
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
         variance.sqrt()
     }
 
@@ -5007,6 +5287,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5073,6 +5354,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5159,6 +5441,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.5,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5295,6 +5578,7 @@ mod tests {
                         ranking: portfolio_construction::RankingMethod::Edge,
                         sizing: portfolio_construction::SizingMethod::Equal,
                         allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                        allocation_mode: AllocationMode::Directional,
                         position_weight: 1.0,
                         min_position_weight: 0.0,
                         reference_edge: 0.01,
@@ -5678,6 +5962,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5724,6 +6009,7 @@ mod tests {
                     ranking: portfolio_construction::RankingMethod::Edge,
                     sizing: portfolio_construction::SizingMethod::Equal,
                     allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                    allocation_mode: AllocationMode::Directional,
                     position_weight: 0.05,
                     min_position_weight: 0.0,
                     reference_edge: 0.01,
@@ -5775,6 +6061,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5819,6 +6106,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5867,6 +6155,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -5956,6 +6245,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -6005,6 +6295,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -6103,6 +6394,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -6201,5 +6493,395 @@ mod tests {
         let bot = [0.01; 10];
         let benchmark = [0.01; 3];
         assert!(active_tstat(&bot, &benchmark).is_none());
+    }
+
+    /// Eight consecutive sessions of one instrument, so an overlay replay has
+    /// both a mark calendar and an index calendar on the same dates.
+    fn overlay_sessions() -> Vec<Date> {
+        (1..=8)
+            .map(|day_of_month| day(&format!("2024-01-0{day_of_month}")))
+            .collect()
+    }
+
+    fn overlay_mark_prices(sessions: &[Date], instruments: &[&str]) -> MarkPrices {
+        let mut prices = MarkPrices::default();
+        for instrument in instruments {
+            prices
+                .insert_history(instrument, sessions.iter().map(|date| (*date, 100.0)))
+                .unwrap();
+        }
+        prices
+    }
+
+    /// The heart of the index-core mode: a configuration that produces no
+    /// candidate at all must still return the index, less only the core's
+    /// tracking cost. A zero prediction with zero costs leaves both the long
+    /// and the short economic edge at exactly zero, and the replay only opens
+    /// a position on a strictly positive edge, so the overlay is empty by
+    /// construction rather than by tuning.
+    #[test]
+    fn an_overlay_replay_without_candidates_earns_the_index_minus_its_tracking_cost() {
+        let sessions = overlay_sessions();
+        let rows = sessions[1..5]
+            .iter()
+            .map(|date| row(*date))
+            .collect::<Vec<_>>();
+        let core_tracking_cost_bps = 10.0;
+        let cadence = 3;
+        let result = backtest(
+            &constant_model(0.0),
+            &rows,
+            &BacktestConfig {
+                start: sessions[1],
+                end: sessions[4],
+                cadence_sessions: cadence,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: cadence,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget: portfolio_construction::OverlayBudget {
+                        core_weight: 1.0,
+                        overlay_gross: 0.4,
+                        overlay_net_cap: 0.0,
+                    },
+                    core_tracking_cost_bps,
+                },
+                position_weight: 0.2,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: Some(overlay_mark_prices(&sessions, &["TX1"])),
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        let tracking = core_tracking_cost_bps / 10_000.0 * cadence as f64 / 252.0;
+        assert_eq!(result.steps.len(), 2);
+        let mut floor_nav = 1.0;
+        for step in &result.steps {
+            assert!(step.positions.is_empty(), "the overlay must be empty");
+            let index = step.benchmark_period_return.expect("core needs the index");
+            assert!(
+                (step.period_return - (index - tracking)).abs() < 1e-9,
+                "period return {} is not the index {index} minus tracking {tracking}",
+                step.period_return
+            );
+            assert!((step.core_return.unwrap() - (index - tracking)).abs() < 1e-9);
+            assert_eq!(step.overlay_return, Some(0.0));
+            // The core is the whole book: one unit of gross, one unit of net.
+            assert!((step.gross - 1.0).abs() < 1e-12);
+            assert!((step.net - 1.0).abs() < 1e-12);
+            floor_nav *= 1.0 + index - tracking;
+        }
+        assert!((result.metrics.total_return - (floor_nav - 1.0)).abs() < 1e-9);
+
+        // Daily marks: the core is marked at the index's own closes on the
+        // sessions between rebalances, with its tracking cost accrued per
+        // session rather than dropped on one of them.
+        let first = &result.steps[0];
+        assert_eq!(first.daily_marks.len(), cadence);
+        let session_tracking = core_tracking_cost_bps / 10_000.0 / 252.0;
+        let entry_close = 100.0 * 1.001_f64.powi(1);
+        for (session, mark) in first.daily_marks.iter().enumerate().take(cadence - 1) {
+            let index_close = 100.0 * 1.001_f64.powi(2 + session as i32);
+            let expected =
+                index_close / entry_close - 1.0 - session_tracking * (session + 1) as f64;
+            assert!(
+                (mark.nav - (1.0 + expected)).abs() < 1e-12,
+                "session {session} mark {} is not the accrued index core {expected}",
+                mark.nav
+            );
+        }
+        assert!((first.daily_marks[cadence - 1].nav - first.nav).abs() < 1e-12);
+
+        let attribution = result
+            .overlay_attribution
+            .as_ref()
+            .expect("an overlay replay must attribute its two legs");
+        assert_eq!(attribution.periods, 2);
+        assert_eq!(attribution.overlay_return, 0.0);
+        assert!((attribution.core_tracking_cost - 2.0 * tracking).abs() < 1e-12);
+        // A dead-flat overlay has no dispersion, so no t-stat exists; the
+        // report says why rather than reporting an infinity.
+        assert_eq!(attribution.overlay_alpha_tstat, None);
+        assert_eq!(
+            attribution.overlay_alpha_tstat_status.as_deref(),
+            Some(NO_ACTIVE_DISPERSION)
+        );
+        assert!(
+            result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("tracking cost") && line.contains("not charged")),
+            "the untraded core's cost model must be disclosed: {:?}",
+            result.disclosures
+        );
+    }
+
+    /// A split model so one instrument is a long candidate and the other a
+    /// short one, which is what a self-funding overlay needs.
+    fn split_model(threshold: f64, below: f64, at_or_above: f64) -> Model {
+        let mut model = constant_model(0.0);
+        model.tree_info = vec![lightgbm_json::Tree {
+            tree_index: 0,
+            num_leaves: 2,
+            num_cat: Some(0),
+            shrinkage: Some(1.0),
+            tree_structure: lightgbm_json::Node {
+                split_feature: Some(0),
+                threshold: Some(threshold),
+                decision_type: Some("<=".into()),
+                default_left: Some(true),
+                missing_type: None,
+                left_child: Some(Box::new(direction_leaf(below))),
+                right_child: Some(Box::new(direction_leaf(at_or_above))),
+                leaf_value: None,
+                diagnostics: Default::default(),
+            },
+        }];
+        model
+    }
+
+    #[test]
+    fn an_active_overlay_decomposes_into_the_core_leg_and_the_self_funding_overlay() {
+        let sessions = overlay_sessions();
+        let long_row = |date: Date| {
+            let mut value = row(date);
+            value.features.insert("x_ret_1".into(), 1.0);
+            value.target = Some(0.01);
+            value
+        };
+        let short_row = |date: Date| {
+            let mut value = row(date);
+            value.instrument_id = "TX2".into();
+            value.symbol = "TX2".into();
+            value.features.insert("x_ret_1".into(), -1.0);
+            value.target = Some(-0.005);
+            value
+        };
+        let rows = sessions[1..5]
+            .iter()
+            .flat_map(|date| [long_row(*date), short_row(*date)])
+            .collect::<Vec<_>>();
+        let costs = CostConfig {
+            round_trip_bps: 20.0,
+            round_trip_commission_bps: 20.0,
+            ..zero_execution_costs()
+        };
+        let core_tracking_cost_bps = 10.0;
+        let cadence = 3;
+        let budget = portfolio_construction::OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.4,
+            overlay_net_cap: 0.0,
+        };
+        let result = backtest(
+            &split_model(0.0, -0.02, 0.02),
+            &rows,
+            &BacktestConfig {
+                start: sessions[1],
+                end: sessions[4],
+                cadence_sessions: cadence,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: cadence,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget,
+                    core_tracking_cost_bps,
+                },
+                position_weight: 0.2,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs,
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        let tracking = core_tracking_cost_bps / 10_000.0 * cadence as f64 / 252.0;
+        assert_eq!(result.steps.len(), 2);
+        for step in &result.steps {
+            assert_eq!(step.positions.len(), 2);
+            let overlay_net = step.positions.iter().map(|p| p.weight).sum::<f64>();
+            let overlay_gross = step.positions.iter().map(|p| p.weight.abs()).sum::<f64>();
+            // Self-funding: the overlay's own net is capped at zero, so the
+            // book's net is exactly the core.
+            assert!(overlay_net.abs() < 1e-12, "overlay net {overlay_net}");
+            assert!((overlay_gross - 0.4).abs() < 1e-12);
+            // Combined book exposure is the core plus the overlay, and the
+            // core never collides with an overlay instrument id.
+            assert!((step.net - (budget.core_weight + overlay_net)).abs() < 1e-12);
+            assert!((step.gross - (budget.core_weight + overlay_gross)).abs() < 1e-12);
+
+            let index = step.benchmark_period_return.unwrap();
+            let core = step.core_return.expect("core leg");
+            let overlay = step.overlay_return.expect("overlay leg");
+            assert!((core - budget.core_weight * (index - tracking)).abs() < 1e-12);
+            // The overlay is charged exactly the costs the ordinary replay
+            // charges, and its return is the sum of its positions' P&L.
+            let position_pnl = step.positions.iter().map(|p| p.pnl).sum::<f64>();
+            assert!((overlay - position_pnl).abs() < 1e-12);
+            let gross_overlay = step
+                .positions
+                .iter()
+                .map(|p| p.weight * p.realised_return)
+                .sum::<f64>();
+            assert!((overlay - (gross_overlay - step.cost_drag)).abs() < 1e-12);
+            assert!(step.cost_drag > 0.0, "the overlay must pay execution costs");
+            // The whole period return decomposes into the two legs exactly.
+            assert!(
+                (step.period_return - (core + overlay)).abs() < 1e-12,
+                "period {} is not core {core} plus overlay {overlay}",
+                step.period_return
+            );
+        }
+        let attribution = result.overlay_attribution.as_ref().unwrap();
+        let core_sum = result
+            .steps
+            .iter()
+            .map(|step| step.core_return.unwrap())
+            .sum::<f64>();
+        let overlay_sum = result
+            .steps
+            .iter()
+            .map(|step| step.overlay_return.unwrap())
+            .sum::<f64>();
+        assert!((attribution.core_return - core_sum).abs() < 1e-12);
+        assert!((attribution.overlay_return - overlay_sum).abs() < 1e-12);
+        assert_eq!(attribution.core_weight, budget.core_weight);
+        assert_eq!(attribution.core_tracking_cost_bps, core_tracking_cost_bps);
+        // The overlay is self-funding, so its t-stat is against zero, not
+        // against the index the core already owns.
+        let overlay_returns = result
+            .steps
+            .iter()
+            .map(|step| step.overlay_return.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attribution.overlay_alpha_tstat,
+            active_tstat(&overlay_returns, &vec![0.0; overlay_returns.len()])
+        );
+
+        // Reports are persisted artifacts that `add-benchmark` and the
+        // phase summaries read back, so the new mode has to survive a JSON
+        // round trip rather than only existing in memory.
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: BacktestResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.allocation_mode, result.allocation_mode);
+        assert_eq!(
+            decoded.overlay_attribution.unwrap().overlay_return,
+            attribution.overlay_return
+        );
+        assert_eq!(decoded.steps[0].core_return, result.steps[0].core_return);
+        // A frozen report predating the mode is directional, with neither leg.
+        let mut frozen = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+        let object = frozen.as_object_mut().unwrap();
+        object.remove("allocation_mode");
+        object.remove("overlay_attribution");
+        for step in object["steps"].as_array_mut().unwrap() {
+            let step = step.as_object_mut().unwrap();
+            step.remove("core_return");
+            step.remove("overlay_return");
+        }
+        let legacy: BacktestResult = serde_json::from_value(frozen).unwrap();
+        assert_eq!(legacy.allocation_mode, AllocationMode::Directional);
+        assert!(legacy.overlay_attribution.is_none());
+        assert_eq!(legacy.steps[0].core_return, None);
+    }
+
+    #[test]
+    fn the_overlay_mode_refuses_configurations_it_cannot_price_or_allocate() {
+        let sessions = overlay_sessions();
+        let rows = sessions[1..5]
+            .iter()
+            .map(|date| row(*date))
+            .collect::<Vec<_>>();
+        let overlay = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.4,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let config =
+            |benchmark: Option<BenchmarkHistory>,
+             max_sector_gross: Option<f64>,
+             direction_config: Option<portfolio_construction::DirectionConfig>| {
+                BacktestConfig {
+                    start: sessions[1],
+                    end: sessions[4],
+                    cadence_sessions: 3,
+                    rebalance_offset_sessions: 0,
+                    model_horizon_sessions: 3,
+                    prediction_horizon_scale: 1.0,
+                    max_positions: 2,
+                    retention_rank: 2,
+                    max_sector_gross,
+                    ranking: portfolio_construction::RankingMethod::Edge,
+                    sizing: portfolio_construction::SizingMethod::Equal,
+                    allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                    allocation_mode: overlay,
+                    position_weight: 0.2,
+                    min_position_weight: 0.0,
+                    reference_edge: 0.01,
+                    reference_volatility: 0.02,
+                    direction_config,
+                    prediction_composition: PredictionComposition::Direct,
+                    market_return_forecasts: None,
+                    market_forecast_model_id: None,
+                    costs: zero_execution_costs(),
+                    benchmark,
+                    mark_prices: None,
+                    risk_free_annual: 0.0,
+                }
+            };
+        // No index history: the core has nothing to be priced against.
+        assert!(backtest(&constant_model(0.0), &rows, &config(None, None, None)).is_err());
+        // The allocator that enforces the overlay net cap has no group cap.
+        assert!(backtest(
+            &constant_model(0.0),
+            &rows,
+            &config(Some(rising_benchmark(8)), Some(0.2), None)
+        )
+        .is_err());
+        // The index core is the market exposure; a timing overlay on top of
+        // it would be a second, contradictory answer to the same question.
+        assert!(backtest(
+            &constant_model(0.0),
+            &rows,
+            &config(
+                Some(rising_benchmark(8)),
+                None,
+                Some(portfolio_construction::DirectionConfig::baseline(1.0).unwrap())
+            )
+        )
+        .is_err());
     }
 }
