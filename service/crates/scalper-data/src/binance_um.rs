@@ -5,7 +5,7 @@
 //! untouched. URL shape:
 //!   https://data.binance.vision/data/futures/um/monthly/klines/{SYMBOL}/1m/{SYMBOL}-1m-{YYYY-MM}.zip
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use features_crypto::Bar;
 use std::io::Read;
 
@@ -50,6 +50,65 @@ pub async fn fetch_um_month(
     }
     let bytes = res.bytes().await.map_err(|e| format!("{url}: {e}"))?;
     Ok(Some(bytes.to_vec()))
+}
+
+/// URL of one daily UM kline zip. Separate from `fetch_um_day` so the shape
+/// can be asserted without a network round trip.
+fn um_day_url(symbol: &str, date: NaiveDate) -> String {
+    format!("{ARCHIVE}/data/futures/um/daily/klines/{symbol}/1m/{symbol}-1m-{date}.zip")
+}
+
+/// One daily zip, or `None` on 404 - Binance publishes the current day's
+/// file with a lag, so a 404 for today (or a day that hasn't happened yet)
+/// is normal, not an error.
+pub async fn fetch_um_day(
+    client: &reqwest::Client,
+    symbol: &str,
+    date: NaiveDate,
+) -> Result<Option<Vec<u8>>, String> {
+    let url = um_day_url(symbol, date);
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {e}"))?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !res.status().is_success() {
+        return Err(format!("{url}: HTTP {}", res.status()));
+    }
+    let bytes = res.bytes().await.map_err(|e| format!("{url}: {e}"))?;
+    Ok(Some(bytes.to_vec()))
+}
+
+/// The days of `(year, month)` from the 1st through `min(month_end,
+/// today_utc)`, inclusive. Empty if the month hasn't started yet as of
+/// `today_utc`. Pure so the "which days does the open month need" decision
+/// is testable without a clock or network.
+pub fn open_month_days(year: i32, month: u32, today_utc: NaiveDate) -> Vec<NaiveDate> {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid year/month");
+    if first > today_utc {
+        return Vec::new();
+    }
+    let next_month_first = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("valid year/month");
+    let month_end = next_month_first
+        .pred_opt()
+        .expect("month has at least one day");
+    let last = month_end.min(today_utc);
+
+    let mut days = Vec::new();
+    let mut day = first;
+    while day <= last {
+        days.push(day);
+        day = day.succ_opt().expect("day within a bounded month range");
+    }
+    days
 }
 
 /// Epochs arrive in ms (pre-2025 files) or µs (2025+). Values, not flags.
@@ -183,6 +242,55 @@ mod tests {
         let bytes_ms = zip_with_one_file("BTCUSDT-1m-2025-08.csv", csv_ms.as_bytes());
         let bars_ms = super::parse_um_klines_zip(&bytes_ms, "BTC", start, end).unwrap();
         assert_eq!(bars_ms[0].ts_utc, bars[0].ts_utc);
+    }
+
+    #[test]
+    fn daily_url_shape() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        assert_eq!(
+            super::um_day_url("BTCUSDT", d),
+            "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-08-13.zip"
+        );
+    }
+
+    #[test]
+    fn open_month_days_mid_month_today_covers_the_1st_through_today() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        let days = super::open_month_days(2026, 8, today);
+        assert_eq!(
+            days.first(),
+            Some(&chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap())
+        );
+        assert_eq!(days.last(), Some(&today));
+        assert_eq!(days.len(), 13);
+    }
+
+    #[test]
+    fn open_month_days_a_past_month_returns_the_full_month() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        let days = super::open_month_days(2026, 7, today);
+        assert_eq!(
+            days.first(),
+            Some(&chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
+        );
+        assert_eq!(
+            days.last(),
+            Some(&chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap())
+        );
+        assert_eq!(days.len(), 31);
+    }
+
+    #[test]
+    fn open_month_days_a_future_month_is_empty() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        assert!(super::open_month_days(2026, 9, today).is_empty());
+    }
+
+    #[test]
+    fn open_month_days_today_is_the_1st_yields_one_day() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let days = super::open_month_days(2026, 8, today);
+        assert_eq!(days, vec![today]);
     }
 
     #[test]

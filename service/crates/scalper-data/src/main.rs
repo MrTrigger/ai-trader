@@ -15,7 +15,9 @@ use chrono::{DateTime, Datelike, Utc};
 use crypto_portfolio::store;
 use hyperliquid::{Info, MAINNET};
 
-use binance_um::{binance_um_symbol, fetch_um_month, parse_um_klines_zip};
+use binance_um::{
+    binance_um_symbol, fetch_um_day, fetch_um_month, open_month_days, parse_um_klines_zip,
+};
 use books::BookSnapshot;
 use costs::{summarize, CostSummary};
 use universe::select_candidates;
@@ -183,6 +185,13 @@ async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
+    // Binance only publishes a MONTHLY archive zip once the month closes, so
+    // the month `today_utc` falls in (and any later enumerated month, which
+    // can only arise from a future --end) can never be fetched that way -
+    // it's pulled a day at a time from the daily archive instead.
+    let today_utc = Utc::now().date_naive();
+    let current_month = (today_utc.year(), today_utc.month());
+
     let months = months(start, end);
     let mut total = 0usize;
     for asset in &assets {
@@ -192,21 +201,64 @@ async fn cmd_pull_binance_perp(args: &[String]) -> Result<(), String> {
             continue;
         };
         for &(year, month) in &months {
-            let label = format!("{year:04}-{month:02}");
-            match fetch_um_month(&client, &symbol, year, month).await? {
-                None => println!("{store_asset} {label}: skipped (404: not listed)"),
-                Some(bytes) => {
-                    let bars = parse_um_klines_zip(&bytes, &store_asset, start, end)?;
-                    println!("{store_asset} {label}: {} bars", bars.len());
-                    if !bars.is_empty() {
-                        total += bars.len();
-                        store::write(&root, &bars)?;
-                    }
+            if (year, month) >= current_month {
+                for day in open_month_days(year, month, today_utc) {
+                    let bytes = fetch_um_day(&client, &symbol, day).await?;
+                    record_fetch(
+                        &root,
+                        &store_asset,
+                        &day.to_string(),
+                        "not yet published",
+                        bytes,
+                        start,
+                        end,
+                        &mut total,
+                    )?;
                 }
+            } else {
+                let label = format!("{year:04}-{month:02}");
+                let bytes = fetch_um_month(&client, &symbol, year, month).await?;
+                record_fetch(
+                    &root,
+                    &store_asset,
+                    &label,
+                    "not listed",
+                    bytes,
+                    start,
+                    end,
+                    &mut total,
+                )?;
             }
         }
     }
     println!("wrote {total} bars total");
+    Ok(())
+}
+
+/// Parse and store one fetched zip (or print the 404 skip line), sharing the
+/// bookkeeping between the monthly and daily fetch paths.
+#[allow(clippy::too_many_arguments)]
+fn record_fetch(
+    root: &std::path::Path,
+    store_asset: &str,
+    label: &str,
+    not_found_reason: &str,
+    bytes: Option<Vec<u8>>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    total: &mut usize,
+) -> Result<(), String> {
+    match bytes {
+        None => println!("{store_asset} {label}: skipped (404: {not_found_reason})"),
+        Some(bytes) => {
+            let bars = parse_um_klines_zip(&bytes, store_asset, start, end)?;
+            println!("{store_asset} {label}: {} bars", bars.len());
+            if !bars.is_empty() {
+                *total += bars.len();
+                store::write(root, &bars)?;
+            }
+        }
+    }
     Ok(())
 }
 
