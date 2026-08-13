@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use time::Date;
 
 const EPSILON: f64 = 1e-12;
 
@@ -410,10 +411,101 @@ pub struct Allocation {
     pub diagnostics: AllocationDiagnostics,
 }
 
+/// Combine equal-capital rebalance phases on the calendar rather than on the
+/// period index. Each input is one phase's daily `(session, NAV)` series; the
+/// output is the combined book's daily NAV over the sessions every phase covers.
+///
+/// Averaging phase returns by period index treats phase `j`'s period `k` as
+/// simultaneous with phase `j+1`'s period `k`, but those periods span different
+/// sessions. The average then behaves like a moving average of overlapping
+/// windows: it suppresses variance while preserving the mean, and any
+/// annualisation of the smoothed series reports a Sharpe no phase earned. Keying
+/// on the session date removes that smoothing entirely — when every phase holds
+/// the same book the combined series is that book's own path.
+///
+/// Capital is split equally at the first common session, so every phase is
+/// normalised to NAV 1.0 there and the combined book is thereafter held without
+/// transfers between phases. Sessions before that (a phase's own ramp-up) and
+/// after the earliest-ending phase are outside the window in which all phases
+/// are invested, so they are excluded; inside the window the phases' session
+/// grids must agree exactly, and a gap is an error rather than a silent
+/// realignment of one phase's NAV onto another phase's dates.
+pub fn equal_weight_phase_daily_navs(
+    phases: &[Vec<(Date, f64)>],
+) -> Result<Vec<(Date, f64)>, String> {
+    if phases.is_empty() || phases.iter().any(Vec::is_empty) {
+        return Err("rebalance phases must be non-empty".into());
+    }
+    for phase in phases {
+        if phase.iter().any(|(_, nav)| !nav.is_finite() || *nav <= 0.0) {
+            return Err("rebalance phase NAVs must be finite and positive".into());
+        }
+        if phase.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err("rebalance phase marks must be strictly ordered by session".into());
+        }
+    }
+    let start = phases
+        .iter()
+        .map(|phase| phase[0].0)
+        .max()
+        .expect("non-empty phases");
+    let end = phases
+        .iter()
+        .map(|phase| phase[phase.len() - 1].0)
+        .min()
+        .expect("non-empty phases");
+    if start > end {
+        return Err("rebalance phases have no overlapping session window".into());
+    }
+    let windows = phases
+        .iter()
+        .map(|phase| {
+            phase
+                .iter()
+                .filter(|(date, _)| *date >= start && *date <= end)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let reference = &windows[0];
+    for (index, window) in windows.iter().enumerate().skip(1) {
+        if window.len() != reference.len() {
+            return Err(format!(
+                "phase {index} covers {} sessions between {start} and {end}, phase 0 covers {}",
+                window.len(),
+                reference.len()
+            ));
+        }
+        if let Some((_, (date, _))) = window
+            .iter()
+            .zip(reference)
+            .enumerate()
+            .find(|(_, (mine, theirs))| mine.0 != theirs.0)
+        {
+            return Err(format!("phase {index} has no {} session", date.0));
+        }
+    }
+    let base = windows.iter().map(|window| window[0].1).collect::<Vec<_>>();
+    Ok((0..reference.len())
+        .map(|index| {
+            let nav = windows
+                .iter()
+                .zip(&base)
+                .map(|(window, opening)| window[index].1 / opening)
+                .sum::<f64>()
+                / windows.len() as f64;
+            (reference[index].0, nav)
+        })
+        .collect())
+}
+
 /// Combine equal-capital rebalance phases without selecting a favourable
 /// calendar alignment. Each input is a complete return series for one phase;
 /// only the common complete prefix is used, so a partial terminal holding can
 /// never receive extra weight.
+#[deprecated(
+    note = "averages phases by period index, which smooths overlapping holding windows and inflates annualised Sharpe; use equal_weight_phase_daily_navs. Retained only to summarise reports predating daily NAV marks."
+)]
 pub fn equal_weight_phase_returns(phases: &[Vec<f64>]) -> Result<Vec<f64>, String> {
     if phases.is_empty() || phases.iter().any(Vec::is_empty) {
         return Err("rebalance phases must be non-empty".into());
@@ -592,17 +684,7 @@ pub fn allocate(proposals: &[Proposal], budget: Budget) -> Result<Allocation, St
         weights.insert(proposal.id.clone(), sign * absolute);
     }
 
-    let realised_long = weights
-        .values()
-        .copied()
-        .filter(|weight| *weight > 0.0)
-        .sum();
-    let realised_short = -weights
-        .values()
-        .copied()
-        .filter(|weight| *weight < 0.0)
-        .sum::<f64>();
-    let realised_gross = realised_long + realised_short;
+    let (realised_long, realised_short, realised_gross) = realised_from_weights(&weights);
     let diagnostics = AllocationDiagnostics {
         budget,
         proposed_long,
@@ -661,19 +743,33 @@ pub fn allocate_with_group_cap(
     for (id, weight) in &mut allocation.weights {
         *weight *= scales[groups[id].as_str()];
     }
-    let realised_long = allocation
-        .weights
-        .values()
-        .copied()
-        .filter(|weight| *weight > 0.0)
-        .sum::<f64>();
-    let realised_short = -allocation
-        .weights
-        .values()
-        .copied()
-        .filter(|weight| *weight < 0.0)
-        .sum::<f64>();
-    let realised_gross = realised_long + realised_short;
+    // Group scaling can push a position that survived the ordinary
+    // per-name minimum below it again. Drop it to cash rather than carry a
+    // sub-minimum sliver; the freed weight is not redistributed (scale-down
+    // only), matching the ordinary allocate() contract.
+    let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
+        .iter()
+        .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
+        .collect();
+    let mut dropped_by_group_cap = Vec::new();
+    allocation.weights.retain(|id, weight| {
+        let minimum = min_abs_weight_by_id
+            .get(id.as_str())
+            .copied()
+            .unwrap_or(0.0);
+        if weight.abs() + EPSILON < minimum {
+            dropped_by_group_cap.push(id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    allocation
+        .diagnostics
+        .dropped_below_minimum
+        .extend(dropped_by_group_cap);
+    let (realised_long, realised_short, realised_gross) =
+        realised_from_weights(&allocation.weights);
     allocation.diagnostics.realised_long = realised_long;
     allocation.diagnostics.realised_short = realised_short;
     allocation.diagnostics.realised_gross = realised_gross;
@@ -684,12 +780,208 @@ pub fn allocate_with_group_cap(
     Ok(allocation)
 }
 
+/// Budget for an index-core-plus-overlay portfolio: a fixed core position in
+/// the benchmark instrument, topped up by a self-funding long/short overlay
+/// built from candidates. `core_weight` is always fully allocated — it is
+/// never reduced by overlay activity — and unfilled overlay capacity is left
+/// as nothing rather than added to the core.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OverlayBudget {
+    /// Weight always allocated to the benchmark instrument, e.g. 1.0 for a
+    /// full beta-one floor.
+    pub core_weight: f64,
+    /// Maximum combined |long| + |short| overlay weight.
+    pub overlay_gross: f64,
+    /// Maximum |overlay long − overlay short|.
+    pub overlay_net_cap: f64,
+}
+
+impl OverlayBudget {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.core_weight.is_finite()
+            || self.core_weight <= 0.0
+            || self.core_weight > 1.5 + EPSILON
+        {
+            return Err("core weight must be finite and in (0, 1.5]".into());
+        }
+        if !self.overlay_gross.is_finite() || self.overlay_gross < 0.0 {
+            return Err("overlay gross must be finite and non-negative".into());
+        }
+        if !self.overlay_net_cap.is_finite() || self.overlay_net_cap < 0.0 {
+            return Err("overlay net cap must be finite and non-negative".into());
+        }
+        Ok(())
+    }
+}
+
+/// An index-core-plus-overlay allocation. `core_weight` is a fixed weight in
+/// the benchmark instrument, tracked separately from `overlay.weights` so an
+/// overlay candidate id can never collide with the core position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayAllocation {
+    pub core_weight: f64,
+    pub overlay: Allocation,
+}
+
+/// Allocate an index-core-plus-overlay portfolio. The core is always fully
+/// allocated to `budget.core_weight`, independent of the overlay. The
+/// overlay reuses the ordinary scale-down-only `allocate` pipeline under
+/// `budget.overlay_gross`, then applies one further scale-down-only pass
+/// that shrinks only the heavier sleeve so the overlay's realised
+/// |long − short| never exceeds `budget.overlay_net_cap`. As with `allocate`,
+/// capped or net-capped excess is never redistributed and unfilled capacity
+/// is left as nothing — the core is not topped up with unused overlay room.
+pub fn allocate_overlay(
+    proposals: &[Proposal],
+    budget: &OverlayBudget,
+) -> Result<OverlayAllocation, String> {
+    budget.validate()?;
+    let overlay_budget = Budget::gross_only(budget.overlay_gross)?;
+    let mut allocation = allocate(proposals, overlay_budget)?;
+
+    let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
+        .iter()
+        .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
+        .collect();
+
+    // A net (difference) cap is not monotonic under one-sided removal:
+    // scaling the heavier sleeve down to its target can push one of its
+    // positions below that position's own minimum, and dropping that
+    // position shrinks the sleeve further than the target — which can flip
+    // which sleeve is heavier, or leave the original violation only partly
+    // corrected. A single shrink-then-drop pass is therefore not enough; the
+    // cap is enforced by repeating the scale-then-drop step against
+    // whichever sleeve is heavier *right now* until it converges. Each
+    // iteration either satisfies the cap without a drop (converged) or
+    // drops at least one position from a finite set, so this terminates in
+    // at most `proposals.len()` iterations; the `+ 2` bound below is pure
+    // defense in depth, not load-bearing for correctness — the invariant
+    // check after the loop is what actually guarantees the contract.
+    let mut newly_dropped = Vec::new();
+    for _ in 0..proposals.len() + 2 {
+        let (realised_long, realised_short, _) = realised_from_weights(&allocation.weights);
+        let excess = (realised_long - realised_short).abs() - budget.overlay_net_cap;
+        if excess <= EPSILON {
+            break;
+        }
+        let heavier = if realised_long > realised_short {
+            Direction::Long
+        } else {
+            Direction::Short
+        };
+        let (heavier_total, lighter_total) = if heavier == Direction::Long {
+            (realised_long, realised_short)
+        } else {
+            (realised_short, realised_long)
+        };
+        // excess > 0 guarantees heavier_total > 0, and target_total is both
+        // non-negative and strictly less than heavier_total.
+        let target_total = lighter_total + budget.overlay_net_cap;
+        let scale = scale_down(heavier_total, target_total);
+
+        for weight in allocation.weights.values_mut() {
+            let direction = if *weight > 0.0 {
+                Direction::Long
+            } else {
+                Direction::Short
+            };
+            if direction == heavier {
+                *weight *= scale;
+            }
+        }
+
+        // Scaling the heavier sleeve down can push one of its positions
+        // below its own economic minimum. Drop it to cash rather than carry
+        // a sub-minimum sliver; the freed weight is not redistributed
+        // (scale-down only). Only the sleeve just scaled is checked here —
+        // the untouched sleeve cannot have newly fallen below its minimum.
+        allocation.weights.retain(|id, weight| {
+            let direction = if *weight > 0.0 {
+                Direction::Long
+            } else {
+                Direction::Short
+            };
+            if direction != heavier {
+                return true;
+            }
+            let minimum = min_abs_weight_by_id
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            if weight.abs() + EPSILON < minimum {
+                newly_dropped.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        // If nothing was dropped, the scale alone satisfied the cap; the
+        // next iteration's top-of-loop check confirms convergence and
+        // breaks. If something was dropped, loop again: the sleeve totals
+        // changed and the heavier sleeve may now be the other side.
+    }
+    allocation
+        .diagnostics
+        .dropped_below_minimum
+        .extend(newly_dropped);
+
+    let (realised_long, realised_short, realised_gross) =
+        realised_from_weights(&allocation.weights);
+    let realised_net = realised_long - realised_short;
+    // Defense in depth: the iterative scheme above always converges to
+    // |net| <= cap (or empties both sleeves). This should never trigger;
+    // fail loudly rather than silently ship a violated risk cap if it does.
+    if realised_net.abs() > budget.overlay_net_cap + EPSILON {
+        debug_assert!(
+            false,
+            "overlay net cap invariant violated: |net| {} exceeds cap {}",
+            realised_net.abs(),
+            budget.overlay_net_cap
+        );
+        return Err(format!(
+            "overlay net cap invariant violated: |net| {} exceeds cap {}",
+            realised_net.abs(),
+            budget.overlay_net_cap
+        ));
+    }
+    allocation.diagnostics.realised_long = realised_long;
+    allocation.diagnostics.realised_short = realised_short;
+    allocation.diagnostics.realised_gross = realised_gross;
+    allocation.diagnostics.realised_net = realised_net;
+    allocation.diagnostics.unused_long = (overlay_budget.max_long - realised_long).max(0.0);
+    allocation.diagnostics.unused_short = (overlay_budget.max_short - realised_short).max(0.0);
+    allocation.diagnostics.unused_gross = (overlay_budget.max_gross - realised_gross).max(0.0);
+
+    Ok(OverlayAllocation {
+        core_weight: budget.core_weight,
+        overlay: allocation,
+    })
+}
+
 fn side_total(capped: &[(&Proposal, f64)], direction: Direction) -> f64 {
     capped
         .iter()
         .filter(|(proposal, _)| proposal.direction == direction)
         .map(|(_, weight)| *weight)
         .sum()
+}
+
+/// Realised long/short/gross exposure from a signed weights map: long is the
+/// sum of positive weights, short the negated sum of negative weights, and
+/// gross their sum.
+fn realised_from_weights(weights: &BTreeMap<String, f64>) -> (f64, f64, f64) {
+    let realised_long = weights
+        .values()
+        .copied()
+        .filter(|weight| *weight > 0.0)
+        .sum::<f64>();
+    let realised_short = -weights
+        .values()
+        .copied()
+        .filter(|weight| *weight < 0.0)
+        .sum::<f64>();
+    let realised_gross = realised_long + realised_short;
+    (realised_long, realised_short, realised_gross)
 }
 
 fn scale_down(value: f64, maximum: f64) -> f64 {
@@ -701,7 +993,11 @@ fn scale_down(value: f64, maximum: f64) -> f64 {
 }
 
 fn normalise_zero(value: f64) -> f64 {
-    if value.abs() <= EPSILON { 0.0 } else { value }
+    if value.abs() <= EPSILON {
+        0.0
+    } else {
+        value
+    }
 }
 
 fn validate_sizing(config: &SizingConfig) -> Result<(), String> {
@@ -879,11 +1175,9 @@ mod tests {
         let mut config = DirectionConfig::baseline(1.0).unwrap();
         config.exit_threshold = config.enter_threshold;
         assert!(config.validate().is_err());
-        assert!(
-            DirectionState::default()
-                .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
-                .is_err()
-        );
+        assert!(DirectionState::default()
+            .update(1.1, 0.1, &DirectionConfig::baseline(1.0).unwrap())
+            .is_err());
     }
 
     #[test]
@@ -955,6 +1249,32 @@ mod tests {
         assert!((allocation.weights["c"] - 0.1).abs() < EPSILON);
         assert!((allocation.diagnostics.realised_gross - 0.6).abs() < EPSILON);
         assert_eq!(allocation.diagnostics.capped_positions, ["a"]);
+    }
+
+    #[test]
+    fn group_cap_drops_positions_scaled_below_minimum_instead_of_keeping_them_tiny() {
+        // Both survive the ordinary per-name allocate() pass on their own
+        // minimums (0.05 and 0.03). The sector cap then scales the whole
+        // "one" group down by 3/7 (0.15 / 0.35), which pushes "b" under its
+        // own minimum (0.05*3/7 ~= 0.0214 < 0.03) while leaving "a" above
+        // (0.30*3/7 ~= 0.1286 > 0.05). "b" must be dropped to cash, not kept
+        // as a sub-minimum sliver, and the dropped weight must not inflate
+        // "a" (scale-down-only: no redistribution).
+        let mut a = proposal("a", Direction::Long, 0.30, 0.30);
+        a.min_abs_weight = 0.05;
+        let mut b = proposal("b", Direction::Long, 0.05, 0.05);
+        b.min_abs_weight = 0.03;
+        let proposals = [a, b];
+        let groups = BTreeMap::from([("a".into(), "one".into()), ("b".into(), "one".into())]);
+        let allocation =
+            allocate_with_group_cap(&proposals, Budget::gross_only(1.0).unwrap(), &groups, 0.15)
+                .unwrap();
+        let expected_a = 0.30 * 3.0 / 7.0;
+        assert!(!allocation.weights.contains_key("b"));
+        assert!((allocation.weights["a"] - expected_a).abs() < EPSILON);
+        assert_eq!(allocation.diagnostics.dropped_below_minimum, ["b"]);
+        assert!((allocation.diagnostics.realised_long - expected_a).abs() < EPSILON);
+        assert!((allocation.diagnostics.realised_gross - expected_a).abs() < EPSILON);
     }
 
     #[test]
@@ -1088,9 +1408,338 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn equal_weight_phases_use_only_the_common_complete_prefix() {
         let combined =
             equal_weight_phase_returns(&[vec![0.10, -0.05, 0.20], vec![0.00, 0.05]]).unwrap();
         assert_eq!(combined, [0.05, 0.0]);
+    }
+
+    /// A deterministic, mean-positive daily return path with enough dispersion
+    /// that overlapping-window averaging visibly flattens it.
+    fn daily_return_path(sessions: usize) -> Vec<f64> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..sessions)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let uniform = (state >> 11) as f64 / (1_u64 << 53) as f64;
+                0.0006 + 0.02 * (uniform - 0.5)
+            })
+            .collect()
+    }
+
+    fn session(index: usize) -> Date {
+        // A synthetic contiguous session grid; only ordering and equality matter.
+        Date::from_ordinal_date(2024, 1).expect("valid ordinal date")
+            + time::Duration::days(index as i64)
+    }
+
+    /// Build one phase's daily `(date, nav)` series over `sessions[start..end]`,
+    /// holding the common asset and paying `rebalance_cost` on every session
+    /// where this phase rebalances.
+    fn phase_marks(
+        path: &[f64],
+        first_session: usize,
+        last_session: usize,
+        offset: usize,
+        cadence: usize,
+        rebalance_cost: f64,
+    ) -> Vec<(Date, f64)> {
+        let mut nav = 1.0;
+        (first_session..=last_session)
+            .map(|index| {
+                nav *= 1.0 + path[index];
+                if index % cadence == offset % cadence {
+                    nav *= 1.0 - rebalance_cost;
+                }
+                (session(index), nav)
+            })
+            .collect()
+    }
+
+    fn daily_returns(navs: &[(Date, f64)]) -> Vec<f64> {
+        navs.windows(2)
+            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+            .collect()
+    }
+
+    fn annualised_sharpe(returns: &[f64], periods_per_year: f64) -> f64 {
+        let average = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns
+            .iter()
+            .map(|value| (value - average).powi(2))
+            .sum::<f64>()
+            / returns.len() as f64;
+        average * periods_per_year / (variance.sqrt() * periods_per_year.sqrt())
+    }
+
+    /// Period returns as the legacy index-averaging path sees them: each phase's
+    /// own non-overlapping holding-period returns, taken off the same NAV path.
+    fn phase_period_returns(navs: &[(Date, f64)], cadence: usize) -> Vec<f64> {
+        navs.iter()
+            .step_by(cadence)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+            .collect()
+    }
+
+    #[test]
+    fn calendar_aligned_phases_do_not_smooth_a_common_daily_path() {
+        let path = daily_return_path(260);
+        let phases = (0..20)
+            .map(|offset| phase_marks(&path, offset, 250, offset, 20, 0.0))
+            .collect::<Vec<_>>();
+        let combined = equal_weight_phase_daily_navs(&phases).unwrap();
+
+        // The combined window starts at the last phase's first mark.
+        assert_eq!(combined[0], (session(19), 1.0));
+        assert_eq!(combined.last().unwrap().0, session(250));
+        let combined_returns = daily_returns(&combined);
+        let expected = &path[20..=250];
+        assert_eq!(combined_returns.len(), expected.len());
+        for (actual, wanted) in combined_returns.iter().zip(expected) {
+            assert!(
+                (actual - wanted).abs() < 1e-12,
+                "combined daily return {actual} is not the common path's {wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_phases_keep_the_single_phase_sharpe() {
+        let path = daily_return_path(200);
+        let single = phase_marks(&path, 0, 199, 0, 20, 0.0);
+        let phases = vec![single.clone(); 20];
+        let combined = equal_weight_phase_daily_navs(&phases).unwrap();
+        assert_eq!(combined.len(), single.len());
+        let combined_sharpe = annualised_sharpe(&daily_returns(&combined), 252.0);
+        let single_sharpe = annualised_sharpe(&daily_returns(&single), 252.0);
+        assert!(
+            (combined_sharpe - single_sharpe).abs() < 1e-9,
+            "combined Sharpe {combined_sharpe} differs from the single-phase {single_sharpe}"
+        );
+    }
+
+    #[test]
+    fn combining_one_asset_cannot_beat_the_best_phase_sharpe() {
+        // Long enough that a phase's Sharpe cannot win by sampling luck alone:
+        // with only a couple of dozen holding periods the best of twenty phases
+        // is dominated by estimation noise, which would hide the smoothing.
+        let path = daily_return_path(2020);
+        let cadence = 20;
+        let phases = (0..cadence)
+            .map(|offset| phase_marks(&path, offset, 2000, offset, cadence, 0.0015))
+            .collect::<Vec<_>>();
+
+        let best_phase_sharpe = phases
+            .iter()
+            .map(|phase| annualised_sharpe(&daily_returns(phase), 252.0))
+            .fold(f64::MIN, f64::max);
+        let combined_sharpe = annualised_sharpe(
+            &daily_returns(&equal_weight_phase_daily_navs(&phases).unwrap()),
+            252.0,
+        );
+        assert!(
+            combined_sharpe <= best_phase_sharpe + 1e-6,
+            "calendar-aligned Sharpe {combined_sharpe} exceeds the best phase's {best_phase_sharpe}"
+        );
+
+        // The defect this replaces: averaging by period index across phases whose
+        // period k spans different sessions smooths the series and manufactures
+        // a Sharpe no single phase earned.
+        #[allow(deprecated)]
+        let smoothed = equal_weight_phase_returns(
+            &phases
+                .iter()
+                .map(|phase| phase_period_returns(phase, cadence))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let periods_per_year = 252.0 / cadence as f64;
+        let smoothed_sharpe = annualised_sharpe(&smoothed, periods_per_year);
+        let best_phase_period_sharpe = phases
+            .iter()
+            .map(|phase| annualised_sharpe(&phase_period_returns(phase, cadence), periods_per_year))
+            .fold(f64::MIN, f64::max);
+        assert!(
+            smoothed_sharpe > best_phase_period_sharpe,
+            "period-index averaging was expected to inflate Sharpe ({smoothed_sharpe} vs {best_phase_period_sharpe})"
+        );
+    }
+
+    #[test]
+    fn overlay_budget_validate_rejects_out_of_range_values() {
+        assert!(OverlayBudget {
+            core_weight: 0.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.6,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: -0.1,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: -0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn zero_candidates_leave_the_portfolio_exactly_at_the_core_floor() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        };
+        let allocation = allocate_overlay(&[], &budget).unwrap();
+        assert_eq!(allocation.core_weight, 1.0);
+        assert!(allocation.overlay.weights.is_empty());
+        assert_eq!(allocation.overlay.diagnostics.realised_gross, 0.0);
+        assert_eq!(allocation.overlay.diagnostics.realised_net, 0.0);
+    }
+
+    #[test]
+    fn overlay_net_cap_scales_down_only_the_heavier_sleeve() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.0,
+            overlay_net_cap: 0.1,
+        };
+        let mut long = proposal("long", Direction::Long, 0.3, 0.3);
+        // Non-zero but below the post-scale weight (0.2): exercises the
+        // min_abs_weight-aware path without binding, unlike the shared
+        // proposal() helper's hardcoded 0.0 minimum.
+        long.min_abs_weight = 0.1;
+        let proposals = [long, proposal("short", Direction::Short, 0.1, 0.1)];
+        // Unconstrained the sleeves would be 0.3 long / 0.1 short (net 0.2),
+        // which violates the 0.1 net cap. Only the heavier long sleeve may be
+        // scaled down; the lighter short sleeve must be untouched.
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        assert!((allocation.overlay.weights["long"] - 0.2).abs() < EPSILON);
+        assert!((allocation.overlay.weights["short"] + 0.1).abs() < EPSILON);
+        assert!(allocation
+            .overlay
+            .diagnostics
+            .dropped_below_minimum
+            .is_empty());
+        let realised_net = allocation.overlay.diagnostics.realised_net;
+        assert!(realised_net.abs() <= budget.overlay_net_cap + EPSILON);
+        assert!((realised_net - 0.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn overlay_net_cap_iterates_when_scaling_drops_a_position_below_its_minimum() {
+        // L's minimum (0.56) sits just above where a single scale-down pass
+        // would land it (0.55) while trying to hit the 0.05 net cap
+        // directly against the *initial* 0.6/0.5 split. A single-pass
+        // shrink-then-drop would drop L to zero and leave S untouched at
+        // 0.5 — ten times over the cap, on the OTHER side. The cap must be
+        // enforced iteratively: once L is dropped, S becomes the heavier
+        // sleeve and must itself be scaled down to satisfy the cap.
+        let mut long = proposal("long", Direction::Long, 0.6, 0.6);
+        long.min_abs_weight = 0.56;
+        let short = proposal("short", Direction::Short, 0.5, 0.5);
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.5,
+            overlay_net_cap: 0.05,
+        };
+        let allocation = allocate_overlay(&[long, short], &budget).unwrap();
+        let realised_net = allocation.overlay.diagnostics.realised_net;
+        assert!(
+            realised_net.abs() <= budget.overlay_net_cap + EPSILON,
+            "realised net {realised_net} exceeds cap {}",
+            budget.overlay_net_cap
+        );
+        assert!(!allocation.overlay.weights.contains_key("long"));
+        assert!((allocation.overlay.weights["short"] + 0.05).abs() < EPSILON);
+        assert_eq!(
+            allocation.overlay.diagnostics.dropped_below_minimum,
+            ["long"]
+        );
+    }
+
+    #[test]
+    fn overlay_caps_never_redistribute_excess_to_other_candidates() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.9,
+            overlay_net_cap: 1.0, // wide enough not to bind
+        };
+        let proposals = [
+            proposal("a", Direction::Long, 0.8, 0.4),
+            proposal("b", Direction::Short, 0.1, 0.4),
+            proposal("c", Direction::Long, 0.1, 0.4),
+        ];
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        assert!((allocation.overlay.weights["a"] - 0.4).abs() < EPSILON);
+        assert!((allocation.overlay.weights["b"] + 0.1).abs() < EPSILON);
+        assert!((allocation.overlay.weights["c"] - 0.1).abs() < EPSILON);
+        assert_eq!(allocation.overlay.diagnostics.capped_positions, ["a"]);
+    }
+
+    #[test]
+    fn realised_combined_net_is_core_plus_overlay_net() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.0,
+            overlay_net_cap: 0.1,
+        };
+        let proposals = [
+            proposal("long", Direction::Long, 0.3, 0.3),
+            proposal("short", Direction::Short, 0.1, 0.1),
+        ];
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        let combined_net = allocation.core_weight + allocation.overlay.diagnostics.realised_net;
+        assert!((combined_net - 1.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn a_session_missing_from_one_phase_is_an_error_not_a_silent_truncation() {
+        let path = daily_return_path(60);
+        let mut phases = (0..3)
+            .map(|offset| phase_marks(&path, offset, 50, offset, 20, 0.0))
+            .collect::<Vec<_>>();
+        phases[1].remove(20);
+        let error = equal_weight_phase_daily_navs(&phases).unwrap_err();
+        assert!(
+            error.contains("session"),
+            "expected a session-mismatch error, got {error}"
+        );
+    }
+
+    #[test]
+    fn phases_without_a_shared_window_are_rejected() {
+        let path = daily_return_path(60);
+        let early = phase_marks(&path, 0, 20, 0, 20, 0.0);
+        let late = phase_marks(&path, 30, 50, 0, 20, 0.0);
+        assert!(equal_weight_phase_daily_navs(&[early, late])
+            .unwrap_err()
+            .contains("overlap"));
     }
 }

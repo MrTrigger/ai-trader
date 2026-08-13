@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use calamine::{Data, Reader, open_workbook_auto_from_rs};
+use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use rayon::prelude::*;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -295,6 +295,44 @@ pub struct FiNetShortCollection {
     pub aggregate_positions: usize,
 }
 
+/// A short-position row as this collector first saw it, prospectively. The
+/// historical register (`FiHistoricalNetShortPosition`) is keyed only by the
+/// filer's `position_date`, which late filings can backfill after the fact --
+/// a real look-ahead risk for anything built on it causally. `first_observed_at`
+/// is instead the wall-clock time this collector first downloaded the row,
+/// which cannot be backfilled and only strengthens (never moves later)
+/// across repeated runs. No features are built on this yet; it exists purely
+/// to start accumulating a genuinely causal publication-time history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FiNetShortObservation {
+    pub holder: String,
+    pub issuer: String,
+    pub isin: String,
+    pub position_percent: Option<f64>,
+    pub below_half_percent: bool,
+    #[serde(with = "date_serde")]
+    pub position_date: Date,
+    /// RFC 3339 wall-clock time this collector first saw this exact
+    /// (holder, isin, position_date) row. This is the causal knowledge
+    /// boundary; `position_date` is not.
+    pub first_observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FiNetShortObservationLog {
+    pub format_version: String,
+    pub observations: Vec<FiNetShortObservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FiNetShortObservationCollection {
+    pub log_path: PathBuf,
+    pub observations_total: usize,
+    pub observations_added: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkvEquityHistoryCompany {
@@ -372,6 +410,10 @@ pub struct SkvListingHistoryDataset {
     pub companies_archived: usize,
     pub failures: BTreeMap<String, String>,
     pub limitations: Vec<String>,
+    /// Rows with a known year whose Swedish day/month text did not parse, so
+    /// they carry no admission gate. See `skv_admission_date_unparsed_count`.
+    #[serde(default)]
+    pub admission_date_unparsed: usize,
     pub rows: Vec<SkvListingHistoryRow>,
 }
 
@@ -382,6 +424,7 @@ pub struct SkvListingHistoryCollection {
     pub companies_archived: usize,
     pub listing_rows: usize,
     pub failures: usize,
+    pub admission_date_unparsed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1767,6 +1810,43 @@ impl PublicEquityData {
         })
     }
 
+    /// Append today's historical-register rows to a prospective,
+    /// publication-timestamped observation log. `collect_fi_net_shorts`
+    /// archives the register as-is, keyed only by the filer's
+    /// (occasionally backfilled) `position_date`; this collector instead
+    /// grows an append-only log where every row keeps the wall-clock time
+    /// this collector *first* saw it, which cannot be backfilled. Run it on
+    /// a schedule so the causal history accumulates going forward. No
+    /// feature reads this data yet -- it is a foundation, not a feature
+    /// source.
+    pub fn collect_fi_net_short_observations(
+        &self,
+        root: &Path,
+    ) -> Result<FiNetShortObservationCollection, String> {
+        let historical_bytes = self.download_bytes(FI_SHORT_HISTORICAL)?;
+        let historical = parse_fi_historical(&historical_bytes)?;
+        let log_path = root.join("fi-net-short").join("observations.json");
+        let log = if log_path.exists() {
+            read_json::<FiNetShortObservationLog>(&log_path)?
+        } else {
+            FiNetShortObservationLog {
+                format_version: "fi-net-short-observations-1".into(),
+                observations: Vec::new(),
+            }
+        };
+        let now = OffsetDateTime::now_utc().to_string();
+        let (log, added) = merge_fi_net_short_observations(log, historical, &now);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        write_json(&log_path, &log)?;
+        Ok(FiNetShortObservationCollection {
+            log_path,
+            observations_total: log.observations.len(),
+            observations_added: added,
+        })
+    }
+
     /// Archive Skatteverket's equity-history catalogue pages and normalize
     /// their company links. Company event pages cover listings, list changes,
     /// corporate actions, and delistings, but the catalogue spans several
@@ -1924,6 +2004,12 @@ impl PublicEquityData {
                 .then_with(|| a.year.cmp(&b.year))
                 .then_with(|| a.comment.cmp(&b.comment))
         });
+        let admission_date_unparsed = skv_admission_date_unparsed_count(&rows);
+        if admission_date_unparsed > 0 {
+            eprintln!(
+                "Skatteverket listing history: {admission_date_unparsed} rows have a year but no parseable admission date"
+            );
+        }
         let now = OffsetDateTime::now_utc();
         let snapshot_name = format!("{}-{}", now.date(), now.unix_timestamp());
         let snapshot_dir = root
@@ -1946,6 +2032,7 @@ impl PublicEquityData {
                 "The year column and raw Swedish comment are retained; exact effective dates are parsed only when an unambiguous Swedish day/month occurs and still require review".into(),
                 "The catalogue spans multiple Swedish venues and selected foreign/unlisted companies".into(),
             ],
+            admission_date_unparsed,
             rows,
         };
         let dataset_path = snapshot_dir.join("listing-history.json");
@@ -1960,6 +2047,7 @@ impl PublicEquityData {
             dataset_path,
             companies_requested: dataset.companies_requested,
             companies_archived: dataset.companies_archived,
+            admission_date_unparsed: dataset.admission_date_unparsed,
             listing_rows: dataset.rows.len(),
             failures: dataset.failures.len(),
         })
@@ -4197,6 +4285,62 @@ pub fn collect_fi_net_shorts(root: &Path) -> Result<FiNetShortCollection, String
     PublicEquityData::new()?.collect_fi_net_shorts(root)
 }
 
+pub fn collect_fi_net_short_observations(
+    root: &Path,
+) -> Result<FiNetShortObservationCollection, String> {
+    PublicEquityData::new()?.collect_fi_net_short_observations(root)
+}
+
+/// Merge freshly downloaded historical-register rows into an observation
+/// log, stamping only genuinely new (holder, isin, position_date) rows with
+/// `observed_at`. Rows already in the log keep their original stamp -- the
+/// whole point is that this timestamp is never moved later. Pure and
+/// side-effect free so it is testable without a network download.
+fn merge_fi_net_short_observations(
+    mut log: FiNetShortObservationLog,
+    positions: Vec<FiHistoricalNetShortPosition>,
+    observed_at: &str,
+) -> (FiNetShortObservationLog, usize) {
+    let mut seen = log
+        .observations
+        .iter()
+        .map(|observation| {
+            (
+                observation.holder.clone(),
+                observation.isin.clone(),
+                observation.position_date,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut added = 0;
+    for position in positions {
+        let key = (
+            position.holder.clone(),
+            position.isin.clone(),
+            position.position_date,
+        );
+        if seen.insert(key) {
+            log.observations.push(FiNetShortObservation {
+                holder: position.holder,
+                issuer: position.issuer,
+                isin: position.isin,
+                position_percent: position.position_percent,
+                below_half_percent: position.below_half_percent,
+                position_date: position.position_date,
+                first_observed_at: observed_at.to_owned(),
+            });
+            added += 1;
+        }
+    }
+    log.observations.sort_by(|a, b| {
+        a.position_date
+            .cmp(&b.position_date)
+            .then_with(|| a.isin.cmp(&b.isin))
+            .then_with(|| a.holder.cmp(&b.holder))
+    });
+    (log, added)
+}
+
 pub fn collect_skv_equity_history_catalogue(
     root: &Path,
 ) -> Result<SkvEquityHistoryCollection, String> {
@@ -4498,6 +4642,10 @@ pub fn load_instruments(path: &Path) -> Result<Vec<Instrument>, String> {
 }
 
 pub fn load_fi_net_shorts(path: &Path) -> Result<FiNetShortDataset, String> {
+    read_json(path)
+}
+
+pub fn load_fi_net_short_observations(path: &Path) -> Result<FiNetShortObservationLog, String> {
     read_json(path)
 }
 
@@ -5133,17 +5281,40 @@ fn skv_listing_rows(
             .next()
             .and_then(|value| value.parse::<i32>().ok())
             .filter(|year| (1800..=2200).contains(year));
+        let effective_date = skv_effective_date(year, &comment);
+        // A year was present -- this row is a real, dated event -- but no
+        // day/month text in the comment parsed. Leaving `effective_date` as
+        // a silent `None` here would drop this issuer's admission gate
+        // entirely rather than merely leaving it undated, so this is loud:
+        // logged, and counted in the collection summary via
+        // `skv_admission_date_unparsed_count`.
+        if year.is_some() && effective_date.is_none() {
+            eprintln!(
+                "Skatteverket listing history: unparseable Swedish date in {:?} comment {comment:?} for {}",
+                year, company.name
+            );
+        }
         rows.push(SkvListingHistoryRow {
             company_name: company.name.clone(),
             source_url: company.url.clone(),
             year,
-            effective_date: skv_effective_date(year, &comment),
+            effective_date,
             event_kind: skv_event_kind(&comment),
             market_hint: skv_market_hint(&comment),
             comment,
         });
     }
     Ok(rows)
+}
+
+/// Count rows whose year was known but whose Swedish day/month text did not
+/// parse into an effective date. Each one silently loses its admission gate
+/// (`skv_current_main_market_admission_dates` only reads dated rows), so the
+/// collector surfaces this count in its manifest instead of staying quiet.
+fn skv_admission_date_unparsed_count(rows: &[SkvListingHistoryRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.year.is_some() && row.effective_date.is_none())
+        .count()
 }
 
 fn skv_effective_date(year: Option<i32>, comment: &str) -> Option<Date> {
@@ -6333,6 +6504,70 @@ mod tests {
     }
 
     #[test]
+    fn fi_net_short_observations_are_stamped_once_and_never_restamped() {
+        // The historical register is keyed only by the filer's position_date,
+        // which late filings can backfill (real look-ahead). This prospective
+        // collector instead stamps each row with the wall-clock time it was
+        // first *seen*, which is a genuine, non-backfillable causal boundary.
+        // A position must keep its original stamp across later collection
+        // runs, even if the same row keeps reappearing in the register.
+        let position =
+            |holder: &str, isin: &str, date: &str, percent: f64| FiHistoricalNetShortPosition {
+                holder: holder.into(),
+                issuer: "Example AB".into(),
+                isin: isin.into(),
+                position_percent: Some(percent),
+                below_half_percent: false,
+                position_date: Date::parse(
+                    date,
+                    &time::macros::format_description!("[year]-[month]-[day]"),
+                )
+                .unwrap(),
+                comment: None,
+            };
+        let log = FiNetShortObservationLog {
+            format_version: "fi-net-short-observations-1".into(),
+            observations: Vec::new(),
+        };
+        let (log, added_day_one) = merge_fi_net_short_observations(
+            log,
+            vec![position("Fund A", "SE0000000001", "2024-01-10", 0.7)],
+            "2024-01-11T00:00:00Z",
+        );
+        assert_eq!(added_day_one, 1);
+        assert_eq!(log.observations.len(), 1);
+        assert_eq!(
+            log.observations[0].first_observed_at,
+            "2024-01-11T00:00:00Z"
+        );
+
+        // Day two: the same row reappears (still in the register) alongside
+        // a genuinely new one. The old row's stamp must not move forward.
+        let (log, added_day_two) = merge_fi_net_short_observations(
+            log,
+            vec![
+                position("Fund A", "SE0000000001", "2024-01-10", 0.7),
+                position("Fund B", "SE0000000002", "2024-01-12", 1.2),
+            ],
+            "2024-01-12T00:00:00Z",
+        );
+        assert_eq!(added_day_two, 1);
+        assert_eq!(log.observations.len(), 2);
+        let fund_a = log
+            .observations
+            .iter()
+            .find(|observation| observation.holder == "Fund A")
+            .unwrap();
+        assert_eq!(fund_a.first_observed_at, "2024-01-11T00:00:00Z");
+        let fund_b = log
+            .observations
+            .iter()
+            .find(|observation| observation.holder == "Fund B")
+            .unwrap();
+        assert_eq!(fund_b.first_observed_at, "2024-01-12T00:00:00Z");
+    }
+
+    #[test]
     fn validates_fi_dates_and_isins() {
         assert_eq!(
             parse_fi_date("2026-08-10T00:00:00").unwrap().to_string(),
@@ -6383,6 +6618,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unparseable_swedish_date_is_counted_instead_of_silently_dropping_the_admission_gate() {
+        let company = SkvEquityHistoryCompany {
+            name: "Garbled Text AB".into(),
+            url: "https://www.skatteverket.se/garbled.html".into(),
+        };
+        // A real year is present (so this issuer should get an admission
+        // gate), but the day/month text is not a parseable Swedish date: the
+        // word before "februari" is "i", not a day number.
+        let html = r#"
+          <table class="sv-aktiehistorik">
+            <caption>Namnändringar och notering på lista</caption>
+            <tbody>
+              <tr><td>2015</td><td>Ny notering på Nasdaq Stockholm i februari.</td></tr>
+            </tbody>
+          </table>
+        "#;
+        let rows = skv_listing_rows(&company, html).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].year, Some(2015));
+        assert!(rows[0].effective_date.is_none());
+        assert_eq!(skv_admission_date_unparsed_count(&rows), 1);
+    }
+
+    #[test]
     fn current_main_market_spell_starts_after_an_explicit_venue_exit() {
         let row = |date: &str, event_kind, market_hint| SkvListingHistoryRow {
             company_name: "Example AB".into(),
@@ -6409,6 +6668,7 @@ mod tests {
             companies_archived: 1,
             failures: BTreeMap::new(),
             limitations: Vec::new(),
+            admission_date_unparsed: 0,
             rows: vec![
                 row(
                     "2010-01-01",

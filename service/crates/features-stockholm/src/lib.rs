@@ -12,26 +12,42 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-2";
-pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-1";
-pub const BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-14";
-pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-3";
-pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-4";
-pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-5";
-pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-6";
-pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-7";
-pub const QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-15";
-pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-8";
-pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-9";
-pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-10";
-pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-11";
+// Every stock feature set shares one candidate-building and cross-section
+// path, so a change to how decision-date membership or its labels are settled
+// changes all of them at once. Versions 1-16 are the contracts in force before
+// decision-date membership stopped depending on future label availability;
+// each advanced by the same offset of sixteen, so old version `n` is new
+// version `n + 16` and no number is ever reused. The separate direction matrix
+// has its own builder and keeps its own `fs-rust-stockholm-direction-*` line.
+pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-18";
+pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-17";
+pub const BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-30";
+pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-19";
+pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-20";
+pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-21";
+pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-22";
+pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-23";
+pub const QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-31";
+pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-24";
+pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-25";
+pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-26";
+pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-27";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-16";
+    "fs-rust-stockholm-32";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-12";
+    "fs-rust-stockholm-28";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-13";
+    "fs-rust-stockholm-29";
 pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
+/// Diagnostics-only: the FI historical short-register is keyed by
+/// `position_date`, and late filings backfill that date, so any candidate
+/// model built on it risks look-ahead. This line keeps the full
+/// `PublicShortCursor` family reachable for research (e.g. quantifying the
+/// look-ahead itself) without it ever appearing in a candidate contract; see
+/// `FeatureSet::DiagnosticsPublicShortLookahead`. It intentionally does not
+/// share the `fs-rust-stockholm-<ordinal>` candidate line or numbering.
+pub const DIAGNOSTICS_PUBLIC_SHORT_LOOKAHEAD_FEATURE_SET_VERSION: &str =
+    "fs-rust-stockholm-diagnostics-public-short-lookahead-1";
 pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
 pub const DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-2";
 pub const DIRECTION_STOCKHOLM_CLOSE_GLOBAL_RISK_FEATURE_SET_VERSION: &str =
@@ -403,8 +419,10 @@ pub struct BorrowFeeBar {
 }
 
 /// Provider-neutral official index session used by the trained market
-/// direction layer. Features use EOD values through the decision date; labels
-/// use later SOD values so the research action remains executable.
+/// direction layer. Features and labels both use EOD values: `start_value` is
+/// the provider's start-of-day level, which is the prior session's close plus
+/// any dividend adjustment rather than an opening-auction print, so it is kept
+/// for provenance and never priced against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketIndexBar {
@@ -426,7 +444,8 @@ pub struct MarketIndexSeries {
 pub struct DirectionTrainingRow {
     #[serde(with = "date_serde")]
     pub date: Date,
-    /// OMXSGI next-session SOD to SOD after the declared horizon.
+    /// OMXSGI close of the first tradable session to the close of the session
+    /// the declared horizon ends on.
     pub target: f64,
     /// Direction-only secondary label finalized in Rust. Zero returns remain
     /// neutral; Python may select this value for fitting but may not derive it.
@@ -446,17 +465,23 @@ pub struct DirectionTrainingMatrix {
     pub rows: Vec<DirectionTrainingRow>,
 }
 
+/// v4 anchors both legs on official closing levels. The retired
+/// `omxsgi-forward-start-value-*-v1` versions anchored on the archive's SOD,
+/// which is the prior session's close, so their labels credited the untradable
+/// gap into the first held session. The prefix changes with the convention, so
+/// a matrix or model carrying the old contract cannot be parsed — let alone
+/// silently mixed — by anything built here.
 pub fn direction_label_version(horizon_sessions: usize) -> Result<String, String> {
     if horizon_sessions == 0 {
         return Err("direction label horizon must be positive".into());
     }
-    Ok(format!("omxsgi-forward-start-value-{horizon_sessions}-v1"))
+    Ok(format!("omxsgi-forward-close-{horizon_sessions}-v4"))
 }
 
 pub fn direction_label_horizon(version: &str) -> Option<usize> {
     version
-        .strip_prefix("omxsgi-forward-start-value-")?
-        .strip_suffix("-v1")?
+        .strip_prefix("omxsgi-forward-close-")?
+        .strip_suffix("-v4")?
         .parse()
         .ok()
         .filter(|horizon| *horizon > 0)
@@ -501,7 +526,7 @@ pub fn direction_stockholm_close_global_risk_model_feature_names() -> Vec<String
 
 /// Build the finalized absolute-return direction matrix. No later observation
 /// can change a row's features: all inputs end at `date`, while only the label
-/// reads the primary index's following SOD values.
+/// reads the primary index's following closing levels.
 pub fn direction_training_matrix(
     series: &[MarketIndexSeries],
     start: Date,
@@ -701,8 +726,14 @@ fn direction_training_matrix_with_global_risk_sources(
         if finalized.iter().any(|value| !value.is_finite()) {
             return Err(format!("non-finite direction feature on {decision}"));
         }
-        let entry_value = primary.bars[index + 1].start_value;
-        let exit_value = primary.bars[exit_index].start_value;
+        // The first tradable session's own close, not its `start_value`: the
+        // archive's SOD is the prior session's close (dividend-adjusted), so a
+        // label anchored there begins at the decision close and collects the
+        // overnight gap into the first held session, which nobody deciding at
+        // that close can trade. One full session of gap is deliberately
+        // forfeited in exchange for a label the replay can act on.
+        let entry_value = primary.bars[index + 1].end_value;
+        let exit_value = primary.bars[exit_index].end_value;
         let target = exit_value / entry_value - 1.0;
         if !target.is_finite() {
             return Err(format!("non-finite OMXSGI direction label on {decision}"));
@@ -1033,7 +1064,24 @@ pub fn residual_model_feature_names() -> Vec<String> {
         .collect()
 }
 
+/// Task 7(d): amended in place to drop the position-date-keyed FI public-short
+/// family (late filings backfill `position_date`, a real look-ahead risk for
+/// a candidate model). No version bump: Task 5 just renumbered every
+/// candidate set and no real matrix has been built under the new numbers
+/// yet, so this amendment breaks nothing that exists. The contract is now
+/// identical to `residual_model_feature_names`; it survives as a distinct
+/// `FeatureSet`/version string for continuity, not because its content
+/// still differs. The retired family lives on only behind
+/// `diagnostics_public_short_lookahead_model_feature_names`.
 pub fn public_short_model_feature_names() -> Vec<String> {
+    residual_model_feature_names()
+}
+
+/// Diagnostics-only counterpart of `public_short_model_feature_names` that
+/// keeps the retired, position-date-keyed FI public-short family. Never use
+/// this for a candidate model; it exists so the look-ahead-prone family and
+/// its `PublicShortCursor` stay reachable for research.
+pub fn diagnostics_public_short_lookahead_model_feature_names() -> Vec<String> {
     FEATURE_NAMES
         .iter()
         .chain(RESIDUAL_FEATURE_NAMES)
@@ -1294,9 +1342,9 @@ pub fn daily(bars: &[DailyBar]) -> Result<Vec<FeatureRow>, String> {
                 max_drawdown(&history, index, 126),
                 distance_from_high(&history, index, 252),
                 distance_from_low(&history, index, 252),
-                index
-                    .checked_sub(1)
-                    .and_then(|previous| finite(bar.raw_open / history[previous].raw_close - 1.0)),
+                index.checked_sub(1).and_then(|previous| {
+                    finite(adjusted_open(bar) / history[previous].adjusted_close - 1.0)
+                }),
                 finite((bar.raw_high - bar.raw_low) / bar.raw_close),
                 close_location(bar),
                 median_notional(&history, index, 20),
@@ -1408,7 +1456,16 @@ pub enum FeatureSet {
     BaselineGlobalRisk,
     Context,
     Residual,
+    /// The candidate contract. Amended in place (see
+    /// `DIAGNOSTICS_PUBLIC_SHORT_LOOKAHEAD_FEATURE_SET_VERSION`'s doc
+    /// comment) to no longer carry the position-date-keyed public-short
+    /// family; its feature list is now identical to `Residual`.
     ResidualPublicShort,
+    /// Diagnostics-only: keeps the retired public-short family and its
+    /// `PublicShortCursor` reachable for research. Never a candidate
+    /// contract -- not wired into `validate_selection`, the runtime, or the
+    /// CLI's `--feature-set` flag.
+    DiagnosticsPublicShortLookahead,
     ResidualPdmr,
     ResidualPdmrReports,
     ResidualFundamentals,
@@ -3669,7 +3726,11 @@ pub struct TrainingRow {
     #[serde(default)]
     pub momentum_12_1: Option<f64>,
     /// Adjusted next-session open to adjusted open after `horizon_sessions`.
-    pub target: f64,
+    /// Null when the decision-date cross-section member has no entry or exit
+    /// bar: membership is settled with decision-date information alone, so a
+    /// row that cannot be labelled is still emitted and still carries the
+    /// cross-section it belonged to.
+    pub target: Option<f64>,
     /// Equal-weight return of the complete eligible decision-date cross-section
     /// over the identical executable holding interval. Rust calculates this
     /// label component before Python sees the matrix.
@@ -3695,8 +3756,13 @@ pub struct TrainingRow {
     /// otherwise transforms outcomes.
     #[serde(default)]
     pub relative_rank_target: Option<f64>,
-    pub entry_price: f64,
-    pub exit_price: f64,
+    /// Executable adjusted open of the session after the decision date. Null
+    /// when that session is missing, which is the only case in which the
+    /// position could not have been opened at all.
+    pub entry_price: Option<f64>,
+    /// Executable adjusted open of the exit session. Null when the history
+    /// stops before it.
+    pub exit_price: Option<f64>,
     pub adv20_sek: f64,
     pub vol60: f64,
     /// Decision-session annual stock-borrow fee as a decimal rate. Missing
@@ -3709,9 +3775,35 @@ pub struct TrainingRow {
     /// uses the backtest's disclosed spread fallback.
     #[serde(default)]
     pub median_closing_spread_bps_20: Option<f64>,
-    /// Each decision date has total training weight one.
+    /// Each decision date has total training weight one. The denominator is
+    /// every emitted row of the date, labelled or not, because the weight
+    /// describes the decision cross-section rather than the trainable subset;
+    /// making it depend on label availability would reintroduce the
+    /// future-conditioned membership this field is meant to describe.
     pub sample_weight: f64,
     pub features: BTreeMap<String, f64>,
+}
+
+impl TrainingRow {
+    /// Whether a replay can both open this position and observe what it
+    /// returned. Cross-section membership deliberately does not depend on
+    /// either fact, so every consumer that turns rows into positions has to
+    /// ask, and every one of them must ask the same question.
+    ///
+    /// A member with no entry bar was never enterable. A member with an entry
+    /// bar but no exit bar is a survivorship gap: it stopped trading inside
+    /// the holding period and this crate has no terminal value for it, so a
+    /// replay cannot honour the position. Once delisted histories carry
+    /// terminal values, that second case becomes a labelled row again.
+    pub fn is_replayable(&self) -> bool {
+        self.entry_price.is_some() && self.target.is_some()
+    }
+
+    /// A member that could have been entered but whose outcome is unobserved.
+    /// Disclosed rather than silently dropped.
+    pub fn entered_without_an_observed_exit(&self) -> bool {
+        self.entry_price.is_some() && self.target.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3743,13 +3835,21 @@ pub fn feature_target_diagnostics(
     }
     let mut by_date = BTreeMap::<Date, Vec<&TrainingRow>>::new();
     for row in rows {
-        by_date.entry(row.date).or_default().push(row);
+        // A row whose forward outcome was never observed carries no ordering
+        // information; it is skipped rather than treated as a zero return.
+        if row.relative_target.or(row.target).is_some() {
+            by_date.entry(row.date).or_default().push(row);
+        }
     }
     let mut correlations = vec![Vec::<f64>::new(); feature_names.len()];
     for group in by_date.values() {
         let targets = group
             .iter()
-            .map(|row| row.relative_target.unwrap_or(row.target))
+            .map(|row| {
+                row.relative_target
+                    .or(row.target)
+                    .expect("unlabelled rows are filtered above")
+            })
             .collect::<Vec<_>>();
         for (index, name) in feature_names.iter().enumerate() {
             let values = group
@@ -3789,9 +3889,9 @@ pub fn feature_target_diagnostics(
 struct Candidate {
     meta: InstrumentMeta,
     feature: FeatureRow,
-    target: f64,
-    entry_price: f64,
-    exit_price: f64,
+    target: Option<f64>,
+    entry_price: Option<f64>,
+    exit_price: Option<f64>,
     adv20_sek: f64,
     vol60: f64,
     momentum_12_1: f64,
@@ -4067,6 +4167,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         feature_set,
         FeatureSet::Residual
             | FeatureSet::ResidualPublicShort
+            | FeatureSet::DiagnosticsPublicShortLookahead
             | FeatureSet::ResidualPdmr
             | FeatureSet::ResidualPdmrReports
             | FeatureSet::ResidualFundamentals
@@ -4167,12 +4268,6 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             {
                 continue;
             }
-            let Some(exit_index) = index.checked_add(1 + horizon_sessions) else {
-                continue;
-            };
-            if exit_index >= history.len() {
-                continue;
-            }
             let feature = by_feature
                 .get(&(instrument_id.to_owned(), decision))
                 .ok_or_else(|| {
@@ -4190,23 +4285,28 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             if feature.values[slow_index].is_none() || adv20_sek < min_adv20_sek {
                 continue;
             }
-            let entry = adjusted_open(history[index + 1]);
-            let exit = adjusted_open(history[exit_index]);
-            let target = exit / entry - 1.0;
-            if !entry.is_finite()
-                || !exit.is_finite()
-                || !target.is_finite()
-                || entry <= 0.0
-                || exit <= 0.0
-            {
-                continue;
-            }
+            // Every gate above reads decision-date information only, so the
+            // cross-section is settled here. Whether the stock still trades on
+            // the entry or exit session is future information: it decides
+            // which labels exist, never who belongs to the group.
+            let tradable_open = |offset: usize| {
+                index
+                    .checked_add(offset)
+                    .and_then(|position| history.get(position))
+                    .map(|bar| adjusted_open(bar))
+                    .filter(|price| price.is_finite() && *price > 0.0)
+            };
+            let entry_price = tradable_open(1);
+            let exit_price = tradable_open(1 + horizon_sessions);
+            let target = entry_price
+                .zip(exit_price)
+                .and_then(|(entry, exit)| finite(exit / entry - 1.0));
             candidates.entry(decision).or_default().push(Candidate {
                 meta: instrument.clone(),
                 feature: feature.clone(),
                 target,
-                entry_price: entry,
-                exit_price: exit,
+                entry_price,
+                exit_price,
                 adv20_sek,
                 vol60,
                 momentum_12_1,
@@ -4219,6 +4319,9 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         FeatureSet::Context => model_feature_names(),
         FeatureSet::Residual => residual_model_feature_names(),
         FeatureSet::ResidualPublicShort => public_short_model_feature_names(),
+        FeatureSet::DiagnosticsPublicShortLookahead => {
+            diagnostics_public_short_lookahead_model_feature_names()
+        }
         FeatureSet::ResidualPdmr => pdmr_model_feature_names(),
         FeatureSet::ResidualPdmrReports => pdmr_report_model_feature_names(),
         FeatureSet::ResidualFundamentals => fundamental_model_feature_names(),
@@ -4239,7 +4342,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             pdmr_microstructure_borrow_news_report_text_model_feature_names()
         }
     };
-    let mut public_short_cursor = (feature_set == FeatureSet::ResidualPublicShort)
+    // Only the diagnostics-labeled feature set may build the position-date-
+    // keyed cursor now; the ResidualPublicShort candidate contract no longer
+    // requests these features at all (see public_short_model_feature_names).
+    let mut public_short_cursor = (feature_set == FeatureSet::DiagnosticsPublicShortLookahead)
         .then(|| PublicShortCursor::new(public_short_events))
         .transpose()?;
     let mut pdmr_cursor = (feature_set == FeatureSet::ResidualPdmr)
@@ -4307,8 +4413,15 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         if group.is_empty() {
             continue;
         }
+        // Labels can only average over the members whose outcome is observed.
+        // The group itself is already fixed, so an unobserved outcome removes
+        // one term from a label and never a member from the cross-section.
+        let observed = group
+            .iter()
+            .filter_map(|candidate| candidate.target)
+            .collect::<Vec<_>>();
         let market_target =
-            group.iter().map(|candidate| candidate.target).sum::<f64>() / group.len() as f64;
+            (!observed.is_empty()).then(|| observed.iter().sum::<f64>() / observed.len() as f64);
         let context = group
             .iter()
             .map(|candidate| CrossSectionInput {
@@ -4500,7 +4613,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             )?,
             FeatureSet::Context => model_cross_section(&context)?,
             FeatureSet::Residual => residual_cross_section(&context, &residual)?,
-            FeatureSet::ResidualPublicShort => {
+            // Same feature list as Residual now; see
+            // public_short_model_feature_names.
+            FeatureSet::ResidualPublicShort => residual_cross_section(&context, &residual)?,
+            FeatureSet::DiagnosticsPublicShortLookahead => {
                 residual_public_short_cross_section(&context, &residual, &public_short)?
             }
             FeatureSet::ResidualPdmr => residual_pdmr_cross_section(&context, &residual, &pdmr)?,
@@ -4559,20 +4675,29 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 )?
             }
         };
-        let ranked_targets = features_common::rank_normalise(
-            &group
+        let mut ranked_targets = features_common::rank_normalise(
+            &observed
                 .iter()
-                .map(|candidate| vec![Some(candidate.target)])
+                .map(|target| vec![Some(*target)])
                 .collect::<Vec<_>>(),
-        )?;
-        let relative_risk_mean = group
-            .iter()
-            .map(|candidate| (candidate.target - market_target) / candidate.vol60)
-            .sum::<f64>()
-            / group.len() as f64;
-        for ((candidate, values), ranked_target) in
-            group.into_iter().zip(normalised).zip(ranked_targets)
-        {
+        )?
+        .into_iter();
+        let relative_risk_mean = market_target.map(|market| {
+            group
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .target
+                        .map(|target| (target - market) / candidate.vol60)
+                })
+                .sum::<f64>()
+                / observed.len() as f64
+        });
+        for (candidate, values) in group.into_iter().zip(normalised) {
+            let ranked_target = candidate
+                .target
+                .and_then(|_| ranked_targets.next())
+                .and_then(|ranks| ranks.first().copied());
             if values.values.len() != names.len() {
                 return Err("Stockholm contextual model row has the wrong width".into());
             }
@@ -4583,7 +4708,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 .median_spread_bps_20
                 .get(&(candidate.meta.instrument_id.clone(), date))
                 .copied();
-            let relative_target = candidate.target - market_target;
+            let relative_target = candidate
+                .target
+                .zip(market_target)
+                .map(|(target, market)| target - market);
             rows.push(TrainingRow {
                 date: candidate.feature.date,
                 instrument_id: candidate.meta.instrument_id,
@@ -4593,13 +4721,15 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 bucket: candidate.meta.bucket,
                 momentum_12_1: Some(candidate.momentum_12_1),
                 target: candidate.target,
-                market_target: Some(market_target),
-                relative_target: Some(relative_target),
-                return_per_risk_target: finite(candidate.target / candidate.vol60),
-                relative_return_per_risk_target: finite(
-                    relative_target / candidate.vol60 - relative_risk_mean,
-                ),
-                relative_rank_target: ranked_target.first().copied(),
+                market_target,
+                relative_target,
+                return_per_risk_target: candidate
+                    .target
+                    .and_then(|target| finite(target / candidate.vol60)),
+                relative_return_per_risk_target: relative_target
+                    .zip(relative_risk_mean)
+                    .and_then(|(relative, mean)| finite(relative / candidate.vol60 - mean)),
+                relative_rank_target: ranked_target,
                 entry_price: candidate.entry_price,
                 exit_price: candidate.exit_price,
                 adv20_sek: candidate.adv20_sek,
@@ -4810,15 +4940,19 @@ fn amihud(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
 
 fn volume_surge(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
     let start = index.checked_sub(window)?;
+    // Traded notional (raw_close * volume), not raw share volume: a split
+    // changes share counts without changing how much money actually traded,
+    // so notional stays continuous while share volume jumps (audit F7). Same
+    // construction as `median_notional`/`amihud`.
     let mut prior = history[start..index]
         .iter()
-        .map(|bar| bar.volume)
+        .map(|bar| bar.raw_close * bar.volume)
         .collect::<Vec<_>>();
     let baseline = median(&mut prior)?;
     if baseline <= 0.0 {
         return None;
     }
-    finite(history[index].volume / baseline)
+    finite((history[index].raw_close * history[index].volume) / baseline)
 }
 
 #[cfg(test)]
@@ -5123,6 +5257,209 @@ mod tests {
             feature_target_diagnostics(&restricted.rows, &restricted.features).unwrap();
         assert_eq!(diagnostics.len(), restricted.features.len());
         assert!(diagnostics.iter().all(|row| row.decision_dates <= 1));
+    }
+
+    const INVARIANCE_HORIZON: usize = 20;
+    const INVARIANCE_DECISION_INDEX: usize = 280;
+    const INVARIANCE_EXIT_INDEX: usize = INVARIANCE_DECISION_INDEX + 1 + INVARIANCE_HORIZON;
+
+    /// `bars` alone only rescales one shared path, which would leave every
+    /// cross-sectional rank tied and the invariance claim vacuous. Give each
+    /// line its own phase so features, ranks and forward returns disperse.
+    fn dispersed_bars(instrument: &str, phase: usize, count: usize) -> Vec<DailyBar> {
+        let mut history = bars(instrument, count, 1.0 + phase as f64 / 100.0);
+        for (day, bar) in history.iter_mut().enumerate() {
+            let factor = 1.0 + (day as f64 * 0.13 + phase as f64).sin() * 0.05;
+            bar.raw_open *= factor;
+            bar.raw_high *= factor;
+            bar.raw_low *= factor;
+            bar.raw_close *= factor;
+            bar.adjusted_close *= factor;
+        }
+        history
+    }
+
+    fn invariance_universe(extra_instrument: &str) -> (Vec<Vec<DailyBar>>, Vec<InstrumentMeta>) {
+        let mut peers = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..5 {
+            let instrument_id = format!("P{index}");
+            peers.push(dispersed_bars(
+                &instrument_id,
+                index,
+                INVARIANCE_EXIT_INDEX + 1,
+            ));
+            instruments.push(InstrumentMeta {
+                instrument_id: instrument_id.clone(),
+                symbol: instrument_id,
+                isin: format!("SE{index:010}"),
+                sector: "Industrials".into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        instruments.push(InstrumentMeta {
+            instrument_id: extra_instrument.into(),
+            symbol: extra_instrument.into(),
+            isin: "SE0000000099".into(),
+            sector: "Industrials".into(),
+            bucket: UniverseBucket::LargeCap,
+        });
+        (peers, instruments)
+    }
+
+    fn invariance_matrix(all_bars: &[DailyBar], instruments: &[InstrumentMeta]) -> TrainingMatrix {
+        let decision = Date::from_calendar_date(2024, Month::January, 1).unwrap()
+            + Duration::days(INVARIANCE_DECISION_INDEX as i64);
+        training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+            all_bars,
+            instruments,
+            decision,
+            decision,
+            INVARIANCE_HORIZON,
+            0.0,
+            FeatureSet::Baseline,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_section_membership_ignores_whether_a_peer_survives_the_horizon() {
+        let (peers, instruments) = invariance_universe("X");
+        // X gets its own ordinary phase; nothing about its forward return is
+        // arranged to flatter the market label.
+        let truncated_x = dispersed_bars("X", 5, INVARIANCE_DECISION_INDEX + 4);
+        let full_x = dispersed_bars("X", 5, INVARIANCE_EXIT_INDEX + 1);
+
+        let build = |x_history: &[DailyBar]| {
+            let mut all_bars = peers.concat();
+            all_bars.extend_from_slice(x_history);
+            invariance_matrix(&all_bars, &instruments)
+        };
+        let truncated = build(&truncated_x);
+        let full = build(&full_x);
+
+        // X stops trading three sessions after the decision date in one arm and
+        // survives the whole horizon in the other. Nothing knowable on the
+        // decision date may move.
+        assert_eq!(truncated.rows.len(), 6);
+        assert_eq!(full.rows.len(), 6);
+        for (left, right) in truncated.rows.iter().zip(&full.rows) {
+            assert_eq!(left.instrument_id, right.instrument_id);
+            assert_eq!(
+                left.features, right.features,
+                "decision-date features, ranks and sector medians must not move"
+            );
+            assert_eq!(left.sample_weight, right.sample_weight);
+            assert!((left.sample_weight - 1.0 / 6.0).abs() < 1e-12);
+            assert_eq!(left.momentum_12_1, right.momentum_12_1);
+            assert_eq!(left.vol60, right.vol60);
+            assert_eq!(left.adv20_sek, right.adv20_sek);
+        }
+        // A degenerate cross-section ranks every member at 0.0 whatever its
+        // size, which would make the identity above vacuous.
+        assert!(truncated
+            .rows
+            .iter()
+            .any(|row| row.features["x_ret_21"] != truncated.rows[0].features["x_ret_21"]));
+        // Each row's own executable prices and absolute outcome are its own
+        // history, so they cannot move either.
+        for (left, right) in truncated
+            .rows
+            .iter()
+            .zip(&full.rows)
+            .filter(|(row, _)| row.instrument_id != "X")
+        {
+            assert_eq!(left.target, right.target);
+            assert_eq!(left.entry_price, right.entry_price);
+            assert_eq!(left.exit_price, right.exit_price);
+        }
+
+        // market_target is label space, not decision space: it is the
+        // equal-weight outcome of the members whose outcome was observed. When
+        // X's outcome is unobservable it drops out of that average, and the
+        // peers' market-relative labels follow it. That is not a decision-time
+        // leak - no live decision reads a label - and pretending otherwise
+        // would mean inventing a return for a stock that stopped trading.
+        let mean = |matrix: &TrainingMatrix| {
+            let observed = matrix
+                .rows
+                .iter()
+                .filter_map(|row| row.target)
+                .collect::<Vec<_>>();
+            observed.iter().sum::<f64>() / observed.len() as f64
+        };
+        for matrix in [&truncated, &full] {
+            assert!((matrix.rows[0].market_target.unwrap() - mean(matrix)).abs() < 1e-12);
+        }
+        assert_eq!(
+            truncated.rows.iter().filter_map(|row| row.target).count(),
+            5
+        );
+        assert_eq!(full.rows.iter().filter_map(|row| row.target).count(), 6);
+        assert_ne!(
+            truncated.rows[0].market_target, full.rows[0].market_target,
+            "the market label averages the observed outcomes, so it must move \
+             when one member's outcome ceases to exist"
+        );
+        assert_ne!(
+            truncated.rows[0].relative_target, full.rows[0].relative_target,
+            "market-relative labels follow their market label"
+        );
+
+        let row = truncated
+            .rows
+            .iter()
+            .find(|row| row.instrument_id == "X")
+            .unwrap();
+        assert_eq!(row.target, None);
+        assert_eq!(row.exit_price, None);
+        assert!(row.entry_price.is_some());
+        assert_eq!(row.relative_target, None);
+        assert_eq!(row.return_per_risk_target, None);
+        assert_eq!(row.relative_return_per_risk_target, None);
+        assert_eq!(row.relative_rank_target, None);
+    }
+
+    #[test]
+    fn a_stock_without_an_entry_bar_still_shapes_the_decision_cross_section() {
+        let (peers, instruments) = invariance_universe("Z");
+        let mut all_bars = peers.concat();
+        // Z's history stops on the decision date itself, so it can never be
+        // entered; its decision-date features are nonetheless knowable.
+        all_bars.extend(dispersed_bars("Z", 5, INVARIANCE_DECISION_INDEX + 1));
+        let matrix = invariance_matrix(&all_bars, &instruments);
+
+        assert_eq!(matrix.rows.len(), 6);
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| (row.sample_weight - 1.0 / 6.0).abs() < 1e-12));
+        let row = matrix
+            .rows
+            .iter()
+            .find(|row| row.instrument_id == "Z")
+            .unwrap();
+        assert_eq!(row.entry_price, None);
+        assert_eq!(row.exit_price, None);
+        assert_eq!(row.target, None);
+        assert!(row.market_target.is_some());
+        assert!(matrix
+            .rows
+            .iter()
+            .filter(|row| row.instrument_id != "Z")
+            .all(|row| row.target.is_some()));
     }
 
     #[test]
@@ -5649,8 +5986,70 @@ mod tests {
         assert!(market_trend(&bars).is_err());
     }
 
+    /// Every index in the direction set, flat except for a single 1% move that
+    /// happens entirely in the gap into `gap_session`. `start_value` is the
+    /// prior session's close throughout — the OMXSGI archive's actual
+    /// convention — so the archive's SOD cannot see that gap at all.
+    fn overnight_gap_direction_indexes(count: usize, gap_session: usize) -> Vec<MarketIndexSeries> {
+        let start = Date::from_calendar_date(2020, Month::January, 1).unwrap();
+        DIRECTION_INDEX_SYMBOLS
+            .iter()
+            .map(|symbol| {
+                let mut close = 100.0;
+                let bars = (0..count)
+                    .map(|index| {
+                        let previous_close = close;
+                        if index == gap_session {
+                            close *= 1.01;
+                        }
+                        MarketIndexBar {
+                            date: start + Duration::days(index as i64),
+                            start_value: previous_close,
+                            end_value: close,
+                        }
+                    })
+                    .collect();
+                MarketIndexSeries {
+                    symbol: (*symbol).into(),
+                    bars,
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn direction_matrix_is_causal_and_uses_forward_sod_label() {
+    fn direction_label_starts_at_the_first_tradable_close_not_the_prior_close() {
+        // The decision is taken at the close of session 252; the whole 1% move
+        // into session 253 is an opening gap nobody holding cash overnight can
+        // capture. A label anchored at `start_value` on session 253 is anchored
+        // at the close of session 252 and collects that gap; the label must
+        // start at session 253's own close instead.
+        let indexes = overnight_gap_direction_indexes(480, 253);
+        let primary = indexes
+            .iter()
+            .find(|series| series.symbol == "OMXSGI")
+            .unwrap();
+        let decision = primary.bars[252].date;
+        let matrix = direction_training_matrix(&indexes, decision, decision, 20).unwrap();
+        let row = &matrix.rows[0];
+        assert_eq!(row.date, decision);
+        assert_eq!(row.entry_value, primary.bars[253].end_value);
+        assert_eq!(row.exit_value, primary.bars[273].end_value);
+        assert!(
+            row.target.abs() < 1e-12,
+            "the only move in the window is the untradable gap into the first held session, so the label must be flat, not {}",
+            row.target
+        );
+        let prior_close_anchored =
+            primary.bars[273].start_value / primary.bars[253].start_value - 1.0;
+        assert!(
+            (prior_close_anchored - 0.01).abs() < 1e-12,
+            "the retired SOD-anchored label credited the full 1% gap, got {prior_close_anchored}"
+        );
+    }
+
+    #[test]
+    fn direction_matrix_is_causal_and_uses_a_forward_close_label() {
         let indexes = direction_indexes(480, 300);
         let primary = indexes
             .iter()
@@ -5661,11 +6060,11 @@ mod tests {
                 .unwrap();
         assert_eq!(full.features, direction_model_feature_names());
         assert_eq!(full.rows[0].date, primary.bars[252].date);
-        assert_eq!(full.rows[0].entry_value, primary.bars[253].start_value);
-        assert_eq!(full.rows[0].exit_value, primary.bars[273].start_value);
+        assert_eq!(full.rows[0].entry_value, primary.bars[253].end_value);
+        assert_eq!(full.rows[0].exit_value, primary.bars[273].end_value);
         assert!(
             (full.rows[0].target
-                - (primary.bars[273].start_value / primary.bars[253].start_value - 1.0))
+                - (primary.bars[273].end_value / primary.bars[253].end_value - 1.0))
                 .abs()
                 < 1e-12
         );
@@ -5829,6 +6228,60 @@ mod tests {
         assert!((last.value("ret_1").unwrap() - expected).abs() < 1e-12);
     }
 
+    /// A 2:1 split lands between t-1 and t: share counts double, raw prices
+    /// halve, volume doubles, and the true (adjusted) price and traded
+    /// notional are unchanged. `gap_1` and `volume_surge_20` must not mistake
+    /// the corporate action for a real overnight move or a real liquidity
+    /// surge (audit F6/F7).
+    fn flat_bars_with_split_on_last_day(count: usize) -> Vec<DailyBar> {
+        let start = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        let mut input: Vec<DailyBar> = (0..count)
+            .map(|index| DailyBar {
+                date: start + Duration::days(index as i64),
+                instrument_id: "SE0000999999".into(),
+                raw_open: 100.0,
+                raw_high: 100.5,
+                raw_low: 99.5,
+                raw_close: 100.0,
+                volume: 10_000.0,
+                adjusted_close: 100.0,
+            })
+            .collect();
+        let last = input.len() - 1;
+        input[last].raw_open *= 0.5;
+        input[last].raw_high *= 0.5;
+        input[last].raw_low *= 0.5;
+        input[last].raw_close *= 0.5;
+        input[last].volume *= 2.0;
+        // adjusted_close is left at the pre-split level: the true price did
+        // not move, so it must stay continuous across the split.
+        input
+    }
+
+    #[test]
+    fn gap_1_survives_a_split_with_unchanged_true_price() {
+        let input = flat_bars_with_split_on_last_day(25);
+        let rows = daily(&input).unwrap();
+        let row = rows.last().unwrap();
+        let gap = row.value("gap_1").unwrap();
+        assert!(
+            gap.abs() < 1e-9,
+            "gap_1 should be ~0 across a split with unchanged true price, got {gap}"
+        );
+    }
+
+    #[test]
+    fn volume_surge_20_survives_a_split_with_flat_true_traded_notional() {
+        let input = flat_bars_with_split_on_last_day(25);
+        let rows = daily(&input).unwrap();
+        let row = rows.last().unwrap();
+        let surge = row.value("volume_surge_20").unwrap();
+        assert!(
+            (surge - 1.0).abs() < 1e-9,
+            "volume_surge_20 should be ~1 when true traded notional is flat, got {surge}"
+        );
+    }
+
     #[test]
     fn cross_section_is_rust_ranked() {
         let mut a = daily(&bars("A", 30, 1.0)).unwrap().pop().unwrap();
@@ -5854,6 +6307,102 @@ mod tests {
         validate_selection(&["g_es_ret_21".into()]).unwrap();
         assert!(validate_selection(&["ret_21".into()]).is_err());
         assert!(validate_selection(&["x_made_up".into()]).is_err());
+    }
+
+    #[test]
+    fn every_stock_feature_set_version_is_distinct_and_past_the_pre_membership_fix_block() {
+        let versions = [
+            FEATURE_SET_VERSION,
+            BASELINE_FEATURE_SET_VERSION,
+            BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION,
+            RESIDUAL_FEATURE_SET_VERSION,
+            PUBLIC_SHORT_FEATURE_SET_VERSION,
+            PDMR_FEATURE_SET_VERSION,
+            REPORT_EVENT_FEATURE_SET_VERSION,
+            FUNDAMENTAL_FEATURE_SET_VERSION,
+            QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION,
+            PDMR_MACRO_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION,
+        ];
+        assert_eq!(
+            versions.iter().collect::<BTreeSet<_>>().len(),
+            versions.len()
+        );
+        // Every set shares the candidate-building path, so none may still
+        // carry a number issued before decision-date membership was fixed.
+        for version in versions {
+            let ordinal: usize = version
+                .strip_prefix("fs-rust-stockholm-")
+                .expect("stock feature-set versions share one prefix")
+                .parse()
+                .expect("stock feature-set versions end in an ordinal");
+            assert!(ordinal > 16, "{version} predates the membership fix");
+        }
+    }
+
+    #[test]
+    fn residual_public_short_no_longer_carries_the_lookahead_prone_short_family() {
+        // Task 7(d): FI's historical short-register events are keyed by
+        // position_date, and late filings backfill that date -- a real
+        // look-ahead risk for any candidate model trained on it. The
+        // ResidualPublicShort candidate contract (fs-rust-stockholm-20) is
+        // amended in place (no version bump: Task 5 just renumbered every
+        // set and no real matrix has been built under the new numbers yet)
+        // to drop the family entirely. The historical cursor survives only
+        // behind the explicitly diagnostics-labeled FeatureSet.
+        let names = public_short_model_feature_names();
+        for short_name in PUBLIC_SHORT_FEATURE_NAMES {
+            assert!(
+                !names.iter().any(|name| name.ends_with(short_name)),
+                "candidate public-short contract still carries {short_name}"
+            );
+        }
+        assert_eq!(names, residual_model_feature_names());
+
+        // The diagnostics-only path still carries the full family.
+        let diagnostics_names = diagnostics_public_short_lookahead_model_feature_names();
+        for short_name in PUBLIC_SHORT_FEATURE_NAMES {
+            assert!(
+                diagnostics_names
+                    .iter()
+                    .any(|name| name.ends_with(short_name)),
+                "diagnostics contract lost {short_name}"
+            );
+        }
+
+        // A candidate matrix under the amended contract builds with no
+        // public-short events at all -- it no longer needs (or accepts) them.
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..20 {
+            let id = format!("P{index}");
+            all_bars.extend(bars(&id, 330, 1.0 + index as f64 / 100.0));
+            instruments.push(InstrumentMeta {
+                instrument_id: id,
+                symbol: format!("PS{index}"),
+                isin: format!("SE{index:010}"),
+                sector: if index < 10 { "A" } else { "B" }.into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        let cutoff =
+            Date::from_calendar_date(2024, Month::January, 1).unwrap() + Duration::days(299);
+        let matrix = training_matrix_for_named_feature_set(
+            &all_bars,
+            &instruments,
+            cutoff,
+            cutoff + Duration::days(20),
+            5,
+            0.0,
+            FeatureSet::ResidualPublicShort,
+        )
+        .unwrap();
+        assert_eq!(matrix.features, residual_model_feature_names());
     }
 
     #[test]
@@ -5916,7 +6465,7 @@ mod tests {
             .all(|row| row.features.len() == residual_model_feature_names().len()));
         assert!(matrix.rows.iter().all(|row| {
             let absolute = row.return_per_risk_target.unwrap();
-            (absolute * row.vol60 - row.target).abs() < 1e-12
+            (absolute * row.vol60 - row.target.unwrap()).abs() < 1e-12
         }));
         for date in matrix
             .rows
@@ -6022,7 +6571,8 @@ mod tests {
                 .sum::<f64>();
             assert!(relative_sum.abs() < 1e-10);
             assert!(rows.iter().all(|row| {
-                (row.market_target.unwrap() + row.relative_target.unwrap() - row.target).abs()
+                (row.market_target.unwrap() + row.relative_target.unwrap() - row.target.unwrap())
+                    .abs()
                     < 1e-12
             }));
         }

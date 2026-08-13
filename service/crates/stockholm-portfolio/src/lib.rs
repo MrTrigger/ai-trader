@@ -16,7 +16,12 @@ pub const FORMAT_VERSION: &str = "stockholm-model-json-2";
 pub const LEGACY_FORMAT_VERSION: &str = "stockholm-lightgbm-json-1";
 pub const MODEL_VERSION: &str = "stockholm-ranker-1";
 pub const DIRECTION_FORMAT_VERSION: &str = "stockholm-direction-model-json-1";
-pub const DIRECTION_MODEL_VERSION: &str = "stockholm-direction-model-1";
+/// v2: `score_scale`'s `absolute_return` semantics changed from
+/// `std(target)` to `std(train_predictions)` (the score-suppression fix in
+/// `train_stockholm_direction.py`). A v1 document would silently reproduce
+/// the defect under the current `predict` contract, so the version bump
+/// makes `load` refuse it outright.
+pub const DIRECTION_MODEL_VERSION: &str = "stockholm-direction-model-2";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,7 +148,14 @@ impl Model {
                 model.model_version
             ));
         }
-        let expected_features = expected_features(&model.feature_set_version)?;
+        // A currently-registered version's feature order is checked against
+        // the registry, same as before. A version this binary no longer
+        // mints is not rejected outright here — see `expected_features`'s
+        // doc comment — but every caller that pairs a model with a matrix
+        // (`run_backtest`) still requires the two to declare the identical
+        // `feature_set_version` and feature list, which is the actual
+        // consistency proof for an old-on-old replay.
+        let expected_features = expected_features(&model.feature_set_version);
         if features_stockholm::label_horizon(&model.label_version).is_none() {
             return Err(format!(
                 "unsupported Stockholm label version {:?}",
@@ -151,8 +163,10 @@ impl Model {
             ));
         }
         features_stockholm::validate_selection(&model.features)?;
-        if model.features != expected_features {
-            return Err("model feature order does not match its declared version".into());
+        if let Some(expected_features) = expected_features {
+            if model.features != expected_features {
+                return Err("model feature order does not match its declared version".into());
+            }
         }
         let validate_linear = |model: &Model| -> Result<(), String> {
             let intercept = model
@@ -333,16 +347,14 @@ impl Model {
             }))
     }
 
-    fn diagnostic_target(&self, row: &TrainingRow) -> Result<f64, String> {
+    /// `None` when the row's forward outcome was never observed. That row was
+    /// still part of the decision cross-section, so it is skipped from
+    /// diagnostics rather than counted as a zero realized return.
+    fn diagnostic_target(&self, row: &TrainingRow) -> Result<Option<f64>, String> {
         match self.reward.as_str() {
             "absolute_return" | "return_per_risk" => Ok(row.target),
             "relative_return" | "relative_return_per_risk" | "relative_rank" => {
-                row.relative_target.ok_or_else(|| {
-                    format!(
-                        "matrix row {} on {} lacks its Rust relative target",
-                        row.instrument_id, row.date
-                    )
-                })
+                relative_target(row)
             }
             _ => Err(format!("unsupported Stockholm reward {:?}", self.reward)),
         }
@@ -477,55 +489,66 @@ impl DirectionModel {
     }
 }
 
-fn expected_features(version: &str) -> Result<Vec<String>, String> {
+/// The canonical feature list for a *currently registered* feature-set
+/// version, or `None` when `version` predates the registry (an old
+/// `fs-rust-stockholm-N` from before a version bump, or anything else this
+/// binary does not currently mint). `None` is not itself a rejection: a
+/// version this binary no longer mints can still be a legitimate frozen
+/// artifact, provided the model and the matrix it is paired with agree with
+/// each other (checked by the caller, e.g. `run_backtest`'s
+/// `manifest.feature_set_version != model.feature_set_version` guard) — an
+/// old-on-old replay reads matrix rows from disk and recomputes nothing, so
+/// it stays internally consistent even though this binary can no longer
+/// regenerate that version's features from scratch.
+fn expected_features(version: &str) -> Option<Vec<String>> {
     match version {
         features_stockholm::BASELINE_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::baseline_model_feature_names())
+            Some(features_stockholm::baseline_model_feature_names())
         }
         features_stockholm::BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::baseline_global_risk_model_feature_names())
+            Some(features_stockholm::baseline_global_risk_model_feature_names())
         }
-        features_stockholm::FEATURE_SET_VERSION => Ok(features_stockholm::model_feature_names()),
+        features_stockholm::FEATURE_SET_VERSION => Some(features_stockholm::model_feature_names()),
         features_stockholm::RESIDUAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::residual_model_feature_names())
+            Some(features_stockholm::residual_model_feature_names())
         }
         features_stockholm::PUBLIC_SHORT_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::public_short_model_feature_names())
+            Some(features_stockholm::public_short_model_feature_names())
         }
         features_stockholm::PDMR_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_model_feature_names())
+            Some(features_stockholm::pdmr_model_feature_names())
         }
         features_stockholm::REPORT_EVENT_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_report_model_feature_names())
+            Some(features_stockholm::pdmr_report_model_feature_names())
         }
         features_stockholm::FUNDAMENTAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::fundamental_model_feature_names())
+            Some(features_stockholm::fundamental_model_feature_names())
         }
         features_stockholm::QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::quarterly_fundamental_model_feature_names())
+            Some(features_stockholm::quarterly_fundamental_model_feature_names())
         }
         features_stockholm::PDMR_MACRO_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_macro_model_feature_names())
+            Some(features_stockholm::pdmr_macro_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_borrow_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_borrow_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_borrow_news_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_borrow_news_model_feature_names())
         }
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_global_risk_model_feature_names(),
         ),
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
-        other => Err(format!("unsupported Stockholm feature version {other:?}")),
+        _ => None,
     }
 }
 
@@ -550,8 +573,19 @@ pub struct CostConfig {
     pub market_friction_multiple: f64,
     /// Extra First North round-trip spread/impact in basis points.
     pub first_north_extra_bps: f64,
-    /// Borrow fee charged over one holding period in basis points.
-    pub short_borrow_bps: f64,
+    /// Fallback borrow fee, in ANNUAL basis points, charged only when a row
+    /// lacks a causal measured `borrow_fee_annualized`. The realized
+    /// per-holding-period charge is `short_borrow_annual_bps/10_000 *
+    /// cadence_sessions/252`; cadence must always be passed explicitly (see
+    /// `holding_borrow_cost`). Renamed from the old `short_borrow_bps`, which
+    /// was an implicit per-5-session charge only correct because CLI call
+    /// sites separately rescaled it by `cadence/5` -- that rescale is gone
+    /// now that this field is unambiguously annual.
+    #[serde(
+        alias = "short_borrow_bps",
+        default = "default_short_borrow_annual_bps"
+    )]
+    pub short_borrow_annual_bps: f64,
     /// Conservative penalty for unobserved historical availability.
     pub short_availability_bps: f64,
     pub safety_margin_bps: f64,
@@ -568,7 +602,7 @@ impl Default for CostConfig {
             fallback_spread_bps: default_fallback_spread_bps(),
             market_friction_multiple: default_market_friction_multiple(),
             first_north_extra_bps: 35.0,
-            short_borrow_bps: 10.0,
+            short_borrow_annual_bps: default_short_borrow_annual_bps(),
             short_availability_bps: 25.0,
             safety_margin_bps: 10.0,
         }
@@ -591,6 +625,17 @@ fn default_market_friction_multiple() -> f64 {
     1.0
 }
 
+/// Old frozen reports and configs recorded a fallback short-borrow charge of
+/// 10.0 bps that the CLI implicitly treated as "per 5 sessions" (rescaling it
+/// by `cadence/5` before use, i.e. 2 bps/session). The annual equivalent that
+/// keeps every already-realized charge unchanged is `2 bps/session * 252
+/// sessions/year = 504 bps/year`; equivalently, the frozen 20-session default
+/// of `10.0 * 20/5 = 40 bps` per holding period annualizes to `40 * 252/20 =
+/// 504 bps`.
+fn default_short_borrow_annual_bps() -> f64 {
+    504.0
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ExecutionCost {
     commission_bps: f64,
@@ -605,6 +650,25 @@ impl ExecutionCost {
     }
 }
 
+/// The row's market-relative label. A row whose absolute outcome was never
+/// observed legitimately has neither; a labelled row missing its relative
+/// component comes from a matrix built before Rust owned that label.
+fn relative_target(row: &TrainingRow) -> Result<Option<f64>, String> {
+    match (row.target, row.relative_target) {
+        (Some(_), None) => Err(format!(
+            "matrix row {} on {} lacks its Rust relative target",
+            row.instrument_id, row.date
+        )),
+        (_, relative) => Ok(relative),
+    }
+}
+
+/// Realized outcome of a row the caller already restricted to replayable rows.
+fn replayed_return(row: &TrainingRow) -> f64 {
+    row.target
+        .expect("replayed rows are filtered to observed outcomes")
+}
+
 fn execution_cost(row: &TrainingRow, costs: &CostConfig) -> Result<ExecutionCost, String> {
     let values = [
         costs.round_trip_bps,
@@ -613,7 +677,7 @@ fn execution_cost(row: &TrainingRow, costs: &CostConfig) -> Result<ExecutionCost
         costs.fallback_spread_bps,
         costs.market_friction_multiple,
         costs.first_north_extra_bps,
-        costs.short_borrow_bps,
+        costs.short_borrow_annual_bps,
         costs.short_availability_bps,
         costs.safety_margin_bps,
     ];
@@ -654,7 +718,7 @@ fn holding_borrow_cost(
     costs: &CostConfig,
 ) -> Result<f64, String> {
     let Some(annual_rate) = row.borrow_fee_annualized else {
-        return Ok(costs.short_borrow_bps / 10_000.0);
+        return Ok(costs.short_borrow_annual_bps / 10_000.0 * cadence_sessions as f64 / 252.0);
     };
     if !annual_rate.is_finite() || annual_rate < 0.0 {
         return Err(format!(
@@ -697,6 +761,29 @@ pub struct PositionResult {
     pub pnl: f64,
 }
 
+/// Portfolio NAV at one session inside a holding period. The rebalance-phase
+/// combination needs a calendar-dated series, not one value per holding
+/// period, so every session between entry and exit is marked here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DailyMark {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub nav: f64,
+}
+
+/// The benchmark index's official closing level at one session inside a holding
+/// period, on the same session dates as `DailyMark`.
+///
+/// A level, not a NAV: every rebalance phase reads the same index archive, so
+/// the combined benchmark book is defined by the level series on the calendar
+/// and needs no phase-specific anchor to be chained onto.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BenchmarkMark {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub close: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     #[serde(with = "date_serde")]
@@ -721,6 +808,17 @@ pub struct Step {
     /// and disclosed in `DirectionLayerMetrics`.
     #[serde(default)]
     pub direction_market_return: Option<f64>,
+    /// The index core's contribution to `period_return` in
+    /// `AllocationMode::Overlay`: `core_weight × (benchmark_period_return −
+    /// tracking accrual)`. `None` in a directional replay, which has no core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_return: Option<f64>,
+    /// The self-funding overlay's contribution to `period_return`, already net
+    /// of its execution and borrow costs. `core_return + overlay_return`
+    /// reconstructs `period_return` exactly. `None` in a directional replay,
+    /// where `period_return` is the whole book.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_return: Option<f64>,
     pub turnover: f64,
     pub long_pnl: f64,
     pub short_pnl: f64,
@@ -732,6 +830,16 @@ pub struct Step {
     #[serde(default)]
     pub active_return: Option<f64>,
     pub positions: Vec<PositionResult>,
+    /// One NAV per session held, empty when the replay was given no mark
+    /// prices. Frozen reports predate the field and default to empty.
+    #[serde(default)]
+    pub daily_marks: Vec<DailyMark>,
+    /// The index's closing level on those same sessions, empty when the replay
+    /// was given no benchmark. Frozen reports predate the field and default to
+    /// empty, which is what puts their benchmark back on holding-period
+    /// frequency in a combined summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_daily_marks: Vec<BenchmarkMark>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +855,11 @@ pub struct DirectionLayerMetrics {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This overlay diagnostic is out of Task 3's gated-evaluation scope and
+    /// stays nominal (non-excess); `0.0` is the true rate, not a
+    /// missing-field default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub mean_budget_gross: f64,
     pub mean_budget_net: f64,
@@ -769,6 +882,11 @@ pub struct SelectionLayerMetrics {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This selection diagnostic is out of Task 3's gated-evaluation scope
+    /// and stays nominal (non-excess); `0.0` is the true rate, not a
+    /// missing-field default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
     pub gross_return_before_costs: f64,
@@ -861,6 +979,11 @@ pub struct DirectionPerformance {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This diagnostic is out of Task 3's gated-evaluation scope and stays
+    /// nominal (non-excess); `0.0` is the true rate, not a missing-field
+    /// default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
 }
@@ -1014,7 +1137,7 @@ pub fn direction_backtest(
         omxsgi_long_only: direction_performance(&omxsgi_returns, cadence),
         disclosures: vec![
             "The direction layer applies target net exposure to official OMXSGI returns before execution, financing, tax, and short-borrow costs; it is a timing diagnostic, not a directly tradable result.".into(),
-            "All model inputs are official Nasdaq index EOD values known on the decision date; the label begins at the following official SOD value.".into(),
+            "All model inputs are official Nasdaq index EOD values known on the decision date; the label begins at the official close of the following session, so the untradable gap into it is not credited to the model.".into(),
             "The trained model is compared on identical non-overlapping sessions with the predeclared fixed five-vote trend control and long-only OMXSGI.".into(),
         ],
     })
@@ -1240,13 +1363,17 @@ fn fixed_direction_score(row: &DirectionTrainingRow) -> Result<f64, String> {
 }
 
 fn direction_performance(returns: &[f64], cadence: usize) -> DirectionPerformance {
-    let metrics = return_metrics(returns, cadence);
+    // The standalone direction-timing diagnostic is a separate acceptance
+    // control (summarize-direction / direction-backtest), not the gated
+    // Stockholm evaluation Task 3 fixes F4/F5 for; it stays non-excess.
+    let metrics = return_metrics(returns, sessions_per_year(cadence), 0.0);
     DirectionPerformance {
         periods: returns.len(),
         total_return: metrics.total_return,
         annualised_return: metrics.annualised_return,
         annualised_volatility: metrics.annualised_volatility,
         sharpe: metrics.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: metrics.max_drawdown,
         positive_periods: returns.iter().filter(|value| **value > 0.0).count(),
     }
@@ -1258,7 +1385,16 @@ pub struct Metrics {
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. `0.0` on a report predating this field.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
     pub long_pnl: f64,
@@ -1301,7 +1437,16 @@ pub struct BenchmarkComparison {
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed, matching the portfolio's own.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. `0.0` on a report predating this field.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub portfolio_minus_benchmark_total_return: f64,
     pub portfolio_minus_benchmark_annualised_return: f64,
@@ -1400,6 +1545,13 @@ pub struct BacktestResult {
     pub sizing: portfolio_construction::SizingMethod,
     #[serde(default = "default_budget")]
     pub allocation_budget: portfolio_construction::Budget,
+    /// Directional book, or index core plus self-funding overlay. Frozen
+    /// reports predate the field and are all directional.
+    #[serde(default)]
+    pub allocation_mode: AllocationMode,
+    /// Two-leg attribution, present only in `AllocationMode::Overlay`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_attribution: Option<OverlayAttribution>,
     #[serde(default = "default_reference_edge")]
     pub reference_edge: f64,
     #[serde(default = "default_reference_volatility")]
@@ -1442,10 +1594,27 @@ pub struct BacktestResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebalancePhasePerformance {
     pub periods: usize,
+    /// Observations per year in the series these statistics come from: 252 for a
+    /// daily NAV series, 252/cadence for a holding-period series. Annualised
+    /// figures are meaningless without it.
+    #[serde(default)]
+    pub periods_per_year: f64,
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. A legacy report predating this field, and one
+    /// where the observation count truly could not be recovered, both
+    /// deserialise to `0.0` here — treat a `0.0` alongside a nonzero `sharpe`
+    /// as "unknown", not "precisely measured".
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
 }
 
@@ -1455,6 +1624,19 @@ pub struct RebalancePhaseDiagnostic {
     pub periods: usize,
     pub total_return: f64,
     pub sharpe: f64,
+    /// The rf basis `sharpe` was computed under. In the calendar-aligned
+    /// branch this is the summary's own `--risk-free-annual`. In the legacy
+    /// (period-index) branch it is copied straight from the frozen phase
+    /// report's own `metrics.risk_free_annual` rather than the summary's rate
+    /// — a phase replayed under a different `--risk-free-annual` (or one that
+    /// predates Task 3, which reads `0.0`, truthfully) can disagree with the
+    /// summary it is now inside, and this field is what lets a reader see
+    /// that rather than silently overwriting it with the summary's own rate.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// `0.0` on a phase report predating this field, in either branch.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub mean_rank_ic: f64,
 }
@@ -1478,13 +1660,47 @@ pub struct RebalancePhaseSummary {
     pub cadence_sessions: usize,
     pub phase_count: usize,
     pub common_complete_periods: usize,
+    /// How the phases were combined into one book. `calendar_aligned_daily_nav`
+    /// keys every phase's daily NAV on the session date;
+    /// `legacy_period_index_average` averages phase returns by period index and
+    /// therefore smooths overlapping holding windows — it survives only for
+    /// reports that predate daily NAV marks.
+    #[serde(default = "legacy_combination_method")]
+    pub combination_method: String,
+    /// The first and last session of the window in which every phase is
+    /// invested. Narrower than `start`/`end`, which are the replay's own bounds.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_date"
+    )]
+    pub combined_start: Option<Date>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_date"
+    )]
+    pub combined_end: Option<Date>,
     pub performance: RebalancePhasePerformance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_performance: Option<RebalancePhasePerformance>,
+    /// The benchmark cannot ride the daily NAV grid until the index itself is
+    /// marked daily, so it discloses its own combination separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_combination_method: Option<String>,
     pub phase_diagnostics: Vec<RebalancePhaseDiagnostic>,
+    /// The combined book's return series at the frequency
+    /// `performance.periods_per_year` names.
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
+    /// Mean per-period active (bot minus benchmark) return over its standard
+    /// error. `None` when there is no benchmark, or when the bot and benchmark
+    /// series do not share one observation grid — see `active_tstat_status`.
+    #[serde(default)]
+    pub active_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tstat_status: Option<String>,
     pub disclosures: Vec<String>,
 }
 
@@ -1509,16 +1725,122 @@ pub struct RebalancePhaseFoldSummary {
     pub positive_folds: usize,
     pub cadence_sessions: usize,
     pub phase_count: usize,
+    #[serde(default = "legacy_combination_method")]
+    pub combination_method: String,
+    /// Retained for its original meaning (a naive absolute-Sharpe bar) but no
+    /// longer drives `passed`; see `target_sharpe_floor`.
     pub target_sharpe: f64,
+    /// The new, explicit promotion floor: `passed` requires
+    /// `sharpe - 1.64*sharpe_se >= target_sharpe_floor`. A legacy report
+    /// predating this field defaults to the same 1.0 the CLI defaults to, so a
+    /// re-read of an old report does not silently read as a floor of zero.
+    #[serde(default = "default_target_sharpe_floor")]
+    pub target_sharpe_floor: f64,
     pub performance: RebalancePhasePerformance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_performance: Option<RebalancePhasePerformance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_combination_method: Option<String>,
     pub fold_diagnostics: Vec<RebalancePhaseFoldDiagnostic>,
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
+    /// Mean per-period active (bot minus benchmark) return over its standard
+    /// error, stitched across every fold. `None` under the same conditions as
+    /// `RebalancePhaseSummary::active_tstat`.
+    #[serde(default)]
+    pub active_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tstat_status: Option<String>,
+    /// The bar `active_tstat` must clear for `passed`. Named explicitly rather
+    /// than left as a bare `2.0` in `passed`'s formula, so it isn't confused
+    /// with `target_sharpe` (also `2.0`, but unrelated — a coincidence, not a
+    /// shared constant).
+    #[serde(default = "default_active_tstat_threshold")]
+    pub active_tstat_threshold: f64,
     pub passed: bool,
     pub disclosures: Vec<String>,
+}
+
+fn default_active_tstat_threshold() -> f64 {
+    ACTIVE_TSTAT_THRESHOLD
+}
+
+fn default_target_sharpe_floor() -> f64 {
+    1.0
+}
+
+/// Phases combined on the calendar: every phase's daily NAV keyed on its session
+/// date, so overlapping holding windows are never averaged against each other.
+pub const CALENDAR_ALIGNED_DAILY_NAV: &str = "calendar_aligned_daily_nav";
+
+/// Phase returns averaged by period index. Phase `j`'s period `k` covers
+/// different sessions than phase `j+1`'s, so the average smooths overlapping
+/// windows and inflates any annualised Sharpe taken from it. Only reports
+/// written before daily NAV marks existed can be summarised this way.
+pub const LEGACY_PERIOD_INDEX_AVERAGE: &str = "legacy_period_index_average";
+
+/// The benchmark is one continuously held index in every phase, so no averaging
+/// across phases is meaningful: the lowest-offset phase's own series is the
+/// combined book's benchmark path, sampled at holding-period frequency. Only
+/// reports written before the index was marked daily need this.
+pub const SINGLE_PHASE_INDEX_PATH: &str = "single_phase_index_path";
+
+/// The index's official close on every session the combined book itself is
+/// marked on. Both legs are then one daily series on one calendar, which is
+/// what makes an active-return t-stat between them meaningful.
+pub const CALENDAR_ALIGNED_DAILY_INDEX_CLOSE: &str = "calendar_aligned_daily_index_close";
+
+/// `active_tstat_status` when the phase reports predate benchmark daily marks:
+/// the bot is daily and the index is still on holding-period frequency, so the
+/// two series are not paired observations and no t-stat can be formed. Rerun
+/// the phases to get one.
+pub const LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS: &str =
+    "unavailable_legacy_benchmark_without_daily_index_marks";
+
+/// `active_tstat_status` when both legs share a grid but it is too short for a
+/// sample standard error.
+pub const TOO_FEW_ACTIVE_OBSERVATIONS: &str = "unavailable_too_few_observations";
+
+/// `active_tstat_status` when the active return never varies, so its standard
+/// error is zero and the ratio is undefined rather than infinite.
+pub const NO_ACTIVE_DISPERSION: &str = "unavailable_active_return_has_no_dispersion";
+
+/// Observations per year in a benchmark block combined by `method`.
+fn benchmark_periods_per_year(method: Option<&str>, cadence: usize) -> f64 {
+    if method == Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE) {
+        SESSIONS_PER_YEAR
+    } else {
+        sessions_per_year(cadence)
+    }
+}
+
+/// Why a benchmarked report has no active-return t-stat.
+fn active_tstat_unavailable(portfolio: &[f64], benchmark: &[f64]) -> String {
+    if portfolio.len() != benchmark.len() {
+        LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS.to_owned()
+    } else if portfolio.len() < 2 {
+        TOO_FEW_ACTIVE_OBSERVATIONS.to_owned()
+    } else {
+        NO_ACTIVE_DISPERSION.to_owned()
+    }
+}
+
+fn legacy_combination_method() -> String {
+    LEGACY_PERIOD_INDEX_AVERAGE.into()
+}
+
+/// Session returns of one phase's daily NAV marks. The replay opens at NAV 1.0,
+/// so the first mark is itself a return and anchors the series.
+fn daily_returns(navs: &[(Date, f64)]) -> Vec<f64> {
+    let mut previous = 1.0;
+    navs.iter()
+        .map(|(_, nav)| {
+            let value = nav / previous - 1.0;
+            previous = *nav;
+            value
+        })
+        .collect()
 }
 
 fn default_budget() -> portfolio_construction::Budget {
@@ -1537,6 +1859,112 @@ fn default_prediction_horizon_scale() -> f64 {
     1.0
 }
 
+/// Session adjusted closes for the instruments a replay can hold. The matrix
+/// only carries the two executable open prices a label spans, so marking the
+/// sessions in between needs the same adjusted daily history the labels were
+/// built from. Nothing here reaches a feature, a label, or a decision.
+#[derive(Debug, Clone, Default)]
+pub struct MarkPrices {
+    sessions: BTreeSet<Date>,
+    closes: BTreeMap<String, BTreeMap<Date, f64>>,
+}
+
+impl MarkPrices {
+    /// Record one instrument's session adjusted closes.
+    pub fn insert_history(
+        &mut self,
+        instrument_id: &str,
+        closes: impl IntoIterator<Item = (Date, f64)>,
+    ) -> Result<(), String> {
+        let instrument = self.closes.entry(instrument_id.to_owned()).or_default();
+        for (date, close) in closes {
+            if !close.is_finite() || close <= 0.0 {
+                return Err(format!(
+                    "mark price for {instrument_id} on {date} is not a positive adjusted close"
+                ));
+            }
+            instrument.insert(date, close);
+            self.sessions.insert(date);
+        }
+        Ok(())
+    }
+
+    fn is_session(&self, date: Date) -> bool {
+        self.sessions.contains(&date)
+    }
+
+    /// The session `offset` trading days after `date` on the union exchange
+    /// calendar of the recorded histories.
+    fn session_after(&self, date: Date, offset: usize) -> Option<Date> {
+        self.sessions.range(date..).nth(offset).copied()
+    }
+
+    /// Most recent adjusted close at or before `date`. An instrument that did
+    /// not trade on a session keeps its last observed mark instead of dropping
+    /// out of the portfolio value.
+    fn close_at(&self, instrument_id: &str, date: Date) -> Option<f64> {
+        self.closes
+            .get(instrument_id)?
+            .range(..=date)
+            .next_back()
+            .map(|(_, close)| *close)
+    }
+}
+
+/// How a replay turns ranked candidates into a book.
+///
+/// The two modes answer different questions. `Directional` asks whether the
+/// candidate pipeline alone can carry a portfolio; `Overlay` holds the index
+/// as a floor and asks whether the candidates add anything on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AllocationMode {
+    /// The historical mode: every krona of exposure comes from candidate
+    /// positions sized under `BacktestConfig::allocation_budget`.
+    #[default]
+    Directional,
+    /// A fixed index core plus a self-funding long/short overlay. The core is
+    /// never reduced by overlay activity, so the book's floor is the index
+    /// less the core's own tracking cost.
+    Overlay {
+        budget: portfolio_construction::OverlayBudget,
+        /// Annual basis-point cost of holding the index core, accrued at
+        /// `cadence/252` per holding period and per session inside it. It
+        /// stands for a futures roll or an ETF's total expense ratio; the core
+        /// is charged nothing else.
+        core_tracking_cost_bps: f64,
+    },
+}
+
+/// Attribution of an index-core-plus-overlay replay into its two legs.
+///
+/// `core_return` and `overlay_return` are sums of per-period contributions,
+/// not compounded paths: the two legs add to each period's `period_return`, so
+/// their sums add to the sum of period returns. Compounding them separately
+/// would produce two numbers that no longer reconcile with anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayAttribution {
+    pub periods: usize,
+    pub core_weight: f64,
+    pub core_tracking_cost_bps: f64,
+    /// Summed core-leg contributions: `core_weight × (index period return −
+    /// tracking accrual)` over every period.
+    pub core_return: f64,
+    /// Summed overlay contributions, net of the overlay's execution and borrow
+    /// costs. The core pays none of these.
+    pub overlay_return: f64,
+    /// Total tracking cost charged to the core over the replay.
+    pub core_tracking_cost: f64,
+    /// The overlay's per-period return tested against zero rather than against
+    /// the index: the core already carries the index, so the overlay's whole
+    /// job is to be positive on its own. Same sample-standard-error statistic
+    /// `active_tstat` uses.
+    #[serde(default)]
+    pub overlay_alpha_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_alpha_tstat_status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
     pub start: Date,
@@ -1550,12 +1978,23 @@ pub struct BacktestConfig {
     /// return over `cadence_sessions`. This affects economic hurdles and
     /// reported predictions, never realised labels.
     pub prediction_horizon_scale: f64,
+    /// Candidate admission cap. In `AllocationMode::Directional` this is a
+    /// single combined cap shared by both directions (no side quota). In
+    /// `AllocationMode::Overlay` it applies PER SLEEVE: the long and short
+    /// books are ranked and admitted independently, each against this cap,
+    /// so the overlay book can hold up to twice this many names.
     pub max_positions: usize,
+    /// Retention buffer width, same per-sleeve/combined split as
+    /// `max_positions` above.
     pub retention_rank: usize,
     pub max_sector_gross: Option<f64>,
     pub ranking: portfolio_construction::RankingMethod,
     pub sizing: portfolio_construction::SizingMethod,
     pub allocation_budget: portfolio_construction::Budget,
+    /// Directional book, or index core plus self-funding overlay. In overlay
+    /// mode `allocation_budget` is unused: the overlay's own gross and net caps
+    /// come from `AllocationMode::Overlay::budget`.
+    pub allocation_mode: AllocationMode,
     /// Maximum absolute single-name weight.
     pub position_weight: f64,
     /// Positions below this absolute weight are uneconomic and left as cash.
@@ -1572,17 +2011,41 @@ pub struct BacktestConfig {
     pub market_forecast_model_id: Option<String>,
     pub costs: CostConfig,
     pub benchmark: Option<BenchmarkHistory>,
+    /// Session closes used only to mark open positions between the executable
+    /// entry and exit opens. Absent means the replay reports holding-period
+    /// NAV alone, exactly as every frozen report already does.
+    pub mark_prices: Option<MarkPrices>,
+    /// Annual risk-free rate subtracted before Sharpe is computed. A Riksbank
+    /// policy-rate approximation until a SWESTR series is wired.
+    pub risk_free_annual: f64,
 }
 
 #[derive(Debug)]
 struct Candidate<'a> {
     row: &'a TrainingRow,
+    /// Executable entry and realized outcome, resolved once when the row is
+    /// admitted so the rest of the replay cannot meet an absent label.
+    entry_price: f64,
+    realised_return: f64,
     direction: Direction,
     absolute_prediction: f64,
     relative_prediction: Option<f64>,
     market_return_prediction: Option<f64>,
     edge: f64,
     execution_cost: ExecutionCost,
+}
+
+/// The resolved index core of an overlay replay: a fixed weight in the
+/// benchmark plus the tracking cost that weight accrues.
+#[derive(Debug, Clone, Copy)]
+struct IndexCore {
+    weight: f64,
+    budget: portfolio_construction::OverlayBudget,
+    tracking_cost_bps: f64,
+    /// Tracking cost accrued by one unit of core over a single session.
+    session_tracking_cost: f64,
+    /// Tracking cost accrued by one unit of core over a whole holding period.
+    period_tracking_cost: f64,
 }
 
 pub fn backtest(
@@ -1630,6 +2093,45 @@ pub fn backtest(
         return Err("maximum position weight must be finite and in (0, 1]".into());
     }
     fallback_budget.validate()?;
+    // The index core, if this replay has one, plus its per-period and
+    // per-session tracking accruals. `None` is the historical directional book.
+    let core = match config.allocation_mode {
+        AllocationMode::Directional => None,
+        AllocationMode::Overlay {
+            budget,
+            core_tracking_cost_bps,
+        } => {
+            budget.validate()?;
+            if !core_tracking_cost_bps.is_finite() || core_tracking_cost_bps < 0.0 {
+                return Err("core tracking cost must be finite and non-negative".into());
+            }
+            if config.benchmark.is_none() {
+                return Err(
+                    "the index-core overlay mode requires benchmark history to price its core"
+                        .into(),
+                );
+            }
+            if config.direction_config.is_some() {
+                return Err(
+                    "the index core already holds the market; a direction-timing overlay on top of it is a second, contradictory answer to the same question"
+                        .into(),
+                );
+            }
+            if max_sector_gross.is_some() {
+                return Err(
+                    "the overlay allocator enforces a net cap and has no sector group cap".into(),
+                );
+            }
+            Some(IndexCore {
+                weight: budget.core_weight,
+                budget,
+                tracking_cost_bps: core_tracking_cost_bps,
+                session_tracking_cost: core_tracking_cost_bps / 10_000.0 / 252.0,
+                period_tracking_cost: core_tracking_cost_bps / 10_000.0 * cadence_sessions as f64
+                    / 252.0,
+            })
+        }
+    };
     if let Some(direction) = config.direction_config {
         direction.validate()?;
         if config.benchmark.is_none() {
@@ -1673,6 +2175,11 @@ pub fn backtest(
             by_date.entry(row.date).or_default().push(row);
         }
     }
+    // The whole decision cross-section is kept, unlabelled members included,
+    // so cross-sectional centering stays point-in-time. A date on which no
+    // outcome at all was observed cannot be replayed, so it is not a
+    // rebalance date; it would otherwise liquidate the book for free.
+    by_date.retain(|_, rows| rows.iter().any(|row| row.target.is_some()));
     let dates = by_date.keys().copied().collect::<Vec<_>>();
     if dates.is_empty() {
         return Err("backtest window has no matrix rows".into());
@@ -1694,6 +2201,12 @@ pub fn backtest(
     };
     let mut previous: BTreeMap<String, (f64, UniverseBucket, ExecutionCost)> = BTreeMap::new();
     let mut diagnostic_blocks = Vec::with_capacity(selected_dates.len());
+    // Candidate-periods this replay would have opened but had to drop because
+    // the security stopped trading inside the holding period and no terminal
+    // value exists for it. Temporary: Phase 1 wires delisted terminal values,
+    // after which these become ordinary labelled rows. Until then the count is
+    // disclosed rather than absorbed into the result.
+    let mut unpriceable_candidate_periods = 0_usize;
     let mut borrow_diagnostics = BorrowDiagnostics {
         matrix_rows: by_date.values().map(Vec::len).sum(),
         matrix_rows_with_fee: by_date
@@ -1756,16 +2269,13 @@ pub fn backtest(
         for (row, raw_prediction) in raw_predictions {
             let selection_prediction = raw_prediction - prediction_center;
             let diagnostic_target = if residual_composition {
-                row.relative_target.ok_or_else(|| {
-                    format!(
-                        "matrix row {} on {} lacks its Rust relative target",
-                        row.instrument_id, row.date
-                    )
-                })?
+                relative_target(row)?
             } else {
                 model.diagnostic_target(row)?
             };
-            diagnostic_block.push((selection_prediction, diagnostic_target));
+            if let Some(diagnostic_target) = diagnostic_target {
+                diagnostic_block.push((selection_prediction, diagnostic_target));
+            }
             // Relative cross-sectional scores only describe performance versus
             // OMXSGI. Their sign cannot determine an absolute BUY/SELL side.
             // Compose the separately trained market forecast first, then apply
@@ -1785,9 +2295,22 @@ pub fn backtest(
             } else {
                 (Direction::Short, short_edge)
             };
+            // The row shaped the cross-section above whatever happened next,
+            // but only a replayable one can become a position.
+            if !row.is_replayable() {
+                if row.entered_without_an_observed_exit() {
+                    unpriceable_candidate_periods += 1;
+                }
+                continue;
+            }
+            let (Some(entry_price), Some(realised_return)) = (row.entry_price, row.target) else {
+                unreachable!("a replayable row has both an entry price and an outcome")
+            };
             if edge > 0.0 {
                 candidates.push(Candidate {
                     row,
+                    entry_price,
+                    realised_return,
                     direction,
                     absolute_prediction,
                     relative_prediction: uses_market_forecast.then_some(selection_prediction),
@@ -1835,13 +2358,44 @@ pub fn backtest(
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        let ranked = portfolio_construction::buffered_ranked_ids(
-            &construction_candidates,
-            ranking,
-            &incumbents,
-            max_positions,
-            retention_rank,
-        )?;
+        // In overlay mode `max_positions`/`retention_rank` apply PER SLEEVE:
+        // long and short candidates are ranked and admitted against separate
+        // caps, so a run of one-sided edges cannot crowd the other sleeve
+        // below the intended book width. Directional mode keeps the
+        // historical combined cap, where both directions compete for the
+        // same slots (there is no side quota there, by design).
+        let ranked = if core.is_some() {
+            let (long_candidates, short_candidates): (Vec<_>, Vec<_>) =
+                construction_candidates.into_iter().partition(|candidate| {
+                    candidate.direction == portfolio_construction::Direction::Long
+                });
+            let (long_incumbents, short_incumbents): (BTreeMap<_, _>, BTreeMap<_, _>) = incumbents
+                .into_iter()
+                .partition(|(_, direction)| *direction == portfolio_construction::Direction::Long);
+            let mut ranked = portfolio_construction::buffered_ranked_ids(
+                &long_candidates,
+                ranking,
+                &long_incumbents,
+                max_positions,
+                retention_rank,
+            )?;
+            ranked.extend(portfolio_construction::buffered_ranked_ids(
+                &short_candidates,
+                ranking,
+                &short_incumbents,
+                max_positions,
+                retention_rank,
+            )?);
+            ranked
+        } else {
+            portfolio_construction::buffered_ranked_ids(
+                &construction_candidates,
+                ranking,
+                &incumbents,
+                max_positions,
+                retention_rank,
+            )?
+        };
         let mut by_id = candidates
             .into_iter()
             .map(|candidate| (candidate.row.instrument_id.clone(), candidate))
@@ -1882,15 +2436,19 @@ pub fn backtest(
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let allocation = if let Some(maximum) = max_sector_gross {
-            portfolio_construction::allocate_with_group_cap(
+        let allocation = match (core, max_sector_gross) {
+            // The core is kept out of `weights` entirely, so no overlay
+            // instrument id can collide with the benchmark position.
+            (Some(core), _) => {
+                portfolio_construction::allocate_overlay(&proposals, &core.budget)?.overlay
+            }
+            (None, Some(maximum)) => portfolio_construction::allocate_with_group_cap(
                 &proposals,
                 allocation_budget,
                 &groups,
                 maximum,
-            )?
-        } else {
-            portfolio_construction::allocate(&proposals, allocation_budget)?
+            )?,
+            (None, None) => portfolio_construction::allocate(&proposals, allocation_budget)?,
         };
         let weights = &allocation.weights;
         let target: BTreeMap<_, _> = candidates
@@ -1912,6 +2470,9 @@ pub fn backtest(
         let mut long_pnl = 0.0;
         let mut short_pnl = 0.0;
         let mut cost_drag = 0.0;
+        // Costs paid at this period's entry open, separated from the terminal
+        // liquidation so daily marks charge each leg on the session it happens.
+        let mut entry_leg_costs = 0.0;
         let mut net = 0.0;
         let mut allocated_costs: BTreeMap<String, f64> = BTreeMap::new();
         let mut identities = previous
@@ -1948,7 +2509,10 @@ pub fn backtest(
             let (borrow_rate, observed) = holding_borrow_costs
                 .get(&instrument_id)
                 .copied()
-                .unwrap_or((costs.short_borrow_bps / 10_000.0, false));
+                .unwrap_or((
+                    costs.short_borrow_annual_bps / 10_000.0 * cadence_sessions as f64 / 252.0,
+                    false,
+                ));
             let holding_cost = target_short * borrow_rate;
             amount += holding_cost;
             if target_short > 0.0 {
@@ -1960,6 +2524,7 @@ pub fn backtest(
                     borrow_diagnostics.fallback_holding_cost_drag += holding_cost;
                 }
             }
+            entry_leg_costs += amount;
             // The last measured holding period includes the terminal close so
             // the backtest does not leave a free liquidation outside the NAV.
             if date_index + 1 == selected_dates.len() {
@@ -1987,21 +2552,27 @@ pub fn backtest(
             .values()
             .filter(|(_, _, cost)| cost.observed_spread)
             .count();
+        let mut held = Vec::new();
         for candidate in candidates {
             let Some(&signed_weight) = weights.get(&candidate.row.instrument_id) else {
                 continue;
             };
+            held.push((
+                candidate.row.instrument_id.clone(),
+                signed_weight,
+                candidate.entry_price,
+            ));
             let sign = signed_weight.signum();
             let absolute_weight = signed_weight.abs();
             let cost_amount = allocated_costs
                 .get(&candidate.row.instrument_id)
                 .copied()
                 .unwrap_or(0.0);
-            let pnl = absolute_weight * sign * candidate.row.target - cost_amount;
+            let pnl = absolute_weight * sign * candidate.realised_return - cost_amount;
             if sign > 0.0 {
-                long_pnl += absolute_weight * candidate.row.target;
+                long_pnl += absolute_weight * candidate.realised_return;
             } else {
-                short_pnl -= absolute_weight * candidate.row.target;
+                short_pnl -= absolute_weight * candidate.realised_return;
             }
             net += signed_weight;
             positions.push(PositionResult {
@@ -2014,20 +2585,82 @@ pub fn backtest(
                 relative_prediction: candidate.relative_prediction,
                 market_return_prediction: candidate.market_return_prediction,
                 net_edge: candidate.edge,
-                realised_return: candidate.row.target,
+                realised_return: candidate.realised_return,
                 weight: signed_weight,
                 cost: cost_amount,
                 pnl,
             });
         }
-        let gross = positions.iter().map(|position| position.weight.abs()).sum();
-        let period_return = long_pnl + short_pnl;
-        nav *= 1.0 + period_return;
-        let benchmark_period_return = config
+        // The index leg is resolved before the book is marked: in overlay mode
+        // the core's own daily path comes from these same index closes. When
+        // the replay has an equity mark-price universe (`--bars-root`), the
+        // session dates it is priced on come from that same book calendar
+        // (`book_session_dates`) rather than by counting rows in the
+        // benchmark archive, which can carry bars on dates the equity market
+        // is closed. Without a mark-price universe there is no independent
+        // equity calendar in scope here, so the count-based lookup is the
+        // best available and is left as it was.
+        let benchmark_period = config
             .benchmark
             .as_ref()
-            .map(|history| benchmark_return(history, date, cadence_sessions))
+            .map(|history| match config.mark_prices.as_ref() {
+                Some(prices) => {
+                    let session_dates = book_session_dates(prices, date, cadence_sessions)?;
+                    benchmark_period_on_dates(history, date, &session_dates)
+                }
+                None => benchmark_period(history, date, cadence_sessions),
+            })
             .transpose()?;
+        let benchmark_period_return = benchmark_period.as_ref().map(|period| period.value);
+        // Everything the candidate pipeline earned, net of its own costs. In
+        // overlay mode this is the overlay leg alone; the core is added below.
+        let candidate_return = long_pnl + short_pnl;
+        let core_leg = core.map(|core| {
+            let period = benchmark_period
+                .as_ref()
+                .expect("overlay mode validated a benchmark");
+            CoreLeg {
+                weight: core.weight,
+                entry_close: period.entry_close,
+                marks: &period.marks,
+                session_tracking_cost: core.session_tracking_cost,
+                period_return: core.weight * (period.value - core.period_tracking_cost),
+            }
+        });
+        let core_return = core_leg.as_ref().map(|leg| leg.period_return);
+        let period_return = candidate_return + core_return.unwrap_or(0.0);
+        let daily_marks = config
+            .mark_prices
+            .as_ref()
+            .map(|prices| {
+                daily_nav_marks(
+                    prices,
+                    date,
+                    cadence_sessions,
+                    selected_dates.get(date_index + 1).copied(),
+                    &held,
+                    core_leg.as_ref(),
+                    nav,
+                    entry_leg_costs,
+                    period_return,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        nav *= 1.0 + period_return;
+        // The core is a real position in the book, so it counts toward both
+        // exposures; it is deliberately not an entry in `positions`, which
+        // holds overlay instruments only.
+        let core_weight = core.map(|core| core.weight).unwrap_or(0.0);
+        let gross = core_weight
+            + positions
+                .iter()
+                .map(|position| position.weight.abs())
+                .sum::<f64>();
+        net += core_weight;
+        let benchmark_daily_marks = benchmark_period
+            .map(|period| period.marks)
+            .unwrap_or_default();
         let direction_market_return = direction.as_ref().map(|attribution| {
             attribution.decision.budget.target_net.unwrap_or(0.0)
                 * benchmark_period_return.unwrap_or(0.0)
@@ -2046,6 +2679,8 @@ pub fn backtest(
             direction,
             market_return_prediction,
             direction_market_return,
+            core_return,
+            overlay_return: core.map(|_| candidate_return),
             turnover,
             long_pnl,
             short_pnl,
@@ -2054,10 +2689,13 @@ pub fn backtest(
             benchmark_nav,
             active_return: benchmark_period_return.map(|value| period_return - value),
             positions,
+            daily_marks,
+            benchmark_daily_marks,
         });
         previous = target;
     }
-    let metrics = metrics(&steps, cadence_sessions);
+    let metrics = metrics(&steps, cadence_sessions, config.risk_free_annual);
+    let overlay_attribution = core.map(|core| overlay_attribution(&steps, &core));
     let diagnostics = prediction_diagnostics(&diagnostic_blocks);
     let direction_metrics = direction_layer_metrics(&steps, cadence_sessions);
     let selection_layer = selection_layer_metrics(
@@ -2071,16 +2709,47 @@ pub fn backtest(
     let benchmark = config
         .benchmark
         .as_ref()
-        .map(|history| benchmark_comparison(&steps, &metrics, cadence_sessions, history))
+        .map(|history| {
+            benchmark_comparison(
+                &steps,
+                &metrics,
+                cadence_sessions,
+                history,
+                config.risk_free_annual,
+            )
+        })
         .transpose()?;
     let mut disclosures = vec![
         "SURVIVORSHIP_CONTAMINATED: current 2026 constituents are projected backward; this result cannot authorize capital.".into(),
         "Historical borrow quantity is unavailable; shorts carry a configured availability penalty but feasibility is not proven.".into(),
         "Yahoo adjusted daily history is research input; production collection remains IB plus a licensed point-in-time universe.".into(),
-        "OMXSGI comparison uses official Nasdaq gross-index SOD levels from the next exchange session through the configured holding horizon; it is a broad market reference, not a forced exposure target.".into(),
+        "OMXSGI comparison uses official Nasdaq gross-index closing levels from the decision session's close through the close of the session the position is exited on, the same sessions the portfolio's daily NAV marks use; the archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against. It is a broad market reference, not a forced exposure target.".into(),
     ];
+    // A model whose declared `feature_set_version` is not one this binary
+    // currently mints predates the 2026-08-13 cross-section/feature
+    // corrections (current stock feature sets are fs-rust-stockholm-17 and
+    // later); `Model::load` still requires the matrix it is paired with to
+    // declare the identical version and feature list, so this is a
+    // consistent old-on-old replay, not a mixed-version one — but it still
+    // carries whatever pre-correction semantics that version had.
+    if expected_features(&model.feature_set_version).is_none() {
+        disclosures.push(format!(
+            "model feature_set_version {:?} predates the 2026-08-13 cross-section/feature corrections (current stock feature sets are fs-rust-stockholm-17 and later); this replay is a constructor re-baseline on pre-correction features, not evidence about the corrected pipeline.",
+            model.feature_set_version
+        ));
+    }
     if config.direction_config.is_some() {
         disclosures.push("The standalone direction-layer series applies smoothed target net exposure to OMXSGI before execution costs; it diagnoses timing only and cannot be treated as a tradable net result.".into());
+    }
+    if let Some(core) = core {
+        disclosures.push(format!(
+            "The index core holds {:.2} units of the OMXSGI gross-index leg and is charged a {:.1} bp annual tracking cost accrued at cadence/252 per period. The core is not charged spread, commission or impact: it stands for a continuously held OMXS30 futures or ETF position whose roll and management costs are that tracking charge. Implementing the core against real futures or ETF fills is later production work and is not represented by this replay.",
+            core.weight, core.tracking_cost_bps,
+        ));
+        disclosures.push(format!(
+            "The overlay is self-funding on top of the core: its gross is capped at {:.2} and its net at {:.2}, and `overlay_alpha_tstat` tests its per-period return against zero rather than against the index, because the core already owns the index exposure. Overlay positions are charged exactly the execution and borrow costs a directional replay charges.",
+            core.budget.overlay_gross, core.budget.overlay_net_cap,
+        ));
     }
     if (config.prediction_horizon_scale - 1.0).abs() > f64::EPSILON {
         disclosures.push(format!(
@@ -2121,6 +2790,11 @@ pub fn backtest(
         disclosures.push("Execution spread uses each security's causal 20-session median Nasdaq closing bid/ask spread when at least ten observations exist; it is a next-open execution proxy, not a fill record. Missing rows use the configured fallback.".into());
     }
     disclosures.push("IBKR Sweden percentage commission is modeled as 0.05% per side. The tiered SEK 10 and fixed SEK 49 per-order minima require NAV-aware minimum-trade-value enforcement and are not represented by a constant-bps replay.".into());
+    if unpriceable_candidate_periods > 0 {
+        disclosures.push(format!(
+            "{unpriceable_candidate_periods} rebalance-date row(s) shaped the decision cross-section but could not be selected by this replay or its selection-layer diagnostic: the security had an entry price and then stopped trading inside the holding period, leaving no terminal value to price the exit. Excluding them biases both toward securities that survived the horizon. This is temporary until delisted terminal values are wired in."
+        ));
+    }
     Ok(BacktestResult {
         kind: "stockholm_walk_forward_fold".into(),
         model_id: model.model_id.clone(),
@@ -2144,6 +2818,8 @@ pub fn backtest(
         ranking,
         sizing,
         allocation_budget: fallback_budget,
+        allocation_mode: config.allocation_mode,
+        overlay_attribution,
         reference_edge: config.reference_edge,
         reference_volatility: config.reference_volatility,
         min_position_weight: config.min_position_weight,
@@ -2166,8 +2842,459 @@ pub fn backtest(
     })
 }
 
+/// Configuration for a single-session forward score (Task 16, shadow forward
+/// logging): the same per-period portfolio construction `backtest` runs at
+/// one rebalance, but for exactly the most recent date in the matrix it is
+/// given, starting from flat (no incumbent book carried between calls) and
+/// requiring no realized outcome -- a live decision date has none yet.
+#[derive(Debug, Clone)]
+pub struct ShadowScoreConfig {
+    pub ranking: portfolio_construction::RankingMethod,
+    pub sizing: portfolio_construction::SizingMethod,
+    pub allocation_mode: AllocationMode,
+    /// Used only in `AllocationMode::Directional`; the overlay's own budget
+    /// comes from `allocation_mode` itself.
+    pub allocation_budget: portfolio_construction::Budget,
+    pub max_positions: usize,
+    pub position_weight: f64,
+    pub min_position_weight: f64,
+    pub reference_edge: f64,
+    pub reference_volatility: f64,
+    pub costs: CostConfig,
+    /// The benchmark's close on the scored date. Required, and used only to
+    /// price the index core, when `allocation_mode` is `Overlay` -- same
+    /// requirement `backtest` enforces for a full replay.
+    pub benchmark_close: Option<f64>,
+}
+
+/// One instrument's forecast for the scored date, independent of whether it
+/// cleared its cost hurdle or was admitted into `ShadowAllocation`. Reporting
+/// the whole scored cross-section, not just the winners, is what makes the
+/// shadow log usable evidence about calibration later, not just about the
+/// names that happened to get funded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowCandidateScore {
+    pub id: String,
+    pub symbol: String,
+    /// `Model::predict`'s raw return-space forecast, before any cost or
+    /// margin hurdle.
+    pub prediction: f64,
+    /// Predicted return net of round-trip execution/borrow cost and the
+    /// safety margin, on whichever side (`side`) clears the higher edge.
+    pub edge: f64,
+    pub side: Direction,
+}
+
+/// The proposed book for the scored date: a fixed index core (overlay mode
+/// only) plus signed per-name weights. Nothing here is an order -- it is what
+/// the frozen model and overlay constructor would have proposed, recorded for
+/// later comparison against what actually happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowAllocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_weight: Option<f64>,
+    pub weights: BTreeMap<String, f64>,
+}
+
+/// One append-only shadow-log row: the frozen model and overlay constructor's
+/// complete, deterministic answer for one Stockholm session. Produced by
+/// `shadow_score`, which touches no disk and mutates no state; the caller
+/// alone decides whether, and where, this gets appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowScoreRecord {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub model_id: String,
+    pub feature_set_version: String,
+    pub survivorship_status: String,
+    pub candidates: Vec<ShadowCandidateScore>,
+    pub allocation: ShadowAllocation,
+    /// Total modeled one-way cost of establishing `allocation` from flat, as
+    /// a fraction of NAV: commission, impact and spread on every leg, plus
+    /// short availability and one holding period of borrow on the short
+    /// leg. Modeled only -- there is no fill and no order.
+    pub modeled_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_close: Option<f64>,
+    /// Survivorship status and other caveats the model/matrix already carry,
+    /// echoed here so a reader of the log never has to cross-reference the
+    /// model file to know what this row's evidence is and is not.
+    pub disclosures: Vec<String>,
+}
+
+/// Score exactly the most recent date in `rows` with `model`, then run the
+/// Task 14/15 overlay-construction pipeline over the resulting candidates.
+/// Pure and deterministic: same inputs, same output, no I/O.
+pub fn shadow_score(
+    model: &Model,
+    rows: &[TrainingRow],
+    config: &ShadowScoreConfig,
+) -> Result<ShadowScoreRecord, String> {
+    if config.max_positions == 0 {
+        return Err("max positions must be positive".into());
+    }
+    if !config.position_weight.is_finite()
+        || config.position_weight <= 0.0
+        || config.position_weight > 1.0
+    {
+        return Err("maximum position weight must be finite and in (0, 1]".into());
+    }
+    if !matches!(model.reward.as_str(), "absolute_return" | "return_per_risk") {
+        return Err(format!(
+            "shadow-score supports only a direct absolute-return-style model; {:?} requires a \
+             market-return forecast this job does not build",
+            model.reward
+        ));
+    }
+    let overlay_budget = match config.allocation_mode {
+        AllocationMode::Directional => None,
+        AllocationMode::Overlay { budget, .. } => {
+            budget.validate()?;
+            if config.benchmark_close.is_none() {
+                return Err(
+                    "the index-core overlay mode requires a benchmark close to price the core"
+                        .into(),
+                );
+            }
+            Some(budget)
+        }
+    };
+    let scored_date = rows
+        .iter()
+        .map(|row| row.date)
+        .max()
+        .ok_or("shadow-score matrix has no rows")?;
+    let day_rows = rows
+        .iter()
+        .filter(|row| row.date == scored_date)
+        .collect::<Vec<_>>();
+    let model_horizon = features_stockholm::label_horizon(&model.label_version).ok_or_else(|| {
+        format!("unsupported Stockholm label version {:?}", model.label_version)
+    })?;
+
+    let mut candidates = Vec::with_capacity(day_rows.len());
+    let mut cost_by_id: BTreeMap<String, (ExecutionCost, f64)> = BTreeMap::new();
+    let mut volatility_by_id: BTreeMap<String, f64> = BTreeMap::new();
+    for row in &day_rows {
+        let prediction = model.predict(row)?;
+        let cost = execution_cost(row, &config.costs)?;
+        let long_cost = cost.total_bps() / 10_000.0;
+        let borrow_cost = holding_borrow_cost(row, model_horizon, &config.costs)?;
+        let short_cost =
+            (cost.total_bps() + config.costs.short_availability_bps) / 10_000.0 + borrow_cost;
+        let margin = config.costs.safety_margin_bps / 10_000.0;
+        let long_edge = prediction - long_cost - margin;
+        let short_edge = -prediction - short_cost - margin;
+        let (side, edge) = if long_edge >= short_edge {
+            (Direction::Long, long_edge)
+        } else {
+            (Direction::Short, short_edge)
+        };
+        cost_by_id.insert(row.instrument_id.clone(), (cost, borrow_cost));
+        volatility_by_id.insert(row.instrument_id.clone(), row.vol60);
+        candidates.push(ShadowCandidateScore {
+            id: row.instrument_id.clone(),
+            symbol: row.symbol.clone(),
+            prediction,
+            edge,
+            side,
+        });
+    }
+
+    let construction_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.edge > 0.0)
+        .map(|candidate| portfolio_construction::Candidate {
+            id: candidate.id.clone(),
+            direction: match candidate.side {
+                Direction::Long => portfolio_construction::Direction::Long,
+                Direction::Short => portfolio_construction::Direction::Short,
+            },
+            edge: candidate.edge,
+            volatility: volatility_by_id[&candidate.id],
+        })
+        .collect::<Vec<_>>();
+    // Every call starts from flat: there is no prior shadow position to
+    // retain, so the retention buffer has nothing to do and its width is set
+    // equal to max_positions (the minimum `buffered_ranked_ids` accepts).
+    let no_incumbents: BTreeMap<String, portfolio_construction::Direction> = BTreeMap::new();
+    let ranked = if overlay_budget.is_some() {
+        // Per-sleeve caps, exactly as `backtest`'s overlay mode: long and
+        // short candidates are ranked and admitted independently so one-sided
+        // edges cannot crowd out the other sleeve.
+        let (long_candidates, short_candidates): (Vec<_>, Vec<_>) = construction_candidates
+            .into_iter()
+            .partition(|candidate| candidate.direction == portfolio_construction::Direction::Long);
+        let mut ranked = portfolio_construction::buffered_ranked_ids(
+            &long_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?;
+        ranked.extend(portfolio_construction::buffered_ranked_ids(
+            &short_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?);
+        ranked
+    } else {
+        portfolio_construction::buffered_ranked_ids(
+            &construction_candidates,
+            config.ranking,
+            &no_incumbents,
+            config.max_positions,
+            config.max_positions,
+        )?
+    };
+
+    let by_candidate_id = candidates
+        .iter()
+        .map(|candidate| (candidate.id.clone(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let selected = ranked
+        .iter()
+        .map(|id| {
+            let candidate = by_candidate_id[id];
+            portfolio_construction::Candidate {
+                id: id.clone(),
+                direction: match candidate.side {
+                    Direction::Long => portfolio_construction::Direction::Long,
+                    Direction::Short => portfolio_construction::Direction::Short,
+                },
+                edge: candidate.edge,
+                volatility: volatility_by_id[id],
+            }
+        })
+        .collect::<Vec<_>>();
+    let proposals = portfolio_construction::propose(
+        &selected,
+        &portfolio_construction::SizingConfig {
+            method: config.sizing,
+            unit_abs_weight: config.position_weight,
+            min_abs_weight: config.min_position_weight,
+            max_abs_weight: config.position_weight,
+            reference_edge: config.reference_edge,
+            reference_volatility: config.reference_volatility,
+        },
+    )?;
+    let (core_weight, weights) = match overlay_budget {
+        Some(budget) => {
+            let overlay = portfolio_construction::allocate_overlay(&proposals, &budget)?;
+            (Some(overlay.core_weight), overlay.overlay.weights)
+        }
+        None => (
+            None,
+            portfolio_construction::allocate(&proposals, config.allocation_budget)?.weights,
+        ),
+    };
+
+    // Cost of establishing `weights` from flat: one-way (half of the
+    // round-trip figure `execution_cost` carries), same accounting
+    // `backtest` uses for a period's entry leg, plus the short-only
+    // availability penalty and one holding period of borrow.
+    let mut modeled_cost = 0.0;
+    for (id, weight) in &weights {
+        let (cost, borrow_cost) = &cost_by_id[id];
+        let mut amount = weight.abs() * cost.total_bps() / 20_000.0;
+        if *weight < 0.0 {
+            amount += weight.abs() * config.costs.short_availability_bps / 10_000.0;
+            amount += weight.abs() * borrow_cost;
+        }
+        modeled_cost += amount;
+    }
+
+    let disclosures = vec![
+        format!("survivorship_status={}", model.survivorship_status),
+        format!("model_trained_through={}", model.trained_through),
+        format!("model_feature_set_version={}", model.feature_set_version),
+        "no-orders, no-state-mutation forward score for policy evidence only; this row is never \
+         tuned against"
+            .to_string(),
+    ];
+
+    Ok(ShadowScoreRecord {
+        date: scored_date,
+        model_id: model.model_id.clone(),
+        feature_set_version: model.feature_set_version.clone(),
+        survivorship_status: model.survivorship_status.clone(),
+        candidates,
+        allocation: ShadowAllocation {
+            core_weight,
+            weights,
+        },
+        modeled_cost,
+        benchmark_close: config.benchmark_close,
+        disclosures,
+    })
+}
+
+/// Split a finished overlay replay into its two legs.
+///
+/// The overlay's t-stat is against zero, not against the index: the core
+/// already holds the index, so the only question left for the overlay is
+/// whether it is positive on its own. It reuses `active_tstat` against a zero
+/// series so the statistic is literally the same one the active-return gate
+/// uses, sample standard error and all.
+fn overlay_attribution(steps: &[Step], core: &IndexCore) -> OverlayAttribution {
+    let overlay_returns = steps
+        .iter()
+        .map(|step| step.overlay_return.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let zero = vec![0.0; overlay_returns.len()];
+    let overlay_alpha_tstat = active_tstat(&overlay_returns, &zero);
+    let overlay_alpha_tstat_status = overlay_alpha_tstat.is_none().then(|| {
+        if overlay_returns.len() < 2 {
+            TOO_FEW_ACTIVE_OBSERVATIONS.to_owned()
+        } else {
+            NO_ACTIVE_DISPERSION.to_owned()
+        }
+    });
+    OverlayAttribution {
+        periods: steps.len(),
+        core_weight: core.weight,
+        core_tracking_cost_bps: core.tracking_cost_bps,
+        core_return: steps
+            .iter()
+            .map(|step| step.core_return.unwrap_or(0.0))
+            .sum(),
+        overlay_return: overlay_returns.iter().sum(),
+        core_tracking_cost: core.weight * core.period_tracking_cost * steps.len() as f64,
+        overlay_alpha_tstat,
+        overlay_alpha_tstat_status,
+    }
+}
+
+/// One holding period of the index core, resolved from the index leg the
+/// report already computes.
+#[derive(Debug, Clone)]
+struct CoreLeg<'a> {
+    weight: f64,
+    /// The decision session's index close, which every mark is measured from.
+    entry_close: f64,
+    /// The index's close on every session from the one after the decision
+    /// session through the exit session.
+    marks: &'a [BenchmarkMark],
+    /// Tracking cost one unit of core accrues per session.
+    session_tracking_cost: f64,
+    /// The core's whole contribution to this period's return:
+    /// `weight × (index return − period tracking cost)`.
+    period_return: f64,
+}
+
+/// Mark the open book at every session of one holding period, one NAV per
+/// session so phases can later be combined on calendar dates.
+///
+/// The book is bought at the open after `date` and sold at the open after the
+/// last held session. Every held session but the last is therefore marked at
+/// its own adjusted close; the last one is the rebalance session, and it is
+/// marked at the realised period close because that is where the book is
+/// actually liquidated. That final mark consequently spans the previous close
+/// through the following open rather than a single session, which is the price
+/// of executing at opens while marking at closes.
+///
+/// Entry-leg costs are charged on the first marked session; the exit leg is
+/// already inside `period_return` and therefore lands on the rebalance session
+/// alone.
+///
+/// An index core, when present, is marked from the same index closes the
+/// benchmark leg uses, with its tracking cost accrued one session at a time so
+/// the daily path never carries a whole period's charge on one date.
+#[allow(clippy::too_many_arguments)]
+fn daily_nav_marks(
+    prices: &MarkPrices,
+    date: Date,
+    cadence_sessions: usize,
+    next_decision_date: Option<Date>,
+    held: &[(String, f64, f64)],
+    core: Option<&CoreLeg<'_>>,
+    opening_nav: f64,
+    entry_leg_costs: f64,
+    period_return: f64,
+) -> Result<Vec<DailyMark>, String> {
+    if !prices.is_session(date) {
+        return Err(format!("mark prices have no {date} exchange session"));
+    }
+    if let Some(core) = core {
+        if core.marks.len() != cadence_sessions {
+            return Err(format!(
+                "the index core has {} marked sessions after {date} but the replay holds {cadence_sessions}",
+                core.marks.len()
+            ));
+        }
+        if !core.entry_close.is_finite() || core.entry_close <= 0.0 {
+            return Err(format!(
+                "the index has a non-positive close on {date} to mark the core against"
+            ));
+        }
+    }
+    let mut marks = Vec::with_capacity(cadence_sessions);
+    for session in 1..=cadence_sessions {
+        let mark_date = prices
+            .session_after(date, session)
+            .ok_or_else(|| format!("mark prices end before session {session} after {date}"))?;
+        // A core marked on different sessions than the book it is combined
+        // with would silently misdate the combined NAV, so the two calendars
+        // must agree session by session, not just at the period's end.
+        if let Some(core) = core {
+            let index_mark = core.marks[session - 1];
+            if index_mark.date != mark_date {
+                return Err(format!(
+                    "the index core's session {session} after {date} falls on {}, but the book is marked on {mark_date}",
+                    index_mark.date
+                ));
+            }
+        }
+        let value = if session == cadence_sessions {
+            period_return
+        } else {
+            let mut marked_return = 0.0;
+            for (instrument_id, weight, entry_price) in held {
+                if !entry_price.is_finite() || *entry_price <= 0.0 {
+                    return Err(format!(
+                        "matrix row {instrument_id} on {date} has a non-positive entry price"
+                    ));
+                }
+                let close = prices.close_at(instrument_id, mark_date).ok_or_else(|| {
+                    format!("mark prices have no {instrument_id} close through {mark_date}")
+                })?;
+                marked_return += weight * (close / entry_price - 1.0);
+            }
+            if let Some(core) = core {
+                marked_return += core.weight
+                    * (core.marks[session - 1].close / core.entry_close
+                        - 1.0
+                        - core.session_tracking_cost * session as f64);
+            }
+            marked_return - entry_leg_costs
+        };
+        marks.push(DailyMark {
+            date: mark_date,
+            nav: opening_nav * (1.0 + value),
+        });
+    }
+    // A mark calendar that disagrees with the replay's own session grid would
+    // silently misdate every NAV, so require the last mark to be the session
+    // the next decision is taken on.
+    if let (Some(next), Some(last)) = (next_decision_date, marks.last()) {
+        if last.date != next {
+            return Err(format!(
+                "mark calendar puts session {cadence_sessions} after {date} on {}, but the replay rebalances on {next}",
+                last.date
+            ));
+        }
+    }
+    Ok(marks)
+}
+
 pub fn summarize_rebalance_phases(
     reports: &[BacktestResult],
+    risk_free_annual: f64,
 ) -> Result<RebalancePhaseSummary, String> {
     let first = reports
         .first()
@@ -2205,17 +3332,56 @@ pub fn summarize_rebalance_phases(
     if !ordered.iter().all(same_contract) {
         return Err("rebalance phase report contracts differ".into());
     }
-    let return_series = ordered
+    let daily_navs = ordered
         .iter()
         .map(|report| {
             report
                 .steps
                 .iter()
-                .map(|step| step.period_return)
+                .flat_map(|step| step.daily_marks.iter().map(|mark| (mark.date, mark.nav)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let period_returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+    let marked = daily_navs.iter().filter(|phase| !phase.is_empty()).count();
+    if marked != 0 && marked != daily_navs.len() {
+        return Err(format!(
+            "{marked} of {} phases carry daily NAV marks; combine either all or none",
+            daily_navs.len()
+        ));
+    }
+    let calendar_aligned = marked == daily_navs.len();
+
+    // The combined book's own return series, at whichever frequency the phase
+    // reports can support. The combined path is normalised to 1.0 on its first
+    // session, so that session's return is genuinely outside the window every
+    // phase shares and is not dropped by accident.
+    let combined = calendar_aligned
+        .then(|| portfolio_construction::equal_weight_phase_daily_navs(&daily_navs))
+        .transpose()?;
+    let (period_returns, combined_start, combined_end, periods_per_year) =
+        if let Some(combined) = &combined {
+            let returns = combined
+                .windows(2)
+                .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+                .collect::<Vec<_>>();
+            let start = combined.first().map(|(date, _)| *date);
+            let end = combined.last().map(|(date, _)| *date);
+            (returns, start, end, SESSIONS_PER_YEAR)
+        } else {
+            let return_series = ordered
+                .iter()
+                .map(|report| {
+                    report
+                        .steps
+                        .iter()
+                        .map(|step| step.period_return)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            #[allow(deprecated)]
+            let returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+            (returns, None, None, sessions_per_year(cadence))
+        };
     let benchmark_presence = ordered
         .iter()
         .map(|report| report.benchmark.is_some())
@@ -2223,42 +3389,146 @@ pub fn summarize_rebalance_phases(
     if benchmark_presence.len() != 1 {
         return Err("benchmark attribution is present in only some phases".into());
     }
-    let benchmark_period_returns = if *benchmark_presence
+    let has_benchmark = *benchmark_presence
         .first()
-        .expect("reports establish benchmark presence")
-    {
-        let phases = ordered
+        .expect("reports establish benchmark presence");
+    let phase_benchmark_returns = |report: &BacktestResult| {
+        report
+            .steps
             .iter()
-            .map(|report| {
-                report
-                    .steps
-                    .iter()
-                    .map(|step| {
-                        step.benchmark_period_return
-                            .ok_or_else(|| "phase step lacks benchmark return".to_owned())
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+            .map(|step| {
+                step.benchmark_period_return
+                    .ok_or_else(|| "phase step lacks benchmark return".to_owned())
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        portfolio_construction::equal_weight_phase_returns(&phases)?
-    } else {
-        Vec::new()
+            .collect::<Result<Vec<_>, String>>()
     };
-    let performance = phase_performance(&period_returns, cadence);
-    let benchmark_performance = (!benchmark_period_returns.is_empty())
-        .then(|| phase_performance(&benchmark_period_returns, cadence));
+    // Every phase reads the same index archive, so the benchmark's daily closes
+    // are one calendar series regardless of which phase recorded them.
+    let benchmark_marks = ordered
+        .iter()
+        .map(|report| {
+            report
+                .steps
+                .iter()
+                .flat_map(|step| step.benchmark_daily_marks.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let marked_benchmarks = benchmark_marks
+        .iter()
+        .filter(|phase| !phase.is_empty())
+        .count();
+    if marked_benchmarks != 0 && marked_benchmarks != benchmark_marks.len() {
+        return Err(format!(
+            "{marked_benchmarks} of {} phases carry daily benchmark marks; combine either all or none",
+            benchmark_marks.len()
+        ));
+    }
+    // Every phase holds the same index continuously, so the equal-capital
+    // combined benchmark book is that index — there is nothing to average, and
+    // averaging overlapping windows is the defect being removed here. With the
+    // index marked daily it rides the same session grid as the combined book;
+    // without those marks (a frozen report) it stays on holding-period
+    // frequency, which `benchmark_combination_method` and `periods_per_year`
+    // both state outright.
+    let (benchmark_period_returns, benchmark_combination_method) = match (has_benchmark, &combined)
+    {
+        (false, _) => (Vec::new(), None),
+        (true, Some(combined)) if marked_benchmarks == benchmark_marks.len() => {
+            let closes = combined_benchmark_closes(&benchmark_marks)?;
+            let levels = combined
+                .iter()
+                .map(|(date, _)| {
+                    closes.get(date).copied().ok_or_else(|| {
+                        format!("the benchmark has no close on {date}, a session the combined book is marked on")
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let returns = levels
+                .windows(2)
+                .map(|pair| pair[1] / pair[0] - 1.0)
+                .collect::<Vec<_>>();
+            (returns, Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE.to_owned()))
+        }
+        (true, Some(_)) => (
+            phase_benchmark_returns(ordered[0])?,
+            Some(SINGLE_PHASE_INDEX_PATH.to_owned()),
+        ),
+        (true, None) => {
+            let phases = ordered
+                .iter()
+                .map(|report| phase_benchmark_returns(report))
+                .collect::<Result<Vec<_>, String>>()?;
+            #[allow(deprecated)]
+            let returns = portfolio_construction::equal_weight_phase_returns(&phases)?;
+            (returns, Some(LEGACY_PERIOD_INDEX_AVERAGE.to_owned()))
+        }
+    };
+    let performance = phase_performance(&period_returns, periods_per_year, risk_free_annual);
+    let benchmark_periods_per_year =
+        benchmark_periods_per_year(benchmark_combination_method.as_deref(), cadence);
+    let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
+        phase_performance(
+            &benchmark_period_returns,
+            benchmark_periods_per_year,
+            risk_free_annual,
+        )
+    });
+    // The active-return t-stat is only meaningful where the bot and benchmark
+    // series share one observation grid, which they do exactly when both are
+    // marked on the same sessions.
+    let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
+    let active_tstat_status = (has_benchmark && active_tstat.is_none())
+        .then(|| active_tstat_unavailable(&period_returns, &benchmark_period_returns));
+    let disclosures = phase_disclosures(calendar_aligned, benchmark_combination_method.as_deref());
+    // Phase diagnostics exist to be compared with the combined result — an
+    // aggregate that beats every one of its parts is the smoothing artefact
+    // this fix removes — so they are measured at the same frequency.
     let phase_diagnostics = ordered
         .iter()
-        .map(|report| RebalancePhaseDiagnostic {
-            offset_sessions: report.rebalance_offset_sessions,
-            periods: report.metrics.periods,
-            total_return: report.metrics.total_return,
-            sharpe: report.metrics.sharpe,
-            max_drawdown: report.metrics.max_drawdown,
-            mean_rank_ic: report
-                .diagnostics
-                .as_ref()
-                .map_or(0.0, |diagnostics| diagnostics.mean_rank_ic),
+        .zip(&daily_navs)
+        .map(|(report, navs)| {
+            // The phase's replay opens at NAV 1.0, so its first mark already
+            // carries a session's return: the series has to start there or the
+            // diagnostic would silently drop one session.
+            let (periods, total_return, sharpe, phase_risk_free_annual, sharpe_se, max_drawdown) =
+                if calendar_aligned {
+                    let returns = daily_returns(navs);
+                    let values = return_metrics(&returns, SESSIONS_PER_YEAR, risk_free_annual);
+                    (
+                        returns.len(),
+                        values.total_return,
+                        values.sharpe,
+                        risk_free_annual,
+                        values.sharpe_se,
+                        values.max_drawdown,
+                    )
+                } else {
+                    // The frozen phase report's own rf basis, not the
+                    // summary's — see the field doc on
+                    // `RebalancePhaseDiagnostic::risk_free_annual`.
+                    (
+                        report.metrics.periods,
+                        report.metrics.total_return,
+                        report.metrics.sharpe,
+                        report.metrics.risk_free_annual,
+                        report.metrics.sharpe_se,
+                        report.metrics.max_drawdown,
+                    )
+                };
+            RebalancePhaseDiagnostic {
+                offset_sessions: report.rebalance_offset_sessions,
+                periods,
+                total_return,
+                sharpe,
+                risk_free_annual: phase_risk_free_annual,
+                sharpe_se,
+                max_drawdown,
+                mean_rank_ic: report
+                    .diagnostics
+                    .as_ref()
+                    .map_or(0.0, |diagnostics| diagnostics.mean_rank_ic),
+            }
         })
         .collect();
     Ok(RebalancePhaseSummary {
@@ -2274,22 +3544,86 @@ pub fn summarize_rebalance_phases(
         cadence_sessions: cadence,
         phase_count: ordered.len(),
         common_complete_periods: period_returns.len(),
+        combination_method: if calendar_aligned {
+            CALENDAR_ALIGNED_DAILY_NAV.into()
+        } else {
+            LEGACY_PERIOD_INDEX_AVERAGE.into()
+        },
+        combined_start,
+        combined_end,
         performance,
         benchmark_performance,
+        benchmark_combination_method,
         phase_diagnostics,
         period_returns,
         benchmark_period_returns,
-        disclosures: vec![
-            "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".into(),
-            "Only the common complete prefix across phases is aggregated, so incomplete terminal holdings are discarded.".into(),
-            "Overlapping phase holdings are one combined portfolio, not independent observations; annualisation remains tied to the original holding cadence.".into(),
-            "SURVIVORSHIP_CONTAMINATED research data cannot authorize paper or live capital regardless of this result.".into(),
-        ],
+        active_tstat,
+        active_tstat_status,
+        disclosures,
     })
+}
+
+/// One index close per session, from every phase's benchmark marks.
+///
+/// The phases overlap by construction, so most sessions are reported several
+/// times. They must agree: two different closes for one session would mean the
+/// phases were replayed against different archives, and averaging them away
+/// would hide that.
+fn combined_benchmark_closes(phases: &[Vec<BenchmarkMark>]) -> Result<BTreeMap<Date, f64>, String> {
+    let mut closes: BTreeMap<Date, f64> = BTreeMap::new();
+    for marks in phases {
+        for mark in marks {
+            if !mark.close.is_finite() || mark.close <= 0.0 {
+                return Err(format!(
+                    "benchmark mark on {} is not a positive index level",
+                    mark.date
+                ));
+            }
+            match closes.entry(mark.date) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(mark.close);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if (slot.get() - mark.close).abs() > slot.get().abs() * 1e-12 {
+                        return Err(format!(
+                            "phases disagree about the benchmark close on {}: {} versus {}",
+                            mark.date,
+                            slot.get(),
+                            mark.close
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(closes)
+}
+
+fn phase_disclosures(calendar_aligned: bool, benchmark_method: Option<&str>) -> Vec<String> {
+    let mut disclosures = vec![
+        "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".to_owned(),
+    ];
+    if calendar_aligned {
+        disclosures.push("Phases are combined on the session date from each phase's daily NAV marks, so no two overlapping holding windows are averaged against each other. Performance is measured on daily returns and annualised over 252 sessions.".into());
+        disclosures.push("Capital is split equally at the first session every phase is invested in and the combined book is then held without transfers between phases; sessions before that and after the earliest-ending phase lie outside combined_start..combined_end and are excluded.".into());
+        if benchmark_method == Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE) {
+            disclosures.push("The benchmark is the index's own official close on every session the combined book is marked on, so both legs are one daily series on one calendar and are annualised over the same 252 sessions. The archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against.".into());
+        } else if benchmark_method.is_some() {
+            disclosures.push("Every phase holds the same index continuously, so the benchmark is reported from the lowest-offset phase's own holding-period series rather than averaged across phases. These phase reports carry no daily benchmark marks, so its annualisation is 252/cadence, not 252: benchmark and portfolio Sharpe are not measured at the same frequency and no active-return t-stat can be formed. Rerun the phases against the index to get one.".into());
+        }
+    } else {
+        disclosures.push("These phase reports carry no daily NAV marks, so phases are averaged by period index. Phase j's period k spans different sessions than phase j+1's, so the average smooths overlapping windows and its annualised volatility is understated and its Sharpe overstated. Rerun the phases with daily marks before citing this number.".into());
+        disclosures.push("Only the common complete prefix across phases is aggregated, so incomplete terminal holdings are discarded.".into());
+        disclosures.push("Overlapping phase holdings are one combined portfolio, not independent observations; annualisation remains tied to the original holding cadence.".into());
+    }
+    disclosures.push("SURVIVORSHIP_CONTAMINATED research data cannot authorize paper or live capital regardless of this result.".into());
+    disclosures
 }
 
 pub fn summarize_rebalance_phase_folds(
     folds: &[RebalancePhaseSummary],
+    risk_free_annual: f64,
+    target_sharpe_floor: f64,
 ) -> Result<RebalancePhaseFoldSummary, String> {
     let first = folds
         .first()
@@ -2311,6 +3645,37 @@ pub fn summarize_rebalance_phase_folds(
     }) {
         return Err("rebalance-phase fold contracts differ".into());
     }
+    // Concatenating a daily fold onto a holding-period fold would produce one
+    // series with two meanings and no annualisation that fits both.
+    if ordered
+        .iter()
+        .any(|fold| fold.combination_method != first.combination_method)
+    {
+        return Err("rebalance-phase folds combine their phases differently".into());
+    }
+    // A daily index leg concatenated onto a holding-period one is one series
+    // with two meanings, exactly as for the portfolio leg above.
+    if ordered
+        .iter()
+        .any(|fold| fold.benchmark_combination_method != first.benchmark_combination_method)
+    {
+        return Err("rebalance-phase folds combine their benchmark differently".into());
+    }
+    // A fold's last daily mark falls after its declared end — the terminal book
+    // is still priced — so non-overlapping fold bounds do not by themselves
+    // prove the daily series do not share a session.
+    if let Some((earlier, later)) =
+        ordered.windows(2).find_map(
+            |pair| match (pair[0].combined_end, pair[1].combined_start) {
+                (Some(earlier), Some(later)) if earlier >= later => Some((earlier, later)),
+                _ => None,
+            },
+        )
+    {
+        return Err(format!(
+            "combined windows overlap: one fold is still invested through {earlier} and the next opens on {later}"
+        ));
+    }
     let benchmark_presence = ordered
         .iter()
         .map(|fold| fold.benchmark_performance.is_some())
@@ -2318,6 +3683,11 @@ pub fn summarize_rebalance_phase_folds(
     if benchmark_presence.len() != 1 {
         return Err("benchmark attribution is present in only some phase folds".into());
     }
+    let periods_per_year = if first.combination_method == CALENDAR_ALIGNED_DAILY_NAV {
+        SESSIONS_PER_YEAR
+    } else {
+        sessions_per_year(first.cadence_sessions)
+    };
     let period_returns = ordered
         .iter()
         .flat_map(|fold| fold.period_returns.iter().copied())
@@ -2326,17 +3696,42 @@ pub fn summarize_rebalance_phase_folds(
         .iter()
         .flat_map(|fold| fold.benchmark_period_returns.iter().copied())
         .collect::<Vec<_>>();
-    let performance = phase_performance(&period_returns, first.cadence_sessions);
-    let benchmark_performance = (!benchmark_period_returns.is_empty())
-        .then(|| phase_performance(&benchmark_period_returns, first.cadence_sessions));
+    let performance = phase_performance(&period_returns, periods_per_year, risk_free_annual);
+    let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
+        phase_performance(
+            &benchmark_period_returns,
+            benchmark_periods_per_year(
+                first.benchmark_combination_method.as_deref(),
+                first.cadence_sessions,
+            ),
+            risk_free_annual,
+        )
+    });
+    let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
+    let has_benchmark = !benchmark_period_returns.is_empty();
+    let active_tstat_status = (has_benchmark && active_tstat.is_none())
+        .then(|| active_tstat_unavailable(&period_returns, &benchmark_period_returns));
     let fold_diagnostics = ordered
         .iter()
-        .map(|fold| RebalancePhaseFoldDiagnostic {
-            start: fold.start,
-            end: fold.end,
-            performance: fold.performance.clone(),
+        .map(|fold| {
+            // `dated_frequency` backfills/validates the observation frequency
+            // for reports written before a fold recorded its own; the
+            // performance itself is then recomputed fresh from the fold's raw
+            // period returns so every fold's Sharpe, SE and risk-free rate are
+            // consistent with this run's `risk_free_annual`, not whatever rate
+            // (if any) was baked in when the fold was originally generated.
+            let dated = dated_frequency(&fold.performance, fold)?;
+            Ok(RebalancePhaseFoldDiagnostic {
+                start: fold.start,
+                end: fold.end,
+                performance: phase_performance(
+                    &fold.period_returns,
+                    dated.periods_per_year,
+                    risk_free_annual,
+                ),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let positive_folds = ordered
         .iter()
         .filter(|fold| fold.performance.total_return > 0.0)
@@ -2344,8 +3739,9 @@ pub fn summarize_rebalance_phase_folds(
     let target_sharpe = 2.0;
     let passed = first.survivorship_status == "POINT_IN_TIME"
         && performance.total_return > 0.0
-        && performance.sharpe >= target_sharpe
-        && positive_folds * 2 > ordered.len();
+        && positive_folds * 2 > ordered.len()
+        && active_tstat.is_some_and(|value| value >= ACTIVE_TSTAT_THRESHOLD)
+        && performance.sharpe - 1.64 * performance.sharpe_se >= target_sharpe_floor;
     Ok(RebalancePhaseFoldSummary {
         kind: "stockholm_equal_weight_rebalance_phase_walk_forward".into(),
         model_family: first.model_family.clone(),
@@ -2357,28 +3753,77 @@ pub fn summarize_rebalance_phase_folds(
         positive_folds,
         cadence_sessions: first.cadence_sessions,
         phase_count: first.phase_count,
+        combination_method: first.combination_method.clone(),
         target_sharpe,
+        target_sharpe_floor,
         performance,
         benchmark_performance,
+        benchmark_combination_method: first.benchmark_combination_method.clone(),
         fold_diagnostics,
         period_returns,
         benchmark_period_returns,
+        active_tstat,
+        active_tstat_status,
+        active_tstat_threshold: ACTIVE_TSTAT_THRESHOLD,
         passed,
-        disclosures: vec![
-            "Fold returns are concatenated only after every calendar phase is equal-weighted within each strictly forward fold.".into(),
-            "The phase combination removes arbitrary rebalance alignment but cannot correct survivorship bias or unstable alpha.".into(),
-        ],
+        disclosures: {
+            let mut disclosures = vec![
+                "Fold returns are concatenated only after every calendar phase is equal-weighted within each strictly forward fold.".to_owned(),
+                "The phase combination removes arbitrary rebalance alignment but cannot correct survivorship bias or unstable alpha.".to_owned(),
+            ];
+            if first.combination_method != CALENDAR_ALIGNED_DAILY_NAV {
+                disclosures.push("These folds averaged their phases by period index, which smooths overlapping holding windows and overstates Sharpe. Rerun the phases with daily NAV marks before citing this number.".into());
+            }
+            disclosures
+        },
     })
 }
 
-fn phase_performance(returns: &[f64], cadence: usize) -> RebalancePhasePerformance {
-    let values = return_metrics(returns, cadence);
+/// Restore the observation frequency of a performance block read from a summary
+/// written before `periods_per_year` existed, where it deserialises to zero.
+///
+/// A zero in an annualised-metrics field is worse than a missing one: it reads
+/// as a measured value and silently propagates. The frequency is fully
+/// determined by the same file's combination method and cadence, so derive it —
+/// and refuse the file outright when the cadence cannot supply one.
+fn dated_frequency(
+    performance: &RebalancePhasePerformance,
+    summary: &RebalancePhaseSummary,
+) -> Result<RebalancePhasePerformance, String> {
+    if performance.periods_per_year != 0.0 {
+        return Ok(performance.clone());
+    }
+    let periods_per_year = if summary.combination_method == CALENDAR_ALIGNED_DAILY_NAV {
+        SESSIONS_PER_YEAR
+    } else if summary.cadence_sessions == 0 {
+        return Err(format!(
+            "the {}..{} phase summary records no observation frequency and no cadence to derive one from",
+            summary.start, summary.end
+        ));
+    } else {
+        sessions_per_year(summary.cadence_sessions)
+    };
+    Ok(RebalancePhasePerformance {
+        periods_per_year,
+        ..performance.clone()
+    })
+}
+
+fn phase_performance(
+    returns: &[f64],
+    periods_per_year: f64,
+    risk_free_annual: f64,
+) -> RebalancePhasePerformance {
+    let values = return_metrics(returns, periods_per_year, risk_free_annual);
     RebalancePhasePerformance {
         periods: returns.len(),
+        periods_per_year,
         total_return: values.total_return,
         annualised_return: values.annualised_return,
         annualised_volatility: values.annualised_volatility,
         sharpe: values.sharpe,
+        risk_free_annual,
+        sharpe_se: values.sharpe_se,
         max_drawdown: values.max_drawdown,
     }
 }
@@ -2430,7 +3875,9 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
         .iter()
         .map(|(_, period_return)| *period_return)
         .collect::<Vec<_>>();
-    let metrics = return_metrics(&returns, cadence);
+    // The direction-timing overlay diagnostic is out of Task 3's gated
+    // Stockholm-evaluation scope; it stays non-excess.
+    let metrics = return_metrics(&returns, sessions_per_year(cadence), 0.0);
     let periods = attributed.len();
     let regime_count = |regime| {
         attributed
@@ -2444,6 +3891,7 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
         annualised_return: metrics.annualised_return,
         annualised_volatility: metrics.annualised_volatility,
         sharpe: metrics.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: metrics.max_drawdown,
         mean_budget_gross: attributed
             .iter()
@@ -2480,7 +3928,13 @@ fn selection_layer_metrics(
     let mut previous: BTreeMap<String, (f64, ExecutionCost)> = BTreeMap::new();
     let mut steps = Vec::with_capacity(selected_dates.len());
     for (date_index, date) in selected_dates.iter().copied().enumerate() {
-        let rows = &by_date[&date];
+        // The others were cross-section members that shaped the ranks; they
+        // were never tradable names.
+        let rows = by_date[&date]
+            .iter()
+            .copied()
+            .filter(|row| row.is_replayable())
+            .collect::<Vec<_>>();
         if rows.len() < positions_per_side * 2 {
             continue;
         }
@@ -2509,7 +3963,7 @@ fn selection_layer_metrics(
 
         let gross_return_before_costs = target
             .values()
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let mut cost_drag = 0.0;
         let mut turnover = 0.0;
@@ -2573,14 +4027,17 @@ fn selection_layer_metrics(
         .iter()
         .map(|step| step.gross_return_before_costs)
         .collect::<Vec<_>>();
-    let net = return_metrics(&net_returns, cadence);
-    let gross = return_metrics(&gross_returns, cadence);
+    // The dollar-neutral selection diagnostic is out of Task 3's gated
+    // Stockholm-evaluation scope; it stays non-excess.
+    let net = return_metrics(&net_returns, sessions_per_year(cadence), 0.0);
+    let gross = return_metrics(&gross_returns, sessions_per_year(cadence), 0.0);
     Ok(Some(SelectionLayerMetrics {
         periods: steps.len(),
         total_return: net.total_return,
         annualised_return: net.annualised_return,
         annualised_volatility: net.annualised_volatility,
         sharpe: net.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: net.max_drawdown,
         positive_periods: net_returns.iter().filter(|value| **value > 0.0).count(),
         gross_return_before_costs: gross.total_return,
@@ -2623,8 +4080,18 @@ pub fn fixed_momentum_backtest(
         );
     }
     let mut by_date: BTreeMap<Date, Vec<&TrainingRow>> = BTreeMap::new();
+    // See `backtest`: entered-then-delisted rows are dropped and disclosed
+    // until delisted terminal values exist.
+    let mut unpriceable_rows = 0_usize;
     for row in rows {
         if row.date < config.start || row.date > config.end {
+            continue;
+        }
+        // The control replays executable positions only.
+        if !row.is_replayable() {
+            if row.entered_without_an_observed_exit() {
+                unpriceable_rows += 1;
+            }
             continue;
         }
         match row.momentum_12_1 {
@@ -2682,13 +4149,21 @@ pub fn fixed_momentum_backtest(
         directional,
         long_only,
         long_short_diagnostic,
-        disclosures: vec![
-            "The fixed rule and its 12-1 lookback were declared before this replay; it is an acceptance control, not a newly fitted model.".into(),
-            "The directional arm chooses the strongest absolute positive or negative stock trends without a long/short quota. Each name keeps the fixed maximum weight and unused capacity stays cash.".into(),
-            "The long/short arm is a dollar-neutral ranking diagnostic only; it is not the intended live allocation policy.".into(),
-            "Historical borrow quantity is unavailable. Short holding fees use causal IB FEE_RATE where present and the configured fallback otherwise; new shorts also pay an availability penalty.".into(),
-            "The current-security history still omits many inactive and delisted shares, so survivorship contamination prevents capital authorization.".into(),
-        ],
+        disclosures: {
+            let mut disclosures = vec![
+                "The fixed rule and its 12-1 lookback were declared before this replay; it is an acceptance control, not a newly fitted model.".into(),
+                "The directional arm chooses the strongest absolute positive or negative stock trends without a long/short quota. Each name keeps the fixed maximum weight and unused capacity stays cash.".into(),
+                "The long/short arm is a dollar-neutral ranking diagnostic only; it is not the intended live allocation policy.".into(),
+                "Historical borrow quantity is unavailable. Short holding fees use causal IB FEE_RATE where present and the configured fallback otherwise; new shorts also pay an availability penalty.".into(),
+                "The current-security history still omits many inactive and delisted shares, so survivorship contamination prevents capital authorization.".into(),
+            ];
+            if unpriceable_rows > 0 {
+                disclosures.push(format!(
+                    "{unpriceable_rows} matrix row(s) were excluded from ranking: the security had an entry price and then stopped trading inside the holding period, and no terminal value exists for it. Dropping them biases this control toward securities that survived the horizon. This is temporary until delisted terminal values are wired in."
+                ));
+            }
+            disclosures
+        },
     })
 }
 
@@ -2771,12 +4246,12 @@ fn fixed_momentum_performance(
         let long_pnl = target
             .values()
             .filter(|(weight, _, _)| *weight > 0.0)
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let short_pnl = target
             .values()
             .filter(|(weight, _, _)| *weight < 0.0)
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let gross_return_before_costs = long_pnl + short_pnl;
         let gross = target.values().map(|(weight, _, _)| weight.abs()).sum();
@@ -2832,6 +4307,11 @@ fn fixed_momentum_performance(
         }
         let net_return = gross_return_before_costs - cost_drag;
         nav *= 1.0 + net_return;
+        // This diagnostic control has no mark-price universe, so there is no
+        // independent equity calendar in scope to check the benchmark
+        // archive's own dates against; left as a count-based lookup (see
+        // `backtest`'s main loop for the by-date fix where a book calendar
+        // does exist).
         let benchmark_period_return = config
             .benchmark
             .as_ref()
@@ -2876,6 +4356,7 @@ fn fixed_momentum_performance(
                 &benchmark_returns,
                 config.cadence_sessions,
                 history,
+                0.0,
             )
         })
         .transpose()?;
@@ -2896,13 +4377,18 @@ fn fixed_momentum_performance(
 
 fn fixed_momentum_metrics(steps: &[FixedMomentumStep], cadence: usize) -> Metrics {
     let returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
-    let values = return_metrics(&returns, cadence);
+    // The fixed-momentum acceptance control is a separate, predeclared control
+    // (fixed-momentum-backtest), not the gated Stockholm evaluation Task 3
+    // fixes F4/F5 for; it stays non-excess.
+    let values = return_metrics(&returns, sessions_per_year(cadence), 0.0);
     Metrics {
         periods: steps.len(),
         total_return: values.total_return,
         annualised_return: values.annualised_return,
         annualised_volatility: values.annualised_volatility,
         sharpe: values.sharpe,
+        risk_free_annual: 0.0,
+        sharpe_se: values.sharpe_se,
         max_drawdown: values.max_drawdown,
         positive_periods: returns.iter().filter(|value| **value > 0.0).count(),
         long_pnl: steps.iter().map(|step| step.long_pnl).sum(),
@@ -2997,25 +4483,65 @@ pub fn add_benchmark(
     mut result: BacktestResult,
     history: &BenchmarkHistory,
 ) -> Result<BacktestResult, String> {
+    let cadence_sessions = result.cadence_sessions;
+    // The book's own equity-session dates for each step, read from its
+    // already-recorded daily marks when present (the exact calendar
+    // `daily_nav_marks` used) rather than by counting rows in the benchmark
+    // archive. A step with no daily marks (a report predating --bars-root)
+    // has no per-session calendar in this frozen report to align to; that
+    // case keeps the count-based lookup, unchanged.
+    let session_dates_per_step = result
+        .steps
+        .iter()
+        .map(|step| -> Option<Vec<Date>> {
+            (!step.daily_marks.is_empty())
+                .then(|| step.daily_marks.iter().map(|mark| mark.date).collect())
+        })
+        .collect::<Vec<_>>();
     let mut nav = 1.0;
-    for step in &mut result.steps {
-        let value = benchmark_return(history, step.date, result.cadence_sessions)?;
-        nav *= 1.0 + value;
-        step.benchmark_period_return = Some(value);
+    for (step, session_dates) in result.steps.iter_mut().zip(&session_dates_per_step) {
+        let period = match session_dates {
+            Some(session_dates) => benchmark_period_on_dates(history, step.date, session_dates)?,
+            None => benchmark_period(history, step.date, cadence_sessions)?,
+        };
+        nav *= 1.0 + period.value;
+        step.benchmark_period_return = Some(period.value);
         step.benchmark_nav = Some(nav);
-        step.active_return = Some(step.period_return - value);
+        step.active_return = Some(step.period_return - period.value);
+        step.benchmark_daily_marks = period.marks;
     }
     result.benchmark = Some(benchmark_comparison(
         &result.steps,
         &result.metrics,
         result.cadence_sessions,
         history,
+        result.metrics.risk_free_annual,
     )?);
-    let disclosure = "OMXSGI comparison uses official Nasdaq gross-index SOD levels from the next exchange session through the configured holding horizon; it is a broad market reference, not a forced exposure target.";
+    let disclosure = "OMXSGI comparison uses official Nasdaq gross-index closing levels from the decision session's close through the close of the session the position is exited on, the same sessions the portfolio's daily NAV marks use; the archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against. It is a broad market reference, not a forced exposure target.";
     if !result.disclosures.iter().any(|value| value == disclosure) {
         result.disclosures.push(disclosure.into());
     }
     Ok(result)
+}
+
+/// The book's own `cadence_sessions` equity-session dates strictly after
+/// `date`, in order — the calendar the index leg must be priced on when a
+/// mark-price universe exists. Never from the benchmark archive itself: an
+/// index can publish a level on a date the equity market is closed (e.g. a
+/// bank holiday), so counting `cadence_sessions` rows forward in the archive
+/// can land on the wrong calendar day entirely.
+fn book_session_dates(
+    prices: &MarkPrices,
+    date: Date,
+    cadence_sessions: usize,
+) -> Result<Vec<Date>, String> {
+    (1..=cadence_sessions)
+        .map(|session| {
+            prices
+                .session_after(date, session)
+                .ok_or_else(|| format!("mark prices end before session {session} after {date}"))
+        })
+        .collect()
 }
 
 fn benchmark_return(
@@ -3023,6 +4549,42 @@ fn benchmark_return(
     decision_date: Date,
     horizon: usize,
 ) -> Result<f64, String> {
+    Ok(benchmark_period(history, decision_date, horizon)?.value)
+}
+
+/// One holding period of the index leg.
+#[derive(Debug, Clone)]
+struct BenchmarkPeriod {
+    /// Close-to-close return over the holding period.
+    value: f64,
+    /// The decision session's official close, the level every mark inside the
+    /// period is measured against.
+    entry_close: f64,
+    /// That period's closing level on every session after the decision session
+    /// through the exit session.
+    marks: Vec<BenchmarkMark>,
+}
+
+/// One holding period of the index leg: the return from the decision session's
+/// official close to the close on `session_dates`'s last entry, plus that
+/// period's closing level on every date in `session_dates` (one entry per
+/// held equity session, in order).
+///
+/// Both legs are read BY DATE, never by counting rows in the archive: an
+/// index archive can carry bars on dates the equity market is closed (its
+/// own calendar need not agree with the exchange's), so counting rows
+/// forward from the decision date can land on the wrong calendar day.
+/// `session_dates` must already be the book's own equity-session dates (see
+/// `book_session_dates`); a `decision_date` or `session_dates` entry the
+/// archive has no bar for is refused rather than silently approximated.
+/// Used wherever a real equity calendar is in scope (a mark-price universe,
+/// or a frozen report's own recorded daily marks); see `benchmark_period`
+/// for the count-based fallback used where no such calendar is available.
+fn benchmark_period_on_dates(
+    history: &BenchmarkHistory,
+    decision_date: Date,
+    session_dates: &[Date],
+) -> Result<BenchmarkPeriod, String> {
     if history
         .bars
         .windows(2)
@@ -3033,32 +4595,112 @@ fn benchmark_return(
             history.symbol
         ));
     }
-    let entry_index = history
-        .bars
-        .partition_point(|bar| bar.date <= decision_date);
-    let exit_index = entry_index
-        .checked_add(horizon)
-        .ok_or("benchmark horizon overflow")?;
-    let entry = history.bars.get(entry_index).ok_or_else(|| {
+    if session_dates.is_empty() {
+        return Err("a benchmark period requires at least one session date".into());
+    }
+    let close_at = |target: Date| -> Option<f64> {
+        history
+            .bars
+            .binary_search_by_key(&target, |bar| bar.date)
+            .ok()
+            .map(|index| history.bars[index].end_value)
+    };
+    let entry_close = close_at(decision_date).ok_or_else(|| {
         format!(
-            "benchmark {} has no session after {decision_date}",
+            "benchmark {} has no session on {decision_date} to price the decision close from",
             history.symbol
         )
     })?;
+    let marks = session_dates
+        .iter()
+        .map(|&date| {
+            close_at(date)
+                .map(|close| BenchmarkMark { date, close })
+                .ok_or_else(|| {
+                    format!(
+                        "benchmark {} has no session on {date}, one of the book's own equity-session dates, to mark the index leg against",
+                        history.symbol
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let exit = marks.last().expect("session_dates is non-empty");
+    let value = exit.close / entry_close - 1.0;
+    if !value.is_finite() {
+        return Err(format!(
+            "benchmark {} has invalid values on {decision_date} or {}",
+            history.symbol, exit.date
+        ));
+    }
+    Ok(BenchmarkPeriod {
+        value,
+        entry_close,
+        marks,
+    })
+}
+
+/// One holding period of the index leg: the return from the decision session's
+/// official close to the close `horizon` rows later in the archive, plus that
+/// period's closing level on every row in between. Used only where no real
+/// equity calendar is available to look the session dates up by (see
+/// `benchmark_period_on_dates`, which every caller with such a calendar in
+/// scope uses instead) — an archive that carries bars on dates the equity
+/// market is closed can make this land on the wrong calendar day, a
+/// pre-existing, disclosed limitation this function does not resolve.
+fn benchmark_period(
+    history: &BenchmarkHistory,
+    decision_date: Date,
+    horizon: usize,
+) -> Result<BenchmarkPeriod, String> {
+    if history
+        .bars
+        .windows(2)
+        .any(|pair| pair[0].date >= pair[1].date)
+    {
+        return Err(format!(
+            "benchmark {} sessions are not strictly increasing",
+            history.symbol
+        ));
+    }
+    let entry_index = history.bars.partition_point(|bar| bar.date < decision_date);
+    let exit_index = entry_index
+        .checked_add(horizon)
+        .ok_or("benchmark horizon overflow")?;
+    let entry = history
+        .bars
+        .get(entry_index)
+        .filter(|bar| bar.date == decision_date)
+        .ok_or_else(|| {
+            format!(
+                "benchmark {} has no session on {decision_date} to price the decision close from",
+                history.symbol
+            )
+        })?;
     let exit = history.bars.get(exit_index).ok_or_else(|| {
         format!(
             "benchmark {} lacks {horizon} sessions after {}",
             history.symbol, entry.date
         )
     })?;
-    let value = exit.start_value / entry.start_value - 1.0;
+    let value = exit.end_value / entry.end_value - 1.0;
     if !value.is_finite() {
         return Err(format!(
             "benchmark {} has invalid values on {} or {}",
             history.symbol, entry.date, exit.date
         ));
     }
-    Ok(value)
+    let marks = history.bars[entry_index + 1..=exit_index]
+        .iter()
+        .map(|bar| BenchmarkMark {
+            date: bar.date,
+            close: bar.end_value,
+        })
+        .collect();
+    Ok(BenchmarkPeriod {
+        value,
+        entry_close: entry.end_value,
+        marks,
+    })
 }
 
 fn benchmark_comparison(
@@ -3066,6 +4708,7 @@ fn benchmark_comparison(
     portfolio: &Metrics,
     cadence: usize,
     history: &BenchmarkHistory,
+    risk_free_annual: f64,
 ) -> Result<BenchmarkComparison, String> {
     let benchmark_returns = steps
         .iter()
@@ -3084,6 +4727,7 @@ fn benchmark_comparison(
         &benchmark_returns,
         cadence,
         history,
+        risk_free_annual,
     )
 }
 
@@ -3093,11 +4737,18 @@ fn benchmark_comparison_from_returns(
     benchmark_returns: &[f64],
     cadence: usize,
     history: &BenchmarkHistory,
+    risk_free_annual: f64,
 ) -> Result<BenchmarkComparison, String> {
     if portfolio_returns.len() != benchmark_returns.len() {
         return Err("portfolio and benchmark return counts differ".into());
     }
-    let benchmark_stats = return_metrics(benchmark_returns, cadence);
+    // Benchmark blocks get the same rf subtraction as the portfolio: same
+    // annual rate, own frequency.
+    let benchmark_stats = return_metrics(
+        benchmark_returns,
+        sessions_per_year(cadence),
+        risk_free_annual,
+    );
     let active = portfolio_returns
         .iter()
         .zip(benchmark_returns)
@@ -3121,6 +4772,8 @@ fn benchmark_comparison_from_returns(
         annualised_return: benchmark_stats.annualised_return,
         annualised_volatility: benchmark_stats.annualised_volatility,
         sharpe: benchmark_stats.sharpe,
+        risk_free_annual,
+        sharpe_se: benchmark_stats.sharpe_se,
         max_drawdown: benchmark_stats.max_drawdown,
         portfolio_minus_benchmark_total_return: portfolio.total_return
             - benchmark_stats.total_return,
@@ -3151,14 +4804,109 @@ struct ReturnMetrics {
     annualised_return: f64,
     annualised_volatility: f64,
     sharpe: f64,
+    sharpe_se: f64,
     max_drawdown: f64,
 }
 
-fn return_metrics(returns: &[f64], cadence: usize) -> ReturnMetrics {
-    let periods_per_year = 252.0 / cadence as f64;
+/// Trading sessions per year, the constant every annualisation in this crate
+/// shares.
+const SESSIONS_PER_YEAR: f64 = 252.0;
+
+/// Observations per year for a series sampled once every `cadence` sessions.
+fn sessions_per_year(cadence: usize) -> f64 {
+    SESSIONS_PER_YEAR / cadence as f64
+}
+
+/// The per-period risk-free rate implied by compounding an annual rate down to
+/// the observation frequency: `(1+rf_annual)^(1/periods_per_year) - 1`. Applied
+/// identically to the bot and to any benchmark measured at the same frequency,
+/// so a rate this converts consistently subtracts out of any active-return
+/// comparison between the two.
+fn per_period_risk_free(risk_free_annual: f64, periods_per_year: f64) -> f64 {
+    if periods_per_year > 0.0 {
+        (1.0 + risk_free_annual).powf(1.0 / periods_per_year) - 1.0
+    } else {
+        0.0
+    }
+}
+
+/// Lo (2002) analytic standard error of the Sharpe ratio under the IID-returns
+/// assumption, computed on the periodic (non-annualised) Sharpe and then scaled
+/// by the same `sqrt(periods_per_year)` factor used to annualise the point
+/// estimate itself: `SE_periodic = sqrt((1 + SR_periodic^2/2) / N)`.
+fn sharpe_standard_error(
+    excess_mean: f64,
+    periodic_std: f64,
+    n: usize,
+    periods_per_year: f64,
+) -> f64 {
+    if n == 0 || periodic_std <= 0.0 {
+        return 0.0;
+    }
+    let sr_periodic = excess_mean / periodic_std;
+    let se_periodic = ((1.0 + sr_periodic.powi(2) / 2.0) / n as f64).sqrt();
+    se_periodic * periods_per_year.sqrt()
+}
+
+/// Active-return t-stat threshold for a fold summary's `passed` gate.
+const ACTIVE_TSTAT_THRESHOLD: f64 = 2.0;
+
+/// Mean per-period active (bot minus benchmark) return over its own standard
+/// error: `mean(active) / (sample_std(active) / sqrt(N))`, where `sample_std`
+/// uses the N−1 Bessel-corrected divisor. `None` when the two series do not
+/// pair up one-for-one — different lengths mean they were not measured on the
+/// same observation grid, most commonly a daily bot series compared against a
+/// benchmark still on holding-period frequency — or when there are no
+/// observations to compare.
+fn active_tstat(bot_returns: &[f64], benchmark_returns: &[f64]) -> Option<f64> {
+    if bot_returns.len() < 2 || bot_returns.len() != benchmark_returns.len() {
+        return None;
+    }
+    let active = bot_returns
+        .iter()
+        .zip(benchmark_returns)
+        .map(|(bot, benchmark)| bot - benchmark)
+        .collect::<Vec<_>>();
+    let standard_error = sample_std(&active) / (active.len() as f64).sqrt();
+    (standard_error > 0.0).then(|| mean(&active) / standard_error)
+}
+
+/// Sample standard deviation (Bessel-corrected, `N-1` divisor) — the
+/// standard-error convention a one-sample t-test uses. The population
+/// (`N` divisor) convention `population_std` provides elsewhere in this
+/// module suits Sharpe/volatility, but here it would understate the standard
+/// error by `sqrt(N/(N-1))` and overstate significance — worst at exactly the
+/// small N (a handful of folds) this task exists to stop driving decisions.
+/// `0.0` below `N=2`, where a sample variance is undefined.
+fn sample_std(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let average = mean(values);
+    (values
+        .iter()
+        .map(|value| (value - average).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64)
+        .sqrt()
+}
+
+/// `periods_per_year` is the observation frequency of `returns`, not a property
+/// of the strategy: a holding-period series sampled every `cadence` sessions
+/// uses `252/cadence`, while a daily NAV series uses 252. Passing it explicitly
+/// is what keeps a daily series from being annualised as if each observation
+/// were a whole holding period.
+///
+/// `risk_free_annual` only shifts `sharpe`/`sharpe_se`: `total_return`,
+/// `annualised_return`, `annualised_volatility` and `max_drawdown` describe the
+/// nominal path actually traded, not an excess-of-cash path. Volatility is
+/// unaffected by the shift because subtracting a constant per-period rate from
+/// every observation does not change their spread.
+fn return_metrics(returns: &[f64], periods_per_year: f64, risk_free_annual: f64) -> ReturnMetrics {
     let total_nav = returns.iter().fold(1.0, |nav, value| nav * (1.0 + value));
     let total_return = total_nav - 1.0;
-    let annualised_volatility = population_std(returns) * periods_per_year.sqrt();
+    let periodic_std = population_std(returns);
+    let annualised_volatility = periodic_std * periods_per_year.sqrt();
     let mut nav = 1.0_f64;
     let mut peak = 1.0_f64;
     let mut max_drawdown = 0.0_f64;
@@ -3167,6 +4915,8 @@ fn return_metrics(returns: &[f64], cadence: usize) -> ReturnMetrics {
         peak = peak.max(nav);
         max_drawdown = max_drawdown.min(nav / peak - 1.0);
     }
+    let per_period_rf = per_period_risk_free(risk_free_annual, periods_per_year);
+    let excess_mean = mean(returns) - per_period_rf;
     ReturnMetrics {
         total_return,
         annualised_return: if returns.is_empty() {
@@ -3179,10 +4929,16 @@ fn return_metrics(returns: &[f64], cadence: usize) -> ReturnMetrics {
         },
         annualised_volatility,
         sharpe: if annualised_volatility > 0.0 {
-            mean(returns) * periods_per_year / annualised_volatility
+            excess_mean * periods_per_year / annualised_volatility
         } else {
             0.0
         },
+        sharpe_se: sharpe_standard_error(
+            excess_mean,
+            periodic_std,
+            returns.len(),
+            periods_per_year,
+        ),
         max_drawdown,
     }
 }
@@ -3222,7 +4978,7 @@ fn population_covariance(left: &[f64], right: &[f64]) -> f64 {
         / left.len() as f64
 }
 
-fn metrics(steps: &[Step], cadence: usize) -> Metrics {
+fn metrics(steps: &[Step], cadence: usize, risk_free_annual: f64) -> Metrics {
     if steps.is_empty() {
         return Metrics {
             periods: 0,
@@ -3230,6 +4986,8 @@ fn metrics(steps: &[Step], cadence: usize) -> Metrics {
             annualised_return: 0.0,
             annualised_volatility: 0.0,
             sharpe: 0.0,
+            risk_free_annual,
+            sharpe_se: 0.0,
             max_drawdown: 0.0,
             positive_periods: 0,
             long_pnl: 0.0,
@@ -3264,16 +5022,26 @@ fn metrics(steps: &[Step], cadence: usize) -> Metrics {
         peak = peak.max(step.nav);
         max_drawdown = max_drawdown.min(step.nav / peak - 1.0);
     }
+    let per_period_rf = per_period_risk_free(risk_free_annual, periods_per_year);
+    let excess_mean = mean - per_period_rf;
+    let periodic_std = variance.sqrt();
     Metrics {
         periods: steps.len(),
         total_return,
         annualised_return,
         annualised_volatility: vol,
         sharpe: if vol > 0.0 {
-            mean * periods_per_year / vol
+            excess_mean * periods_per_year / vol
         } else {
             0.0
         },
+        risk_free_annual,
+        sharpe_se: sharpe_standard_error(
+            excess_mean,
+            periodic_std,
+            returns.len(),
+            periods_per_year,
+        ),
         max_drawdown,
         positive_periods: steps.iter().filter(|step| step.period_return > 0.0).count(),
         long_pnl: steps.iter().map(|step| step.long_pnl).sum(),
@@ -3306,6 +5074,28 @@ mod date_serde {
         let value = String::deserialize(deserializer)?;
         let format = time::macros::format_description!("[year]-[month]-[day]");
         Date::parse(&value, format).map_err(serde::de::Error::custom)
+    }
+}
+
+mod optional_date {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::Date;
+
+    pub fn serialize<S: Serializer>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error> {
+        match date {
+            Some(value) => serializer.serialize_str(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Date>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        let format = time::macros::format_description!("[year]-[month]-[day]");
+        value
+            .map(|text| Date::parse(&text, format).map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 
@@ -3366,6 +5156,262 @@ mod tests {
         }
     }
 
+    fn direction_leaf(value: f64) -> lightgbm_json::Node {
+        lightgbm_json::Node {
+            split_feature: None,
+            threshold: None,
+            decision_type: None,
+            default_left: None,
+            missing_type: None,
+            left_child: None,
+            right_child: None,
+            leaf_value: Some(value),
+            diagnostics: Default::default(),
+        }
+    }
+
+    /// A single-split tree on one feature: below the threshold predicts
+    /// `-leaf_abs`, at/above it predicts `+leaf_abs`. Feeding it a
+    /// population evenly split across the threshold produces predictions
+    /// whose population std is exactly `leaf_abs`, so the fixture's own
+    /// prediction spread is fixed by construction.
+    fn direction_model_with_leaf(leaf_abs: f64, score_scale: f64) -> DirectionModel {
+        DirectionModel {
+            format_version: DIRECTION_FORMAT_VERSION.into(),
+            model_version: DIRECTION_MODEL_VERSION.into(),
+            feature_set_version: features_stockholm::DIRECTION_FEATURE_SET_VERSION.into(),
+            label_version: features_stockholm::direction_label_version(20).unwrap(),
+            trained_through: day("2023-12-31"),
+            trained_at: "fixture".into(),
+            n_rows: 1,
+            n_dates: 1,
+            features: vec!["m_ret_20".into()],
+            model_family: "lightgbm".into(),
+            reward: "absolute_return".into(),
+            objective: "l2".into(),
+            target_clip: None,
+            score_scale,
+            tree_info: vec![lightgbm_json::Tree {
+                tree_index: 0,
+                num_leaves: 2,
+                num_cat: Some(0),
+                shrinkage: Some(1.0),
+                tree_structure: lightgbm_json::Node {
+                    split_feature: Some(0),
+                    threshold: Some(0.0),
+                    decision_type: Some("<=".into()),
+                    default_left: Some(true),
+                    missing_type: None,
+                    left_child: Some(Box::new(direction_leaf(-leaf_abs))),
+                    right_child: Some(Box::new(direction_leaf(leaf_abs))),
+                    leaf_value: None,
+                    diagnostics: Default::default(),
+                },
+            }],
+            model_id: "fixture".into(),
+        }
+    }
+
+    fn direction_row(date: Date, feature_value: f64) -> DirectionTrainingRow {
+        let mut features = BTreeMap::new();
+        features.insert("m_ret_20".to_string(), feature_value);
+        DirectionTrainingRow {
+            date,
+            target: 0.0,
+            sign_target: 0.0,
+            entry_value: 100.0,
+            exit_value: 100.0,
+            annualised_volatility_20: 0.15,
+            features,
+        }
+    }
+
+    fn population_std(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        variance.sqrt()
+    }
+
+    /// A model whose predictions have std 0.005 against targets with std
+    /// 0.05: normalizing by the model's own prediction spread (the new
+    /// convention) must produce scores with std ~= 1 (near-full threshold
+    /// range), not ~= 0.1 as normalizing by the wider target's std would.
+    #[test]
+    fn score_scale_from_prediction_spread_spans_threshold_range() {
+        let rows = (0..10_i64)
+            .map(|i| {
+                direction_row(
+                    day("2024-01-02") + time::Duration::days(i),
+                    if i % 2 == 0 { -1.0 } else { 1.0 },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // New convention: score_scale is the model's own prediction spread
+        // (0.005), matching what Python now exports.
+        let fixed_model = direction_model_with_leaf(0.005, 0.005);
+        let fixed_scores = rows
+            .iter()
+            .map(|row| fixed_model.predict(row).unwrap().score)
+            .collect::<Vec<_>>();
+        assert!((population_std(&fixed_scores) - 1.0).abs() < 1e-9);
+        for score in &fixed_scores {
+            assert!((score.abs() - 1.0).abs() < 1e-9);
+        }
+
+        // Old, buggy convention: score_scale was the target's std (0.05),
+        // roughly ten times the model's actual prediction spread, so the
+        // same predictions produced scores parked near zero.
+        let buggy_model = direction_model_with_leaf(0.005, 0.05);
+        let buggy_scores = rows
+            .iter()
+            .map(|row| buggy_model.predict(row).unwrap().score)
+            .collect::<Vec<_>>();
+        assert!((population_std(&buggy_scores) - 0.1).abs() < 1e-9);
+    }
+
+    /// A document still carrying the pre-fix `stockholm-direction-model-1`
+    /// version (score_scale = std(target) under absolute_return) must be
+    /// refused outright, not silently loaded and mis-scaled.
+    #[test]
+    fn stale_v1_direction_model_version_is_refused() {
+        let mut model = direction_model_with_leaf(0.005, 0.005);
+        model.model_version = "stockholm-direction-model-1".into();
+        let bytes = serde_json::to_vec(&model).expect("serialize fixture");
+        let path = std::env::temp_dir().join(format!(
+            "stockholm-direction-model-v1-fixture-{}-{}.json",
+            std::process::id(),
+            "stale_v1_direction_model_version_is_refused"
+        ));
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let result = DirectionModel::load(&path);
+        std::fs::remove_file(&path).ok();
+        let error = result.expect_err("stale v1 model_version must be refused");
+        assert!(
+            error.contains("format or version"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Controller ruling on the Task 15 blocker: `Model::load` must not
+    /// refuse a model merely for declaring a `feature_set_version` this
+    /// binary no longer mints. The safety property is CONSISTENCY between
+    /// the model and the matrix it is paired with (enforced by the
+    /// caller, e.g. `stockholm-portfolio`'s `run_backtest`), not currency
+    /// with the binary's current registry.
+    #[test]
+    fn model_load_accepts_a_pre_correction_feature_set_version_it_no_longer_mints() {
+        let mut model = constant_model(0.0);
+        model.feature_set_version = "fs-rust-stockholm-1".into();
+        let bytes = serde_json::to_vec(&model).expect("serialize fixture");
+        let path = std::env::temp_dir().join(format!(
+            "stockholm-model-pre-correction-fixture-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let result = Model::load(&path);
+        std::fs::remove_file(&path).ok();
+        let loaded =
+            result.expect("an unregistered feature_set_version must not be refused on its own");
+        assert_eq!(loaded.feature_set_version, "fs-rust-stockholm-1");
+    }
+
+    /// A `backtest()` replay run against such a model discloses that the
+    /// feature set predates the 2026-08-13 corrections, so a re-baseline
+    /// report is never mistaken for evidence about the corrected pipeline.
+    #[test]
+    fn backtest_discloses_when_the_models_feature_set_predates_the_current_registry() {
+        let mut model = constant_model(0.0);
+        model.feature_set_version = "fs-rust-stockholm-1".into();
+        let rows = [row(day("2024-01-02")), row(day("2024-01-03"))];
+        let result = backtest(
+            &model,
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-03"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 1.0,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("fs-rust-stockholm-1")
+                    && line.contains("predates")
+                    && line.contains("re-baseline")),
+            "expected a pre-correction disclosure naming the version: {:?}",
+            result.disclosures
+        );
+
+        // A model on a currently-registered version carries no such
+        // disclosure.
+        let current_model = constant_model(0.0);
+        let current_result = backtest(
+            &current_model,
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-03"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 1.0,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            !current_result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("predates the 2026-08-13")),
+            "a current-version model must not carry the pre-correction disclosure: {:?}",
+            current_result.disclosures
+        );
+    }
+
     #[test]
     fn per_risk_model_score_is_converted_back_to_return() {
         let mut model = constant_model(0.5);
@@ -3412,10 +5458,31 @@ mod tests {
         observed.borrow_fee_annualized = None;
         assert!(
             (holding_borrow_cost(&observed, 10, &costs).unwrap()
-                - costs.short_borrow_bps / 10_000.0)
+                - costs.short_borrow_annual_bps / 10_000.0 * 10.0 / 252.0)
                 .abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn library_caller_with_explicit_cadence_charges_the_annual_rate_prorated_without_a_cli_rescale()
+    {
+        // Before this fix, the CLI multiplied the fallback `short_borrow_bps`
+        // by `cadence/5` before calling into the library, making the field
+        // implicitly "per 5 sessions" -- correct only because of that
+        // external rescale. The library now takes the cadence explicitly and
+        // prorates an annual rate itself: the frozen realized charge at
+        // cadence 20 was 40 bps per holding period (10.0 default *
+        // 20/5 CLI rescale). The equivalent annual rate is
+        // 40 bps * 252/20 = 504 bps, so a caller that passes cadence
+        // straight into the library -- no CLI rescale involved -- must still
+        // realize 504 bps * 20/252 = 40 bps over a 20-session holding period.
+        let mut unobserved = row(day("2024-01-02"));
+        unobserved.borrow_fee_annualized = None;
+        let costs = CostConfig::default();
+        assert!((costs.short_borrow_annual_bps - 504.0).abs() < 1e-9);
+        let charge = holding_borrow_cost(&unobserved, 20, &costs).unwrap();
+        assert!((charge - 0.0040).abs() < 1e-12, "got {charge}");
     }
 
     #[test]
@@ -3582,7 +5649,7 @@ mod tests {
                 let mut value = row(date);
                 value.instrument_id = format!("TX{index}");
                 value.features.insert("x_ret_1".into(), score);
-                value.target = score * 0.05;
+                value.target = Some(score * 0.05);
                 value
             })
             .collect::<Vec<_>>();
@@ -3603,6 +5670,9 @@ mod tests {
         assert_eq!(diagnostic.cost_drag, 0.0);
         assert_eq!(diagnostic.steps[0].long_positions, 2);
         assert_eq!(diagnostic.steps[0].short_positions, 2);
+        // Out of Task 3's gated-evaluation scope: self-discloses nominal (rf
+        // 0.0), not silently non-excess with no field saying so.
+        assert_eq!(diagnostic.risk_free_annual, 0.0);
     }
 
     #[test]
@@ -3620,7 +5690,7 @@ mod tests {
             value.instrument_id = instrument.into();
             value.symbol = instrument.into();
             value.momentum_12_1 = Some(momentum);
-            value.target = target;
+            value.target = Some(target);
             value
         })
         .collect::<Vec<_>>();
@@ -3645,6 +5715,62 @@ mod tests {
         assert_eq!(result.long_only.steps[0].long_positions, 2);
         assert_eq!(result.long_only.steps[0].short_positions, 0);
         assert!((result.long_only.steps[0].net_return - 0.075).abs() < 1e-12);
+        assert!(!result
+            .disclosures
+            .iter()
+            .any(|line| line.contains("no terminal value")));
+    }
+
+    #[test]
+    fn the_fixed_momentum_control_discloses_the_rows_it_could_not_price() {
+        let date = day("2024-02-01");
+        let mut rows = [("A", 0.40, 0.10), ("B", 0.20, 0.05), ("C", -0.30, -0.08)]
+            .into_iter()
+            .map(|(instrument, momentum, target)| {
+                let mut value = row(date);
+                value.instrument_id = instrument.into();
+                value.symbol = instrument.into();
+                value.momentum_12_1 = Some(momentum);
+                value.target = Some(target);
+                value
+            })
+            .collect::<Vec<_>>();
+        // The strongest trend of the date stopped trading inside the holding
+        // period. The control cannot price its exit, so it silently would
+        // have ranked a weaker name instead.
+        let mut delisted = row(date);
+        delisted.instrument_id = "GONE".into();
+        delisted.symbol = "GONE".into();
+        delisted.momentum_12_1 = Some(0.90);
+        delisted.target = None;
+        rows.push(delisted);
+
+        let result = fixed_momentum_backtest(
+            &rows,
+            &FixedMomentumConfig {
+                start: date,
+                end: date,
+                cadence_sessions: 20,
+                max_positions: 2,
+                position_weight: 0.5,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                survivorship_status: "test".into(),
+            },
+        )
+        .unwrap();
+
+        // A (+0.40) and C (-0.30) are taken, not the stronger unpriceable
+        // GONE (+0.90): 0.5 * 0.10 + 0.5 * 0.08.
+        assert_eq!(result.directional.steps[0].long_positions, 1);
+        assert_eq!(result.directional.steps[0].short_positions, 1);
+        assert!((result.directional.steps[0].net_return - 0.09).abs() < 1e-12);
+        let disclosure = result
+            .disclosures
+            .iter()
+            .find(|line| line.contains("no terminal value"))
+            .expect("an unpriceable exit must be disclosed");
+        assert!(disclosure.starts_with("1 matrix row(s)"), "{disclosure}");
     }
 
     fn row(date: Date) -> TrainingRow {
@@ -3656,14 +5782,14 @@ mod tests {
             sector: "Industrials".into(),
             bucket: UniverseBucket::LargeCap,
             momentum_12_1: Some(0.1),
-            target: 0.01,
+            target: Some(0.01),
             market_target: Some(0.005),
             relative_target: Some(0.005),
             return_per_risk_target: Some(0.5),
             relative_return_per_risk_target: Some(0.25),
             relative_rank_target: Some(0.5),
-            entry_price: 100.0,
-            exit_price: 101.0,
+            entry_price: Some(100.0),
+            exit_price: Some(101.0),
             adv20_sek: 10_000_000.0,
             vol60: 0.02,
             borrow_fee_annualized: None,
@@ -3681,7 +5807,7 @@ mod tests {
             fallback_spread_bps: 0.0,
             market_friction_multiple: 1.0,
             first_north_extra_bps: 0.0,
-            short_borrow_bps: 0.0,
+            short_borrow_annual_bps: 0.0,
             short_availability_bps: 0.0,
             safety_margin_bps: 0.0,
         }
@@ -3713,6 +5839,106 @@ mod tests {
     }
 
     #[test]
+    fn the_replay_never_trades_a_cross_section_member_it_cannot_price() {
+        let unlabelled = |date: Date, instrument: &str, entry_price: Option<f64>| {
+            let mut value = row(date);
+            value.instrument_id = instrument.into();
+            value.symbol = instrument.into();
+            value.entry_price = entry_price;
+            value.exit_price = None;
+            value.target = None;
+            value.relative_target = None;
+            value.return_per_risk_target = None;
+            value.relative_return_per_risk_target = None;
+            value.relative_rank_target = None;
+            value
+        };
+        // Never entered at all versus entered and then delisted mid-horizon.
+        // Neither is replayable; only the second is a survivorship gap worth
+        // disclosing, because that position would otherwise have been opened.
+        let never_entered = unlabelled(day("2024-01-02"), "NOENTRY", None);
+        let delisted = unlabelled(day("2024-01-02"), "GONE", Some(100.0));
+        assert!(!never_entered.is_replayable());
+        assert!(!never_entered.entered_without_an_observed_exit());
+        assert!(!delisted.is_replayable());
+        assert!(delisted.entered_without_an_observed_exit());
+        assert!(row(day("2024-01-02")).is_replayable());
+        // A new matrix carries decision-date rows whose forward outcome was
+        // never observed. They must survive deserialization, stay out of the
+        // book, and never turn a labelless date into a rebalance.
+        let encoded = serde_json::to_string(&never_entered).unwrap();
+        assert!(encoded.contains("\"target\":null"));
+        assert!(encoded.contains("\"entry_price\":null"));
+        let decoded: TrainingRow = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.target, None);
+
+        let rows = [
+            row(day("2024-01-02")),
+            never_entered.clone(),
+            delisted.clone(),
+            row(day("2024-01-03")),
+            unlabelled(day("2024-01-04"), "GONE", Some(100.0)),
+        ];
+        let result = backtest(
+            &constant_model(0.02),
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-04"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 0.05,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 2);
+        assert!(result
+            .steps
+            .iter()
+            .all(|step| step.date != day("2024-01-04")));
+        assert!(result
+            .steps
+            .iter()
+            .flat_map(|step| &step.positions)
+            .all(|position| !["GONE", "NOENTRY"].contains(&position.instrument_id.as_str())));
+        // Skipped rather than scored as a zero realized return.
+        assert_eq!(result.diagnostics.unwrap().observations, 2);
+        // The one entered-then-delisted row on a replayed rebalance date is
+        // disclosed, not absorbed. The 2024-01-04 row is not counted because
+        // that whole date has no observed outcome and is never replayed.
+        let disclosure = result
+            .disclosures
+            .iter()
+            .find(|line| line.contains("no terminal value"))
+            .expect("an unpriceable exit must be disclosed");
+        assert!(
+            disclosure.starts_with("1 rebalance-date row(s)"),
+            "{disclosure}"
+        );
+    }
+
+    #[test]
     fn direction_is_not_forced_and_unchanged_positions_do_not_round_trip() {
         let rows = [row(day("2024-01-02")), row(day("2024-01-03"))];
         let costs = CostConfig {
@@ -3736,6 +5962,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -3746,6 +5973,8 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -3759,6 +5988,563 @@ mod tests {
         // One 50 bp entry and one 50 bp terminal exit on a 5% position.
         assert!((result.metrics.cost_drag - 0.0005).abs() < 1e-12);
         assert!((result.steps.iter().map(|step| step.turnover).sum::<f64>() - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn daily_marks_price_the_book_on_every_held_session() {
+        let decision = day("2024-01-02");
+        let mut first = row(decision);
+        first.entry_price = Some(100.0);
+        first.exit_price = Some(120.0);
+        first.target = Some(0.20);
+        let mut second = row(decision);
+        second.instrument_id = "TX2".into();
+        second.symbol = "OTHER".into();
+        second.entry_price = Some(50.0);
+        second.exit_price = Some(55.0);
+        second.target = Some(0.10);
+        // Decision session plus the three held sessions; the position is bought
+        // at the open after the decision and sold at the open after the last.
+        let sessions = [
+            decision,
+            day("2024-01-03"),
+            day("2024-01-04"),
+            day("2024-01-05"),
+            day("2024-01-08"),
+        ];
+        let mut mark_prices = MarkPrices::default();
+        mark_prices
+            .insert_history(
+                "TX1",
+                sessions
+                    .iter()
+                    .copied()
+                    .zip([98.0, 110.0, 105.0, 118.0, 121.0]),
+            )
+            .unwrap();
+        mark_prices
+            .insert_history(
+                "TX2",
+                sessions.iter().copied().zip([51.0, 45.0, 48.0, 54.0, 56.0]),
+            )
+            .unwrap();
+        let costs = CostConfig {
+            round_trip_bps: 100.0,
+            round_trip_commission_bps: 100.0,
+            ..zero_execution_costs()
+        };
+        let result = backtest(
+            &constant_model(0.02),
+            &[first, second],
+            &BacktestConfig {
+                start: decision,
+                end: decision,
+                cadence_sessions: 3,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 3,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 0.5,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs,
+                benchmark: None,
+                mark_prices: Some(mark_prices),
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+        let step = &result.steps[0];
+        assert_eq!(step.daily_marks.len(), 3);
+        assert_eq!(
+            step.daily_marks
+                .iter()
+                .map(|mark| mark.date)
+                .collect::<Vec<_>>(),
+            sessions[1..4].to_vec(),
+        );
+        // Equal 50% legs: the first session's closes offset each other exactly,
+        // so only the 25 bp entry leg on each position shows up.
+        assert!((step.daily_marks[0].nav - 0.995).abs() < 1e-12);
+        assert!((step.daily_marks[1].nav - 1.0).abs() < 1e-12);
+        // The rebalance session is marked at the realised exit, which already
+        // carries the terminal exit leg.
+        assert!((step.daily_marks[2].nav - step.nav).abs() < 1e-12);
+        let mut compounded = 1.0;
+        let mut previous = 1.0;
+        for mark in &step.daily_marks {
+            compounded *= mark.nav / previous;
+            previous = mark.nav;
+        }
+        assert!((compounded - 1.0 - step.period_return).abs() < 1e-12);
+    }
+
+    /// Fifteen sessions of one instrument at hand-set prices, replayed once per
+    /// rebalance offset. Both phases hold the same asset throughout, which is
+    /// the case where a combined result that beats every phase can only be an
+    /// artefact of the combination.
+    fn two_phase_replay(with_marks: bool) -> Vec<BacktestResult> {
+        two_phase_replay_against(with_marks, false)
+    }
+
+    /// The index the fifteen-session replay is compared against: its own close
+    /// path, with `start_value` set to the previous close exactly as the OMXSGI
+    /// archive does, so a leg priced off SOD is visibly a session behind.
+    fn two_phase_benchmark(sessions: &[Date]) -> BenchmarkHistory {
+        let closes = [
+            1000.0, 1004.0, 998.0, 1006.0, 1012.0, 1002.0, 1000.0, 1015.0, 1008.0, 1020.0, 1010.0,
+            1025.0, 1014.0, 1028.0, 1018.0,
+        ];
+        BenchmarkHistory {
+            format_version: "fixture".into(),
+            symbol: "OMXSGI".into(),
+            name: "fixture".into(),
+            return_type: "gross_total_return".into(),
+            currency: "SEK".into(),
+            source: "fixture".into(),
+            generated_at: "fixture".into(),
+            bars: sessions
+                .iter()
+                .zip(closes)
+                .enumerate()
+                .map(|(index, (date, close))| equity_data::BenchmarkBar {
+                    date: *date,
+                    start_value: closes[index.saturating_sub(1)],
+                    end_value: close,
+                    high_value: None,
+                    low_value: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn two_phase_replay_against(with_marks: bool, with_benchmark: bool) -> Vec<BacktestResult> {
+        let sessions = [
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-08",
+            "2024-01-09",
+            "2024-01-10",
+            "2024-01-11",
+            "2024-01-12",
+            "2024-01-15",
+            "2024-01-16",
+            "2024-01-17",
+            "2024-01-18",
+            "2024-01-19",
+            "2024-01-22",
+        ]
+        .map(day);
+        let prices = [
+            100.0, 101.0, 99.5, 102.0, 103.5, 101.0, 100.5, 104.0, 102.5, 105.0, 103.0, 106.5,
+            104.5, 107.0, 105.0,
+        ];
+        let cadence = 2;
+        // Decisions are taken on the first eleven sessions; the book is bought at
+        // the next session's price and sold `cadence` sessions later.
+        let rows = (0..11)
+            .map(|index| {
+                let mut row = row(sessions[index]);
+                row.entry_price = Some(prices[index + 1]);
+                row.exit_price = Some(prices[index + 1 + cadence]);
+                row.target = Some(prices[index + 1 + cadence] / prices[index + 1] - 1.0);
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut mark_prices = MarkPrices::default();
+        mark_prices
+            .insert_history("TX1", sessions.iter().copied().zip(prices))
+            .unwrap();
+        (0..cadence)
+            .map(|offset| {
+                backtest(
+                    &constant_model(0.02),
+                    &rows,
+                    &BacktestConfig {
+                        start: sessions[0],
+                        end: sessions[10],
+                        cadence_sessions: cadence,
+                        rebalance_offset_sessions: offset,
+                        model_horizon_sessions: cadence,
+                        prediction_horizon_scale: 1.0,
+                        max_positions: 1,
+                        retention_rank: 1,
+                        max_sector_gross: None,
+                        ranking: portfolio_construction::RankingMethod::Edge,
+                        sizing: portfolio_construction::SizingMethod::Equal,
+                        allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                        allocation_mode: AllocationMode::Directional,
+                        position_weight: 1.0,
+                        min_position_weight: 0.0,
+                        reference_edge: 0.01,
+                        reference_volatility: 0.02,
+                        direction_config: None,
+                        prediction_composition: PredictionComposition::Direct,
+                        market_return_forecasts: None,
+                        market_forecast_model_id: None,
+                        costs: zero_execution_costs(),
+                        benchmark: with_benchmark.then(|| two_phase_benchmark(&sessions)),
+                        mark_prices: with_marks.then(|| mark_prices.clone()),
+                        risk_free_annual: 0.0,
+                    },
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn daily_marks_combine_phases_on_the_calendar_at_daily_frequency() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        assert_eq!(summary.combination_method, CALENDAR_ALIGNED_DAILY_NAV);
+        assert_eq!(summary.performance.periods_per_year, SESSIONS_PER_YEAR);
+        // Offset 0 marks 2024-01-03..01-18 and offset 1 marks 01-04..01-17, so
+        // both phases are invested over the ten sessions in between.
+        assert_eq!(summary.combined_start, Some(day("2024-01-04")));
+        assert_eq!(summary.combined_end, Some(day("2024-01-17")));
+        assert_eq!(summary.period_returns.len(), 9);
+        assert_eq!(summary.common_complete_periods, 9);
+        assert!(summary.benchmark_combination_method.is_none());
+    }
+
+    #[test]
+    fn the_benchmark_rides_the_bots_own_daily_grid_and_the_active_tstat_follows() {
+        let summary =
+            summarize_rebalance_phases(&two_phase_replay_against(true, true), 0.02).unwrap();
+        assert_eq!(
+            summary.benchmark_combination_method.as_deref(),
+            Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE)
+        );
+        // The combined book is marked 2024-01-04..01-17; the index leg is its
+        // own closing level on exactly those sessions, independently listed
+        // here rather than read back out of the replay.
+        let closes = [
+            998.0, 1006.0, 1012.0, 1002.0, 1000.0, 1015.0, 1008.0, 1020.0, 1010.0, 1025.0,
+        ];
+        let expected = closes
+            .windows(2)
+            .map(|pair| pair[1] / pair[0] - 1.0)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.benchmark_period_returns.len(), expected.len());
+        for (actual, expected) in summary.benchmark_period_returns.iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1e-12, "{actual} vs {expected}");
+        }
+        assert_eq!(
+            summary.benchmark_period_returns.len(),
+            summary.period_returns.len(),
+            "both legs must be measured on one grid"
+        );
+        let benchmark = summary.benchmark_performance.as_ref().unwrap();
+        assert_eq!(benchmark.periods_per_year, SESSIONS_PER_YEAR);
+        assert!((benchmark.total_return - (1025.0 / 998.0 - 1.0)).abs() < 1e-12);
+        // The whole point of the shared grid: the active t-stat is computable.
+        let observed = summary
+            .active_tstat
+            .expect("active t-stat on a shared grid");
+        let hand = active_tstat(&summary.period_returns, &summary.benchmark_period_returns)
+            .expect("paired series");
+        assert!((observed - hand).abs() < 1e-12);
+        assert_eq!(summary.active_tstat_status, None);
+    }
+
+    #[test]
+    fn a_report_without_benchmark_daily_marks_falls_back_and_says_why() {
+        // Exactly what a frozen pre-Task-4 phase report looks like: bot daily
+        // marks, no benchmark ones, and the field absent from the JSON.
+        let mut phases = two_phase_replay_against(true, true)
+            .into_iter()
+            .map(|report| {
+                let mut value = serde_json::to_value(&report).unwrap();
+                for step in value["steps"].as_array_mut().unwrap() {
+                    assert!(step
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("benchmark_daily_marks")
+                        .is_some());
+                }
+                serde_json::from_value::<BacktestResult>(value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_rebalance_phases(&phases, 0.02).unwrap();
+        assert_eq!(summary.combination_method, CALENDAR_ALIGNED_DAILY_NAV);
+        assert_eq!(
+            summary.benchmark_combination_method.as_deref(),
+            Some(SINGLE_PHASE_INDEX_PATH)
+        );
+        assert_eq!(summary.active_tstat, None);
+        assert_eq!(
+            summary.active_tstat_status.as_deref(),
+            Some(LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS)
+        );
+
+        // Half-marked is neither: it would compare a daily index leg in one
+        // phase against a holding-period one in the next.
+        phases[0] = two_phase_replay_against(true, true).remove(0);
+        let error = summarize_rebalance_phases(&phases, 0.02).unwrap_err();
+        assert!(error.contains("benchmark"), "{error}");
+    }
+
+    #[test]
+    fn daily_phase_diagnostics_still_reconcile_with_each_phase_report() {
+        let phases = two_phase_replay(true);
+        let summary = summarize_rebalance_phases(&phases, 0.02).unwrap();
+        for (diagnostic, report) in summary.phase_diagnostics.iter().zip(&phases) {
+            // Re-measuring a phase daily may not quietly restate what it earned:
+            // the mark path opens at NAV 1.0 and closes on the phase's own NAV.
+            assert!(
+                (diagnostic.total_return - report.metrics.total_return).abs() < 1e-12,
+                "phase {} daily total return {} differs from its report's {}",
+                diagnostic.offset_sessions,
+                diagnostic.total_return,
+                report.metrics.total_return
+            );
+            assert_eq!(
+                diagnostic.periods,
+                report
+                    .steps
+                    .iter()
+                    .map(|step| step.daily_marks.len())
+                    .sum::<usize>()
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_aligned_phase_diagnostics_report_the_summarys_own_rf() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        for diagnostic in &summary.phase_diagnostics {
+            assert_eq!(diagnostic.risk_free_annual, 0.02);
+        }
+    }
+
+    #[test]
+    fn legacy_phase_diagnostics_keep_the_frozen_phase_reports_own_rf_not_the_summarys() {
+        // The phase reports were replayed at rf 0.0 (two_phase_replay's fixed
+        // BacktestConfig.risk_free_annual); the summary itself is asked for a
+        // different rate. In the legacy (period-index) branch, a phase
+        // diagnostic's sharpe was never recomputed at the summary's rate — it
+        // is read straight from the frozen phase report — so its
+        // risk_free_annual must disclose the phase's own 0.0, not silently
+        // inherit the summary's 0.05, or a reader could not tell the two
+        // bases differ.
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.05).unwrap();
+        assert_eq!(summary.performance.risk_free_annual, 0.05);
+        for diagnostic in &summary.phase_diagnostics {
+            assert_eq!(diagnostic.risk_free_annual, 0.0);
+        }
+    }
+
+    #[test]
+    fn phases_without_daily_marks_disclose_the_legacy_period_index_average() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        assert_eq!(summary.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
+        assert_eq!(summary.performance.periods_per_year, 126.0);
+        assert_eq!(summary.combined_start, None);
+        assert!(summary
+            .disclosures
+            .iter()
+            .any(|line| line.contains("no daily NAV marks")));
+    }
+
+    /// A phase summary as it would have been written before performance blocks
+    /// carried their observation frequency.
+    fn without_recorded_frequency(summary: &RebalancePhaseSummary) -> RebalancePhaseSummary {
+        let mut value = serde_json::to_value(summary).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("combination_method");
+        object["performance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("periods_per_year");
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn shift_fold(
+        summary: &RebalancePhaseSummary,
+        start: &str,
+        end: &str,
+    ) -> RebalancePhaseSummary {
+        let mut shifted = summary.clone();
+        shifted.start = day(start);
+        shifted.end = day(end);
+        shifted
+    }
+
+    #[test]
+    fn a_fold_without_a_recorded_frequency_gets_it_back_rather_than_zero() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let old = without_recorded_frequency(&summary);
+        assert_eq!(old.performance.periods_per_year, 0.0);
+        assert_eq!(old.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
+        let folds = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&old, "2024-01-02", "2024-01-16"),
+                shift_fold(&old, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
+        .unwrap();
+        for diagnostic in &folds.fold_diagnostics {
+            assert_eq!(diagnostic.performance.periods_per_year, 126.0);
+        }
+    }
+
+    #[test]
+    fn fold_summary_names_the_active_tstat_threshold_the_gate_uses() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let folds = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&summary, "2024-01-02", "2024-01-16"),
+                shift_fold(&summary, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(folds.active_tstat_threshold, 2.0);
+        // `passed`'s active-tstat condition is exactly this named threshold,
+        // not a second, possibly-drifted literal.
+        assert_eq!(
+            folds.passed,
+            folds.survivorship_status == "POINT_IN_TIME"
+                && folds.performance.total_return > 0.0
+                && folds.positive_folds * 2 > folds.folds
+                && folds
+                    .active_tstat
+                    .is_some_and(|value| value >= folds.active_tstat_threshold)
+                && folds.performance.sharpe - 1.64 * folds.performance.sharpe_se
+                    >= folds.target_sharpe_floor
+        );
+    }
+
+    #[test]
+    fn a_fold_summary_with_no_cadence_to_derive_a_frequency_from_is_rejected() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let mut old = without_recorded_frequency(&summary);
+        old.cadence_sessions = 0;
+        let error = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&old, "2024-01-02", "2024-01-16"),
+                shift_fold(&old, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("no observation frequency and no cadence"),
+            "expected a underivable-frequency error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_that_price_their_index_differently_may_not_be_concatenated() {
+        let daily =
+            summarize_rebalance_phases(&two_phase_replay_against(true, true), 0.02).unwrap();
+        assert_eq!(
+            daily.benchmark_combination_method.as_deref(),
+            Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE)
+        );
+        let mut legacy = shift_fold(&daily, "2024-02-01", "2024-02-15");
+        legacy.benchmark_combination_method = Some(SINGLE_PHASE_INDEX_PATH.into());
+        let error = summarize_rebalance_phase_folds(
+            &[shift_fold(&daily, "2024-01-02", "2024-01-16"), legacy],
+            0.02,
+            1.0,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("combine their benchmark differently"),
+            "expected a mixed-benchmark error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_combined_by_different_methods_may_not_be_concatenated() {
+        let daily = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        let legacy = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let error = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&daily, "2024-01-02", "2024-01-16"),
+                shift_fold(&legacy, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("combine their phases differently"),
+            "expected a mixed-combination error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_whose_combined_windows_overlap_may_not_be_concatenated() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        assert_eq!(summary.combined_end, Some(day("2024-01-17")));
+        // Declared bounds do not overlap — the second fold decides after the
+        // first one stops — but the first fold's book is still marked into the
+        // second fold's opening session.
+        let first = shift_fold(&summary, "2024-01-02", "2024-01-16");
+        let mut second = shift_fold(&summary, "2024-01-18", "2024-02-15");
+        second.combined_start = Some(day("2024-01-17"));
+        second.combined_end = Some(day("2024-02-16"));
+        let error = summarize_rebalance_phase_folds(&[first, second], 0.02, 1.0).unwrap_err();
+        assert!(
+            error.contains("combined windows overlap")
+                && error.contains("2024-01-17")
+                && error.contains("through 2024-01-17"),
+            "expected the combined dates in the error, got {error}"
+        );
+    }
+
+    #[test]
+    fn phases_may_not_mix_marked_and_unmarked_reports() {
+        let marked = two_phase_replay(true);
+        let unmarked = two_phase_replay(false);
+        let error = summarize_rebalance_phases(&[marked[0].clone(), unmarked[1].clone()], 0.02)
+            .unwrap_err();
+        assert!(
+            error.contains("daily NAV marks"),
+            "expected a mixed-marks error, got {error}"
+        );
+    }
+
+    #[test]
+    fn frozen_reports_without_daily_marks_stay_readable() {
+        let step: Step = serde_json::from_str(
+            r#"{
+                "date": "2024-01-02",
+                "nav": 1.01,
+                "period_return": 0.01,
+                "gross": 0.5,
+                "net": 0.1,
+                "turnover": 0.5,
+                "long_pnl": 0.02,
+                "short_pnl": -0.01,
+                "cost_drag": 0.001,
+                "positions": []
+            }"#,
+        )
+        .unwrap();
+        assert!(step.daily_marks.is_empty());
+        let round_trip: Step =
+            serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
+        assert!(round_trip.daily_marks.is_empty());
     }
 
     #[test]
@@ -3784,6 +6570,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -3794,6 +6581,8 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -3828,6 +6617,7 @@ mod tests {
                     ranking: portfolio_construction::RankingMethod::Edge,
                     sizing: portfolio_construction::SizingMethod::Equal,
                     allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                    allocation_mode: AllocationMode::Directional,
                     position_weight: 0.05,
                     min_position_weight: 0.0,
                     reference_edge: 0.01,
@@ -3838,18 +6628,20 @@ mod tests {
                     market_forecast_model_id: None,
                     costs: zero_execution_costs(),
                     benchmark: None,
+                    mark_prices: None,
+                    risk_free_annual: 0.0,
                 },
             )
             .unwrap()
         };
         let phase_zero = replay(0);
         let phase_one = replay(1);
-        let summary = summarize_rebalance_phases(&[phase_zero.clone(), phase_one]).unwrap();
+        let summary = summarize_rebalance_phases(&[phase_zero.clone(), phase_one], 0.02).unwrap();
         assert_eq!(summary.phase_count, 2);
         assert_eq!(summary.common_complete_periods, 2);
         assert_eq!(summary.period_returns.len(), 2);
         assert!(
-            summarize_rebalance_phases(&[phase_zero.clone(), phase_zero])
+            summarize_rebalance_phases(&[phase_zero.clone(), phase_zero], 0.02)
                 .unwrap_err()
                 .contains("offsets")
         );
@@ -3877,6 +6669,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -3889,6 +6682,8 @@ mod tests {
                 market_forecast_model_id: Some("market-fixture".into()),
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -3919,6 +6714,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -3931,6 +6727,8 @@ mod tests {
                 market_forecast_model_id: Some("market-fixture".into()),
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -3965,6 +6763,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -3975,6 +6774,8 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4010,6 +6811,29 @@ mod tests {
     }
 
     #[test]
+    fn cost_config_still_reads_the_legacy_short_borrow_bps_field_name() {
+        // Frozen reports on disk (e.g. var/stockholm-remediation/phase-0-v3.json)
+        // still serialize the old `short_borrow_bps` key under `deny_unknown_fields`.
+        // They must stay readable, even though their number was the old
+        // per-holding-period convention rather than the new annual rate.
+        let costs: CostConfig = serde_json::from_str(
+            r#"{
+                "round_trip_bps": 35.0,
+                "round_trip_commission_bps": 10.0,
+                "round_trip_impact_bps": 5.0,
+                "fallback_spread_bps": 20.0,
+                "market_friction_multiple": 1.0,
+                "first_north_extra_bps": 35.0,
+                "short_borrow_bps": 40.0,
+                "short_availability_bps": 25.0,
+                "safety_margin_bps": 10.0
+            }"#,
+        )
+        .unwrap();
+        assert!((costs.short_borrow_annual_bps - 40.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn borrow_diagnostics_separate_observed_cost_from_availability_penalty() {
         let mut observed = row(day("2024-01-02"));
         observed.borrow_fee_annualized = Some(0.252);
@@ -4029,6 +6853,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -4038,11 +6863,13 @@ mod tests {
                 market_return_forecasts: None,
                 market_forecast_model_id: None,
                 costs: CostConfig {
-                    short_borrow_bps: 10.0,
+                    short_borrow_annual_bps: 10.0,
                     short_availability_bps: 20.0,
                     ..zero_execution_costs()
                 },
                 benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4076,6 +6903,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -4088,6 +6916,8 @@ mod tests {
                 market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4102,11 +6932,16 @@ mod tests {
         assert_eq!(direction.periods, 2);
         assert_eq!(direction.strong_up_periods, 2);
         assert!(direction.total_return > 0.0);
+        // Out of Task 3's gated-evaluation scope: self-discloses nominal (rf
+        // 0.0), not silently non-excess with no field saying so.
+        assert_eq!(direction.risk_free_annual, 0.0);
     }
 
-    #[test]
-    fn benchmark_uses_next_session_sod_over_the_same_horizon() {
-        let history = BenchmarkHistory {
+    /// Four sessions whose start-of-day level is *not* the previous close, so a
+    /// leg priced off `start_value` cannot accidentally agree with one priced
+    /// off the close.
+    fn sod_eod_benchmark() -> BenchmarkHistory {
+        BenchmarkHistory {
             format_version: "fixture".into(),
             symbol: "OMXSGI".into(),
             name: "fixture".into(),
@@ -4115,21 +6950,126 @@ mod tests {
             source: "fixture".into(),
             generated_at: "fixture".into(),
             bars: [
-                ("2024-01-02", 99.0),
-                ("2024-01-03", 100.0),
-                ("2024-01-04", 102.0),
-                ("2024-01-05", 103.0),
+                ("2024-01-02", 90.0, 100.0),
+                ("2024-01-03", 95.0, 102.0),
+                ("2024-01-04", 97.0, 105.0),
+                ("2024-01-05", 99.0, 107.0),
             ]
             .into_iter()
-            .map(|(date, value)| equity_data::BenchmarkBar {
+            .map(|(date, start_value, end_value)| equity_data::BenchmarkBar {
                 date: day(date),
-                start_value: value,
-                end_value: value,
+                start_value,
+                end_value,
                 high_value: None,
                 low_value: None,
             })
             .collect(),
+        }
+    }
+
+    #[test]
+    fn benchmark_period_return_spans_session_closes_not_the_archives_sod() {
+        let history = sod_eod_benchmark();
+        // Decide at the close of 01-02, exit at the close of 01-03: the index
+        // leg is EOD(exit)/EOD(entry) - 1 = 102/100 - 1, on the same session
+        // closes the portfolio's daily NAV marks use. The retired convention
+        // read SOD(01-04)/SOD(01-03) - 1 = 97/95 - 1.
+        let value = benchmark_return(&history, day("2024-01-02"), 1).unwrap();
+        assert!((value - 0.02).abs() < 1e-12, "got {value}");
+        let two_sessions = benchmark_return(&history, day("2024-01-02"), 2).unwrap();
+        assert!((two_sessions - 0.05).abs() < 1e-12, "got {two_sessions}");
+        // The index has no session before 01-02, so a decision taken there
+        // cannot be priced rather than silently sliding to another anchor.
+        assert!(benchmark_return(&history, day("2024-01-01"), 1).is_err());
+    }
+
+    /// Task 15 controller ruling: an index archive can carry a bar on a date
+    /// the equity market is closed (e.g. a bank holiday the index still
+    /// prices through) — 2023-06-06, Sweden's National Day, is the case that
+    /// broke the Task 15 overlay replay. `benchmark_period_on_dates` reads
+    /// the archive strictly by the book's own session dates, so such an
+    /// extra bar must never be consulted and must not change the result; a
+    /// bar genuinely missing on one of the book's own dates must still be
+    /// refused.
+    #[test]
+    fn benchmark_period_on_dates_ignores_extra_archive_bars_and_still_refuses_missing_ones() {
+        let index_bar = |date: Date, value: f64| equity_data::BenchmarkBar {
+            date,
+            start_value: value,
+            end_value: value,
+            high_value: None,
+            low_value: None,
         };
+        // The book's own equity sessions skip 2024-01-03 entirely (the
+        // simulated holiday); the index archive below still has a bar for
+        // it.
+        let clean = BenchmarkHistory {
+            format_version: "fixture".into(),
+            symbol: "OMXSGI".into(),
+            name: "fixture".into(),
+            return_type: "gross_total_return".into(),
+            currency: "SEK".into(),
+            source: "fixture".into(),
+            generated_at: "fixture".into(),
+            bars: vec![
+                index_bar(day("2024-01-01"), 100.0),
+                index_bar(day("2024-01-02"), 100.5),
+                index_bar(day("2024-01-04"), 101.0),
+                index_bar(day("2024-01-05"), 101.5),
+            ],
+        };
+        let mut with_holiday_bar = clean.clone();
+        with_holiday_bar
+            .bars
+            .insert(2, index_bar(day("2024-01-03"), 999.0));
+
+        let session_dates = [day("2024-01-04"), day("2024-01-05")];
+        let clean_period =
+            benchmark_period_on_dates(&clean, day("2024-01-02"), &session_dates).unwrap();
+        let holiday_period =
+            benchmark_period_on_dates(&with_holiday_bar, day("2024-01-02"), &session_dates)
+                .unwrap();
+        assert_eq!(clean_period.value, holiday_period.value);
+        assert_eq!(clean_period.entry_close, holiday_period.entry_close);
+        assert_eq!(
+            clean_period
+                .marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+            holiday_period
+                .marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !holiday_period
+                .marks
+                .iter()
+                .any(|mark| mark.date == day("2024-01-03")),
+            "the equity-closed date must never be consulted: {:?}",
+            holiday_period.marks
+        );
+
+        // A book session date the index genuinely has no bar for is still
+        // refused, not silently skipped or substituted.
+        let mut missing_a_book_date = clean.clone();
+        missing_a_book_date
+            .bars
+            .retain(|bar| bar.date != day("2024-01-04"));
+        let error =
+            benchmark_period_on_dates(&missing_a_book_date, day("2024-01-02"), &session_dates)
+                .unwrap_err();
+        assert!(
+            error.contains("2024-01-04"),
+            "expected the missing date named in the error: {error}"
+        );
+    }
+
+    #[test]
+    fn benchmark_uses_session_closes_over_the_same_horizon() {
+        let history = sod_eod_benchmark();
         let result = backtest(
             &constant_model(0.02),
             &[row(day("2024-01-02"))],
@@ -4146,6 +7086,7 @@ mod tests {
                 ranking: portfolio_construction::RankingMethod::Edge,
                 sizing: portfolio_construction::SizingMethod::Equal,
                 allocation_budget: portfolio_construction::Budget::gross_only(0.05).unwrap(),
+                allocation_mode: AllocationMode::Directional,
                 position_weight: 0.05,
                 min_position_weight: 0.0,
                 reference_edge: 0.01,
@@ -4156,10 +7097,790 @@ mod tests {
                 market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(history),
+                mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
         assert!((result.steps[0].benchmark_period_return.unwrap() - 0.02).abs() < 1e-12);
+        // The same period, marked session by session at the index's own closes.
+        assert_eq!(
+            result.steps[0]
+                .benchmark_daily_marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+            vec![(day("2024-01-03"), 102.0)]
+        );
         assert_eq!(result.benchmark.unwrap().symbol, "OMXSGI");
+    }
+
+    #[test]
+    fn sharpe_shifts_by_the_risk_free_rate_over_annualised_volatility() {
+        // A non-degenerate return series so annualised volatility is nonzero;
+        // periods_per_year = 1 makes the per-period risk-free conversion exact
+        // (`(1+rf)^1 - 1 = rf`), so the shift is precisely `rf / vol_ann`.
+        let returns = [0.05, -0.02, 0.03, 0.01];
+        let periods_per_year = 1.0;
+        let zero_rf = return_metrics(&returns, periods_per_year, 0.0);
+        let with_rf = return_metrics(&returns, periods_per_year, 0.02);
+        // Subtracting a constant per-period rate does not change the spread.
+        assert!((zero_rf.annualised_volatility - with_rf.annualised_volatility).abs() < 1e-12);
+        let expected_shift = 0.02 / zero_rf.annualised_volatility;
+        assert!(
+            (zero_rf.sharpe - with_rf.sharpe - expected_shift).abs() < 1e-9,
+            "expected sharpe to fall by {expected_shift}, got a shift of {}",
+            zero_rf.sharpe - with_rf.sharpe
+        );
+    }
+
+    #[test]
+    fn sharpe_standard_error_matches_the_lo_2002_closed_form() {
+        // Nine periods with mean 0.01 and a hand-computable population
+        // variance: symmetric deviations {-0.04..0.04} step 0.01 sum to zero
+        // (mean stays 0.01) and their squares sum to 0.006, so
+        // variance = 0.006/9 and SR_periodic^2 = mean^2/variance = 0.15 exactly.
+        let returns = [
+            -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05, // 0.01 + each deviation
+        ];
+        assert_eq!(returns.len(), 9);
+        let periods_per_year = 252.0;
+        let metrics = return_metrics(&returns, periods_per_year, 0.0);
+        // se_periodic = sqrt((1 + 0.15/2) / 9); se_annual = se_periodic * sqrt(252)
+        let expected_se_annual = 5.486346689738081_f64;
+        assert!(
+            (metrics.sharpe_se - expected_se_annual).abs() < 1e-9,
+            "expected sharpe_se {expected_se_annual}, got {}",
+            metrics.sharpe_se
+        );
+    }
+
+    #[test]
+    fn active_tstat_matches_a_hand_computed_value_when_grids_agree() {
+        let bot = [0.02, 0.01, 0.03, -0.01];
+        let benchmark = [0.01, 0.015, 0.005, -0.02];
+        // active = [0.01, -0.005, 0.025, 0.01]; mean = 0.01, sample
+        // (N-1-divisor) std computed independently below.
+        let active = [0.01_f64, -0.005, 0.025, 0.01];
+        let active_mean = active.iter().sum::<f64>() / 4.0;
+        let sample_variance = active
+            .iter()
+            .map(|value| (value - active_mean).powi(2))
+            .sum::<f64>()
+            / 3.0;
+        let expected = active_mean / (sample_variance.sqrt() / 4.0_f64.sqrt());
+        let value = active_tstat(&bot, &benchmark).unwrap();
+        assert!(
+            (value - expected).abs() < 1e-9,
+            "expected {expected}, got {value}"
+        );
+    }
+
+    #[test]
+    fn active_tstat_is_unavailable_when_the_two_series_do_not_share_a_grid() {
+        // A daily bot series compared against a benchmark still on
+        // holding-period frequency has a different number of observations —
+        // exactly the calendar-aligned-vs-single-phase-index-path mismatch
+        // combined reports carry until Task 4.
+        let bot = [0.01; 10];
+        let benchmark = [0.01; 3];
+        assert!(active_tstat(&bot, &benchmark).is_none());
+    }
+
+    /// Eight consecutive sessions of one instrument, so an overlay replay has
+    /// both a mark calendar and an index calendar on the same dates.
+    fn overlay_sessions() -> Vec<Date> {
+        (1..=8)
+            .map(|day_of_month| day(&format!("2024-01-0{day_of_month}")))
+            .collect()
+    }
+
+    fn overlay_mark_prices(sessions: &[Date], instruments: &[&str]) -> MarkPrices {
+        let mut prices = MarkPrices::default();
+        for instrument in instruments {
+            prices
+                .insert_history(instrument, sessions.iter().map(|date| (*date, 100.0)))
+                .unwrap();
+        }
+        prices
+    }
+
+    /// The heart of the index-core mode: a configuration that produces no
+    /// candidate at all must still return the index, less only the core's
+    /// tracking cost. A zero prediction with zero costs leaves both the long
+    /// and the short economic edge at exactly zero, and the replay only opens
+    /// a position on a strictly positive edge, so the overlay is empty by
+    /// construction rather than by tuning.
+    #[test]
+    fn an_overlay_replay_without_candidates_earns_the_index_minus_its_tracking_cost() {
+        let sessions = overlay_sessions();
+        let rows = sessions[1..5]
+            .iter()
+            .map(|date| row(*date))
+            .collect::<Vec<_>>();
+        let core_tracking_cost_bps = 10.0;
+        let cadence = 3;
+        let result = backtest(
+            &constant_model(0.0),
+            &rows,
+            &BacktestConfig {
+                start: sessions[1],
+                end: sessions[4],
+                cadence_sessions: cadence,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: cadence,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget: portfolio_construction::OverlayBudget {
+                        core_weight: 1.0,
+                        overlay_gross: 0.4,
+                        overlay_net_cap: 0.0,
+                    },
+                    core_tracking_cost_bps,
+                },
+                position_weight: 0.2,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: Some(overlay_mark_prices(&sessions, &["TX1"])),
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        let tracking = core_tracking_cost_bps / 10_000.0 * cadence as f64 / 252.0;
+        assert_eq!(result.steps.len(), 2);
+        let mut floor_nav = 1.0;
+        for step in &result.steps {
+            assert!(step.positions.is_empty(), "the overlay must be empty");
+            let index = step.benchmark_period_return.expect("core needs the index");
+            assert!(
+                (step.period_return - (index - tracking)).abs() < 1e-9,
+                "period return {} is not the index {index} minus tracking {tracking}",
+                step.period_return
+            );
+            assert!((step.core_return.unwrap() - (index - tracking)).abs() < 1e-9);
+            assert_eq!(step.overlay_return, Some(0.0));
+            // The core is the whole book: one unit of gross, one unit of net.
+            assert!((step.gross - 1.0).abs() < 1e-12);
+            assert!((step.net - 1.0).abs() < 1e-12);
+            floor_nav *= 1.0 + index - tracking;
+        }
+        assert!((result.metrics.total_return - (floor_nav - 1.0)).abs() < 1e-9);
+
+        // Daily marks: the core is marked at the index's own closes on the
+        // sessions between rebalances, with its tracking cost accrued per
+        // session rather than dropped on one of them.
+        let first = &result.steps[0];
+        assert_eq!(first.daily_marks.len(), cadence);
+        let session_tracking = core_tracking_cost_bps / 10_000.0 / 252.0;
+        let entry_close = 100.0 * 1.001_f64.powi(1);
+        for (session, mark) in first.daily_marks.iter().enumerate().take(cadence - 1) {
+            let index_close = 100.0 * 1.001_f64.powi(2 + session as i32);
+            let expected =
+                index_close / entry_close - 1.0 - session_tracking * (session + 1) as f64;
+            assert!(
+                (mark.nav - (1.0 + expected)).abs() < 1e-12,
+                "session {session} mark {} is not the accrued index core {expected}",
+                mark.nav
+            );
+        }
+        assert!((first.daily_marks[cadence - 1].nav - first.nav).abs() < 1e-12);
+
+        let attribution = result
+            .overlay_attribution
+            .as_ref()
+            .expect("an overlay replay must attribute its two legs");
+        assert_eq!(attribution.periods, 2);
+        assert_eq!(attribution.overlay_return, 0.0);
+        assert!((attribution.core_tracking_cost - 2.0 * tracking).abs() < 1e-12);
+        // A dead-flat overlay has no dispersion, so no t-stat exists; the
+        // report says why rather than reporting an infinity.
+        assert_eq!(attribution.overlay_alpha_tstat, None);
+        assert_eq!(
+            attribution.overlay_alpha_tstat_status.as_deref(),
+            Some(NO_ACTIVE_DISPERSION)
+        );
+        assert!(
+            result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("tracking cost") && line.contains("not charged")),
+            "the untraded core's cost model must be disclosed: {:?}",
+            result.disclosures
+        );
+    }
+
+    /// A split model so one instrument is a long candidate and the other a
+    /// short one, which is what a self-funding overlay needs.
+    fn split_model(threshold: f64, below: f64, at_or_above: f64) -> Model {
+        let mut model = constant_model(0.0);
+        model.tree_info = vec![lightgbm_json::Tree {
+            tree_index: 0,
+            num_leaves: 2,
+            num_cat: Some(0),
+            shrinkage: Some(1.0),
+            tree_structure: lightgbm_json::Node {
+                split_feature: Some(0),
+                threshold: Some(threshold),
+                decision_type: Some("<=".into()),
+                default_left: Some(true),
+                missing_type: None,
+                left_child: Some(Box::new(direction_leaf(below))),
+                right_child: Some(Box::new(direction_leaf(at_or_above))),
+                leaf_value: None,
+                diagnostics: Default::default(),
+            },
+        }];
+        model
+    }
+
+    #[test]
+    fn an_active_overlay_decomposes_into_the_core_leg_and_the_self_funding_overlay() {
+        let sessions = overlay_sessions();
+        let long_row = |date: Date| {
+            let mut value = row(date);
+            value.features.insert("x_ret_1".into(), 1.0);
+            value.target = Some(0.01);
+            value
+        };
+        let short_row = |date: Date| {
+            let mut value = row(date);
+            value.instrument_id = "TX2".into();
+            value.symbol = "TX2".into();
+            value.features.insert("x_ret_1".into(), -1.0);
+            value.target = Some(-0.005);
+            value
+        };
+        let rows = sessions[1..5]
+            .iter()
+            .flat_map(|date| [long_row(*date), short_row(*date)])
+            .collect::<Vec<_>>();
+        let costs = CostConfig {
+            round_trip_bps: 20.0,
+            round_trip_commission_bps: 20.0,
+            ..zero_execution_costs()
+        };
+        let core_tracking_cost_bps = 10.0;
+        let cadence = 3;
+        let budget = portfolio_construction::OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.4,
+            overlay_net_cap: 0.0,
+        };
+        let result = backtest(
+            &split_model(0.0, -0.02, 0.02),
+            &rows,
+            &BacktestConfig {
+                start: sessions[1],
+                end: sessions[4],
+                cadence_sessions: cadence,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: cadence,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget,
+                    core_tracking_cost_bps,
+                },
+                position_weight: 0.2,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs,
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        let tracking = core_tracking_cost_bps / 10_000.0 * cadence as f64 / 252.0;
+        assert_eq!(result.steps.len(), 2);
+        for step in &result.steps {
+            assert_eq!(step.positions.len(), 2);
+            let overlay_net = step.positions.iter().map(|p| p.weight).sum::<f64>();
+            let overlay_gross = step.positions.iter().map(|p| p.weight.abs()).sum::<f64>();
+            // Self-funding: the overlay's own net is capped at zero, so the
+            // book's net is exactly the core.
+            assert!(overlay_net.abs() < 1e-12, "overlay net {overlay_net}");
+            assert!((overlay_gross - 0.4).abs() < 1e-12);
+            // Combined book exposure is the core plus the overlay, and the
+            // core never collides with an overlay instrument id.
+            assert!((step.net - (budget.core_weight + overlay_net)).abs() < 1e-12);
+            assert!((step.gross - (budget.core_weight + overlay_gross)).abs() < 1e-12);
+
+            let index = step.benchmark_period_return.unwrap();
+            let core = step.core_return.expect("core leg");
+            let overlay = step.overlay_return.expect("overlay leg");
+            assert!((core - budget.core_weight * (index - tracking)).abs() < 1e-12);
+            // The overlay is charged exactly the costs the ordinary replay
+            // charges, and its return is the sum of its positions' P&L.
+            let position_pnl = step.positions.iter().map(|p| p.pnl).sum::<f64>();
+            assert!((overlay - position_pnl).abs() < 1e-12);
+            let gross_overlay = step
+                .positions
+                .iter()
+                .map(|p| p.weight * p.realised_return)
+                .sum::<f64>();
+            assert!((overlay - (gross_overlay - step.cost_drag)).abs() < 1e-12);
+            assert!(step.cost_drag > 0.0, "the overlay must pay execution costs");
+            // The whole period return decomposes into the two legs exactly.
+            assert!(
+                (step.period_return - (core + overlay)).abs() < 1e-12,
+                "period {} is not core {core} plus overlay {overlay}",
+                step.period_return
+            );
+        }
+        let attribution = result.overlay_attribution.as_ref().unwrap();
+        let core_sum = result
+            .steps
+            .iter()
+            .map(|step| step.core_return.unwrap())
+            .sum::<f64>();
+        let overlay_sum = result
+            .steps
+            .iter()
+            .map(|step| step.overlay_return.unwrap())
+            .sum::<f64>();
+        assert!((attribution.core_return - core_sum).abs() < 1e-12);
+        assert!((attribution.overlay_return - overlay_sum).abs() < 1e-12);
+        assert_eq!(attribution.core_weight, budget.core_weight);
+        assert_eq!(attribution.core_tracking_cost_bps, core_tracking_cost_bps);
+        // The overlay is self-funding, so its t-stat is against zero, not
+        // against the index the core already owns.
+        let overlay_returns = result
+            .steps
+            .iter()
+            .map(|step| step.overlay_return.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attribution.overlay_alpha_tstat,
+            active_tstat(&overlay_returns, &vec![0.0; overlay_returns.len()])
+        );
+
+        // Reports are persisted artifacts that `add-benchmark` and the
+        // phase summaries read back, so the new mode has to survive a JSON
+        // round trip rather than only existing in memory.
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: BacktestResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.allocation_mode, result.allocation_mode);
+        assert_eq!(
+            decoded.overlay_attribution.unwrap().overlay_return,
+            attribution.overlay_return
+        );
+        assert_eq!(decoded.steps[0].core_return, result.steps[0].core_return);
+        // A frozen report predating the mode is directional, with neither leg.
+        let mut frozen = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+        let object = frozen.as_object_mut().unwrap();
+        object.remove("allocation_mode");
+        object.remove("overlay_attribution");
+        for step in object["steps"].as_array_mut().unwrap() {
+            let step = step.as_object_mut().unwrap();
+            step.remove("core_return");
+            step.remove("overlay_return");
+        }
+        let legacy: BacktestResult = serde_json::from_value(frozen).unwrap();
+        assert_eq!(legacy.allocation_mode, AllocationMode::Directional);
+        assert!(legacy.overlay_attribution.is_none());
+        assert_eq!(legacy.steps[0].core_return, None);
+    }
+
+    #[test]
+    fn the_overlay_mode_refuses_configurations_it_cannot_price_or_allocate() {
+        let sessions = overlay_sessions();
+        let rows = sessions[1..5]
+            .iter()
+            .map(|date| row(*date))
+            .collect::<Vec<_>>();
+        let overlay = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.4,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let config =
+            |benchmark: Option<BenchmarkHistory>,
+             max_sector_gross: Option<f64>,
+             direction_config: Option<portfolio_construction::DirectionConfig>| {
+                BacktestConfig {
+                    start: sessions[1],
+                    end: sessions[4],
+                    cadence_sessions: 3,
+                    rebalance_offset_sessions: 0,
+                    model_horizon_sessions: 3,
+                    prediction_horizon_scale: 1.0,
+                    max_positions: 2,
+                    retention_rank: 2,
+                    max_sector_gross,
+                    ranking: portfolio_construction::RankingMethod::Edge,
+                    sizing: portfolio_construction::SizingMethod::Equal,
+                    allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                    allocation_mode: overlay,
+                    position_weight: 0.2,
+                    min_position_weight: 0.0,
+                    reference_edge: 0.01,
+                    reference_volatility: 0.02,
+                    direction_config,
+                    prediction_composition: PredictionComposition::Direct,
+                    market_return_forecasts: None,
+                    market_forecast_model_id: None,
+                    costs: zero_execution_costs(),
+                    benchmark,
+                    mark_prices: None,
+                    risk_free_annual: 0.0,
+                }
+            };
+        // No index history: the core has nothing to be priced against.
+        assert!(backtest(&constant_model(0.0), &rows, &config(None, None, None)).is_err());
+        // The allocator that enforces the overlay net cap has no group cap.
+        assert!(backtest(
+            &constant_model(0.0),
+            &rows,
+            &config(Some(rising_benchmark(8)), Some(0.2), None)
+        )
+        .is_err());
+        // The index core is the market exposure; a timing overlay on top of
+        // it would be a second, contradictory answer to the same question.
+        assert!(backtest(
+            &constant_model(0.0),
+            &rows,
+            &config(
+                Some(rising_benchmark(8)),
+                None,
+                Some(portfolio_construction::DirectionConfig::baseline(1.0).unwrap())
+            )
+        )
+        .is_err());
+    }
+
+    /// Builds a chain of `<=` splits on feature index 0 so each `(x, leaf)`
+    /// rung maps to its own leaf, in ascending-`x` order. Lets a test hand
+    /// every instrument its own distinct model prediction without a real
+    /// trained tree.
+    fn ladder_model(rungs: &[(f64, f64)]) -> Model {
+        fn build(rungs: &[(f64, f64)]) -> lightgbm_json::Node {
+            if rungs.len() == 1 {
+                return direction_leaf(rungs[0].1);
+            }
+            let threshold = (rungs[0].0 + rungs[1].0) / 2.0;
+            lightgbm_json::Node {
+                split_feature: Some(0),
+                threshold: Some(threshold),
+                decision_type: Some("<=".into()),
+                default_left: Some(true),
+                missing_type: None,
+                left_child: Some(Box::new(direction_leaf(rungs[0].1))),
+                right_child: Some(Box::new(build(&rungs[1..]))),
+                leaf_value: None,
+                diagnostics: Default::default(),
+            }
+        }
+        let mut model = constant_model(0.0);
+        model.tree_info = vec![lightgbm_json::Tree {
+            tree_index: 0,
+            num_leaves: rungs.len(),
+            num_cat: Some(0),
+            shrinkage: Some(1.0),
+            tree_structure: build(rungs),
+        }];
+        model
+    }
+
+    /// Task 15: in overlay mode, `max_positions` admits candidates PER
+    /// SLEEVE. Six candidates are set up so three longs strictly out-rank
+    /// all three shorts by edge (0.06/0.05/0.04 versus 0.03/0.02/0.01); with
+    /// a combined cap of 2 the old ranking would fill both slots from the
+    /// long sleeve and admit zero shorts (the un-hedged, un-diversified
+    /// admission the fix removes). With the per-sleeve cap the two
+    /// strongest names on EACH side are admitted, so the book holds two
+    /// longs and two shorts.
+    #[test]
+    fn overlay_mode_admits_candidates_per_sleeve_not_from_one_combined_ranking() {
+        let sessions = overlay_sessions();
+        let date = sessions[1];
+        let named = |id: &str, x_ret_1: f64| {
+            let mut value = row(date);
+            value.instrument_id = id.into();
+            value.symbol = id.into();
+            value.features = BTreeMap::from([("x_ret_1".into(), x_ret_1)]);
+            value
+        };
+        // Ascending by x_ret_1: three shorts (weakest to strongest edge),
+        // then three longs (weakest to strongest edge).
+        let rows = vec![
+            named("TS3", -5.0), // short edge 0.01 (weakest)
+            named("TS2", -4.0), // short edge 0.02
+            named("TS1", -3.0), // short edge 0.03 (strongest short)
+            named("TL3", 3.0),  // long edge 0.04 (weakest long)
+            named("TL2", 4.0),  // long edge 0.05
+            named("TL1", 5.0),  // long edge 0.06 (strongest overall)
+        ];
+        let model = ladder_model(&[
+            (-5.0, -0.01),
+            (-4.0, -0.02),
+            (-3.0, -0.03),
+            (3.0, 0.04),
+            (4.0, 0.05),
+            (5.0, 0.06),
+        ]);
+        let result = backtest(
+            &model,
+            &rows,
+            &BacktestConfig {
+                start: date,
+                end: date,
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget: portfolio_construction::OverlayBudget {
+                        core_weight: 1.0,
+                        overlay_gross: 0.6,
+                        overlay_net_cap: 0.1,
+                    },
+                    core_tracking_cost_bps: 10.0,
+                },
+                position_weight: 0.1,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 1);
+        let mut ids = result.steps[0]
+            .positions
+            .iter()
+            .map(|position| position.instrument_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["TL1", "TL2", "TS1", "TS2"],
+            "expected the two strongest names on each sleeve, not the four \
+             strongest names overall (which would starve the short sleeve): {ids:?}"
+        );
+        let longs = result.steps[0]
+            .positions
+            .iter()
+            .filter(|position| matches!(position.direction, Direction::Long))
+            .count();
+        let shorts = result.steps[0]
+            .positions
+            .iter()
+            .filter(|position| matches!(position.direction, Direction::Short))
+            .count();
+        assert_eq!(longs, 2, "the long sleeve must fill its own cap");
+        assert_eq!(
+            shorts, 2,
+            "the short sleeve must fill its own cap, unstarved by the longs"
+        );
+    }
+
+    fn shadow_config(allocation_mode: AllocationMode) -> ShadowScoreConfig {
+        ShadowScoreConfig {
+            ranking: portfolio_construction::RankingMethod::Edge,
+            sizing: portfolio_construction::SizingMethod::Equal,
+            allocation_mode,
+            allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+            max_positions: 5,
+            position_weight: 0.05,
+            min_position_weight: 0.0,
+            reference_edge: 0.01,
+            reference_volatility: 0.02,
+            costs: zero_execution_costs(),
+            benchmark_close: None,
+        }
+    }
+
+    /// Task 16: only the most recent date in the matrix is a live decision --
+    /// an earlier session's cross-section must not leak into the score.
+    #[test]
+    fn shadow_score_scores_only_the_last_date() {
+        let mut earlier = row(day("2024-01-02"));
+        earlier.instrument_id = "OLD1".into();
+        let mut later = row(day("2024-01-03"));
+        later.instrument_id = "NEW1".into();
+        let rows = [earlier, later];
+
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.date, day("2024-01-03"));
+        assert_eq!(record.candidates.len(), 1);
+        assert_eq!(record.candidates[0].id, "NEW1");
+    }
+
+    /// A directional score has no core leg: every krona of the allocation
+    /// comes from candidates, exactly like `backtest`'s directional mode.
+    #[test]
+    fn shadow_score_directional_allocates_a_cleared_candidate() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.candidates.len(), 1);
+        assert!(matches!(record.candidates[0].side, Direction::Long));
+        assert!((record.candidates[0].prediction - 0.02).abs() < 1e-9);
+        assert_eq!(record.allocation.core_weight, None);
+        let weight = record.allocation.weights.get("TX1").copied().unwrap();
+        assert!((weight - 0.05).abs() < 1e-9, "weight was {weight}");
+        assert_eq!(
+            record.modeled_cost, 0.0,
+            "zero execution costs must model zero cost"
+        );
+    }
+
+    /// The overlay mode prices a fixed index core; without a close to price
+    /// it from, the score cannot be built at all (same requirement `backtest`
+    /// enforces for a replay).
+    #[test]
+    fn shadow_score_overlay_requires_a_benchmark_close() {
+        let rows = [row(day("2024-01-02"))];
+        let overlay_mode = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.6,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let error = shadow_score(&constant_model(0.02), &rows, &shadow_config(overlay_mode))
+            .unwrap_err();
+        assert!(
+            error.contains("benchmark close"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// With a benchmark close supplied, overlay mode reports the fixed core
+    /// weight alongside the overlay's own per-name weights.
+    #[test]
+    fn shadow_score_overlay_reports_core_and_overlay_weights() {
+        let rows = [row(day("2024-01-02"))];
+        let overlay_mode = AllocationMode::Overlay {
+            budget: portfolio_construction::OverlayBudget {
+                core_weight: 1.0,
+                overlay_gross: 0.6,
+                overlay_net_cap: 0.0,
+            },
+            core_tracking_cost_bps: 10.0,
+        };
+        let mut config = shadow_config(overlay_mode);
+        config.benchmark_close = Some(2500.0);
+        let record = shadow_score(&constant_model(0.02), &rows, &config).unwrap();
+
+        assert_eq!(record.allocation.core_weight, Some(1.0));
+        assert!(record.allocation.weights.contains_key("TX1"));
+        assert_eq!(record.benchmark_close, Some(2500.0));
+    }
+
+    /// A candidate that cannot clear its cost-plus-margin hurdle on either
+    /// side is still reported (the log is evidence about the whole
+    /// cross-section, not just what got funded) but never allocated.
+    #[test]
+    fn shadow_score_reports_but_does_not_allocate_a_negative_edge_candidate() {
+        let mut costs = zero_execution_costs();
+        costs.safety_margin_bps = 1_000.0; // 10% -- swamps a 2% prediction both ways.
+        let rows = [row(day("2024-01-02"))];
+        let mut config = shadow_config(AllocationMode::Directional);
+        config.costs = costs;
+
+        let record = shadow_score(&constant_model(0.02), &rows, &config).unwrap();
+
+        assert_eq!(record.candidates.len(), 1);
+        assert!(record.allocation.weights.is_empty());
+        assert_eq!(record.modeled_cost, 0.0);
+    }
+
+    /// The record self-documents the model's survivorship caveat so a reader
+    /// of the append-only log never has to cross-reference the model file.
+    #[test]
+    fn shadow_score_disclosures_echo_survivorship_status() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        assert_eq!(record.survivorship_status, "SURVIVORSHIP_CONTAMINATED");
+        assert!(
+            record
+                .disclosures
+                .iter()
+                .any(|line| line.contains("SURVIVORSHIP_CONTAMINATED")),
+            "disclosures did not echo survivorship status: {:?}",
+            record.disclosures
+        );
+    }
+
+    /// One line, parseable JSON, with every field the shadow-forward-logging
+    /// job promises: this is the acceptance shape Task 16 asks for.
+    #[test]
+    fn shadow_score_record_round_trips_through_json() {
+        let rows = [row(day("2024-01-02"))];
+        let record = shadow_score(
+            &constant_model(0.02),
+            &rows,
+            &shadow_config(AllocationMode::Directional),
+        )
+        .unwrap();
+
+        let line = serde_json::to_string(&record).unwrap();
+        assert!(!line.contains('\n'), "must serialize to a single line");
+        let decoded: ShadowScoreRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.date, record.date);
+        assert_eq!(decoded.model_id, record.model_id);
+        assert_eq!(decoded.feature_set_version, record.feature_set_version);
     }
 }

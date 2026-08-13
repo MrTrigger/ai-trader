@@ -14,14 +14,68 @@ from pathlib import Path
 import numpy as np
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fold", type=Path, action="append", required=True)
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--min-sharpe", type=float, default=2.0)
-    args = parser.parse_args()
+def per_period_risk_free(risk_free_annual: float, periods_per_year: float) -> float:
+    """Annual risk-free rate compounded down to the observation frequency.
 
-    folds = [json.loads(path.read_text()) for path in args.fold]
+    Mirrors `per_period_risk_free` in `stockholm-portfolio/src/lib.rs`: the same
+    conversion, applied identically to the bot and to the benchmark measured at
+    the same `periods_per_year`, so it cancels out of any active-return
+    comparison between the two.
+    """
+    if periods_per_year <= 0:
+        return 0.0
+    return (1.0 + risk_free_annual) ** (1.0 / periods_per_year) - 1.0
+
+
+def sharpe_standard_error(
+    excess_mean: float, periodic_std: float, n: int, periods_per_year: float
+) -> float:
+    """Lo (2002) analytic standard error of the Sharpe ratio.
+
+    Mirrors `sharpe_standard_error` in `stockholm-portfolio/src/lib.rs`: computed
+    on the periodic (non-annualised) Sharpe and then annualised the same way the
+    point estimate itself is, `sqrt((1 + SR_periodic^2/2) / N) * sqrt(periods_per_year)`.
+    """
+    if n == 0 or periodic_std <= 0:
+        return 0.0
+    sr_periodic = excess_mean / periodic_std
+    se_periodic = math.sqrt((1.0 + sr_periodic**2 / 2.0) / n)
+    return se_periodic * math.sqrt(periods_per_year)
+
+
+#: The active-return t-stat bar `passed` requires. Named so the value in the
+#: gate and the value reported in `active_tstat_threshold` cannot drift apart;
+#: unrelated to `target_sharpe` (also 2.0) despite the coincidence.
+ACTIVE_TSTAT_THRESHOLD = 2.0
+
+
+def active_return_tstat(bot_returns: np.ndarray, benchmark_returns: np.ndarray) -> float | None:
+    """Mean per-period active (bot minus benchmark) return over its own SE.
+
+    Mirrors `active_tstat` in `stockholm-portfolio/src/lib.rs`, including its
+    sample (ddof=1, N-1 divisor) standard error: the population (ddof=0)
+    convention used elsewhere in this file for Sharpe/volatility would
+    understate the standard error by sqrt(N/(N-1)) and overstate significance,
+    worst at exactly the small N this task exists to stop driving decisions.
+    `None` when the two series do not pair up one-for-one, or N < 2 (a sample
+    standard deviation is undefined below that).
+    """
+    if len(bot_returns) < 2 or len(bot_returns) != len(benchmark_returns):
+        return None
+    active = bot_returns - benchmark_returns
+    standard_error = float(active.std(ddof=1)) / math.sqrt(len(active))
+    if standard_error <= 0:
+        return None
+    return float(active.mean()) / standard_error
+
+
+def summarize(
+    folds: list[dict],
+    *,
+    min_sharpe: float,
+    risk_free_annual: float,
+    target_sharpe_floor: float,
+) -> dict:
     specifications = {
         (
             fold.get("model_family", "legacy_unspecified"),
@@ -95,11 +149,19 @@ def main() -> None:
     benchmark_drawdowns = (
         np.concatenate(([1.0], benchmark_nav)) / benchmark_peaks - 1.0
     )
+    # Bot and benchmark share one observation grid here (period returns, one
+    # row per rebalance), so both the excess-return Sharpe and the
+    # active-return t-stat below are well-defined at this frequency.
+    per_period_rf = per_period_risk_free(risk_free_annual, periods_per_year) if len(returns) else 0.0
+    periodic_std = float(returns.std()) if len(returns) else 0.0
     mean = float(returns.mean()) if len(returns) else 0.0
-    vol = float(returns.std()) * math.sqrt(periods_per_year) if len(returns) else 0.0
+    excess_mean = mean - per_period_rf
+    vol = periodic_std * math.sqrt(periods_per_year) if len(returns) else 0.0
+    benchmark_periodic_std = float(benchmark_returns.std()) if len(returns) else 0.0
     benchmark_mean = float(benchmark_returns.mean()) if len(returns) else 0.0
+    benchmark_excess_mean = benchmark_mean - per_period_rf
     benchmark_vol = (
-        float(benchmark_returns.std()) * math.sqrt(periods_per_year)
+        benchmark_periodic_std * math.sqrt(periods_per_year)
         if len(returns)
         else 0.0
     )
@@ -180,9 +242,27 @@ def main() -> None:
             else 0.0
         ),
         "annualised_volatility": vol,
-        "sharpe": mean * periods_per_year / vol if vol else 0.0,
+        # Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+        # subtracted before this figure was computed.
+        "sharpe": excess_mean * periods_per_year / vol if vol else 0.0,
+        "risk_free_annual": risk_free_annual,
+        # Analytic Lo (2002) standard error of `sharpe`, annualised the same
+        # way the point estimate is.
+        "sharpe_se": sharpe_standard_error(excess_mean, periodic_std, len(returns), periods_per_year),
         "max_drawdown": float(drawdowns.min()) if len(drawdowns) else 0.0,
-        "target_sharpe": args.min_sharpe,
+        "target_sharpe": min_sharpe,
+        # The new, explicit promotion floor: `passed` requires
+        # `sharpe - 1.64*sharpe_se >= target_sharpe_floor`. `target_sharpe`
+        # above keeps its original meaning (a naive absolute-Sharpe bar) but no
+        # longer drives `passed`.
+        "target_sharpe_floor": target_sharpe_floor,
+        # Mean per-period active (bot minus benchmark) return over its own
+        # standard error. Fold reports carry both series on one observation
+        # grid (one row per rebalance period), so this is always computable
+        # here — unlike the Rust combined-phase reports, which can carry a
+        # daily bot series against a still-holding-period benchmark.
+        "active_tstat": active_return_tstat(returns, benchmark_returns),
+        "active_tstat_threshold": ACTIVE_TSTAT_THRESHOLD,
         "diagnostics": {
             "observations": sum(item["observations"] for item in diagnostics),
             "decision_dates": sum(item["decision_dates"] for item in diagnostics),
@@ -224,10 +304,19 @@ def main() -> None:
                 else 0.0
             ),
             "annualised_volatility": benchmark_vol,
+            # Same rf subtraction as the portfolio: same annual rate, own
+            # (here, identical) frequency.
             "sharpe": (
-                benchmark_mean * periods_per_year / benchmark_vol
+                benchmark_excess_mean * periods_per_year / benchmark_vol
                 if benchmark_vol
                 else 0.0
+            ),
+            "risk_free_annual": risk_free_annual,
+            "sharpe_se": sharpe_standard_error(
+                benchmark_excess_mean,
+                benchmark_periodic_std,
+                len(benchmark_returns),
+                periods_per_year,
             ),
             "portfolio_minus_benchmark_total_return": (
                 float(nav[-1] - benchmark_nav[-1]) if len(nav) else 0.0
@@ -449,19 +538,46 @@ def main() -> None:
         report["survivorship_status"] == "POINT_IN_TIME"
         and all(fold.get("survivorship_status") == "POINT_IN_TIME" for fold in folds)
         and report["total_return"] > 0
-        and report["sharpe"] >= report["target_sharpe"]
         and report["positive_folds"] >= math.ceil(len(folds) / 2)
+        and report["active_tstat"] is not None
+        and report["active_tstat"] >= report["active_tstat_threshold"]
+        and report["sharpe"] - 1.64 * report["sharpe_se"] >= report["target_sharpe_floor"]
+    )
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fold", type=Path, action="append", required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--min-sharpe", type=float, default=2.0)
+    # Riksbank policy-rate approximation until a SWESTR series is wired.
+    parser.add_argument("--risk-free-annual", type=float, default=0.02)
+    # Provisional pending Decision Point 1 in the remediation plan.
+    parser.add_argument("--target-sharpe-floor", type=float, default=1.0)
+    args = parser.parse_args()
+
+    folds = [json.loads(path.read_text()) for path in args.fold]
+    report = summarize(
+        folds,
+        min_sharpe=args.min_sharpe,
+        risk_free_annual=args.risk_free_annual,
+        target_sharpe_floor=args.target_sharpe_floor,
     )
     args.out.write_text(json.dumps(report, indent=2) + "\n")
+    active_tstat = report["active_tstat"]
+    active_tstat_text = f"{active_tstat:+.2f}" if active_tstat is not None else "n/a"
     print(
-        f"{args.out}: {model_family}/{feature_set_version} "
-        f"{reward}/{objective}/{ensemble_seeds} seed(s), "
-        f"return {report['total_return']:.1%}, Sharpe {report['sharpe']:.2f}, "
+        f"{args.out}: {report['model_family']}/{report['feature_set_version']} "
+        f"{report['reward']}/{report['objective']}/{report['ensemble_seeds']} seed(s), "
+        f"return {report['total_return']:.1%}, Sharpe {report['sharpe']:.2f} "
+        f"± {report['sharpe_se']:.2f} (rf {report['risk_free_annual']:.1%}), "
         f"max DD {report['max_drawdown']:.1%}, {report['positive_folds']}/{len(folds)} "
         f"positive, IC {report['diagnostics']['mean_rank_ic']:+.4f}; "
         f"{report['benchmark']['symbol']} "
         f"{report['benchmark']['total_return']:.1%}, "
         f"excess {report['benchmark']['portfolio_minus_benchmark_total_return']:.1%}, "
+        f"active t-stat {active_tstat_text}, "
         f"passed={report['passed']}"
     )
 
