@@ -59,6 +59,10 @@ def prepare(rows, feature_names, horizon, through_ts):
             f"refusing a fit under {MIN_ROWS:,} rows"
         )
     kept = [row for row in rows if row["ts"] <= through_ts]
+    # The matrix producer writes rows one asset block at a time (ts-ascending
+    # only within each block), so a global chronological order is Python's
+    # obligation here - fit()'s early-stopping tail-split depends on it.
+    kept.sort(key=lambda row: row["ts"])
     x = np.asarray([[row["features"][name] for name in feature_names] for row in kept])
     y = np.asarray([row["fwd_bps"][str(horizon)] for row in kept], dtype=float)
     lo, hi = np.percentile(y, [0.5, 99.5])

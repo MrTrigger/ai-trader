@@ -49,6 +49,37 @@ def test_too_small_matrix_is_refused(tmp_path):
         train_scalper.prepare(rows, names, 30, through_ts=10**12)
 
 
+def test_prepare_sorts_asset_blocked_rows_into_chronological_order(tmp_path):
+    # The real matrix producer writes one asset block at a time - all of an
+    # asset's rows in ts order, but block B's timestamps can be interleaved
+    # with (even predate) block A's. prepare() must restore a single global
+    # chronological order, or fit()'s "last 10%" early-stopping split would
+    # leak rows from the future into training and the past into validation.
+    names = ["f0"]
+    path = tmp_path / "blocked.jsonl"
+    with open(path, "w") as fh:
+        fh.write(json.dumps({"kind": "manifest", "feature_set_version": "fs-test",
+                             "features": names, "horizons_min": [30], "stride_min": 5,
+                             "assets": ["A", "B"]}) + "\n")
+        base = 1_700_000_000
+        half = 30_000  # 60,000 rows total, clearing the 50,000-row MIN_ROWS gate
+        # Asset block A: even ts offsets 0, 2, 4, ...
+        for i in range(half):
+            ts = base + 2 * i * 300
+            fh.write(json.dumps({"ts": ts, "asset": "A",
+                                 "features": {"f0": 0.0},
+                                 "fwd_bps": {"30": ts / 1_000_000}}) + "\n")
+        # Asset block B: odd ts offsets 1, 3, 5, ... - fully interleaved with A
+        for i in range(half):
+            ts = base + (2 * i + 1) * 300
+            fh.write(json.dumps({"ts": ts, "asset": "B",
+                                 "features": {"f0": 0.0},
+                                 "fwd_bps": {"30": ts / 1_000_000}}) + "\n")
+    _, rows = train_scalper.load_matrix(path)
+    x, y = train_scalper.prepare(rows, names, 30, through_ts=10**12)
+    assert list(y) == sorted(y)
+
+
 def test_artifact_envelope_roundtrips(tmp_path):
     path, names = synthetic_matrix(tmp_path)
     out = tmp_path / "model.json"
