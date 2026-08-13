@@ -1316,9 +1316,9 @@ pub fn daily(bars: &[DailyBar]) -> Result<Vec<FeatureRow>, String> {
                 max_drawdown(&history, index, 126),
                 distance_from_high(&history, index, 252),
                 distance_from_low(&history, index, 252),
-                index
-                    .checked_sub(1)
-                    .and_then(|previous| finite(bar.raw_open / history[previous].raw_close - 1.0)),
+                index.checked_sub(1).and_then(|previous| {
+                    finite(adjusted_open(bar) / history[previous].adjusted_close - 1.0)
+                }),
                 finite((bar.raw_high - bar.raw_low) / bar.raw_close),
                 close_location(bar),
                 median_notional(&history, index, 20),
@@ -4895,15 +4895,19 @@ fn amihud(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
 
 fn volume_surge(history: &[&DailyBar], index: usize, window: usize) -> Option<f64> {
     let start = index.checked_sub(window)?;
+    // Traded notional (raw_close * volume), not raw share volume: a split
+    // changes share counts without changing how much money actually traded,
+    // so notional stays continuous while share volume jumps (audit F7). Same
+    // construction as `median_notional`/`amihud`.
     let mut prior = history[start..index]
         .iter()
-        .map(|bar| bar.volume)
+        .map(|bar| bar.raw_close * bar.volume)
         .collect::<Vec<_>>();
     let baseline = median(&mut prior)?;
     if baseline <= 0.0 {
         return None;
     }
-    finite(history[index].volume / baseline)
+    finite((history[index].raw_close * history[index].volume) / baseline)
 }
 
 #[cfg(test)]
@@ -6177,6 +6181,60 @@ mod tests {
         let last = rows.last().unwrap();
         let expected = input[29].adjusted_close / input[28].adjusted_close - 1.0;
         assert!((last.value("ret_1").unwrap() - expected).abs() < 1e-12);
+    }
+
+    /// A 2:1 split lands between t-1 and t: share counts double, raw prices
+    /// halve, volume doubles, and the true (adjusted) price and traded
+    /// notional are unchanged. `gap_1` and `volume_surge_20` must not mistake
+    /// the corporate action for a real overnight move or a real liquidity
+    /// surge (audit F6/F7).
+    fn flat_bars_with_split_on_last_day(count: usize) -> Vec<DailyBar> {
+        let start = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        let mut input: Vec<DailyBar> = (0..count)
+            .map(|index| DailyBar {
+                date: start + Duration::days(index as i64),
+                instrument_id: "SE0000999999".into(),
+                raw_open: 100.0,
+                raw_high: 100.5,
+                raw_low: 99.5,
+                raw_close: 100.0,
+                volume: 10_000.0,
+                adjusted_close: 100.0,
+            })
+            .collect();
+        let last = input.len() - 1;
+        input[last].raw_open *= 0.5;
+        input[last].raw_high *= 0.5;
+        input[last].raw_low *= 0.5;
+        input[last].raw_close *= 0.5;
+        input[last].volume *= 2.0;
+        // adjusted_close is left at the pre-split level: the true price did
+        // not move, so it must stay continuous across the split.
+        input
+    }
+
+    #[test]
+    fn gap_1_survives_a_split_with_unchanged_true_price() {
+        let input = flat_bars_with_split_on_last_day(25);
+        let rows = daily(&input).unwrap();
+        let row = rows.last().unwrap();
+        let gap = row.value("gap_1").unwrap();
+        assert!(
+            gap.abs() < 1e-9,
+            "gap_1 should be ~0 across a split with unchanged true price, got {gap}"
+        );
+    }
+
+    #[test]
+    fn volume_surge_20_survives_a_split_with_flat_true_traded_notional() {
+        let input = flat_bars_with_split_on_last_day(25);
+        let rows = daily(&input).unwrap();
+        let row = rows.last().unwrap();
+        let surge = row.value("volume_surge_20").unwrap();
+        assert!(
+            (surge - 1.0).abs() < 1e-9,
+            "volume_surge_20 should be ~1 when true traded notional is flat, got {surge}"
+        );
     }
 
     #[test]
