@@ -684,17 +684,7 @@ pub fn allocate(proposals: &[Proposal], budget: Budget) -> Result<Allocation, St
         weights.insert(proposal.id.clone(), sign * absolute);
     }
 
-    let realised_long = weights
-        .values()
-        .copied()
-        .filter(|weight| *weight > 0.0)
-        .sum();
-    let realised_short = -weights
-        .values()
-        .copied()
-        .filter(|weight| *weight < 0.0)
-        .sum::<f64>();
-    let realised_gross = realised_long + realised_short;
+    let (realised_long, realised_short, realised_gross) = realised_from_weights(&weights);
     let diagnostics = AllocationDiagnostics {
         budget,
         proposed_long,
@@ -778,19 +768,8 @@ pub fn allocate_with_group_cap(
         .diagnostics
         .dropped_below_minimum
         .extend(dropped_by_group_cap);
-    let realised_long = allocation
-        .weights
-        .values()
-        .copied()
-        .filter(|weight| *weight > 0.0)
-        .sum::<f64>();
-    let realised_short = -allocation
-        .weights
-        .values()
-        .copied()
-        .filter(|weight| *weight < 0.0)
-        .sum::<f64>();
-    let realised_gross = realised_long + realised_short;
+    let (realised_long, realised_short, realised_gross) =
+        realised_from_weights(&allocation.weights);
     allocation.diagnostics.realised_long = realised_long;
     allocation.diagnostics.realised_short = realised_short;
     allocation.diagnostics.realised_gross = realised_gross;
@@ -860,23 +839,44 @@ pub fn allocate_overlay(
     let overlay_budget = Budget::gross_only(budget.overlay_gross)?;
     let mut allocation = allocate(proposals, overlay_budget)?;
 
-    let realised_long = allocation.diagnostics.realised_long;
-    let realised_short = allocation.diagnostics.realised_short;
-    let excess = (realised_long - realised_short).abs() - budget.overlay_net_cap;
-    if excess > EPSILON {
+    let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
+        .iter()
+        .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
+        .collect();
+
+    // A net (difference) cap is not monotonic under one-sided removal:
+    // scaling the heavier sleeve down to its target can push one of its
+    // positions below that position's own minimum, and dropping that
+    // position shrinks the sleeve further than the target — which can flip
+    // which sleeve is heavier, or leave the original violation only partly
+    // corrected. A single shrink-then-drop pass is therefore not enough; the
+    // cap is enforced by repeating the scale-then-drop step against
+    // whichever sleeve is heavier *right now* until it converges. Each
+    // iteration either satisfies the cap without a drop (converged) or
+    // drops at least one position from a finite set, so this terminates in
+    // at most `proposals.len()` iterations; the `+ 2` bound below is pure
+    // defense in depth, not load-bearing for correctness — the invariant
+    // check after the loop is what actually guarantees the contract.
+    let mut newly_dropped = Vec::new();
+    for _ in 0..proposals.len() + 2 {
+        let (realised_long, realised_short, _) = realised_from_weights(&allocation.weights);
+        let excess = (realised_long - realised_short).abs() - budget.overlay_net_cap;
+        if excess <= EPSILON {
+            break;
+        }
         let heavier = if realised_long > realised_short {
             Direction::Long
         } else {
             Direction::Short
         };
-        let heavier_total = if heavier == Direction::Long {
-            realised_long
+        let (heavier_total, lighter_total) = if heavier == Direction::Long {
+            (realised_long, realised_short)
         } else {
-            realised_short
+            (realised_short, realised_long)
         };
-        // excess > 0 guarantees target_total = lighter + net_cap is both
+        // excess > 0 guarantees heavier_total > 0, and target_total is both
         // non-negative and strictly less than heavier_total.
-        let target_total = heavier_total - excess;
+        let target_total = lighter_total + budget.overlay_net_cap;
         let scale = scale_down(heavier_total, target_total);
 
         for weight in allocation.weights.values_mut() {
@@ -893,13 +893,17 @@ pub fn allocate_overlay(
         // Scaling the heavier sleeve down can push one of its positions
         // below its own economic minimum. Drop it to cash rather than carry
         // a sub-minimum sliver; the freed weight is not redistributed
-        // (scale-down only), matching the ordinary allocate() contract.
-        let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
-            .iter()
-            .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
-            .collect();
-        let mut newly_dropped = Vec::new();
+        // (scale-down only). Only the sleeve just scaled is checked here —
+        // the untouched sleeve cannot have newly fallen below its minimum.
         allocation.weights.retain(|id, weight| {
+            let direction = if *weight > 0.0 {
+                Direction::Long
+            } else {
+                Direction::Short
+            };
+            if direction != heavier {
+                return true;
+            }
             let minimum = min_abs_weight_by_id
                 .get(id.as_str())
                 .copied()
@@ -911,32 +915,42 @@ pub fn allocate_overlay(
                 true
             }
         });
-        allocation
-            .diagnostics
-            .dropped_below_minimum
-            .extend(newly_dropped);
-
-        let realised_long = allocation
-            .weights
-            .values()
-            .copied()
-            .filter(|weight| *weight > 0.0)
-            .sum::<f64>();
-        let realised_short = -allocation
-            .weights
-            .values()
-            .copied()
-            .filter(|weight| *weight < 0.0)
-            .sum::<f64>();
-        let realised_gross = realised_long + realised_short;
-        allocation.diagnostics.realised_long = realised_long;
-        allocation.diagnostics.realised_short = realised_short;
-        allocation.diagnostics.realised_gross = realised_gross;
-        allocation.diagnostics.realised_net = realised_long - realised_short;
-        allocation.diagnostics.unused_long = (overlay_budget.max_long - realised_long).max(0.0);
-        allocation.diagnostics.unused_short = (overlay_budget.max_short - realised_short).max(0.0);
-        allocation.diagnostics.unused_gross = (overlay_budget.max_gross - realised_gross).max(0.0);
+        // If nothing was dropped, the scale alone satisfied the cap; the
+        // next iteration's top-of-loop check confirms convergence and
+        // breaks. If something was dropped, loop again: the sleeve totals
+        // changed and the heavier sleeve may now be the other side.
     }
+    allocation
+        .diagnostics
+        .dropped_below_minimum
+        .extend(newly_dropped);
+
+    let (realised_long, realised_short, realised_gross) =
+        realised_from_weights(&allocation.weights);
+    let realised_net = realised_long - realised_short;
+    // Defense in depth: the iterative scheme above always converges to
+    // |net| <= cap (or empties both sleeves). This should never trigger;
+    // fail loudly rather than silently ship a violated risk cap if it does.
+    if realised_net.abs() > budget.overlay_net_cap + EPSILON {
+        debug_assert!(
+            false,
+            "overlay net cap invariant violated: |net| {} exceeds cap {}",
+            realised_net.abs(),
+            budget.overlay_net_cap
+        );
+        return Err(format!(
+            "overlay net cap invariant violated: |net| {} exceeds cap {}",
+            realised_net.abs(),
+            budget.overlay_net_cap
+        ));
+    }
+    allocation.diagnostics.realised_long = realised_long;
+    allocation.diagnostics.realised_short = realised_short;
+    allocation.diagnostics.realised_gross = realised_gross;
+    allocation.diagnostics.realised_net = realised_net;
+    allocation.diagnostics.unused_long = (overlay_budget.max_long - realised_long).max(0.0);
+    allocation.diagnostics.unused_short = (overlay_budget.max_short - realised_short).max(0.0);
+    allocation.diagnostics.unused_gross = (overlay_budget.max_gross - realised_gross).max(0.0);
 
     Ok(OverlayAllocation {
         core_weight: budget.core_weight,
@@ -950,6 +964,24 @@ fn side_total(capped: &[(&Proposal, f64)], direction: Direction) -> f64 {
         .filter(|(proposal, _)| proposal.direction == direction)
         .map(|(_, weight)| *weight)
         .sum()
+}
+
+/// Realised long/short/gross exposure from a signed weights map: long is the
+/// sum of positive weights, short the negated sum of negative weights, and
+/// gross their sum.
+fn realised_from_weights(weights: &BTreeMap<String, f64>) -> (f64, f64, f64) {
+    let realised_long = weights
+        .values()
+        .copied()
+        .filter(|weight| *weight > 0.0)
+        .sum::<f64>();
+    let realised_short = -weights
+        .values()
+        .copied()
+        .filter(|weight| *weight < 0.0)
+        .sum::<f64>();
+    let realised_gross = realised_long + realised_short;
+    (realised_long, realised_short, realised_gross)
 }
 
 fn scale_down(value: f64, maximum: f64) -> f64 {
@@ -1598,19 +1630,58 @@ mod tests {
             overlay_gross: 1.0,
             overlay_net_cap: 0.1,
         };
-        let proposals = [
-            proposal("long", Direction::Long, 0.3, 0.3),
-            proposal("short", Direction::Short, 0.1, 0.1),
-        ];
+        let mut long = proposal("long", Direction::Long, 0.3, 0.3);
+        // Non-zero but below the post-scale weight (0.2): exercises the
+        // min_abs_weight-aware path without binding, unlike the shared
+        // proposal() helper's hardcoded 0.0 minimum.
+        long.min_abs_weight = 0.1;
+        let proposals = [long, proposal("short", Direction::Short, 0.1, 0.1)];
         // Unconstrained the sleeves would be 0.3 long / 0.1 short (net 0.2),
         // which violates the 0.1 net cap. Only the heavier long sleeve may be
         // scaled down; the lighter short sleeve must be untouched.
         let allocation = allocate_overlay(&proposals, &budget).unwrap();
         assert!((allocation.overlay.weights["long"] - 0.2).abs() < EPSILON);
         assert!((allocation.overlay.weights["short"] + 0.1).abs() < EPSILON);
+        assert!(allocation
+            .overlay
+            .diagnostics
+            .dropped_below_minimum
+            .is_empty());
         let realised_net = allocation.overlay.diagnostics.realised_net;
         assert!(realised_net.abs() <= budget.overlay_net_cap + EPSILON);
         assert!((realised_net - 0.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn overlay_net_cap_iterates_when_scaling_drops_a_position_below_its_minimum() {
+        // L's minimum (0.56) sits just above where a single scale-down pass
+        // would land it (0.55) while trying to hit the 0.05 net cap
+        // directly against the *initial* 0.6/0.5 split. A single-pass
+        // shrink-then-drop would drop L to zero and leave S untouched at
+        // 0.5 — ten times over the cap, on the OTHER side. The cap must be
+        // enforced iteratively: once L is dropped, S becomes the heavier
+        // sleeve and must itself be scaled down to satisfy the cap.
+        let mut long = proposal("long", Direction::Long, 0.6, 0.6);
+        long.min_abs_weight = 0.56;
+        let short = proposal("short", Direction::Short, 0.5, 0.5);
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.5,
+            overlay_net_cap: 0.05,
+        };
+        let allocation = allocate_overlay(&[long, short], &budget).unwrap();
+        let realised_net = allocation.overlay.diagnostics.realised_net;
+        assert!(
+            realised_net.abs() <= budget.overlay_net_cap + EPSILON,
+            "realised net {realised_net} exceeds cap {}",
+            budget.overlay_net_cap
+        );
+        assert!(!allocation.overlay.weights.contains_key("long"));
+        assert!((allocation.overlay.weights["short"] + 0.05).abs() < EPSILON);
+        assert_eq!(
+            allocation.overlay.diagnostics.dropped_below_minimum,
+            ["long"]
+        );
     }
 
     #[test]
