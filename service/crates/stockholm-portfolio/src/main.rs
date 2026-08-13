@@ -1,9 +1,10 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use equity_data::UniverseBucket as DataBucket;
 use features_stockholm::{DirectionTrainingRow, InstrumentMeta, TrainingRow, UniverseBucket};
+use sha2::{Digest, Sha256};
 use time::Date;
 
 const USAGE: &str = "\
@@ -3006,25 +3007,212 @@ fn read_matrix_all(path: &Path) -> Result<(MatrixManifest, Vec<TrainingRow>), St
     Ok((manifest, rows))
 }
 
-/// The date of the last row already recorded in an append-only shadow log, if
-/// any. `None` for a log that does not exist yet or is empty.
-fn last_shadow_log_date(path: &Path) -> Result<Option<Date>, String> {
+/// Just enough of a shadow-log row to recover its `date`, deliberately not
+/// `ShadowScoreRecord` itself and deliberately without `deny_unknown_fields`:
+/// the append-only guard only ever needs the date, and coupling the tail
+/// read to every field the record happens to carry today would let an
+/// unrelated future field change wedge every later append.
+#[derive(Debug, serde::Deserialize)]
+struct ShadowLogTailDate {
+    date: String,
+}
+
+/// A file's last line, found by seeking backward from EOF rather than
+/// reading anything earlier in the file.
+struct LastLine {
+    /// Byte offset where this line's content starts.
+    start: u64,
+    /// Whether the file's last byte is the newline that terminates a
+    /// completed append. `false` means the file ends mid-line -- exactly
+    /// the shape a write that never finished (a crash, `kill -9`, a torn
+    /// `O_APPEND` write past `PIPE_BUF`) leaves behind, so it is never
+    /// treated as a real row below regardless of what it contains.
+    well_terminated: bool,
+    text: String,
+}
+
+/// Read only the last line of `path`: a handful of chunked backward seeks
+/// bounded by that line's own length, never a scan of the whole file.
+/// `Ok(None)` for a missing or empty file.
+fn read_last_line(path: &Path) -> Result<Option<LastLine>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let file =
+    let mut file =
         std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut last = None;
-    for line in std::io::BufReader::new(file).lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: stockholm_portfolio::ShadowScoreRecord = serde_json::from_str(&line)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        last = Some(record.date);
+    let length = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    if length == 0 {
+        return Ok(None);
     }
-    Ok(last)
+    let mut last_byte = [0_u8; 1];
+    file.seek(SeekFrom::Start(length - 1))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.read_exact(&mut last_byte)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let well_terminated = last_byte[0] == b'\n';
+    // The final newline itself, when present, is not part of the line's
+    // content -- the search below looks for the PREVIOUS newline strictly
+    // before it.
+    let content_end = if well_terminated { length - 1 } else { length };
+
+    const CHUNK: u64 = 8192;
+    let mut cursor = content_end;
+    let start = loop {
+        let chunk_start = cursor.saturating_sub(CHUNK);
+        let read_len = (cursor - chunk_start) as usize;
+        let mut chunk = vec![0_u8; read_len];
+        file.seek(SeekFrom::Start(chunk_start))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        file.read_exact(&mut chunk)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if let Some(position) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            break chunk_start + position as u64 + 1;
+        }
+        if chunk_start == 0 {
+            break 0;
+        }
+        cursor = chunk_start;
+    };
+    let mut content = vec![0_u8; (content_end - start) as usize];
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.read_exact(&mut content)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(Some(LastLine {
+        start,
+        well_terminated,
+        text: String::from_utf8_lossy(&content).into_owned(),
+    }))
+}
+
+/// Best-effort filename hint for a quarantined line: the `date` its own
+/// JSON claims, read as raw text without parsing (the line is, by
+/// definition, one this function is never asked about unless it already
+/// failed to parse), falling back to a content hash so two different torn
+/// lines never collide on the same sidecar name.
+fn tail_quarantine_hint(text: &str) -> String {
+    let marker = "\"date\":\"";
+    let candidate = text
+        .find(marker)
+        .and_then(|index| text.get(index + marker.len()..))
+        .and_then(|rest| rest.get(..10))
+        .filter(|value| value.as_bytes().get(4) == Some(&b'-') && value.as_bytes().get(7) == Some(&b'-'));
+    match candidate {
+        Some(value) => value.to_owned(),
+        None => format!("{:x}", Sha256::digest(text.as_bytes()))[..12].to_owned(),
+    }
+}
+
+/// A shadow log's last line is the residue of a write that never
+/// completed, not evidence: move it to a sidecar file (with a header
+/// explaining when and why), then repair the log by truncating exactly the
+/// torn tail away. Every earlier line -- each already a completed,
+/// newline-terminated append -- is untouched; this is the append-only log's
+/// own self-repair, not an exception to it. Both writes are fsynced before
+/// this returns, so the repair itself is as durable as an ordinary append.
+fn quarantine_torn_tail(path: &Path, last: &LastLine, reason: &str) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "scores.jsonl".into());
+    let sidecar = path.with_file_name(format!(
+        "{file_name}.corrupt-{}",
+        tail_quarantine_hint(&last.text)
+    ));
+    let header = format!(
+        "# shadow-score quarantined a torn tail line from {} at {} UTC: {reason}\n",
+        path.display(),
+        humantime_now(),
+    );
+    let mut sidecar_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sidecar)
+        .map_err(|error| format!("{}: {error}", sidecar.display()))?;
+    sidecar_file
+        .write_all(header.as_bytes())
+        .and_then(|()| sidecar_file.write_all(last.text.as_bytes()))
+        .and_then(|()| sidecar_file.write_all(b"\n"))
+        .map_err(|error| format!("{}: {error}", sidecar.display()))?;
+    sidecar_file
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", sidecar.display()))?;
+
+    let repair_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    repair_file
+        .set_len(last.start)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    repair_file
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+
+    eprintln!(
+        "shadow-score: quarantined a torn tail line in {} -> {} ({reason})",
+        path.display(),
+        sidecar.display()
+    );
+    Ok(sidecar)
+}
+
+/// A timestamp for the quarantine header. Not parsed by anything -- purely
+/// for a human reading the sidecar later -- so this deliberately avoids
+/// pulling in a date-formatting dependency for one log line.
+fn humantime_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("unix {seconds}")
+}
+
+/// The date of the last row already recorded in an append-only shadow log,
+/// reading only that last line (never the whole file). If the last line is
+/// torn -- missing the newline a completed append always writes, or present
+/// but not parseable -- it is quarantined to a sidecar and the log is
+/// repaired to its last complete line before this returns, so the
+/// append-only guard is judged against real prior evidence, never a corrupt
+/// fragment. Returns the resolved date (`None` for a missing, empty, or now
+/// fully-quarantined log) plus any disclosure the caller should fold into
+/// the record it is about to write.
+fn last_shadow_log_date(path: &Path) -> Result<(Option<Date>, Vec<String>), String> {
+    let Some(last) = read_last_line(path)? else {
+        return Ok((None, Vec::new()));
+    };
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    let parsed = last.well_terminated.then(|| {
+        serde_json::from_str::<ShadowLogTailDate>(&last.text)
+            .ok()
+            .and_then(|value| Date::parse(&value.date, format).ok())
+    });
+    match parsed.flatten() {
+        Some(date) => Ok((Some(date), Vec::new())),
+        None => {
+            let reason = if last.well_terminated {
+                "last line is not parseable JSON with a date field"
+            } else {
+                "file does not end with the newline a completed append always writes"
+            };
+            let sidecar = quarantine_torn_tail(path, &last, reason)?;
+            let disclosure = format!(
+                "quarantined a torn tail line in {} to {} ({reason})",
+                path.display(),
+                sidecar.display()
+            );
+            // The log is now repaired to its last complete line (or empty).
+            // One more resolution always suffices: truncation lands exactly
+            // on a previous newline boundary, so the new tail is either
+            // absent (file now empty) or itself already well-terminated.
+            let (date, mut disclosures) = last_shadow_log_date(path)?;
+            disclosures.insert(0, disclosure);
+            Ok((date, disclosures))
+        }
+    }
 }
 
 /// Task 16 shadow forward logging: score the most recent decision date in
@@ -3118,7 +3306,7 @@ fn run_shadow_score(args: &[String]) -> Result<(), String> {
         0.015_f64,
     )?;
 
-    let record = stockholm_portfolio::shadow_score(
+    let mut record = stockholm_portfolio::shadow_score(
         &model,
         &rows,
         &stockholm_portfolio::ShadowScoreConfig {
@@ -3143,8 +3331,14 @@ fn run_shadow_score(args: &[String]) -> Result<(), String> {
     // Append-only idempotency guard: a log that already holds a row on or
     // after the date being scored is left untouched. A rerun of the same
     // day, or an out-of-order matrix, must never rewrite or duplicate a
-    // day's already-recorded evidence.
-    if let Some(last_date) = last_shadow_log_date(&path)? {
+    // day's already-recorded evidence. `last_shadow_log_date` reads only the
+    // log's last line; if that line turns out to be torn (an interrupted
+    // write's residue, not a real prior row) it is quarantined and the log
+    // repaired before the date below is judged, and the repair is disclosed
+    // in the row this call is about to append.
+    let (last_date, quarantine_disclosures) = last_shadow_log_date(&path)?;
+    record.disclosures.extend(quarantine_disclosures);
+    if let Some(last_date) = last_date {
         if record.date <= last_date {
             return Err(format!(
                 "{} already holds a row for {last_date}, which is on or after the scored date \
@@ -3163,6 +3357,11 @@ fn run_shadow_score(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", path.display()))?;
     file.write_all(line.as_bytes())
         .map_err(|error| error.to_string())?;
+    // Durability: "row logged" means on disk, not sitting in a page-cache
+    // buffer an unattended cron job's crash can lose. `flush` is a formality
+    // for an unbuffered `File`; `sync_all` is the fsync that matters.
+    file.flush().map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
     println!(
         "shadow-score {} ({} candidates, {} allocated) -> {}",
         record.date,
@@ -3829,6 +4028,164 @@ mod shadow_score_cli_tests {
 
         let after = read_lines(&out_path);
         assert_eq!(before, after, "a refused append must leave the log untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading the log's last line must never require successfully
+    /// deserializing anything earlier: a huge, schema-incompatible earlier
+    /// line (extra fields no `ShadowScoreRecord` has -- the old
+    /// `deny_unknown_fields`-on-every-line implementation would have
+    /// refused to even read past it) must not stop today's run, and its
+    /// made-up future date must never be consulted by the guard.
+    #[test]
+    fn shadow_score_guard_reads_only_the_last_line_of_the_log() {
+        let dir = unique_temp_dir();
+        let model_path = dir.join("model.json");
+        let out_path = dir.join("scores.jsonl");
+        write_fixture_model(&model_path);
+
+        // Line 1: huge, schema-incompatible, and claims a date far in the
+        // future. If the guard read (or choked on) this line, either a
+        // spurious refusal or a hard failure would show up below.
+        let bogus_line = serde_json::json!({
+            "date": "2099-01-01",
+            "not_a_shadow_score_record_field": "x".repeat(4096),
+            "another_unknown_field": (0..200).collect::<Vec<i64>>(),
+        });
+        // Line 2: the log's real last line, an earlier, ordinary date.
+        let real_line = serde_json::json!({
+            "date": "2024-01-01",
+            "model_id": "fixture",
+            "feature_set_version": FIXTURE_FEATURE_SET_VERSION,
+            "survivorship_status": "SURVIVORSHIP_CONTAMINATED",
+            "candidates": [],
+            "allocation": { "weights": {} },
+            "modeled_cost": 0.0,
+            "disclosures": [],
+        });
+        {
+            let mut file = std::fs::File::create(&out_path).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&bogus_line).unwrap()).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&real_line).unwrap()).unwrap();
+        }
+
+        let matrix_path = dir.join("matrix.jsonl");
+        write_fixture_matrix(&matrix_path, &["2024-01-02"]);
+
+        run_shadow_score(&[
+            "--matrix".into(),
+            matrix_path.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .expect(
+            "an odd, schema-incompatible earlier line must not stop the run, and its \
+             made-up future date must never be consulted",
+        );
+
+        let lines = read_lines(&out_path);
+        assert_eq!(
+            lines.len(),
+            3,
+            "the two untouched prior lines plus the new row"
+        );
+        let appended: stockholm_portfolio::ShadowScoreRecord =
+            serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(
+            appended.date.to_string(),
+            "2024-01-02",
+            "2024-01-02 clears the real last line's 2024-01-01; a run refused by the \
+             bogus line's fictitious 2099-01-01 would prove the guard read more than \
+             the last line"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn tail line -- no trailing newline, the residue of a write that
+    /// never finished -- must be quarantined to a sidecar and the log
+    /// repaired to its last complete line, not treated as evidence and not
+    /// left wedging every future append.
+    #[test]
+    fn shadow_score_quarantines_a_torn_tail_line_and_repairs_the_log() {
+        let dir = unique_temp_dir();
+        let model_path = dir.join("model.json");
+        let out_path = dir.join("scores.jsonl");
+        write_fixture_model(&model_path);
+
+        // A genuine, complete first row, produced by a real run so its shape
+        // is exactly whatever ShadowScoreRecord actually serializes today.
+        let day1 = dir.join("matrix-day1.jsonl");
+        write_fixture_matrix(&day1, &["2024-01-01"]);
+        run_shadow_score(&[
+            "--matrix".into(),
+            day1.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let before_corruption = read_lines(&out_path);
+        assert_eq!(before_corruption.len(), 1);
+
+        // Simulate a write killed mid-append: bytes on disk, no trailing
+        // newline, not a complete JSON row.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&out_path)
+                .unwrap();
+            file.write_all(br#"{"date":"2024-01-05","model_id":"tor"#)
+                .unwrap();
+        }
+
+        let day2 = dir.join("matrix-day2.jsonl");
+        write_fixture_matrix(&day2, &["2024-01-10"]);
+        run_shadow_score(&[
+            "--matrix".into(),
+            day2.to_string_lossy().into_owned(),
+            "--model".into(),
+            model_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_path.to_string_lossy().into_owned(),
+        ])
+        .expect("a torn tail line must be quarantined and repaired, not wedge the append");
+
+        let lines = read_lines(&out_path);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the torn line gone, the first real row kept, and the new row appended"
+        );
+        assert_eq!(
+            lines[0], before_corruption[0],
+            "the intact first row must be byte-for-byte unchanged"
+        );
+        let appended: stockholm_portfolio::ShadowScoreRecord =
+            serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(appended.date.to_string(), "2024-01-10");
+        assert!(
+            appended
+                .disclosures
+                .iter()
+                .any(|line| line.contains("quarantined") && line.contains("torn tail line")),
+            "the appended row must disclose the repair: {:?}",
+            appended.disclosures
+        );
+
+        // A sidecar file was created next to the log, named after the torn
+        // line's own claimed date, holding a header plus the torn content --
+        // this is the persisted form of the same warning `quarantine_torn_tail`
+        // also writes to stderr.
+        let sidecar = dir.join("scores.jsonl.corrupt-2024-01-05");
+        let sidecar_contents =
+            std::fs::read_to_string(&sidecar).expect("a sidecar quarantine file must exist");
+        assert!(sidecar_contents.contains("quarantined"));
+        assert!(sidecar_contents.contains(r#"{"date":"2024-01-05","model_id":"tor"#));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

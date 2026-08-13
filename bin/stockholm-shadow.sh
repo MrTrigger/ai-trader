@@ -34,7 +34,8 @@
 # retrains under the current feature-set version. Until then this script is a
 # deterministic plumbing check: it will run to the refusal and exit non-zero,
 # which is the correct, loud outcome (see docs/stockholm-portfolio-status.md,
-# "Shadow forward log"). It does NOT weaken the gate to force a row out.
+# "2026-08-13 Task 16: shadow forward logging"). It does NOT weaken the gate
+# to force a row out.
 #
 # Exit codes are the point, same as bin/cycle.sh: anything non-zero and cron
 # mails a human, rather than the job pressing on with a stale or inconsistent
@@ -44,6 +45,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Release preferred, debug as fallback, same as bin/cycle.sh -- neither is
+# built here. A stale release binary from before your last change is
+# preferred silently over a freshly built debug one (bitten by this once
+# while testing this script: rebuild release after touching this crate).
 CLI=./service/target/release/stockholm-portfolio
 [ -x "$CLI" ] || CLI=./service/target/debug/stockholm-portfolio
 [ -x "$CLI" ] || { echo "stockholm-shadow: no stockholm-portfolio binary — cargo build first" >&2; exit 2; }
