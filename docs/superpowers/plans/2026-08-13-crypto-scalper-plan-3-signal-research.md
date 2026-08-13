@@ -4,14 +4,14 @@
 
 **Goal:** The research pipeline that decides whether the scalper deserves to exist: 1m features in Rust, a training matrix, LightGBM training in Python, and a cost-charging walk-forward that reports annualized Sharpe against the > 2.0 gate.
 
-**Architecture:** New lib crate `features-scalper` (house pattern: Rust computes every feature, incremental/append-safe). `scalper-data` gains a `training-matrix` subcommand emitting JSONL (manifest + rows). Python gains `training/train_scalper.py` (fit + house JSON dump) and `training/walk_forward_scalper.py` (purged folds, cost-aware simulation, daily Sharpe, gate report). The definitive gate run needs weeks of recorded book costs — this plan delivers and smoke-tests the machinery end to end on available data; it does NOT claim the gate.
+**Architecture:** New lib crate `features-scalper` (house pattern: Rust computes every feature, incremental/append-safe). `scalper-data` gains `training-matrix` (JSONL manifest + rows) and `gate` (Rust simulation: lightgbm-json inference, cost charging, daily Sharpe, gate report). Python's role is training orchestration ONLY (user-stated hard rule): `train_scalper.py` fits and dumps the house JSON artifact; `walk_forward_scalper.py` slices purged folds and fits one model per fold — no simulation, no predictions, no feature math in Python, ever. The definitive gate run needs weeks of recorded book costs — this plan delivers and smoke-tests the machinery end to end on available data; it does NOT claim the gate.
 
 **Tech Stack:** Rust (features, matrix), Python/LightGBM (training, walk-forward), JSONL interchange. Spec: `docs/superpowers/specs/2026-08-12-crypto-scalper-design.md`. Prior plans: 1 (venue), 2 (data) — both merged.
 
 ## Global Constraints
 
 - Identity rule (from plan 2's final review): `data/scalper-universe.json` is the sole identity source. A candidate's HL coin name (e.g. `kPEPE`) is the row identity everywhere in this plan's outputs; the Parquet store key is `coin.to_uppercase()` (`KPEPE`); NEVER call `binance_um_symbol` on a store key.
-- Features are Rust-only; Python fits and simulates but computes no feature (house rule). `FEATURE_SET_VERSION = "fs-rust-scalper-1"`.
+- Python is for training orchestration ONLY (user-stated hard rule): fold slicing, fitting, artifact dumping. Features, inference, simulation, costs, Sharpe, gate verdict — all Rust. `FEATURE_SET_VERSION = "fs-rust-scalper-1"`.
 - Append-safety: recomputing features over a longer bar history must reproduce identical earlier rows (same discipline as `features-crypto`, asserted by test).
 - Costs are never optimistic: symbols missing from the cost summary get `DEFAULT_ROUND_TRIP_BPS = 20.0`; an unabsorbable notional (null in the summary) excludes the symbol from simulation entirely and the report says so.
 - Sharpe is computed on daily net returns, annualized with √365, out-of-sample folds only. Per-trade or in-sample numbers never appear in the gate report.
@@ -298,64 +298,154 @@ def test_artifact_envelope_roundtrips(tmp_path):
 
 ---
 
-### Task 4: `training/walk_forward_scalper.py`
+### Task 4a: Fold orchestration — `training/walk_forward_scalper.py` (Python = training ONLY)
+
+**House rule (user-stated, binding):** Python is allowed only for training orchestration. This script slices folds, fits per fold via Task 3's functions, and dumps artifacts. It computes NO feature, NO prediction file, NO simulation, NO Sharpe.
 
 **Files:**
 - Create: `training/walk_forward_scalper.py`, `training/test_walk_forward_scalper.py`
 
+**Interfaces:**
+- CLI: `uv run python walk_forward_scalper.py --matrix PATH --horizon 30 --out-dir DIR [--train-days 90] [--test-days 30] [--step-days 30]`
+- Fold math: chronological folds over the matrix's ts span; first fold trains on days [0, 90), tests [90, 120), stepping 30; training rows with `ts > train_end − horizon·60` are dropped (embargo/purge — the label would peek across the boundary). Skip a fold whose training slice has < 50,000 rows (consistent with Task 3's floor); if ALL folds are skipped, exit nonzero with a clear message.
+- Output: one model artifact per fold at `{out-dir}/fold-{i}.json` (Task 3's envelope, `trained_through` = fold train_end date) plus `{out-dir}/folds.json`:
+  `{"matrix": ..., "horizon_min": H, "feature_set_version": <manifest's>, "folds": [{"i": 0, "train_start_ts": ..., "train_end_ts": ..., "test_start_ts": ..., "test_end_ts": ..., "model": "fold-0.json"}, ...]}`
+
+- [ ] **Step 1: Failing tests** (`test_walk_forward_scalper.py`; reuse `synthetic_matrix` from `test_train_scalper.py` by import — same directory)
+
+```python
+def test_folds_are_chronological_purged_and_dumped(tmp_path):
+    path, names = synthetic_matrix(tmp_path, n=120_000)  # 300s stride → ~416 days
+    out = tmp_path / "folds"
+    walk_forward_scalper.main(["--matrix", str(path), "--horizon", "30",
+                               "--out-dir", str(out)])
+    spec = json.loads((out / "folds.json").read_text())
+    folds = spec["folds"]
+    assert len(folds) >= 2
+    for f in folds:
+        assert f["train_end_ts"] <= f["test_start_ts"]
+        assert (out / f["model"]).exists()
+        art = json.loads((out / f["model"]).read_text())
+        assert art["features"] == names
+    # steps advance by test_days
+    assert folds[1]["test_start_ts"] - folds[0]["test_start_ts"] == 30 * 86400
+
+def test_embargo_drops_training_rows_inside_the_horizon(tmp_path):
+    # prepare() must never see a training row whose label window crosses train_end.
+    path, names = synthetic_matrix(tmp_path, n=60_000)
+    _, rows = train_scalper.load_matrix(path)
+    kept = walk_forward_scalper.training_slice(rows, train_start_ts=rows[0]["ts"],
+                                               train_end_ts=rows[-1]["ts"], horizon_min=30)
+    assert max(r["ts"] for r in kept) <= rows[-1]["ts"] - 30 * 60
+
+def test_all_folds_skipped_is_a_loud_failure(tmp_path):
+    path, _ = synthetic_matrix(tmp_path, n=60_000)  # ~208 days, but train floor will pass — shrink instead
+    small, _ = synthetic_matrix(tmp_path / "s", n=52_000)
+    with pytest.raises(SystemExit):
+        walk_forward_scalper.main(["--matrix", str(small), "--horizon", "30",
+                                   "--out-dir", str(tmp_path / "o"),
+                                   "--train-days", "400"])
+```
+
+(`synthetic_matrix` writes to a fixed filename inside the directory it's given — create the `tmp_path / "s"` directory first. Adjust row counts if the fold arithmetic in your implementation makes a boundary differ by one; the CONTRACT is: ≥2 folds from ~416 days with defaults, embargo strictly enforced, loud failure when nothing is trainable.)
+
+- [ ] **Step 2-4: fail → implement → pass** (`uv run pytest` — whole training suite green).
+- [ ] **Step 5: Emit the Rust parity fixture.** Add `training/make_parity_fixture.py` (small, committed): builds a deterministic 30-row matrix with seed 7, fits a 20-tree model via Task 3's `fit`, dumps `service/crates/scalper-data/tests/fixtures/parity/model.json`, `rows.jsonl`, and `expected.json` (the Python booster's `predict` outputs, full float precision). Run it; commit the three fixtures with the scripts. Task 4b's Rust test asserts lightgbm-json reproduces `expected.json` to 1e-9 — THE train/live parity proof.
+- [ ] **Step 6: Commit** — `Slice the folds and fit them; Python's job ends there`
+
+---
+
+### Task 4b: The gate engine in Rust — `scalper-data gate`
+
+The simulation IS future live logic, so it is Rust (house rule). Prediction runs through the `lightgbm-json` crate — the exact artifact-loading path the plan-4 bot will use.
+
+**Files:**
+- Create: `crates/scalper-data/src/gate.rs`
+- Modify: `crates/scalper-data/src/main.rs` (subcommand), `crates/scalper-data/Cargo.toml` (add `lightgbm-json.workspace = true`)
+
 **The simulation rules (exact, they ARE the deliverable):**
 
-- Folds: `train_days=90, test_days=30, step_days=30`, chronological, first fold starts after 90 days of data; embargo: training rows with `ts > fold_train_end − horizon·60` are dropped (purge — the label would peek across the boundary).
-- Per fold: fit on train rows (Task 3's `prepare`/`fit`), predict on test rows.
+- Folds come from Task 4a's `folds.json`; per fold: load `fold-{i}.json`, verify `features` == matrix manifest's feature list (order-exact; mismatch = hard error), predict every test row (`ts` in `[test_start_ts, test_end_ts)`) via `lightgbm_json::predict`.
 - Costs: `round_trip_bps(asset)` = `2·(taker_fee_bps + spread_bps_median/2 + cross_bps[notional])` from `--costs` JSON (plan 2 summary; `--notional` selects the bucket, default "5000"); `taker_fee_bps = 4.5`. Asset absent from the JSON → `DEFAULT_ROUND_TRIP_BPS = 20.0`. `cross_bps[notional]` null → the asset is EXCLUDED from simulation and listed in the report under `"excluded_thin_books"`.
 - Trading rule, per asset independently: when flat and `pred > threshold_mult · round_trip_bps` → open long; `pred < −threshold_mult·round_trip_bps` → open short (`threshold_mult = 1.5`). A position holds for exactly `horizon` minutes, then closes at the bar `horizon` after entry (the matrix's `fwd_bps` IS that trade's gross return by construction — signal row t's realized fwd). Net trade bps = `±fwd_bps − round_trip_bps`. While a position is open the asset takes no new signals (rows within the hold window are skipped — enforce via `ts >= flat_after` per asset).
 - Aggregation: each trade's net bps is booked on the UTC day of its ENTRY. Daily portfolio return (bps) = sum of that day's booked trade bps / `len(traded_assets)` (equal-weight capital slots, idle slots earn 0). Days with no trades are 0-return days and COUNT in the Sharpe (a strategy that never trades must score 0, not NaN).
 - `sharpe = mean(daily) / std(daily) · sqrt(365)` over all test-fold days, `None` if fewer than 2 trading days or zero variance.
 - Report JSON (`--out`): `{"generated_utc", "matrix", "costs", "horizon_min", "threshold_mult", "notional", "folds": [...per-fold {train_span, test_span, n_trades, sharpe}...], "per_asset": {asset: {n_trades, total_net_bps, hit_rate}}, "excluded_thin_books": [...], "daily_returns_bps": {...date: bps...}, "overall": {"n_trades", "sharpe_annualized", "gate": "PASS"|"FAIL"|"NO-TRADES", "gate_threshold": 2.0}}`.
-- CLI: `uv run python walk_forward_scalper.py --matrix PATH --costs PATH --horizon 30 [--threshold-mult 1.5] [--notional 5000] --out PATH`.
+- CLI: `scalper-data gate --matrix PATH --folds DIR/folds.json --costs PATH [--threshold-mult 1.5] [--notional 5000] --out PATH`.
 
-**Interfaces:** public functions `simulate(rows_by_asset, preds, costs, horizon, threshold_mult) -> list[Trade]`, `daily_returns(trades, assets) -> dict[date, float]`, `annualized_sharpe(daily) -> float | None`, `run(args) -> report dict` — all imported by tests.
+**Interfaces (all `pub` in `gate.rs`, all pure except the CLI driver):**
+- `pub struct Pred { pub ts: i64, pub asset: String, pub pred_bps: f64, pub fwd_bps: f64 }`
+- `pub struct Trade { pub asset: String, pub entry_ts: i64, pub side: i8, pub net_bps: f64 }`
+- `pub fn simulate(preds: &[Pred], round_trip_bps: &BTreeMap<String, f64>, horizon_min: i64, threshold_mult: f64) -> Vec<Trade>` — preds sorted (asset, ts); assets absent from `round_trip_bps` are untradeable (caller decides default vs exclusion before this call).
+- `pub fn daily_returns_bps(trades: &[Trade], n_assets: usize, span: (i64, i64)) -> BTreeMap<chrono::NaiveDate, f64>` — every UTC day in `span` present, no-trade days 0.0.
+- `pub fn annualized_sharpe(daily: &BTreeMap<chrono::NaiveDate, f64>) -> Option<f64>` — None if < 2 days or zero variance.
+- `pub fn load_model(path: &Path, expected_features: &[String]) -> Result<Vec<lightgbm_json::Tree>, String>` (or whatever tree type `lightgbm-json`'s `predict` takes — read `crates/lightgbm-json/src/lib.rs:74` first and match it; the artifact envelope's `model` field holds the booster dump).
 
-- [ ] **Step 1: Failing tests**
+- [ ] **Step 1: Failing tests** (in `gate.rs`; helper `fn pred(asset: &str, ts: i64, p: f64, f: f64) -> Pred`)
 
-```python
-def test_planted_signal_with_zero_costs_passes_and_noise_fails(tmp_path):
-    # label == 10*f0 exactly; predictions from a real fit will track it.
-    ...build synthetic matrix as in test_train_scalper but y = 10*f0, 250 days of rows...
-    report = walk_forward_scalper.run([...--costs, zero_costs_path, ...])
-    assert report["overall"]["gate"] == "PASS"
-    ...same rows with y = pure noise...
-    report2 = walk_forward_scalper.run([...])
-    assert report2["overall"]["gate"] in ("FAIL", "NO-TRADES")
+```rust
+#[test]
+fn parity_with_the_python_booster() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/parity");
+    let art: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/model.json")).unwrap()).unwrap();
+    let features: Vec<String> = art["features"].as_array().unwrap().iter()
+        .map(|v| v.as_str().unwrap().to_string()).collect();
+    let trees = load_model(Path::new(&format!("{dir}/model.json")), &features).unwrap();
+    let expected: Vec<f64> =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/expected.json")).unwrap()).unwrap();
+    for (i, line) in std::fs::read_to_string(format!("{dir}/rows.jsonl")).unwrap().lines().enumerate() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let values: Vec<f64> = features.iter()
+            .map(|n| row["features"][n].as_f64().unwrap()).collect();
+        let got = lightgbm_json::predict(&trees, &values);
+        assert!((got - expected[i]).abs() < 1e-9, "row {i}: {got} vs {}", expected[i]);
+    }
+}
 
-def test_costs_gate_trades_out():
-    # One asset, alternating +30/-30bps preds, threshold_mult=1.5, round_trip=25
-    # → |pred|=30 < 37.5 → no trades.
-    trades = walk_forward_scalper.simulate(rows, preds, {"A": 25.0}, 30, 1.5)
-    assert trades == []
+#[test]
+fn costs_gate_trades_out() {
+    // |pred| = 30 < 1.5 × 25 → nothing trades.
+    let preds: Vec<Pred> = (0..20).map(|i| pred("A", i * 300, if i % 2 == 0 { 30.0 } else { -30.0 }, 5.0)).collect();
+    let costs = BTreeMap::from([("A".to_string(), 25.0)]);
+    assert!(simulate(&preds, &costs, 30, 1.5).is_empty());
+}
 
-def test_hold_window_blocks_overlapping_trades():
-    # Constant +100bps pred every 5 minutes, horizon 30 → trades at least 30min apart per asset.
-    ...
-    entries = [t.entry_ts for t in trades]
-    assert all(b - a >= 30 * 60 for a, b in zip(entries, entries[1:]))
+#[test]
+fn the_hold_window_blocks_overlapping_trades() {
+    let preds: Vec<Pred> = (0..24).map(|i| pred("A", i * 300, 100.0, 8.0)).collect();
+    let costs = BTreeMap::from([("A".to_string(), 10.0)]);
+    let trades = simulate(&preds, &costs, 30, 1.5);
+    assert!(!trades.is_empty());
+    let entries: Vec<i64> = trades.iter().map(|t| t.entry_ts).collect();
+    assert!(entries.windows(2).all(|w| w[1] - w[0] >= 30 * 60));
+}
 
-def test_thin_book_assets_are_excluded_not_defaulted():
-    # costs JSON with cross_bps {"5000": None} → asset in excluded_thin_books, zero trades.
-    ...
+#[test]
+fn shorts_earn_the_negated_move_and_both_sides_pay_costs() {
+    let preds = vec![pred("A", 0, -50.0, -20.0)]; // predicts down 50, market fell 20
+    let costs = BTreeMap::from([("A".to_string(), 10.0)]);
+    let t = &simulate(&preds, &costs, 30, 1.5)[0];
+    assert_eq!(t.side, -1);
+    assert!((t.net_bps - (20.0 - 10.0)).abs() < 1e-9);
+}
 
-def test_no_trade_days_count_as_zero():
-    daily = walk_forward_scalper.daily_returns([one_trade_on_day_3], ["A"], span_days=10)
-    assert len(daily) == 10 and sum(1 for v in daily.values() if v == 0.0) == 9
-
-def test_sharpe_of_flat_series_is_none():
-    assert walk_forward_scalper.annualized_sharpe({d: 0.0 for d in ten_days}) is None
+#[test]
+fn no_trade_days_count_as_zero_and_flat_series_has_no_sharpe() {
+    let day = 86_400i64;
+    let trades = vec![Trade { asset: "A".into(), entry_ts: 3 * day + 60, side: 1, net_bps: 12.0 }];
+    let daily = daily_returns_bps(&trades, 2, (0, 10 * day));
+    assert_eq!(daily.len(), 10);
+    assert_eq!(daily.values().filter(|v| **v == 0.0).count(), 9);
+    let booked: f64 = *daily.values().find(|v| **v != 0.0).unwrap();
+    assert!((booked - 6.0).abs() < 1e-9, "12bps over 2 equal-weight slots");
+    let flat: BTreeMap<_, _> = daily.iter().map(|(d, _)| (*d, 0.0)).collect();
+    assert!(annualized_sharpe(&flat).is_none());
+}
 ```
 
-(Write the elided setup code fully in the test file; the assertions above are the contract. `daily_returns` takes an explicit `span_days`/date-range argument so zero-days are constructible — match the signature to that need.)
-
-- [ ] **Step 2-4: fail → implement → pass** (`uv run pytest` whole suite green).
-- [ ] **Step 5: Commit** — `Charge the measured costs and let the Sharpe gate speak`
+- [ ] **Step 2-4: fail → implement → pass.** The CLI driver: parse matrix (manifest + rows), folds.json, costs JSON (plan 2 `CostSummary` shape — compute `round_trip_bps = 2·(4.5 + spread_bps_median/2 + cross)`, thin-book nulls → `excluded_thin_books`, absent assets → `DEFAULT_ROUND_TRIP_BPS = 20.0`); predict per fold; simulate per fold over ONLY that fold's test window; stitch daily returns across folds; write the report. Run the whole workspace suite.
+- [ ] **Step 5: Commit** — `Charge the measured costs and let the Sharpe gate speak, in Rust`
 
 ---
 
@@ -366,7 +456,7 @@ def test_sharpe_of_flat_series_is_none():
 
 - [ ] **Step 1:** Pull 6 months of perp 1m for five liquid names: `cargo run -p scalper-data -- pull-binance-perp --data-root ../data/perp --assets BTC,ETH,SOL,DOGE,XRP --start 2026-02-01 --end 2026-08-01` (BTC/ETH partly cached from plan 2; expect ~260k bars/asset total).
 - [ ] **Step 2:** `scalper-data universe --data-root ../data --top 25` (refresh), then `training-matrix --data-root ../data --universe ../data/scalper-universe.json --start 2026-02-01 --end 2026-08-01 --out ../data/matrices/smoke-2026-02-08.jsonl --stride 5` — note: only the five pulled assets will have bars; the subcommand must skip-with-warning universe names whose store directory is absent (verify it does; if Task 2 made that an error, loosen it to a warning in this task with a one-line change + test tweak).
-- [ ] **Step 3:** Train + walk-forward for horizons 15/30/60 with the plan-2 smoke cost file (and document that it is a 30-second sample standing in for weeks): three `walk_forward_scalper.py` runs, reports into `data/reports/`.
+- [ ] **Step 3:** For each horizon 15/30/60: `uv run python walk_forward_scalper.py --matrix … --horizon H --out-dir ../data/models/smoke-hH` then `cargo run -p scalper-data -- gate --matrix … --folds ../data/models/smoke-hH/folds.json --costs ../data/costs/<plan-2 smoke summary> --out ../data/reports/smoke-hH.json` (document that the cost file is a 30-second sample standing in for weeks).
 - [ ] **Step 4:** Write `docs/scalper-research-smoke.md`: commands run, row counts, per-horizon overall Sharpe + trade counts, and the explicit statement: **this validates plumbing; the gate decision requires ≥4 weeks of recorded book costs and the full candidate universe.** No gate claim, whatever the numbers say. If Sharpe happens to be high, the doc says why it doesn't count (5 assets, stand-in costs, one period).
 - [ ] **Step 5:** Commit — `Prove the research pipeline end to end without claiming the gate`
 
@@ -377,5 +467,5 @@ def test_sharpe_of_flat_series_is_none():
 **Files:**
 - Create: `docs/scalper-research.md`
 
-- [ ] **Step 1:** Write the runbook: (a) nightly `pull-binance-perp` command for the universe's mapped assets; (b) `record-books` cadence (hourly cron, `--top 25 --seconds 3600 --interval 10`) and where it accrues; (c) universe refresh policy (weekly, additions need 90d of Binance history before entering training); (d) matrix + train + walk-forward commands; (e) **the gate protocol, written before the numbers exist** (evidence-gate house style): minimum 4 weeks of book data, all mapped candidates in the matrix, horizons 15/30/60 each run, gate = overall out-of-sample annualized Sharpe > 2.0 on daily net returns with measured costs at the intended notional; universe selection = symbols may be dropped only by the pre-registered rule (negative total_net_bps over the walk-forward), one re-run after dropping, no other iteration; a FAIL means the project stops or returns to feature research — not threshold shopping.
+- [ ] **Step 1:** Write the runbook: (a) nightly `pull-binance-perp` command for the universe's mapped assets; (b) `record-books` cadence (hourly cron, `--top 25 --seconds 3600 --interval 10`) and where it accrues; (c) universe refresh policy (weekly, additions need 90d of Binance history before entering training); (d) matrix + fold-training (`walk_forward_scalper.py`) + Rust gate (`scalper-data gate`) commands; (e) **the gate protocol, written before the numbers exist** (evidence-gate house style): minimum 4 weeks of book data, all mapped candidates in the matrix, horizons 15/30/60 each run, gate = overall out-of-sample annualized Sharpe > 2.0 on daily net returns with measured costs at the intended notional; universe selection = symbols may be dropped only by the pre-registered rule (negative total_net_bps over the walk-forward), one re-run after dropping, no other iteration; a FAIL means the project stops or returns to feature research — not threshold shopping.
 - [ ] **Step 2:** Commit — `Write the gate protocol before the numbers exist`
