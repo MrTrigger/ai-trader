@@ -2656,15 +2656,16 @@ pub fn summarize_rebalance_phase_folds(
     // A fold's last daily mark falls after its declared end — the terminal book
     // is still priced — so non-overlapping fold bounds do not by themselves
     // prove the daily series do not share a session.
-    if let Some(overlap) = ordered.windows(2).find(|pair| {
-        matches!(
-            (pair[0].combined_end, pair[1].combined_start),
-            (Some(earlier), Some(later)) if earlier >= later
+    if let Some((earlier, later)) =
+        ordered.windows(2).find_map(
+            |pair| match (pair[0].combined_end, pair[1].combined_start) {
+                (Some(earlier), Some(later)) if earlier >= later => Some((earlier, later)),
+                _ => None,
+            },
         )
-    }) {
+    {
         return Err(format!(
-            "fold ending {} and fold starting {} share sessions in their combined windows",
-            overlap[0].end, overlap[1].start
+            "combined windows overlap: one fold is still invested through {earlier} and the next opens on {later}"
         ));
     }
     let benchmark_presence = ordered
@@ -2696,12 +2697,14 @@ pub fn summarize_rebalance_phase_folds(
     });
     let fold_diagnostics = ordered
         .iter()
-        .map(|fold| RebalancePhaseFoldDiagnostic {
-            start: fold.start,
-            end: fold.end,
-            performance: fold.performance.clone(),
+        .map(|fold| {
+            Ok(RebalancePhaseFoldDiagnostic {
+                start: fold.start,
+                end: fold.end,
+                performance: dated_frequency(&fold.performance, fold)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let positive_folds = ordered
         .iter()
         .filter(|fold| fold.performance.total_return > 0.0)
@@ -2741,6 +2744,36 @@ pub fn summarize_rebalance_phase_folds(
             }
             disclosures
         },
+    })
+}
+
+/// Restore the observation frequency of a performance block read from a summary
+/// written before `periods_per_year` existed, where it deserialises to zero.
+///
+/// A zero in an annualised-metrics field is worse than a missing one: it reads
+/// as a measured value and silently propagates. The frequency is fully
+/// determined by the same file's combination method and cadence, so derive it —
+/// and refuse the file outright when the cadence cannot supply one.
+fn dated_frequency(
+    performance: &RebalancePhasePerformance,
+    summary: &RebalancePhaseSummary,
+) -> Result<RebalancePhasePerformance, String> {
+    if performance.periods_per_year != 0.0 {
+        return Ok(performance.clone());
+    }
+    let periods_per_year = if summary.combination_method == CALENDAR_ALIGNED_DAILY_NAV {
+        SESSIONS_PER_YEAR
+    } else if summary.cadence_sessions == 0 {
+        return Err(format!(
+            "the {}..{} phase summary records no observation frequency and no cadence to derive one from",
+            summary.start, summary.end
+        ));
+    } else {
+        sessions_per_year(summary.cadence_sessions)
+    };
+    Ok(RebalancePhasePerformance {
+        periods_per_year,
+        ..performance.clone()
     })
 }
 
@@ -4378,7 +4411,11 @@ mod tests {
             );
             assert_eq!(
                 diagnostic.periods,
-                report.steps.iter().map(|step| step.daily_marks.len()).sum::<usize>()
+                report
+                    .steps
+                    .iter()
+                    .map(|step| step.daily_marks.len())
+                    .sum::<usize>()
             );
         }
     }
@@ -4393,6 +4430,97 @@ mod tests {
             .disclosures
             .iter()
             .any(|line| line.contains("no daily NAV marks")));
+    }
+
+    /// A phase summary as it would have been written before performance blocks
+    /// carried their observation frequency.
+    fn without_recorded_frequency(summary: &RebalancePhaseSummary) -> RebalancePhaseSummary {
+        let mut value = serde_json::to_value(summary).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("combination_method");
+        object["performance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("periods_per_year");
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn shift_fold(
+        summary: &RebalancePhaseSummary,
+        start: &str,
+        end: &str,
+    ) -> RebalancePhaseSummary {
+        let mut shifted = summary.clone();
+        shifted.start = day(start);
+        shifted.end = day(end);
+        shifted
+    }
+
+    #[test]
+    fn a_fold_without_a_recorded_frequency_gets_it_back_rather_than_zero() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let old = without_recorded_frequency(&summary);
+        assert_eq!(old.performance.periods_per_year, 0.0);
+        assert_eq!(old.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
+        let folds = summarize_rebalance_phase_folds(&[
+            shift_fold(&old, "2024-01-02", "2024-01-16"),
+            shift_fold(&old, "2024-02-01", "2024-02-15"),
+        ])
+        .unwrap();
+        for diagnostic in &folds.fold_diagnostics {
+            assert_eq!(diagnostic.performance.periods_per_year, 126.0);
+        }
+    }
+
+    #[test]
+    fn a_fold_summary_with_no_cadence_to_derive_a_frequency_from_is_rejected() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let mut old = without_recorded_frequency(&summary);
+        old.cadence_sessions = 0;
+        let error = summarize_rebalance_phase_folds(&[
+            shift_fold(&old, "2024-01-02", "2024-01-16"),
+            shift_fold(&old, "2024-02-01", "2024-02-15"),
+        ])
+        .unwrap_err();
+        assert!(
+            error.contains("no observation frequency and no cadence"),
+            "expected a underivable-frequency error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_combined_by_different_methods_may_not_be_concatenated() {
+        let daily = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
+        let legacy = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let error = summarize_rebalance_phase_folds(&[
+            shift_fold(&daily, "2024-01-02", "2024-01-16"),
+            shift_fold(&legacy, "2024-02-01", "2024-02-15"),
+        ])
+        .unwrap_err();
+        assert!(
+            error.contains("combine their phases differently"),
+            "expected a mixed-combination error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_whose_combined_windows_overlap_may_not_be_concatenated() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
+        assert_eq!(summary.combined_end, Some(day("2024-01-17")));
+        // Declared bounds do not overlap — the second fold decides after the
+        // first one stops — but the first fold's book is still marked into the
+        // second fold's opening session.
+        let first = shift_fold(&summary, "2024-01-02", "2024-01-16");
+        let mut second = shift_fold(&summary, "2024-01-18", "2024-02-15");
+        second.combined_start = Some(day("2024-01-17"));
+        second.combined_end = Some(day("2024-02-16"));
+        let error = summarize_rebalance_phase_folds(&[first, second]).unwrap_err();
+        assert!(
+            error.contains("combined windows overlap")
+                && error.contains("2024-01-17")
+                && error.contains("through 2024-01-17"),
+            "expected the combined dates in the error, got {error}"
+        );
     }
 
     #[test]
