@@ -656,9 +656,25 @@ mod tests {
     fn micro_all_none_reproduces_fs1_and_nones_the_rest() {
         let bars = ramp(70);
         let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
-        assert!(rows[65].values[i("ret_60")].is_some());
-        assert!(rows[65].values[i("mom_15")].is_some());
-        assert!(rows[65].values[i("vwap_dist_60")].is_some());
+
+        // Golden values for row 65 of `ramp(70)`, pinned bit-for-bit. These
+        // literals ARE fs-1's outputs on this input: `is_some()` alone lets
+        // a future refactor silently perturb the shared 26 features (e.g.
+        // in the 15th decimal) and still pass. Every deployed fs-1/fs-2
+        // model was trained against exactly these numbers for this input -
+        // changing them without an intentional feature-set version bump is
+        // train/live drift. Recompute deliberately (never "fix the test to
+        // match") if the formula genuinely changes.
+        assert_eq!(rows[65].values[i("ret_1")], Some(9.935913367004817e-5));
+        assert_eq!(rows[65].values[i("ret_60")], Some(0.005979091056058231));
+        assert_eq!(rows[65].values[i("mom_15")], Some(2239.1677202124374));
+        assert_eq!(
+            rows[65].values[i("vwap_dist_60")],
+            Some(0.003275639617194944)
+        );
+        assert_eq!(rows[65].values[i("volume_z_60")], Some(-0.4683630922972444));
+        assert_eq!(rows[65].values[i("body_frac")], Some(0.33333333333224513));
+
         for (idx, row) in rows.iter().enumerate() {
             for name in FEATURE_NAMES.iter().skip(26) {
                 assert!(

@@ -85,8 +85,11 @@ usage: scalper-data <command>
       funding files (read from {micro-root}/binance-micro/, same layout
       pull-binance-micro writes) into the 12 fs-2 microstructure features;
       omit it to run fs-2 with those 12 features all None (still a valid,
-      just uninformative, matrix). Prints per-asset 'kept N of M (micro
-      coverage from DATE|none)'.
+      just uninformative, matrix). Prints per-asset 'kept N of M (book from
+      DATE|none, flow from DATE|none, metrics from DATE|none, funding from
+      DATE|none)' - one first-coverage date per source, since funding's
+      unlimited lookback covers from day one while book/flow/metrics (the
+      sources that actually gate row survival) typically start later.
 
   gate --matrix <path> --folds <path/folds.json> --costs <path> [--threshold-mult 1.5] [--notional 5000] --out <path>
       Walk-forward gate: for each fold in folds.json, load fold-N.json (a
@@ -778,6 +781,48 @@ struct Manifest<'a> {
     assets: &'a [String],
 }
 
+/// The first bar's date where each of the four micro sources has ALL of
+/// its own fields populated - "first date this source could have
+/// contributed to a surviving row". Reported separately per source rather
+/// than as one combined date because funding has unlimited lookback (per
+/// the plan's causal rule, "latest rate at or before ts", no staleness
+/// window) and so is typically present from bar one once a single funding
+/// pull has landed - collapsing that into a single "micro coverage from"
+/// date would read as the whole matrix being warm from the very start,
+/// when book/flow (120s tolerance) and metrics (10m tolerance) - the
+/// sources that actually gate most rows - start covering much later.
+struct CoverageStarts {
+    book: Option<chrono::NaiveDate>,
+    flow: Option<chrono::NaiveDate>,
+    metrics: Option<chrono::NaiveDate>,
+    funding: Option<chrono::NaiveDate>,
+}
+
+fn coverage_starts(
+    bars: &[features_crypto::Bar],
+    micro: &[Option<features_scalper::MicroMinute>],
+) -> CoverageStarts {
+    let first_where = |pred: &dyn Fn(&features_scalper::MicroMinute) -> bool| {
+        bars.iter()
+            .zip(micro.iter())
+            .find(|(_, m)| m.as_ref().is_some_and(|mm| pred(mm)))
+            .map(|(b, _)| b.ts_utc.date_naive())
+    };
+    CoverageStarts {
+        book: first_where(&|mm| {
+            mm.bid_02.is_some() && mm.ask_02.is_some() && mm.bid_10.is_some() && mm.ask_10.is_some()
+        }),
+        flow: first_where(&|mm| mm.spread_bps.is_some() && mm.taker_buy_ratio.is_some()),
+        metrics: first_where(&|mm| mm.oi_value.is_some() && mm.taker_ls_ratio.is_some()),
+        funding: first_where(&|mm| mm.funding_rate.is_some()),
+    }
+}
+
+fn coverage_date_or_none(d: Option<chrono::NaiveDate>) -> String {
+    d.map(|d| d.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
 fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let universe_path = PathBuf::from(need(args, "--universe")?);
@@ -855,23 +900,7 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             }
             None => vec![None; bars.len()],
         };
-        let coverage_start = bars
-            .iter()
-            .zip(micro.iter())
-            .find(|(_, m)| {
-                m.as_ref().is_some_and(|mm| {
-                    mm.spread_bps.is_some()
-                        || mm.taker_buy_ratio.is_some()
-                        || mm.bid_02.is_some()
-                        || mm.ask_02.is_some()
-                        || mm.bid_10.is_some()
-                        || mm.ask_10.is_some()
-                        || mm.oi_value.is_some()
-                        || mm.taker_ls_ratio.is_some()
-                        || mm.funding_rate.is_some()
-                })
-            })
-            .map(|(b, _)| b.ts_utc.date_naive());
+        let cov = coverage_starts(&bars, &micro);
 
         let feature_rows = features_scalper::compute(&bars, &btc_bars, &micro)?;
         let fwd = matrix::forward_returns_bps(&bars, &horizons);
@@ -891,16 +920,15 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
                     && b.ts_utc.timestamp() < end_ts
             })
             .count();
-        let coverage_note = match coverage_start {
-            Some(d) => d.to_string(),
-            None => "none".to_string(),
-        };
         println!(
-            "{}: kept {} of {} (micro coverage from {})",
+            "{}: kept {} of {} (book from {}, flow from {}, metrics from {}, funding from {})",
             candidate.coin,
             rows.len(),
             m,
-            coverage_note
+            coverage_date_or_none(cov.book),
+            coverage_date_or_none(cov.flow),
+            coverage_date_or_none(cov.metrics),
+            coverage_date_or_none(cov.funding),
         );
         assets.push(candidate.coin.clone());
         all_rows.extend(rows);
@@ -1062,6 +1090,95 @@ mod tests {
         // 1000-prefix shorthand - a case-insensitive `k` match would corrupt
         // them into a nonexistent "1000AITOUSDT" symbol.
         assert_eq!(resolve_asset("KAITO").1, Some("KAITOUSDT".to_string()));
+    }
+
+    fn bar_at(ts: DateTime<Utc>) -> features_crypto::Bar {
+        features_crypto::Bar {
+            ts_utc: ts,
+            asset: "TEST".into(),
+            interval_s: 60,
+            open: 99.9,
+            high: 100.1,
+            low: 99.8,
+            close: 100.0,
+            volume: 5.0,
+            quote_volume: Some(500.0),
+            trades: Some(10),
+        }
+    }
+
+    /// Funding has unlimited lookback (the plan's "latest rate at or
+    /// before ts", no staleness window), so it is typically present from
+    /// the very first bar once a single funding pull has landed - but
+    /// book/flow/metrics (the sources that actually gate row survival)
+    /// start covering later. `coverage_starts` must report each source's
+    /// own first-covered date, not let funding's early date collapse the
+    /// whole diagnostic into "covered from day one".
+    #[test]
+    fn coverage_starts_reports_each_source_independently_not_collapsed_by_funding() {
+        use chrono::TimeZone;
+        let day1 = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let day2 = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
+        let day3 = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
+        let bars = vec![bar_at(day1), bar_at(day2), bar_at(day3)];
+
+        let micro = vec![
+            Some(features_scalper::MicroMinute {
+                ts_s: day1.timestamp(),
+                funding_rate: Some(0.0001),
+                ..Default::default()
+            }),
+            Some(features_scalper::MicroMinute {
+                ts_s: day2.timestamp(),
+                funding_rate: Some(0.0001),
+                spread_bps: Some(3.0),
+                taker_buy_ratio: Some(0.5),
+                ..Default::default()
+            }),
+            Some(features_scalper::MicroMinute {
+                ts_s: day3.timestamp(),
+                funding_rate: Some(0.0001),
+                spread_bps: Some(3.0),
+                taker_buy_ratio: Some(0.5),
+                bid_02: Some(10.0),
+                ask_02: Some(9.0),
+                bid_10: Some(50.0),
+                ask_10: Some(48.0),
+                oi_value: Some(1_000.0),
+                taker_ls_ratio: Some(1.1),
+            }),
+        ];
+
+        let cov = coverage_starts(&bars, &micro);
+        assert_eq!(
+            cov.funding,
+            Some(day1.date_naive()),
+            "funding's unlimited lookback covers from bar one"
+        );
+        assert_eq!(cov.flow, Some(day2.date_naive()));
+        assert_eq!(cov.book, Some(day3.date_naive()));
+        assert_eq!(cov.metrics, Some(day3.date_naive()));
+        assert_ne!(
+            cov.book, cov.funding,
+            "funding's early coverage must not collapse into book's later start"
+        );
+    }
+
+    #[test]
+    fn coverage_starts_is_none_for_a_source_that_never_appears() {
+        use chrono::TimeZone;
+        let day1 = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let bars = vec![bar_at(day1)];
+        let micro = vec![Some(features_scalper::MicroMinute {
+            ts_s: day1.timestamp(),
+            funding_rate: Some(0.0001),
+            ..Default::default()
+        })];
+        let cov = coverage_starts(&bars, &micro);
+        assert_eq!(cov.funding, Some(day1.date_naive()));
+        assert_eq!(cov.book, None);
+        assert_eq!(cov.flow, None);
+        assert_eq!(cov.metrics, None);
     }
 
     #[tokio::test]
@@ -1257,6 +1374,10 @@ mod tests {
         );
         assert!(rows.iter().any(|r| r.asset == "kTEST"));
         assert!(rows.iter().all(|r| r.asset == "BTC" || r.asset == "kTEST"));
+        assert!(
+            rows.iter().all(|r| r.features.len() == 38),
+            "fs-2 rows carry all 38 features, not fs-1's 26"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
