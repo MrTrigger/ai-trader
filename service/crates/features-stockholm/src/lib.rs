@@ -26,7 +26,7 @@ pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-9";
 pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-10";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-11";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-16";
+    "fs-rust-stockholm-17";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str =
     "fs-rust-stockholm-12";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION: &str =
@@ -3684,7 +3684,11 @@ pub struct TrainingRow {
     #[serde(default)]
     pub momentum_12_1: Option<f64>,
     /// Adjusted next-session open to adjusted open after `horizon_sessions`.
-    pub target: f64,
+    /// Null when the decision-date cross-section member has no entry or exit
+    /// bar: membership is settled with decision-date information alone, so a
+    /// row that cannot be labelled is still emitted and still carries the
+    /// cross-section it belonged to.
+    pub target: Option<f64>,
     /// Equal-weight return of the complete eligible decision-date cross-section
     /// over the identical executable holding interval. Rust calculates this
     /// label component before Python sees the matrix.
@@ -3710,8 +3714,13 @@ pub struct TrainingRow {
     /// otherwise transforms outcomes.
     #[serde(default)]
     pub relative_rank_target: Option<f64>,
-    pub entry_price: f64,
-    pub exit_price: f64,
+    /// Executable adjusted open of the session after the decision date. Null
+    /// when that session is missing, which is the only case in which the
+    /// position could not have been opened at all.
+    pub entry_price: Option<f64>,
+    /// Executable adjusted open of the exit session. Null when the history
+    /// stops before it.
+    pub exit_price: Option<f64>,
     pub adv20_sek: f64,
     pub vol60: f64,
     /// Decision-session annual stock-borrow fee as a decimal rate. Missing
@@ -3724,7 +3733,11 @@ pub struct TrainingRow {
     /// uses the backtest's disclosed spread fallback.
     #[serde(default)]
     pub median_closing_spread_bps_20: Option<f64>,
-    /// Each decision date has total training weight one.
+    /// Each decision date has total training weight one. The denominator is
+    /// every emitted row of the date, labelled or not, because the weight
+    /// describes the decision cross-section rather than the trainable subset;
+    /// making it depend on label availability would reintroduce the
+    /// future-conditioned membership this field is meant to describe.
     pub sample_weight: f64,
     pub features: BTreeMap<String, f64>,
 }
@@ -3758,13 +3771,21 @@ pub fn feature_target_diagnostics(
     }
     let mut by_date = BTreeMap::<Date, Vec<&TrainingRow>>::new();
     for row in rows {
-        by_date.entry(row.date).or_default().push(row);
+        // A row whose forward outcome was never observed carries no ordering
+        // information; it is skipped rather than treated as a zero return.
+        if row.relative_target.or(row.target).is_some() {
+            by_date.entry(row.date).or_default().push(row);
+        }
     }
     let mut correlations = vec![Vec::<f64>::new(); feature_names.len()];
     for group in by_date.values() {
         let targets = group
             .iter()
-            .map(|row| row.relative_target.unwrap_or(row.target))
+            .map(|row| {
+                row.relative_target
+                    .or(row.target)
+                    .expect("unlabelled rows are filtered above")
+            })
             .collect::<Vec<_>>();
         for (index, name) in feature_names.iter().enumerate() {
             let values = group
@@ -3804,9 +3825,9 @@ pub fn feature_target_diagnostics(
 struct Candidate {
     meta: InstrumentMeta,
     feature: FeatureRow,
-    target: f64,
-    entry_price: f64,
-    exit_price: f64,
+    target: Option<f64>,
+    entry_price: Option<f64>,
+    exit_price: Option<f64>,
     adv20_sek: f64,
     vol60: f64,
     momentum_12_1: f64,
@@ -4182,12 +4203,6 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             {
                 continue;
             }
-            let Some(exit_index) = index.checked_add(1 + horizon_sessions) else {
-                continue;
-            };
-            if exit_index >= history.len() {
-                continue;
-            }
             let feature = by_feature
                 .get(&(instrument_id.to_owned(), decision))
                 .ok_or_else(|| {
@@ -4205,23 +4220,28 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             if feature.values[slow_index].is_none() || adv20_sek < min_adv20_sek {
                 continue;
             }
-            let entry = adjusted_open(history[index + 1]);
-            let exit = adjusted_open(history[exit_index]);
-            let target = exit / entry - 1.0;
-            if !entry.is_finite()
-                || !exit.is_finite()
-                || !target.is_finite()
-                || entry <= 0.0
-                || exit <= 0.0
-            {
-                continue;
-            }
+            // Every gate above reads decision-date information only, so the
+            // cross-section is settled here. Whether the stock still trades on
+            // the entry or exit session is future information: it decides
+            // which labels exist, never who belongs to the group.
+            let tradable_open = |offset: usize| {
+                index
+                    .checked_add(offset)
+                    .and_then(|position| history.get(position))
+                    .map(|bar| adjusted_open(bar))
+                    .filter(|price| price.is_finite() && *price > 0.0)
+            };
+            let entry_price = tradable_open(1);
+            let exit_price = tradable_open(1 + horizon_sessions);
+            let target = entry_price
+                .zip(exit_price)
+                .and_then(|(entry, exit)| finite(exit / entry - 1.0));
             candidates.entry(decision).or_default().push(Candidate {
                 meta: instrument.clone(),
                 feature: feature.clone(),
                 target,
-                entry_price: entry,
-                exit_price: exit,
+                entry_price,
+                exit_price,
                 adv20_sek,
                 vol60,
                 momentum_12_1,
@@ -4322,8 +4342,15 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         if group.is_empty() {
             continue;
         }
+        // Labels can only average over the members whose outcome is observed.
+        // The group itself is already fixed, so an unobserved outcome removes
+        // one term from a label and never a member from the cross-section.
+        let observed = group
+            .iter()
+            .filter_map(|candidate| candidate.target)
+            .collect::<Vec<_>>();
         let market_target =
-            group.iter().map(|candidate| candidate.target).sum::<f64>() / group.len() as f64;
+            (!observed.is_empty()).then(|| observed.iter().sum::<f64>() / observed.len() as f64);
         let context = group
             .iter()
             .map(|candidate| CrossSectionInput {
@@ -4574,20 +4601,29 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 )?
             }
         };
-        let ranked_targets = features_common::rank_normalise(
-            &group
+        let mut ranked_targets = features_common::rank_normalise(
+            &observed
                 .iter()
-                .map(|candidate| vec![Some(candidate.target)])
+                .map(|target| vec![Some(*target)])
                 .collect::<Vec<_>>(),
-        )?;
-        let relative_risk_mean = group
-            .iter()
-            .map(|candidate| (candidate.target - market_target) / candidate.vol60)
-            .sum::<f64>()
-            / group.len() as f64;
-        for ((candidate, values), ranked_target) in
-            group.into_iter().zip(normalised).zip(ranked_targets)
-        {
+        )?
+        .into_iter();
+        let relative_risk_mean = market_target.map(|market| {
+            group
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .target
+                        .map(|target| (target - market) / candidate.vol60)
+                })
+                .sum::<f64>()
+                / observed.len() as f64
+        });
+        for (candidate, values) in group.into_iter().zip(normalised) {
+            let ranked_target = candidate
+                .target
+                .and_then(|_| ranked_targets.next())
+                .and_then(|ranks| ranks.first().copied());
             if values.values.len() != names.len() {
                 return Err("Stockholm contextual model row has the wrong width".into());
             }
@@ -4598,7 +4634,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 .median_spread_bps_20
                 .get(&(candidate.meta.instrument_id.clone(), date))
                 .copied();
-            let relative_target = candidate.target - market_target;
+            let relative_target = candidate
+                .target
+                .zip(market_target)
+                .map(|(target, market)| target - market);
             rows.push(TrainingRow {
                 date: candidate.feature.date,
                 instrument_id: candidate.meta.instrument_id,
@@ -4608,13 +4647,15 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
                 bucket: candidate.meta.bucket,
                 momentum_12_1: Some(candidate.momentum_12_1),
                 target: candidate.target,
-                market_target: Some(market_target),
-                relative_target: Some(relative_target),
-                return_per_risk_target: finite(candidate.target / candidate.vol60),
-                relative_return_per_risk_target: finite(
-                    relative_target / candidate.vol60 - relative_risk_mean,
-                ),
-                relative_rank_target: ranked_target.first().copied(),
+                market_target,
+                relative_target,
+                return_per_risk_target: candidate
+                    .target
+                    .and_then(|target| finite(target / candidate.vol60)),
+                relative_return_per_risk_target: relative_target
+                    .zip(relative_risk_mean)
+                    .and_then(|(relative, mean)| finite(relative / candidate.vol60 - mean)),
+                relative_rank_target: ranked_target,
                 entry_price: candidate.entry_price,
                 exit_price: candidate.exit_price,
                 adv20_sek: candidate.adv20_sek,
@@ -5138,6 +5179,205 @@ mod tests {
             feature_target_diagnostics(&restricted.rows, &restricted.features).unwrap();
         assert_eq!(diagnostics.len(), restricted.features.len());
         assert!(diagnostics.iter().all(|row| row.decision_dates <= 1));
+    }
+
+    const INVARIANCE_HORIZON: usize = 20;
+    const INVARIANCE_DECISION_INDEX: usize = 280;
+    const INVARIANCE_EXIT_INDEX: usize = INVARIANCE_DECISION_INDEX + 1 + INVARIANCE_HORIZON;
+
+    /// `bars` alone only rescales one shared path, which would leave every
+    /// cross-sectional rank tied and the invariance claim vacuous. Give each
+    /// line its own phase so features, ranks and forward returns disperse.
+    fn dispersed_bars(instrument: &str, phase: usize, count: usize) -> Vec<DailyBar> {
+        let mut history = bars(instrument, count, 1.0 + phase as f64 / 100.0);
+        for (day, bar) in history.iter_mut().enumerate() {
+            let factor = 1.0 + (day as f64 * 0.13 + phase as f64).sin() * 0.05;
+            bar.raw_open *= factor;
+            bar.raw_high *= factor;
+            bar.raw_low *= factor;
+            bar.raw_close *= factor;
+            bar.adjusted_close *= factor;
+        }
+        history
+    }
+
+    fn invariance_universe(extra_instrument: &str) -> (Vec<Vec<DailyBar>>, Vec<InstrumentMeta>) {
+        let mut peers = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..5 {
+            let instrument_id = format!("P{index}");
+            peers.push(dispersed_bars(
+                &instrument_id,
+                index,
+                INVARIANCE_EXIT_INDEX + 1,
+            ));
+            instruments.push(InstrumentMeta {
+                instrument_id: instrument_id.clone(),
+                symbol: instrument_id,
+                isin: format!("SE{index:010}"),
+                sector: "Industrials".into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        instruments.push(InstrumentMeta {
+            instrument_id: extra_instrument.into(),
+            symbol: extra_instrument.into(),
+            isin: "SE0000000099".into(),
+            sector: "Industrials".into(),
+            bucket: UniverseBucket::LargeCap,
+        });
+        (peers, instruments)
+    }
+
+    fn invariance_matrix(all_bars: &[DailyBar], instruments: &[InstrumentMeta]) -> TrainingMatrix {
+        let decision = Date::from_calendar_date(2024, Month::January, 1).unwrap()
+            + Duration::days(INVARIANCE_DECISION_INDEX as i64);
+        training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
+            all_bars,
+            instruments,
+            decision,
+            decision,
+            INVARIANCE_HORIZON,
+            0.0,
+            FeatureSet::Baseline,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_section_membership_ignores_whether_a_peer_survives_the_horizon() {
+        let (peers, instruments) = invariance_universe("X");
+        // `bars` leaves adjusted_close equal to raw_close, so the executable
+        // adjusted open of a fixture bar is exactly its raw open.
+        let peer_mean = peers
+            .iter()
+            .map(|history| {
+                history[INVARIANCE_EXIT_INDEX].raw_open
+                    / history[INVARIANCE_DECISION_INDEX + 1].raw_open
+                    - 1.0
+            })
+            .sum::<f64>()
+            / peers.len() as f64;
+        let truncated_x = dispersed_bars("X", 5, INVARIANCE_DECISION_INDEX + 4);
+        let mut full_x = dispersed_bars("X", 5, INVARIANCE_EXIT_INDEX + 1);
+        // Give the surviving arm exactly the peers' average forward return so
+        // the market label is comparable between the arms and only
+        // cross-section membership is under test.
+        let exit_open = full_x[INVARIANCE_DECISION_INDEX + 1].raw_open * (1.0 + peer_mean);
+        let exit_bar = &mut full_x[INVARIANCE_EXIT_INDEX];
+        exit_bar.raw_open = exit_open;
+        exit_bar.raw_close = exit_open;
+        exit_bar.adjusted_close = exit_open;
+        exit_bar.raw_high = exit_open * 1.005;
+        exit_bar.raw_low = exit_open * 0.995;
+
+        let build = |x_history: &[DailyBar]| {
+            let mut all_bars = peers.concat();
+            all_bars.extend_from_slice(x_history);
+            invariance_matrix(&all_bars, &instruments)
+        };
+        let truncated = build(&truncated_x);
+        let full = build(&full_x);
+
+        // X stops trading three sessions after the decision date in one arm and
+        // survives the whole horizon in the other. Nothing knowable on the
+        // decision date may move.
+        assert_eq!(truncated.rows.len(), 6);
+        assert_eq!(full.rows.len(), 6);
+        for (left, right) in truncated.rows.iter().zip(&full.rows) {
+            assert_eq!(left.instrument_id, right.instrument_id);
+            assert_eq!(
+                left.features, right.features,
+                "decision-date features, ranks and sector medians must not move"
+            );
+            assert_eq!(left.sample_weight, right.sample_weight);
+            assert!((left.sample_weight - 1.0 / 6.0).abs() < 1e-12);
+            assert_eq!(left.momentum_12_1, right.momentum_12_1);
+            assert_eq!(left.vol60, right.vol60);
+            assert_eq!(left.adv20_sek, right.adv20_sek);
+        }
+        // The surviving arm averages one extra, exactly-average term, so the
+        // two market labels agree to summation rounding rather than bitwise.
+        assert!(
+            (truncated.rows[0].market_target.unwrap() - full.rows[0].market_target.unwrap()).abs()
+                < 1e-12
+        );
+        assert!((truncated.rows[0].market_target.unwrap() - peer_mean).abs() < 1e-12);
+        // A degenerate cross-section would make the invariance vacuous.
+        assert!(truncated
+            .rows
+            .iter()
+            .filter_map(|row| row.target)
+            .any(|target| (target - peer_mean).abs() > 1e-6));
+        for (left, right) in truncated
+            .rows
+            .iter()
+            .zip(&full.rows)
+            .filter(|(row, _)| row.instrument_id != "X")
+        {
+            assert_eq!(left.target, right.target);
+            assert!(
+                (left.relative_target.unwrap() - right.relative_target.unwrap()).abs() < 1e-12,
+                "market-relative labels must follow the invariant market label"
+            );
+            assert_eq!(left.entry_price, right.entry_price);
+            assert_eq!(left.exit_price, right.exit_price);
+        }
+
+        let row = truncated
+            .rows
+            .iter()
+            .find(|row| row.instrument_id == "X")
+            .unwrap();
+        assert_eq!(row.target, None);
+        assert_eq!(row.exit_price, None);
+        assert!(row.entry_price.is_some());
+        assert_eq!(row.relative_target, None);
+        assert_eq!(row.return_per_risk_target, None);
+        assert_eq!(row.relative_return_per_risk_target, None);
+        assert_eq!(row.relative_rank_target, None);
+    }
+
+    #[test]
+    fn a_stock_without_an_entry_bar_still_shapes_the_decision_cross_section() {
+        let (peers, instruments) = invariance_universe("Z");
+        let mut all_bars = peers.concat();
+        // Z's history stops on the decision date itself, so it can never be
+        // entered; its decision-date features are nonetheless knowable.
+        all_bars.extend(dispersed_bars("Z", 5, INVARIANCE_DECISION_INDEX + 1));
+        let matrix = invariance_matrix(&all_bars, &instruments);
+
+        assert_eq!(matrix.rows.len(), 6);
+        assert!(matrix
+            .rows
+            .iter()
+            .all(|row| (row.sample_weight - 1.0 / 6.0).abs() < 1e-12));
+        let row = matrix
+            .rows
+            .iter()
+            .find(|row| row.instrument_id == "Z")
+            .unwrap();
+        assert_eq!(row.entry_price, None);
+        assert_eq!(row.exit_price, None);
+        assert_eq!(row.target, None);
+        assert!(row.market_target.is_some());
+        assert!(matrix
+            .rows
+            .iter()
+            .filter(|row| row.instrument_id != "Z")
+            .all(|row| row.target.is_some()));
     }
 
     #[test]
@@ -5993,7 +6233,7 @@ mod tests {
             .all(|row| row.features.len() == residual_model_feature_names().len()));
         assert!(matrix.rows.iter().all(|row| {
             let absolute = row.return_per_risk_target.unwrap();
-            (absolute * row.vol60 - row.target).abs() < 1e-12
+            (absolute * row.vol60 - row.target.unwrap()).abs() < 1e-12
         }));
         for date in matrix
             .rows
@@ -6099,7 +6339,8 @@ mod tests {
                 .sum::<f64>();
             assert!(relative_sum.abs() < 1e-10);
             assert!(rows.iter().all(|row| {
-                (row.market_target.unwrap() + row.relative_target.unwrap() - row.target).abs()
+                (row.market_target.unwrap() + row.relative_target.unwrap() - row.target.unwrap())
+                    .abs()
                     < 1e-12
             }));
         }

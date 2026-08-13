@@ -46,6 +46,15 @@ REWARDS = (
     "relative_return_per_risk",
     "relative_rank",
 )
+# Rust names the label for every reward. A row whose decision-date cross-section
+# membership was settled without an observable forward outcome carries null here.
+TARGET_FIELDS = {
+    "absolute_return": "target",
+    "return_per_risk": "return_per_risk_target",
+    "relative_return": "relative_target",
+    "relative_return_per_risk": "relative_return_per_risk_target",
+    "relative_rank": "relative_rank_target",
+}
 
 
 def load_matrix(
@@ -76,41 +85,21 @@ def load_matrix(
         raise ValueError(f"unsupported Stockholm reward {reward!r}")
     if not 0.0 <= clip_quantile < 0.5:
         raise ValueError("clip quantile must be in [0, 0.5)")
-    if reward == "return_per_risk":
-        rows = [row for row in rows if row.get("return_per_risk_target") is not None]
-        if len(rows) < 10_000:
-            raise ValueError(
-                f"only {len(rows)} Rust risk-target rows through {through}; "
-                "refusing a small fit"
-            )
-        y = np.asarray([row["return_per_risk_target"] for row in rows], dtype=np.float64)
-    elif reward == "relative_return_per_risk":
-        rows = [
-            row
-            for row in rows
-            if row.get("relative_return_per_risk_target") is not None
-        ]
-        if len(rows) < 10_000:
-            raise ValueError(
-                f"only {len(rows)} Rust relative-risk rows through {through}; "
-                "refusing a small fit"
-            )
-        y = np.asarray(
-            [row["relative_return_per_risk_target"] for row in rows],
-            dtype=np.float64,
+    if reward == "relative_rank" and clip_quantile:
+        raise ValueError("relative-rank labels are Rust-bounded; clipping must be zero")
+    # Rust emits every decision-date cross-section member, including the ones
+    # whose forward outcome was never observed: membership is a decision-date
+    # fact and must not depend on it. Only labelled rows can be fitted.
+    target_field = TARGET_FIELDS[reward]
+    labelled = [row for row in rows if row.get(target_field) is not None]
+    dropped_rows = len(rows) - len(labelled)
+    rows = labelled
+    if len(rows) < 10_000:
+        raise ValueError(
+            f"only {len(rows)} rows with a Rust {target_field} through {through} "
+            f"({dropped_rows} unlabelled); refusing a small fit"
         )
-    elif reward == "relative_return":
-        if any(row.get("relative_target") is None for row in rows):
-            raise ValueError("Rust matrix lacks relative-return labels")
-        y = np.asarray([row["relative_target"] for row in rows], dtype=np.float64)
-    elif reward == "relative_rank":
-        if clip_quantile:
-            raise ValueError("relative-rank labels are Rust-bounded; clipping must be zero")
-        if any(row.get("relative_rank_target") is None for row in rows):
-            raise ValueError("Rust matrix lacks relative-rank labels")
-        y = np.asarray([row["relative_rank_target"] for row in rows], dtype=np.float64)
-    else:
-        y = np.asarray([row["target"] for row in rows], dtype=np.float64)
+    y = np.asarray([row[target_field] for row in rows], dtype=np.float64)
     x = np.asarray(
         [[row["features"][feature] for feature in features] for row in rows],
         dtype=np.float64,
@@ -132,7 +121,7 @@ def load_matrix(
         reward_scale = float(np.sum(weights * y * relative) / denominator)
         if not np.isfinite(reward_scale) or reward_scale <= 0.0:
             raise ValueError("relative-rank calibration is not finite and positive")
-    return manifest, features, rows, x, y, weights, clip, reward_scale
+    return manifest, features, rows, x, y, weights, clip, reward_scale, dropped_rows
 
 
 def scale_leaves(node, factor):
@@ -346,7 +335,7 @@ def main() -> None:
     if args.calibration_sessions < 0:
         parser.error("--calibration-sessions must be non-negative")
 
-    manifest, features, rows, x, y, weights, clip, reward_scale = load_matrix(
+    manifest, features, rows, x, y, weights, clip, reward_scale, dropped_rows = load_matrix(
         args.matrix,
         args.through,
         args.reward,
@@ -395,6 +384,7 @@ def main() -> None:
         "trained_through": args.through.isoformat(),
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "n_rows": len(rows),
+        "n_unlabelled_rows_dropped": dropped_rows,
         "n_dates": len({row["date"] for row in rows}),
         "features": features,
         "survivorship_status": manifest["survivorship_status"],
@@ -414,7 +404,8 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(document, sort_keys=True, indent=2) + "\n")
     print(
-        f"wrote {args.out}: {len(rows):,} rows, {len(features)} Rust-owned inputs, "
+        f"wrote {args.out}: {len(rows):,} rows "
+        f"({dropped_rows:,} unlabelled dropped), {len(features)} Rust-owned inputs, "
         f"{args.model_family} {args.reward}/{args.objective}, {args.seeds} seed(s), "
         f"{args.from_date or 'inception'} through {args.through}"
     )

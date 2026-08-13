@@ -333,16 +333,14 @@ impl Model {
             }))
     }
 
-    fn diagnostic_target(&self, row: &TrainingRow) -> Result<f64, String> {
+    /// `None` when the row's forward outcome was never observed. That row was
+    /// still part of the decision cross-section, so it is skipped from
+    /// diagnostics rather than counted as a zero realized return.
+    fn diagnostic_target(&self, row: &TrainingRow) -> Result<Option<f64>, String> {
         match self.reward.as_str() {
             "absolute_return" | "return_per_risk" => Ok(row.target),
             "relative_return" | "relative_return_per_risk" | "relative_rank" => {
-                row.relative_target.ok_or_else(|| {
-                    format!(
-                        "matrix row {} on {} lacks its Rust relative target",
-                        row.instrument_id, row.date
-                    )
-                })
+                relative_target(row)
             }
             _ => Err(format!("unsupported Stockholm reward {:?}", self.reward)),
         }
@@ -603,6 +601,25 @@ impl ExecutionCost {
     fn total_bps(self) -> f64 {
         self.commission_bps + self.impact_bps + self.spread_bps
     }
+}
+
+/// The row's market-relative label. A row whose absolute outcome was never
+/// observed legitimately has neither; a labelled row missing its relative
+/// component comes from a matrix built before Rust owned that label.
+fn relative_target(row: &TrainingRow) -> Result<Option<f64>, String> {
+    match (row.target, row.relative_target) {
+        (Some(_), None) => Err(format!(
+            "matrix row {} on {} lacks its Rust relative target",
+            row.instrument_id, row.date
+        )),
+        (_, relative) => Ok(relative),
+    }
+}
+
+/// Realized outcome of a row the caller already restricted to replayable rows.
+fn replayed_return(row: &TrainingRow) -> f64 {
+    row.target
+        .expect("replayed rows are filtered to observed outcomes")
 }
 
 fn execution_cost(row: &TrainingRow, costs: &CostConfig) -> Result<ExecutionCost, String> {
@@ -1876,6 +1893,10 @@ pub struct BacktestConfig {
 #[derive(Debug)]
 struct Candidate<'a> {
     row: &'a TrainingRow,
+    /// Executable entry and realized outcome, resolved once when the row is
+    /// admitted so the rest of the replay cannot meet an absent label.
+    entry_price: f64,
+    realised_return: f64,
     direction: Direction,
     absolute_prediction: f64,
     relative_prediction: Option<f64>,
@@ -1972,6 +1993,11 @@ pub fn backtest(
             by_date.entry(row.date).or_default().push(row);
         }
     }
+    // The whole decision cross-section is kept, unlabelled members included,
+    // so cross-sectional centering stays point-in-time. A date on which no
+    // outcome at all was observed cannot be replayed, so it is not a
+    // rebalance date; it would otherwise liquidate the book for free.
+    by_date.retain(|_, rows| rows.iter().any(|row| row.target.is_some()));
     let dates = by_date.keys().copied().collect::<Vec<_>>();
     if dates.is_empty() {
         return Err("backtest window has no matrix rows".into());
@@ -2055,16 +2081,13 @@ pub fn backtest(
         for (row, raw_prediction) in raw_predictions {
             let selection_prediction = raw_prediction - prediction_center;
             let diagnostic_target = if residual_composition {
-                row.relative_target.ok_or_else(|| {
-                    format!(
-                        "matrix row {} on {} lacks its Rust relative target",
-                        row.instrument_id, row.date
-                    )
-                })?
+                relative_target(row)?
             } else {
                 model.diagnostic_target(row)?
             };
-            diagnostic_block.push((selection_prediction, diagnostic_target));
+            if let Some(diagnostic_target) = diagnostic_target {
+                diagnostic_block.push((selection_prediction, diagnostic_target));
+            }
             // Relative cross-sectional scores only describe performance versus
             // OMXSGI. Their sign cannot determine an absolute BUY/SELL side.
             // Compose the separately trained market forecast first, then apply
@@ -2084,9 +2107,17 @@ pub fn backtest(
             } else {
                 (Direction::Short, short_edge)
             };
+            // A row without an entry bar could not have been opened, and one
+            // without an exit bar has no outcome this replay could honour.
+            // Both still shaped the cross-section above; neither is tradable.
+            let (Some(entry_price), Some(realised_return)) = (row.entry_price, row.target) else {
+                continue;
+            };
             if edge > 0.0 {
                 candidates.push(Candidate {
                     row,
+                    entry_price,
+                    realised_return,
                     direction,
                     absolute_prediction,
                     relative_prediction: uses_market_forecast.then_some(selection_prediction),
@@ -2298,7 +2329,7 @@ pub fn backtest(
             held.push((
                 candidate.row.instrument_id.clone(),
                 signed_weight,
-                candidate.row.entry_price,
+                candidate.entry_price,
             ));
             let sign = signed_weight.signum();
             let absolute_weight = signed_weight.abs();
@@ -2306,11 +2337,11 @@ pub fn backtest(
                 .get(&candidate.row.instrument_id)
                 .copied()
                 .unwrap_or(0.0);
-            let pnl = absolute_weight * sign * candidate.row.target - cost_amount;
+            let pnl = absolute_weight * sign * candidate.realised_return - cost_amount;
             if sign > 0.0 {
-                long_pnl += absolute_weight * candidate.row.target;
+                long_pnl += absolute_weight * candidate.realised_return;
             } else {
-                short_pnl -= absolute_weight * candidate.row.target;
+                short_pnl -= absolute_weight * candidate.realised_return;
             }
             net += signed_weight;
             positions.push(PositionResult {
@@ -2323,7 +2354,7 @@ pub fn backtest(
                 relative_prediction: candidate.relative_prediction,
                 market_return_prediction: candidate.market_return_prediction,
                 net_edge: candidate.edge,
-                realised_return: candidate.row.target,
+                realised_return: candidate.realised_return,
                 weight: signed_weight,
                 cost: cost_amount,
                 pnl,
@@ -3211,7 +3242,14 @@ fn selection_layer_metrics(
     let mut previous: BTreeMap<String, (f64, ExecutionCost)> = BTreeMap::new();
     let mut steps = Vec::with_capacity(selected_dates.len());
     for (date_index, date) in selected_dates.iter().copied().enumerate() {
-        let rows = &by_date[&date];
+        // Only a row with an executable entry and an observed outcome can be
+        // replayed. The others were cross-section members that shaped the
+        // ranks; they were never tradable names.
+        let rows = by_date[&date]
+            .iter()
+            .copied()
+            .filter(|row| row.entry_price.is_some() && row.target.is_some())
+            .collect::<Vec<_>>();
         if rows.len() < positions_per_side * 2 {
             continue;
         }
@@ -3240,7 +3278,7 @@ fn selection_layer_metrics(
 
         let gross_return_before_costs = target
             .values()
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let mut cost_drag = 0.0;
         let mut turnover = 0.0;
@@ -3359,6 +3397,11 @@ pub fn fixed_momentum_backtest(
     let mut by_date: BTreeMap<Date, Vec<&TrainingRow>> = BTreeMap::new();
     for row in rows {
         if row.date < config.start || row.date > config.end {
+            continue;
+        }
+        // The control replays executable positions only. A cross-section
+        // member with no entry bar or no observed outcome is not one.
+        if row.entry_price.is_none() || row.target.is_none() {
             continue;
         }
         match row.momentum_12_1 {
@@ -3505,12 +3548,12 @@ fn fixed_momentum_performance(
         let long_pnl = target
             .values()
             .filter(|(weight, _, _)| *weight > 0.0)
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let short_pnl = target
             .values()
             .filter(|(weight, _, _)| *weight < 0.0)
-            .map(|(weight, _, row)| weight * row.target)
+            .map(|(weight, _, row)| weight * replayed_return(row))
             .sum::<f64>();
         let gross_return_before_costs = long_pnl + short_pnl;
         let gross = target.values().map(|(weight, _, _)| weight.abs()).sum();
@@ -4501,7 +4544,7 @@ mod tests {
                 let mut value = row(date);
                 value.instrument_id = format!("TX{index}");
                 value.features.insert("x_ret_1".into(), score);
-                value.target = score * 0.05;
+                value.target = Some(score * 0.05);
                 value
             })
             .collect::<Vec<_>>();
@@ -4542,7 +4585,7 @@ mod tests {
             value.instrument_id = instrument.into();
             value.symbol = instrument.into();
             value.momentum_12_1 = Some(momentum);
-            value.target = target;
+            value.target = Some(target);
             value
         })
         .collect::<Vec<_>>();
@@ -4578,14 +4621,14 @@ mod tests {
             sector: "Industrials".into(),
             bucket: UniverseBucket::LargeCap,
             momentum_12_1: Some(0.1),
-            target: 0.01,
+            target: Some(0.01),
             market_target: Some(0.005),
             relative_target: Some(0.005),
             return_per_risk_target: Some(0.5),
             relative_return_per_risk_target: Some(0.25),
             relative_rank_target: Some(0.5),
-            entry_price: 100.0,
-            exit_price: 101.0,
+            entry_price: Some(100.0),
+            exit_price: Some(101.0),
             adv20_sek: 10_000_000.0,
             vol60: 0.02,
             borrow_fee_annualized: None,
@@ -4632,6 +4675,82 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn the_replay_never_trades_a_cross_section_member_it_cannot_price() {
+        let unlabelled = |date: Date, instrument: &str| {
+            let mut value = row(date);
+            value.instrument_id = instrument.into();
+            value.symbol = instrument.into();
+            value.entry_price = None;
+            value.exit_price = None;
+            value.target = None;
+            value.relative_target = None;
+            value.return_per_risk_target = None;
+            value.relative_return_per_risk_target = None;
+            value.relative_rank_target = None;
+            value
+        };
+        // A new matrix carries decision-date rows whose forward outcome was
+        // never observed. They must survive deserialization, stay out of the
+        // book, and never turn a labelless date into a rebalance.
+        let encoded = serde_json::to_string(&unlabelled(day("2024-01-02"), "GONE")).unwrap();
+        assert!(encoded.contains("\"target\":null"));
+        assert!(encoded.contains("\"entry_price\":null"));
+        let decoded: TrainingRow = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.target, None);
+
+        let rows = [
+            row(day("2024-01-02")),
+            unlabelled(day("2024-01-02"), "GONE"),
+            row(day("2024-01-03")),
+            unlabelled(day("2024-01-04"), "GONE"),
+        ];
+        let result = backtest(
+            &constant_model(0.02),
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-04"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                position_weight: 0.05,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 2);
+        assert!(result
+            .steps
+            .iter()
+            .all(|step| step.date != day("2024-01-04")));
+        assert!(result
+            .steps
+            .iter()
+            .flat_map(|step| &step.positions)
+            .all(|position| position.instrument_id != "GONE"));
+        // Skipped rather than scored as a zero realized return.
+        assert_eq!(result.diagnostics.unwrap().observations, 2);
     }
 
     #[test]
@@ -4689,15 +4808,15 @@ mod tests {
     fn daily_marks_price_the_book_on_every_held_session() {
         let decision = day("2024-01-02");
         let mut first = row(decision);
-        first.entry_price = 100.0;
-        first.exit_price = 120.0;
-        first.target = 0.20;
+        first.entry_price = Some(100.0);
+        first.exit_price = Some(120.0);
+        first.target = Some(0.20);
         let mut second = row(decision);
         second.instrument_id = "TX2".into();
         second.symbol = "OTHER".into();
-        second.entry_price = 50.0;
-        second.exit_price = 55.0;
-        second.target = 0.10;
+        second.entry_price = Some(50.0);
+        second.exit_price = Some(55.0);
+        second.target = Some(0.10);
         // Decision session plus the three held sessions; the position is bought
         // at the open after the decision and sold at the open after the last.
         let sessions = [
@@ -4852,9 +4971,9 @@ mod tests {
         let rows = (0..11)
             .map(|index| {
                 let mut row = row(sessions[index]);
-                row.entry_price = prices[index + 1];
-                row.exit_price = prices[index + 1 + cadence];
-                row.target = row.exit_price / row.entry_price - 1.0;
+                row.entry_price = Some(prices[index + 1]);
+                row.exit_price = Some(prices[index + 1 + cadence]);
+                row.target = Some(prices[index + 1 + cadence] / prices[index + 1] - 1.0);
                 row
             })
             .collect::<Vec<_>>();

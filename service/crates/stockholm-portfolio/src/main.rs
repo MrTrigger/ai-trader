@@ -204,6 +204,10 @@ struct MatrixManifest {
     kind: String,
     feature_set_version: String,
     label_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label_coverage: Option<String>,
     features: Vec<String>,
     horizon_sessions: usize,
     min_adv20_sek: f64,
@@ -1511,6 +1515,11 @@ fn matrix(args: &[String]) -> Result<(), String> {
     }
     let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
     let mut output = std::io::BufWriter::new(file);
+    let labelled_rows = matrix
+        .rows
+        .iter()
+        .filter(|row| row.target.is_some())
+        .count();
     let manifest = MatrixManifest {
         kind: "stockholm_training_manifest".into(),
         feature_set_version: match feature_set {
@@ -1563,6 +1572,19 @@ fn matrix(args: &[String]) -> Result<(), String> {
         }
         .into(),
         label_version: features_stockholm::label_version(horizon)?,
+        label_policy: Some(
+            "Decision-date cross-section membership uses information available on the decision date alone. A member whose entry (t+1) or exit (t+1+H) session is missing keeps its features, cross-sectional ranks, sector medians and sample weight, and carries null targets; market and relative labels average only the members whose outcome was observed. Each decision date's sample weight is one divided by every emitted row of that date, labelled or not, so weights describe the decision cross-section rather than the trainable subset."
+                .into(),
+        ),
+        label_coverage: Some(format!(
+            "{labelled_rows}/{} emitted rows carry an observed forward return; {} could never have been entered",
+            matrix.rows.len(),
+            matrix
+                .rows
+                .iter()
+                .filter(|row| row.entry_price.is_none())
+                .count()
+        )),
         features: matrix.features,
         horizon_sessions: horizon,
         min_adv20_sek: min_adv,
@@ -1850,8 +1872,9 @@ fn matrix(args: &[String]) -> Result<(), String> {
     }
     output.flush().map_err(|error| error.to_string())?;
     println!(
-        "wrote {} final Rust Stockholm rows -> {}",
+        "wrote {} final Rust Stockholm rows ({} with an observed forward return) -> {}",
         matrix.rows.len(),
+        labelled_rows,
         path.display()
     );
     Ok(())
