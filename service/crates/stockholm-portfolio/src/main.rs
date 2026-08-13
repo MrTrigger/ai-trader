@@ -158,10 +158,13 @@ usage: stockholm-portfolio <command>
            [--reference-edge 0.01] [--reference-volatility 0.02]
            [--aggregate-short-horizon-forecast]
            [--cost-multiple 1] [--bars-root <dir>]
+           [--risk-free-annual 0.02]
       Replay one strictly-forward model fold with no long/short quota.
       --bars-root reads the same adjusted daily history the matrix was built
       from and marks NAV on every held session; without it a step reports its
-      holding-period NAV alone.
+      holding-period NAV alone. --risk-free-annual (a Riksbank policy-rate
+      approximation until a SWESTR series is wired) is subtracted before
+      Sharpe is computed, for both the portfolio and any benchmark.
 
   direction-backtest --matrix <jsonl> --model <json>
                      --start YYYY-MM-DD --end YYYY-MM-DD --out <json>
@@ -174,12 +177,21 @@ usage: stockholm-portfolio <command>
       non-overlapping fold steps.
 
   summarize-rebalance-phases --phase <json> [--phase <json> ...] --out <json>
+                             [--risk-free-annual 0.02]
       Equal-weight every rebalance offset for one frozen model/fold. Exactly
       one report per offset from zero through cadence minus one is required.
 
   summarize-rebalance-phase-folds --fold <json> [--fold <json> ...] --out <json>
+                                  [--risk-free-annual 0.02]
+                                  [--target-sharpe-floor 1.0]
       Stitch non-overlapping equal-weight phase summaries into one auditable
       walk-forward result without treating overlapping phases as observations.
+      `passed` requires `active_tstat >= 2.0` and
+      `sharpe - 1.64*sharpe_se >= target_sharpe_floor`; the active t-stat reads
+      null with a disclosed reason when the bot and benchmark series do not
+      share one observation grid (daily bot vs holding-period benchmark, until
+      Task 4 delivers a daily benchmark mark). --target-sharpe-floor is
+      provisional pending Decision Point 1 in the remediation plan.
 
   add-benchmark --report <json> --benchmark <json> [--out <json>]
       Add exact-session benchmark attribution to an existing frozen Rust fold
@@ -2611,6 +2623,7 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             costs,
             benchmark,
             mark_prices,
+            risk_free_annual: number(args, "--risk-free-annual", 0.02_f64)?,
         },
     )?;
     let path = PathBuf::from(need(args, "--out")?);
@@ -2621,19 +2634,22 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     bytes.push(b'\n');
     std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
     println!(
-        "{} periods, return {:.2}%, Sharpe {:.2}, max DD {:.2}% -> {}",
+        "{} periods, return {:.2}%, Sharpe {:.2} ± {:.2} (rf {:.2}%), max DD {:.2}% -> {}",
         result.metrics.periods,
         result.metrics.total_return * 100.0,
         result.metrics.sharpe,
+        result.metrics.sharpe_se,
+        result.metrics.risk_free_annual * 100.0,
         result.metrics.max_drawdown * 100.0,
         path.display()
     );
     if let Some(benchmark) = &result.benchmark {
         println!(
-            "{} return {:.2}%, Sharpe {:.2}; portfolio minus benchmark {:.2}pp, beta {:.2}",
+            "{} return {:.2}%, Sharpe {:.2} ± {:.2}; portfolio minus benchmark {:.2}pp, beta {:.2}",
             benchmark.symbol,
             benchmark.total_return * 100.0,
             benchmark.sharpe,
+            benchmark.sharpe_se,
             benchmark.portfolio_minus_benchmark_total_return * 100.0,
             benchmark.beta,
         );
@@ -2663,7 +2679,8 @@ fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
             serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
         })
         .collect::<Result<Vec<stockholm_portfolio::BacktestResult>, String>>()?;
-    let summary = stockholm_portfolio::summarize_rebalance_phases(&reports)?;
+    let risk_free_annual = number(args, "--risk-free-annual", 0.02_f64)?;
+    let summary = stockholm_portfolio::summarize_rebalance_phases(&reports, risk_free_annual)?;
     let path = PathBuf::from(need(args, "--out")?);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -2672,16 +2689,26 @@ fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
     bytes.push(b'\n');
     std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     println!(
-        "{} equal-weight phases combined by {}, {} observations at {:.1}/yr: return {:.2}%, Sharpe {:.2}, max DD {:.2}% -> {}",
+        "{} equal-weight phases combined by {}, {} observations at {:.1}/yr: return {:.2}%, Sharpe {:.2} ± {:.2} (rf {:.2}%), max DD {:.2}% -> {}",
         summary.phase_count,
         summary.combination_method,
         summary.performance.periods,
         summary.performance.periods_per_year,
         summary.performance.total_return * 100.0,
         summary.performance.sharpe,
+        summary.performance.sharpe_se,
+        summary.performance.risk_free_annual * 100.0,
         summary.performance.max_drawdown * 100.0,
         path.display(),
     );
+    match summary.active_tstat {
+        Some(value) => println!("active t-stat vs benchmark: {value:.2}"),
+        None => {
+            if let Some(status) = &summary.active_tstat_status {
+                println!("active t-stat vs benchmark: unavailable ({status})");
+            }
+        }
+    }
     if summary.combination_method != stockholm_portfolio::CALENDAR_ALIGNED_DAILY_NAV {
         eprintln!(
             "warning: these phase reports carry no daily NAV marks, so overlapping holding windows were averaged by period index and the Sharpe above is overstated. Rerun the phases with --bars-root."
@@ -2702,7 +2729,13 @@ fn summarize_rebalance_phase_folds(args: &[String]) -> Result<(), String> {
             serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
         })
         .collect::<Result<Vec<stockholm_portfolio::RebalancePhaseSummary>, String>>()?;
-    let summary = stockholm_portfolio::summarize_rebalance_phase_folds(&folds)?;
+    let risk_free_annual = number(args, "--risk-free-annual", 0.02_f64)?;
+    let target_sharpe_floor = number(args, "--target-sharpe-floor", 1.0_f64)?;
+    let summary = stockholm_portfolio::summarize_rebalance_phase_folds(
+        &folds,
+        risk_free_annual,
+        target_sharpe_floor,
+    )?;
     let path = PathBuf::from(need(args, "--out")?);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -2711,16 +2744,27 @@ fn summarize_rebalance_phase_folds(args: &[String]) -> Result<(), String> {
     bytes.push(b'\n');
     std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     println!(
-        "{} folds, {} equal-weight phases combined by {}: return {:.2}%, Sharpe {:.2}, max DD {:.2}%, passed={} -> {}",
+        "{} folds, {} equal-weight phases combined by {}: return {:.2}%, Sharpe {:.2} ± {:.2} (rf {:.2}%, floor {:.2}), max DD {:.2}%, passed={} -> {}",
         summary.folds,
         summary.phase_count,
         summary.combination_method,
         summary.performance.total_return * 100.0,
         summary.performance.sharpe,
+        summary.performance.sharpe_se,
+        summary.performance.risk_free_annual * 100.0,
+        summary.target_sharpe_floor,
         summary.performance.max_drawdown * 100.0,
         summary.passed,
         path.display(),
     );
+    match summary.active_tstat {
+        Some(value) => println!("active t-stat vs benchmark: {value:.2}"),
+        None => {
+            if let Some(status) = &summary.active_tstat_status {
+                println!("active t-stat vs benchmark: unavailable ({status})");
+            }
+        }
+    }
     if summary.combination_method != stockholm_portfolio::CALENDAR_ALIGNED_DAILY_NAV {
         eprintln!(
             "warning: these folds averaged their phases by period index; the Sharpe above is overstated. Rerun the phases with --bars-root."

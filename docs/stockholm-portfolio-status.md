@@ -2,11 +2,16 @@
 
 > **Last updated:** 2026-08-13  
 > **Decision:** **FAILED / NOT PROMOTABLE**  
-> **Required net Sharpe:** 2.0 after realistic costs  
-> **Best corrected development Sharpe:** 1.27 (was 1.52 before the 2026-08-13
+> **Required net Sharpe:** 2.0 after realistic costs (superseded as the
+> promotion gate by the active-t-stat/Sharpe-floor rule below, pending the
+> user's Decision Point 1 ruling)  
+> **Best corrected development Sharpe:** 1.16 ± 0.60 SE, excess of a 2%
+> risk-free rate (was 1.27 non-excess, was 1.52 before the 2026-08-13
 > phase-combination fix)  
-> **Latest 2025-10–2026-07 diagnostic Sharpe:** -0.35 (was -0.89)  
-> **Latest comparable OMXSGI Sharpe:** 1.25 (was 2.38)  
+> **Latest 2025-10–2026-07 diagnostic Sharpe:** -0.47 ± 1.22 SE, excess of a 2%
+> risk-free rate (was -0.35 non-excess, was -0.89)  
+> **Latest comparable OMXSGI Sharpe:** 0.79 ± 0.58 SE, excess (was 1.25
+> non-excess, was 2.38)  
 > **Data status:** `SURVIVORSHIP_CONTAMINATED`  
 > **Execution status:** no Stockholm paper or live orders; no deployment
 
@@ -76,6 +81,63 @@ originals are unchanged. Older phase reports carrying no daily marks still
 summarise, but the summary stamps
 `combination_method: "legacy_period_index_average"` and the CLI warns that the
 Sharpe is overstated.
+
+## 2026-08-13 Task 3: excess-return Sharpe, standard errors, and an honest gate
+
+Every Sharpe this document reported before today assumed a 0% risk-free rate
+and carried no uncertainty: a 9-period fold Sharpe and a 160-period fold
+Sharpe were compared as if equally precise, when the analytic standard error
+of a 9-period Sharpe is roughly ±1.1 — wide enough to have driven accept/reject
+calls across the ~85 arms this project has tried. `stockholm-portfolio` now
+subtracts a Riksbank-policy-rate approximation (`--risk-free-annual`, default
+2%, until a SWESTR series is wired) before computing Sharpe, reports an
+analytic Lo (2002) standard error (`sharpe_se`) annualised the same way the
+point estimate is, and reports an active-return t-stat (mean per-period bot
+minus benchmark return, over its own standard error) wherever the bot and
+benchmark share one observation grid. The `passed` field on a walk-forward
+fold summary is now `active_tstat >= 2.0 AND sharpe - 1.64*sharpe_se >=
+target_sharpe_floor`, with `target_sharpe_floor` a new explicit, provisional
+default of 1.0 pending the user's ruling on Decision Point 1 in the
+remediation plan; the old `target_sharpe` (2.0) field is retained for its
+original meaning but no longer gates `passed`.
+
+Regenerated from Task 2's already-regenerated phase replays (`--bars-root`,
+same matrices/models/folds/costs):
+
+| interval / model | return | Sharpe (excess, rf 2%) | ± SE | max drawdown | previously (non-excess) |
+|---|---:|---:|---:|---:|---:|
+| 2022-09–2025-09, lean 20-phase (4 folds) | +83.77% | **1.16** | ±0.60 | -21.67% | 1.27 |
+| 2025-10–2026-07, rich v11 20-phase diagnostic | -4.62% | **-0.47** | ±1.22 | -12.99% | -0.35 |
+| OMXSGI, lean development window | — | 0.79 | ±0.58 | — | 0.92 |
+| OMXSGI, pseudo-holdout window | — | 1.11 | ±1.15 | — | 1.25 |
+
+`sharpe - 1.64*sharpe_se` (the new gate's lower bound) is **0.18** for the
+lean development aggregate and **-2.47** for the recent diagnostic — both well
+short of even the provisional 1.0 floor, before the active-t-stat condition is
+considered at all.
+
+**The active-return t-stat is not yet computable for either headline number.**
+Both are `calendar_aligned_daily_nav` combined reports: the bot series is
+daily (252 obs/yr) while the benchmark stays on holding-period frequency
+(`single_phase_index_path`, 12.6 obs/yr) until Task 4 delivers a daily
+benchmark mark, so the two series cannot be paired into one t-stat yet. Both
+new reports carry `active_tstat: null` and
+`active_tstat_status: "unavailable_mixed_frequencies_pending_task4"` rather
+than a wrong number, and `passed` is `false` on that basis alone regardless of
+the Sharpe-floor comparison above. `training/summarize_stockholm.py`'s fold
+stitching (a separate pipeline, on one period grid on both sides) computes a
+real `active_tstat` — verified against a hand-computed value in
+`training/test_summarize_stockholm.py` — but has not been run against a
+frozen headline fold set as part of this task.
+
+The corrected-and-excess numbers are recorded in
+`var/stockholm-remediation/task3/` in the remediation worktree; Task 2's
+non-excess corrected numbers and the frozen originals are unchanged.
+
+**None of this changes the verdict.** Subtracting a risk-free rate and adding
+standard errors only makes the existing failure more precise: the lean
+aggregate's Sharpe lower bound is close to zero, not two, and the recent
+diagnostic's is solidly negative.
 
 ## Current verdict
 

@@ -1254,7 +1254,10 @@ fn fixed_direction_score(row: &DirectionTrainingRow) -> Result<f64, String> {
 }
 
 fn direction_performance(returns: &[f64], cadence: usize) -> DirectionPerformance {
-    let metrics = return_metrics(returns, sessions_per_year(cadence));
+    // The standalone direction-timing diagnostic is a separate acceptance
+    // control (summarize-direction / direction-backtest), not the gated
+    // Stockholm evaluation Task 3 fixes F4/F5 for; it stays non-excess.
+    let metrics = return_metrics(returns, sessions_per_year(cadence), 0.0);
     DirectionPerformance {
         periods: returns.len(),
         total_return: metrics.total_return,
@@ -1272,7 +1275,16 @@ pub struct Metrics {
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. `0.0` on a report predating this field.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
     pub long_pnl: f64,
@@ -1315,7 +1327,16 @@ pub struct BenchmarkComparison {
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed, matching the portfolio's own.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. `0.0` on a report predating this field.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub portfolio_minus_benchmark_total_return: f64,
     pub portfolio_minus_benchmark_annualised_return: f64,
@@ -1464,7 +1485,19 @@ pub struct RebalancePhasePerformance {
     pub total_return: f64,
     pub annualised_return: f64,
     pub annualised_volatility: f64,
+    /// Excess-of-risk-free Sharpe: `risk_free_annual` names the annual rate
+    /// subtracted before this figure was computed.
     pub sharpe: f64,
+    /// Riksbank policy-rate approximation until a SWESTR series is wired.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// Analytic Lo (2002) standard error of `sharpe`, annualised the same way
+    /// the point estimate is. A legacy report predating this field, and one
+    /// where the observation count truly could not be recovered, both
+    /// deserialise to `0.0` here — treat a `0.0` alongside a nonzero `sharpe`
+    /// as "unknown", not "precisely measured".
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
 }
 
@@ -1531,6 +1564,13 @@ pub struct RebalancePhaseSummary {
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
+    /// Mean per-period active (bot minus benchmark) return over its standard
+    /// error. `None` when there is no benchmark, or when the bot and benchmark
+    /// series do not share one observation grid — see `active_tstat_status`.
+    #[serde(default)]
+    pub active_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tstat_status: Option<String>,
     pub disclosures: Vec<String>,
 }
 
@@ -1557,7 +1597,15 @@ pub struct RebalancePhaseFoldSummary {
     pub phase_count: usize,
     #[serde(default = "legacy_combination_method")]
     pub combination_method: String,
+    /// Retained for its original meaning (a naive absolute-Sharpe bar) but no
+    /// longer drives `passed`; see `target_sharpe_floor`.
     pub target_sharpe: f64,
+    /// The new, explicit promotion floor: `passed` requires
+    /// `sharpe - 1.64*sharpe_se >= target_sharpe_floor`. A legacy report
+    /// predating this field defaults to the same 1.0 the CLI defaults to, so a
+    /// re-read of an old report does not silently read as a floor of zero.
+    #[serde(default = "default_target_sharpe_floor")]
+    pub target_sharpe_floor: f64,
     pub performance: RebalancePhasePerformance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_performance: Option<RebalancePhasePerformance>,
@@ -1567,8 +1615,19 @@ pub struct RebalancePhaseFoldSummary {
     pub period_returns: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_period_returns: Vec<f64>,
+    /// Mean per-period active (bot minus benchmark) return over its standard
+    /// error, stitched across every fold. `None` under the same conditions as
+    /// `RebalancePhaseSummary::active_tstat`.
+    #[serde(default)]
+    pub active_tstat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tstat_status: Option<String>,
     pub passed: bool,
     pub disclosures: Vec<String>,
+}
+
+fn default_target_sharpe_floor() -> f64 {
+    1.0
 }
 
 /// Phases combined on the calendar: every phase's daily NAV keyed on its session
@@ -1710,6 +1769,9 @@ pub struct BacktestConfig {
     /// entry and exit opens. Absent means the replay reports holding-period
     /// NAV alone, exactly as every frozen report already does.
     pub mark_prices: Option<MarkPrices>,
+    /// Annual risk-free rate subtracted before Sharpe is computed. A Riksbank
+    /// policy-rate approximation until a SWESTR series is wired.
+    pub risk_free_annual: f64,
 }
 
 #[derive(Debug)]
@@ -2223,7 +2285,7 @@ pub fn backtest(
         });
         previous = target;
     }
-    let metrics = metrics(&steps, cadence_sessions);
+    let metrics = metrics(&steps, cadence_sessions, config.risk_free_annual);
     let diagnostics = prediction_diagnostics(&diagnostic_blocks);
     let direction_metrics = direction_layer_metrics(&steps, cadence_sessions);
     let selection_layer = selection_layer_metrics(
@@ -2237,7 +2299,15 @@ pub fn backtest(
     let benchmark = config
         .benchmark
         .as_ref()
-        .map(|history| benchmark_comparison(&steps, &metrics, cadence_sessions, history))
+        .map(|history| {
+            benchmark_comparison(
+                &steps,
+                &metrics,
+                cadence_sessions,
+                history,
+                config.risk_free_annual,
+            )
+        })
         .transpose()?;
     let mut disclosures = vec![
         "SURVIVORSHIP_CONTAMINATED: current 2026 constituents are projected backward; this result cannot authorize capital.".into(),
@@ -2403,6 +2473,7 @@ fn daily_nav_marks(
 
 pub fn summarize_rebalance_phases(
     reports: &[BacktestResult],
+    risk_free_annual: f64,
 ) -> Result<RebalancePhaseSummary, String> {
     let first = reports
         .first()
@@ -2530,9 +2601,22 @@ pub fn summarize_rebalance_phases(
                 (returns, Some(LEGACY_PERIOD_INDEX_AVERAGE.to_owned()))
             }
         };
-    let performance = phase_performance(&period_returns, periods_per_year);
-    let benchmark_performance = (!benchmark_period_returns.is_empty())
-        .then(|| phase_performance(&benchmark_period_returns, sessions_per_year(cadence)));
+    let performance = phase_performance(&period_returns, periods_per_year, risk_free_annual);
+    let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
+        phase_performance(
+            &benchmark_period_returns,
+            sessions_per_year(cadence),
+            risk_free_annual,
+        )
+    });
+    // The active-return t-stat is only meaningful where the bot and benchmark
+    // series share one observation grid. Once daily NAV marks are the norm
+    // (`calendar_aligned`) the benchmark stays on holding-period frequency
+    // (`single_phase_index_path`) until Task 4 delivers a daily benchmark mark,
+    // so the two series differ in both frequency and length here.
+    let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
+    let active_tstat_status = (has_benchmark && active_tstat.is_none())
+        .then(|| "unavailable_mixed_frequencies_pending_task4".to_owned());
     // Phase diagnostics exist to be compared with the combined result — an
     // aggregate that beats every one of its parts is the smoothing artefact
     // this fix removes — so they are measured at the same frequency.
@@ -2545,7 +2629,7 @@ pub fn summarize_rebalance_phases(
             // diagnostic would silently drop one session.
             let (periods, total_return, sharpe, max_drawdown) = if calendar_aligned {
                 let returns = daily_returns(navs);
-                let values = return_metrics(&returns, SESSIONS_PER_YEAR);
+                let values = return_metrics(&returns, SESSIONS_PER_YEAR, risk_free_annual);
                 (
                     returns.len(),
                     values.total_return,
@@ -2599,6 +2683,8 @@ pub fn summarize_rebalance_phases(
         phase_diagnostics,
         period_returns,
         benchmark_period_returns,
+        active_tstat,
+        active_tstat_status,
         disclosures: phase_disclosures(calendar_aligned, has_benchmark),
     })
 }
@@ -2624,6 +2710,8 @@ fn phase_disclosures(calendar_aligned: bool, has_benchmark: bool) -> Vec<String>
 
 pub fn summarize_rebalance_phase_folds(
     folds: &[RebalancePhaseSummary],
+    risk_free_annual: f64,
+    target_sharpe_floor: f64,
 ) -> Result<RebalancePhaseFoldSummary, String> {
     let first = folds
         .first()
@@ -2688,20 +2776,36 @@ pub fn summarize_rebalance_phase_folds(
         .iter()
         .flat_map(|fold| fold.benchmark_period_returns.iter().copied())
         .collect::<Vec<_>>();
-    let performance = phase_performance(&period_returns, periods_per_year);
+    let performance = phase_performance(&period_returns, periods_per_year, risk_free_annual);
     let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
         phase_performance(
             &benchmark_period_returns,
             sessions_per_year(first.cadence_sessions),
+            risk_free_annual,
         )
     });
+    let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
+    let has_benchmark = !benchmark_period_returns.is_empty();
+    let active_tstat_status = (has_benchmark && active_tstat.is_none())
+        .then(|| "unavailable_mixed_frequencies_pending_task4".to_owned());
     let fold_diagnostics = ordered
         .iter()
         .map(|fold| {
+            // `dated_frequency` backfills/validates the observation frequency
+            // for reports written before a fold recorded its own; the
+            // performance itself is then recomputed fresh from the fold's raw
+            // period returns so every fold's Sharpe, SE and risk-free rate are
+            // consistent with this run's `risk_free_annual`, not whatever rate
+            // (if any) was baked in when the fold was originally generated.
+            let dated = dated_frequency(&fold.performance, fold)?;
             Ok(RebalancePhaseFoldDiagnostic {
                 start: fold.start,
                 end: fold.end,
-                performance: dated_frequency(&fold.performance, fold)?,
+                performance: phase_performance(
+                    &fold.period_returns,
+                    dated.periods_per_year,
+                    risk_free_annual,
+                ),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2712,8 +2816,9 @@ pub fn summarize_rebalance_phase_folds(
     let target_sharpe = 2.0;
     let passed = first.survivorship_status == "POINT_IN_TIME"
         && performance.total_return > 0.0
-        && performance.sharpe >= target_sharpe
-        && positive_folds * 2 > ordered.len();
+        && positive_folds * 2 > ordered.len()
+        && active_tstat.is_some_and(|value| value >= 2.0)
+        && performance.sharpe - 1.64 * performance.sharpe_se >= target_sharpe_floor;
     Ok(RebalancePhaseFoldSummary {
         kind: "stockholm_equal_weight_rebalance_phase_walk_forward".into(),
         model_family: first.model_family.clone(),
@@ -2727,12 +2832,15 @@ pub fn summarize_rebalance_phase_folds(
         phase_count: first.phase_count,
         combination_method: first.combination_method.clone(),
         target_sharpe,
+        target_sharpe_floor,
         performance,
         benchmark_performance,
         benchmark_combination_method: first.benchmark_combination_method.clone(),
         fold_diagnostics,
         period_returns,
         benchmark_period_returns,
+        active_tstat,
+        active_tstat_status,
         passed,
         disclosures: {
             let mut disclosures = vec![
@@ -2777,8 +2885,12 @@ fn dated_frequency(
     })
 }
 
-fn phase_performance(returns: &[f64], periods_per_year: f64) -> RebalancePhasePerformance {
-    let values = return_metrics(returns, periods_per_year);
+fn phase_performance(
+    returns: &[f64],
+    periods_per_year: f64,
+    risk_free_annual: f64,
+) -> RebalancePhasePerformance {
+    let values = return_metrics(returns, periods_per_year, risk_free_annual);
     RebalancePhasePerformance {
         periods: returns.len(),
         periods_per_year,
@@ -2786,6 +2898,8 @@ fn phase_performance(returns: &[f64], periods_per_year: f64) -> RebalancePhasePe
         annualised_return: values.annualised_return,
         annualised_volatility: values.annualised_volatility,
         sharpe: values.sharpe,
+        risk_free_annual,
+        sharpe_se: values.sharpe_se,
         max_drawdown: values.max_drawdown,
     }
 }
@@ -2837,7 +2951,9 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
         .iter()
         .map(|(_, period_return)| *period_return)
         .collect::<Vec<_>>();
-    let metrics = return_metrics(&returns, sessions_per_year(cadence));
+    // The direction-timing overlay diagnostic is out of Task 3's gated
+    // Stockholm-evaluation scope; it stays non-excess.
+    let metrics = return_metrics(&returns, sessions_per_year(cadence), 0.0);
     let periods = attributed.len();
     let regime_count = |regime| {
         attributed
@@ -2980,8 +3096,10 @@ fn selection_layer_metrics(
         .iter()
         .map(|step| step.gross_return_before_costs)
         .collect::<Vec<_>>();
-    let net = return_metrics(&net_returns, sessions_per_year(cadence));
-    let gross = return_metrics(&gross_returns, sessions_per_year(cadence));
+    // The dollar-neutral selection diagnostic is out of Task 3's gated
+    // Stockholm-evaluation scope; it stays non-excess.
+    let net = return_metrics(&net_returns, sessions_per_year(cadence), 0.0);
+    let gross = return_metrics(&gross_returns, sessions_per_year(cadence), 0.0);
     Ok(Some(SelectionLayerMetrics {
         periods: steps.len(),
         total_return: net.total_return,
@@ -3283,6 +3401,7 @@ fn fixed_momentum_performance(
                 &benchmark_returns,
                 config.cadence_sessions,
                 history,
+                0.0,
             )
         })
         .transpose()?;
@@ -3303,13 +3422,18 @@ fn fixed_momentum_performance(
 
 fn fixed_momentum_metrics(steps: &[FixedMomentumStep], cadence: usize) -> Metrics {
     let returns = steps.iter().map(|step| step.net_return).collect::<Vec<_>>();
-    let values = return_metrics(&returns, sessions_per_year(cadence));
+    // The fixed-momentum acceptance control is a separate, predeclared control
+    // (fixed-momentum-backtest), not the gated Stockholm evaluation Task 3
+    // fixes F4/F5 for; it stays non-excess.
+    let values = return_metrics(&returns, sessions_per_year(cadence), 0.0);
     Metrics {
         periods: steps.len(),
         total_return: values.total_return,
         annualised_return: values.annualised_return,
         annualised_volatility: values.annualised_volatility,
         sharpe: values.sharpe,
+        risk_free_annual: 0.0,
+        sharpe_se: values.sharpe_se,
         max_drawdown: values.max_drawdown,
         positive_periods: returns.iter().filter(|value| **value > 0.0).count(),
         long_pnl: steps.iter().map(|step| step.long_pnl).sum(),
@@ -3417,6 +3541,7 @@ pub fn add_benchmark(
         &result.metrics,
         result.cadence_sessions,
         history,
+        result.metrics.risk_free_annual,
     )?);
     let disclosure = "OMXSGI comparison uses official Nasdaq gross-index SOD levels from the next exchange session through the configured holding horizon; it is a broad market reference, not a forced exposure target.";
     if !result.disclosures.iter().any(|value| value == disclosure) {
@@ -3473,6 +3598,7 @@ fn benchmark_comparison(
     portfolio: &Metrics,
     cadence: usize,
     history: &BenchmarkHistory,
+    risk_free_annual: f64,
 ) -> Result<BenchmarkComparison, String> {
     let benchmark_returns = steps
         .iter()
@@ -3491,6 +3617,7 @@ fn benchmark_comparison(
         &benchmark_returns,
         cadence,
         history,
+        risk_free_annual,
     )
 }
 
@@ -3500,11 +3627,18 @@ fn benchmark_comparison_from_returns(
     benchmark_returns: &[f64],
     cadence: usize,
     history: &BenchmarkHistory,
+    risk_free_annual: f64,
 ) -> Result<BenchmarkComparison, String> {
     if portfolio_returns.len() != benchmark_returns.len() {
         return Err("portfolio and benchmark return counts differ".into());
     }
-    let benchmark_stats = return_metrics(benchmark_returns, sessions_per_year(cadence));
+    // Benchmark blocks get the same rf subtraction as the portfolio: same
+    // annual rate, own frequency.
+    let benchmark_stats = return_metrics(
+        benchmark_returns,
+        sessions_per_year(cadence),
+        risk_free_annual,
+    );
     let active = portfolio_returns
         .iter()
         .zip(benchmark_returns)
@@ -3528,6 +3662,8 @@ fn benchmark_comparison_from_returns(
         annualised_return: benchmark_stats.annualised_return,
         annualised_volatility: benchmark_stats.annualised_volatility,
         sharpe: benchmark_stats.sharpe,
+        risk_free_annual,
+        sharpe_se: benchmark_stats.sharpe_se,
         max_drawdown: benchmark_stats.max_drawdown,
         portfolio_minus_benchmark_total_return: portfolio.total_return
             - benchmark_stats.total_return,
@@ -3558,6 +3694,7 @@ struct ReturnMetrics {
     annualised_return: f64,
     annualised_volatility: f64,
     sharpe: f64,
+    sharpe_se: f64,
     max_drawdown: f64,
 }
 
@@ -3570,15 +3707,72 @@ fn sessions_per_year(cadence: usize) -> f64 {
     SESSIONS_PER_YEAR / cadence as f64
 }
 
+/// The per-period risk-free rate implied by compounding an annual rate down to
+/// the observation frequency: `(1+rf_annual)^(1/periods_per_year) - 1`. Applied
+/// identically to the bot and to any benchmark measured at the same frequency,
+/// so a rate this converts consistently subtracts out of any active-return
+/// comparison between the two.
+fn per_period_risk_free(risk_free_annual: f64, periods_per_year: f64) -> f64 {
+    if periods_per_year > 0.0 {
+        (1.0 + risk_free_annual).powf(1.0 / periods_per_year) - 1.0
+    } else {
+        0.0
+    }
+}
+
+/// Lo (2002) analytic standard error of the Sharpe ratio under the IID-returns
+/// assumption, computed on the periodic (non-annualised) Sharpe and then scaled
+/// by the same `sqrt(periods_per_year)` factor used to annualise the point
+/// estimate itself: `SE_periodic = sqrt((1 + SR_periodic^2/2) / N)`.
+fn sharpe_standard_error(
+    excess_mean: f64,
+    periodic_std: f64,
+    n: usize,
+    periods_per_year: f64,
+) -> f64 {
+    if n == 0 || periodic_std <= 0.0 {
+        return 0.0;
+    }
+    let sr_periodic = excess_mean / periodic_std;
+    let se_periodic = ((1.0 + sr_periodic.powi(2) / 2.0) / n as f64).sqrt();
+    se_periodic * periods_per_year.sqrt()
+}
+
+/// Mean per-period active (bot minus benchmark) return over its own standard
+/// error: `mean(active) / (population_std(active) / sqrt(N))`. `None` when the
+/// two series do not pair up one-for-one — different lengths mean they were
+/// not measured on the same observation grid, most commonly a daily bot series
+/// compared against a benchmark still on holding-period frequency — or when
+/// there are no observations to compare.
+fn active_tstat(bot_returns: &[f64], benchmark_returns: &[f64]) -> Option<f64> {
+    if bot_returns.is_empty() || bot_returns.len() != benchmark_returns.len() {
+        return None;
+    }
+    let active = bot_returns
+        .iter()
+        .zip(benchmark_returns)
+        .map(|(bot, benchmark)| bot - benchmark)
+        .collect::<Vec<_>>();
+    let standard_error = population_std(&active) / (active.len() as f64).sqrt();
+    (standard_error > 0.0).then(|| mean(&active) / standard_error)
+}
+
 /// `periods_per_year` is the observation frequency of `returns`, not a property
 /// of the strategy: a holding-period series sampled every `cadence` sessions
 /// uses `252/cadence`, while a daily NAV series uses 252. Passing it explicitly
 /// is what keeps a daily series from being annualised as if each observation
 /// were a whole holding period.
-fn return_metrics(returns: &[f64], periods_per_year: f64) -> ReturnMetrics {
+///
+/// `risk_free_annual` only shifts `sharpe`/`sharpe_se`: `total_return`,
+/// `annualised_return`, `annualised_volatility` and `max_drawdown` describe the
+/// nominal path actually traded, not an excess-of-cash path. Volatility is
+/// unaffected by the shift because subtracting a constant per-period rate from
+/// every observation does not change their spread.
+fn return_metrics(returns: &[f64], periods_per_year: f64, risk_free_annual: f64) -> ReturnMetrics {
     let total_nav = returns.iter().fold(1.0, |nav, value| nav * (1.0 + value));
     let total_return = total_nav - 1.0;
-    let annualised_volatility = population_std(returns) * periods_per_year.sqrt();
+    let periodic_std = population_std(returns);
+    let annualised_volatility = periodic_std * periods_per_year.sqrt();
     let mut nav = 1.0_f64;
     let mut peak = 1.0_f64;
     let mut max_drawdown = 0.0_f64;
@@ -3587,6 +3781,8 @@ fn return_metrics(returns: &[f64], periods_per_year: f64) -> ReturnMetrics {
         peak = peak.max(nav);
         max_drawdown = max_drawdown.min(nav / peak - 1.0);
     }
+    let per_period_rf = per_period_risk_free(risk_free_annual, periods_per_year);
+    let excess_mean = mean(returns) - per_period_rf;
     ReturnMetrics {
         total_return,
         annualised_return: if returns.is_empty() {
@@ -3599,10 +3795,16 @@ fn return_metrics(returns: &[f64], periods_per_year: f64) -> ReturnMetrics {
         },
         annualised_volatility,
         sharpe: if annualised_volatility > 0.0 {
-            mean(returns) * periods_per_year / annualised_volatility
+            excess_mean * periods_per_year / annualised_volatility
         } else {
             0.0
         },
+        sharpe_se: sharpe_standard_error(
+            excess_mean,
+            periodic_std,
+            returns.len(),
+            periods_per_year,
+        ),
         max_drawdown,
     }
 }
@@ -3642,7 +3844,7 @@ fn population_covariance(left: &[f64], right: &[f64]) -> f64 {
         / left.len() as f64
 }
 
-fn metrics(steps: &[Step], cadence: usize) -> Metrics {
+fn metrics(steps: &[Step], cadence: usize, risk_free_annual: f64) -> Metrics {
     if steps.is_empty() {
         return Metrics {
             periods: 0,
@@ -3650,6 +3852,8 @@ fn metrics(steps: &[Step], cadence: usize) -> Metrics {
             annualised_return: 0.0,
             annualised_volatility: 0.0,
             sharpe: 0.0,
+            risk_free_annual,
+            sharpe_se: 0.0,
             max_drawdown: 0.0,
             positive_periods: 0,
             long_pnl: 0.0,
@@ -3684,16 +3888,26 @@ fn metrics(steps: &[Step], cadence: usize) -> Metrics {
         peak = peak.max(step.nav);
         max_drawdown = max_drawdown.min(step.nav / peak - 1.0);
     }
+    let per_period_rf = per_period_risk_free(risk_free_annual, periods_per_year);
+    let excess_mean = mean - per_period_rf;
+    let periodic_std = variance.sqrt();
     Metrics {
         periods: steps.len(),
         total_return,
         annualised_return,
         annualised_volatility: vol,
         sharpe: if vol > 0.0 {
-            mean * periods_per_year / vol
+            excess_mean * periods_per_year / vol
         } else {
             0.0
         },
+        risk_free_annual,
+        sharpe_se: sharpe_standard_error(
+            excess_mean,
+            periodic_std,
+            returns.len(),
+            periods_per_year,
+        ),
         max_drawdown,
         positive_periods: steps.iter().filter(|step| step.period_return > 0.0).count(),
         long_pnl: steps.iter().map(|step| step.long_pnl).sum(),
@@ -4189,6 +4403,7 @@ mod tests {
                 costs,
                 benchmark: None,
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4274,6 +4489,7 @@ mod tests {
                 costs,
                 benchmark: None,
                 mark_prices: Some(mark_prices),
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4374,6 +4590,7 @@ mod tests {
                         costs: zero_execution_costs(),
                         benchmark: None,
                         mark_prices: with_marks.then(|| mark_prices.clone()),
+                        risk_free_annual: 0.0,
                     },
                 )
                 .unwrap()
@@ -4383,7 +4600,7 @@ mod tests {
 
     #[test]
     fn daily_marks_combine_phases_on_the_calendar_at_daily_frequency() {
-        let summary = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
         assert_eq!(summary.combination_method, CALENDAR_ALIGNED_DAILY_NAV);
         assert_eq!(summary.performance.periods_per_year, SESSIONS_PER_YEAR);
         // Offset 0 marks 2024-01-03..01-18 and offset 1 marks 01-04..01-17, so
@@ -4398,7 +4615,7 @@ mod tests {
     #[test]
     fn daily_phase_diagnostics_still_reconcile_with_each_phase_report() {
         let phases = two_phase_replay(true);
-        let summary = summarize_rebalance_phases(&phases).unwrap();
+        let summary = summarize_rebalance_phases(&phases, 0.02).unwrap();
         for (diagnostic, report) in summary.phase_diagnostics.iter().zip(&phases) {
             // Re-measuring a phase daily may not quietly restate what it earned:
             // the mark path opens at NAV 1.0 and closes on the phase's own NAV.
@@ -4422,7 +4639,7 @@ mod tests {
 
     #[test]
     fn phases_without_daily_marks_disclose_the_legacy_period_index_average() {
-        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
         assert_eq!(summary.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
         assert_eq!(summary.performance.periods_per_year, 126.0);
         assert_eq!(summary.combined_start, None);
@@ -4458,14 +4675,18 @@ mod tests {
 
     #[test]
     fn a_fold_without_a_recorded_frequency_gets_it_back_rather_than_zero() {
-        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
         let old = without_recorded_frequency(&summary);
         assert_eq!(old.performance.periods_per_year, 0.0);
         assert_eq!(old.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
-        let folds = summarize_rebalance_phase_folds(&[
-            shift_fold(&old, "2024-01-02", "2024-01-16"),
-            shift_fold(&old, "2024-02-01", "2024-02-15"),
-        ])
+        let folds = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&old, "2024-01-02", "2024-01-16"),
+                shift_fold(&old, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
         .unwrap();
         for diagnostic in &folds.fold_diagnostics {
             assert_eq!(diagnostic.performance.periods_per_year, 126.0);
@@ -4474,13 +4695,17 @@ mod tests {
 
     #[test]
     fn a_fold_summary_with_no_cadence_to_derive_a_frequency_from_is_rejected() {
-        let summary = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
         let mut old = without_recorded_frequency(&summary);
         old.cadence_sessions = 0;
-        let error = summarize_rebalance_phase_folds(&[
-            shift_fold(&old, "2024-01-02", "2024-01-16"),
-            shift_fold(&old, "2024-02-01", "2024-02-15"),
-        ])
+        let error = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&old, "2024-01-02", "2024-01-16"),
+                shift_fold(&old, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
         .unwrap_err();
         assert!(
             error.contains("no observation frequency and no cadence"),
@@ -4490,12 +4715,16 @@ mod tests {
 
     #[test]
     fn folds_combined_by_different_methods_may_not_be_concatenated() {
-        let daily = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
-        let legacy = summarize_rebalance_phases(&two_phase_replay(false)).unwrap();
-        let error = summarize_rebalance_phase_folds(&[
-            shift_fold(&daily, "2024-01-02", "2024-01-16"),
-            shift_fold(&legacy, "2024-02-01", "2024-02-15"),
-        ])
+        let daily = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        let legacy = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let error = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&daily, "2024-01-02", "2024-01-16"),
+                shift_fold(&legacy, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
         .unwrap_err();
         assert!(
             error.contains("combine their phases differently"),
@@ -4505,7 +4734,7 @@ mod tests {
 
     #[test]
     fn folds_whose_combined_windows_overlap_may_not_be_concatenated() {
-        let summary = summarize_rebalance_phases(&two_phase_replay(true)).unwrap();
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
         assert_eq!(summary.combined_end, Some(day("2024-01-17")));
         // Declared bounds do not overlap — the second fold decides after the
         // first one stops — but the first fold's book is still marked into the
@@ -4514,7 +4743,7 @@ mod tests {
         let mut second = shift_fold(&summary, "2024-01-18", "2024-02-15");
         second.combined_start = Some(day("2024-01-17"));
         second.combined_end = Some(day("2024-02-16"));
-        let error = summarize_rebalance_phase_folds(&[first, second]).unwrap_err();
+        let error = summarize_rebalance_phase_folds(&[first, second], 0.02, 1.0).unwrap_err();
         assert!(
             error.contains("combined windows overlap")
                 && error.contains("2024-01-17")
@@ -4527,8 +4756,8 @@ mod tests {
     fn phases_may_not_mix_marked_and_unmarked_reports() {
         let marked = two_phase_replay(true);
         let unmarked = two_phase_replay(false);
-        let error =
-            summarize_rebalance_phases(&[marked[0].clone(), unmarked[1].clone()]).unwrap_err();
+        let error = summarize_rebalance_phases(&[marked[0].clone(), unmarked[1].clone()], 0.02)
+            .unwrap_err();
         assert!(
             error.contains("daily NAV marks"),
             "expected a mixed-marks error, got {error}"
@@ -4592,6 +4821,7 @@ mod tests {
                 costs,
                 benchmark: None,
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4637,18 +4867,19 @@ mod tests {
                     costs: zero_execution_costs(),
                     benchmark: None,
                     mark_prices: None,
+                    risk_free_annual: 0.0,
                 },
             )
             .unwrap()
         };
         let phase_zero = replay(0);
         let phase_one = replay(1);
-        let summary = summarize_rebalance_phases(&[phase_zero.clone(), phase_one]).unwrap();
+        let summary = summarize_rebalance_phases(&[phase_zero.clone(), phase_one], 0.02).unwrap();
         assert_eq!(summary.phase_count, 2);
         assert_eq!(summary.common_complete_periods, 2);
         assert_eq!(summary.period_returns.len(), 2);
         assert!(
-            summarize_rebalance_phases(&[phase_zero.clone(), phase_zero])
+            summarize_rebalance_phases(&[phase_zero.clone(), phase_zero], 0.02)
                 .unwrap_err()
                 .contains("offsets")
         );
@@ -4689,6 +4920,7 @@ mod tests {
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4732,6 +4964,7 @@ mod tests {
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4777,6 +5010,7 @@ mod tests {
                 costs,
                 benchmark: None,
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4846,6 +5080,7 @@ mod tests {
                 },
                 benchmark: None,
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4892,6 +5127,7 @@ mod tests {
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
@@ -4961,10 +5197,83 @@ mod tests {
                 costs: zero_execution_costs(),
                 benchmark: Some(history),
                 mark_prices: None,
+                risk_free_annual: 0.0,
             },
         )
         .unwrap();
         assert!((result.steps[0].benchmark_period_return.unwrap() - 0.02).abs() < 1e-12);
         assert_eq!(result.benchmark.unwrap().symbol, "OMXSGI");
+    }
+
+    #[test]
+    fn sharpe_shifts_by_the_risk_free_rate_over_annualised_volatility() {
+        // A non-degenerate return series so annualised volatility is nonzero;
+        // periods_per_year = 1 makes the per-period risk-free conversion exact
+        // (`(1+rf)^1 - 1 = rf`), so the shift is precisely `rf / vol_ann`.
+        let returns = [0.05, -0.02, 0.03, 0.01];
+        let periods_per_year = 1.0;
+        let zero_rf = return_metrics(&returns, periods_per_year, 0.0);
+        let with_rf = return_metrics(&returns, periods_per_year, 0.02);
+        // Subtracting a constant per-period rate does not change the spread.
+        assert!((zero_rf.annualised_volatility - with_rf.annualised_volatility).abs() < 1e-12);
+        let expected_shift = 0.02 / zero_rf.annualised_volatility;
+        assert!(
+            (zero_rf.sharpe - with_rf.sharpe - expected_shift).abs() < 1e-9,
+            "expected sharpe to fall by {expected_shift}, got a shift of {}",
+            zero_rf.sharpe - with_rf.sharpe
+        );
+    }
+
+    #[test]
+    fn sharpe_standard_error_matches_the_lo_2002_closed_form() {
+        // Nine periods with mean 0.01 and a hand-computable population
+        // variance: symmetric deviations {-0.04..0.04} step 0.01 sum to zero
+        // (mean stays 0.01) and their squares sum to 0.006, so
+        // variance = 0.006/9 and SR_periodic^2 = mean^2/variance = 0.15 exactly.
+        let returns = [
+            -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05, // 0.01 + each deviation
+        ];
+        assert_eq!(returns.len(), 9);
+        let periods_per_year = 252.0;
+        let metrics = return_metrics(&returns, periods_per_year, 0.0);
+        // se_periodic = sqrt((1 + 0.15/2) / 9); se_annual = se_periodic * sqrt(252)
+        let expected_se_annual = 5.486346689738081_f64;
+        assert!(
+            (metrics.sharpe_se - expected_se_annual).abs() < 1e-9,
+            "expected sharpe_se {expected_se_annual}, got {}",
+            metrics.sharpe_se
+        );
+    }
+
+    #[test]
+    fn active_tstat_matches_a_hand_computed_value_when_grids_agree() {
+        let bot = [0.02, 0.01, 0.03, -0.01];
+        let benchmark = [0.01, 0.015, 0.005, -0.02];
+        // active = [0.01, -0.005, 0.025, 0.01]; mean = 0.01, population std
+        // computed independently below.
+        let active = [0.01_f64, -0.005, 0.025, 0.01];
+        let active_mean = active.iter().sum::<f64>() / 4.0;
+        let variance = active
+            .iter()
+            .map(|value| (value - active_mean).powi(2))
+            .sum::<f64>()
+            / 4.0;
+        let expected = active_mean / (variance.sqrt() / 4.0_f64.sqrt());
+        let value = active_tstat(&bot, &benchmark).unwrap();
+        assert!(
+            (value - expected).abs() < 1e-9,
+            "expected {expected}, got {value}"
+        );
+    }
+
+    #[test]
+    fn active_tstat_is_unavailable_when_the_two_series_do_not_share_a_grid() {
+        // A daily bot series compared against a benchmark still on
+        // holding-period frequency has a different number of observations —
+        // exactly the calendar-aligned-vs-single-phase-index-path mismatch
+        // combined reports carry until Task 4.
+        let bot = [0.01; 10];
+        let benchmark = [0.01; 3];
+        assert!(active_tstat(&bot, &benchmark).is_none());
     }
 }
