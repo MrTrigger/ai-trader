@@ -70,9 +70,19 @@ def prepare(rows, feature_names, horizon, through_ts):
     return x, y
 
 
-def fit(x, y, feature_names):
+def fit(x, y, feature_names, num_boost_round=N_ESTIMATORS, params_overrides=None):
     """Fit the pinned LightGBM regressor, early-stopping on the chronologically
-    last 10% of the given (already time-ordered) rows."""
+    last 10% of the given (already time-ordered) rows.
+
+    `num_boost_round` defaults to the pinned production tree count; callers
+    (e.g. the parity fixture generator) may cap it lower for a small,
+    fast-to-produce model. `params_overrides`, if given, is layered on top of
+    the pinned `PARAMS` (production call sites never pass it, so the frozen
+    hyperparameters are untouched); it exists so a tiny fixture matrix - far
+    below `min_data_in_leaf` - can still produce a model with real splits
+    instead of a single trivial leaf.
+    """
+    params = PARAMS if not params_overrides else {**PARAMS, **params_overrides}
     n = len(x)
     split = max(1, int(n * 0.9))
     train_set = lgb.Dataset(x[:split], label=y[:split], feature_name=list(feature_names))
@@ -80,9 +90,9 @@ def fit(x, y, feature_names):
         x[split:], label=y[split:], feature_name=list(feature_names), reference=train_set
     )
     booster = lgb.train(
-        PARAMS,
+        params,
         train_set,
-        num_boost_round=N_ESTIMATORS,
+        num_boost_round=num_boost_round,
         valid_sets=[valid_set],
         callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
     )
