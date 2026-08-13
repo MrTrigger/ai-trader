@@ -229,6 +229,10 @@ pub struct FlowMinute {
     /// minute (thin trading, or no maker/taker pairs within 1000ms).
     pub spread_bps_med: Option<f64>,
     pub n_spread_samples: usize,
+    /// How many DISTINCT bid-side trades were used as an anchor among
+    /// `n_spread_samples` - see `spread_estimate_bps`'s doc comment for why
+    /// this exists alongside the sample count.
+    pub distinct_bids: usize,
     pub taker_buy_ratio: f64,
     pub n_trades: u64,
     pub notional: f64,
@@ -239,9 +243,20 @@ pub struct FlowMinute {
 /// the ask) with the time-nearest bid-side trade (a taker sell,
 /// `is_buyer_maker == true`) within 1000ms; sample = `(ask_px - bid_px) /
 /// mid * 1e4`; negative samples (an out-of-order or stale pair) are
-/// discarded. Requires ≥5 valid samples, else no spread estimate that
-/// minute - `n_spread_samples` still reports however many were actually
-/// found, so a near-miss ("4 samples, no estimate") stays visible.
+/// discarded.
+///
+/// Greedy nearest-neighbor pairing is not 1:1: during bursty one-sided flow
+/// (a run of asks with only one bid trade nearby), a single stale bid can
+/// anchor many ask samples at once. Left unchecked that both overstates the
+/// evidence (`n_spread_samples` counts anchored duplicates as independent)
+/// and lets the median drift toward whatever that one anchor happened to
+/// print. The fix is a second, independent floor: a minute's spread
+/// estimate is valid only when it clears BOTH `n_spread_samples >= 5` AND
+/// `distinct_bids >= 3` (three or more different bid trades actually used
+/// as anchors) - a burst pinned to one or two anchors reports `None` even
+/// with plenty of raw samples. `distinct_bids` is always reported (even
+/// when `None`), so a near-miss ("5 samples, 2 distinct anchors") stays
+/// visible rather than silently indistinguishable from "no data".
 ///
 /// `ask_trades`/`bid_trades` are `(ts_ms, price)`, each already sorted
 /// ascending by `ts_ms` (the archive's native row order) - the binary
@@ -249,24 +264,30 @@ pub struct FlowMinute {
 pub(crate) fn spread_estimate_bps(
     ask_trades: &[(i64, f64)],
     bid_trades: &[(i64, f64)],
-) -> (Option<f64>, usize) {
+) -> (Option<f64>, usize, usize) {
     const MAX_GAP_MS: i64 = 1000;
+    const MIN_SAMPLES: usize = 5;
+    const MIN_DISTINCT_BIDS: usize = 3;
     let mut samples = Vec::new();
+    // The bid trade's own index in `bid_trades` uniquely identifies it as
+    // an anchor, independent of price/timestamp ties between distinct
+    // trades.
+    let mut anchors: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for &(ask_ts, ask_px) in ask_trades {
         let idx = bid_trades.partition_point(|&(ts, _)| ts < ask_ts);
-        let mut best: Option<(i64, f64)> = None;
+        let mut best: Option<(i64, f64, usize)> = None;
         if idx < bid_trades.len() {
             let (ts, px) = bid_trades[idx];
-            best = Some(((ts - ask_ts).abs(), px));
+            best = Some(((ts - ask_ts).abs(), px, idx));
         }
         if idx > 0 {
             let (ts, px) = bid_trades[idx - 1];
             let gap = (ts - ask_ts).abs();
-            if best.map(|(g, _)| gap < g).unwrap_or(true) {
-                best = Some((gap, px));
+            if best.map(|(g, _, _)| gap < g).unwrap_or(true) {
+                best = Some((gap, px, idx - 1));
             }
         }
-        let Some((gap, bid_px)) = best else {
+        let Some((gap, bid_px, anchor_idx)) = best else {
             continue; // no bid-side trade at all this minute
         };
         if gap > MAX_GAP_MS {
@@ -281,12 +302,18 @@ pub(crate) fn spread_estimate_bps(
             continue; // discarded, per the pre-registered rule
         }
         samples.push(sample);
+        anchors.insert(anchor_idx);
     }
     let n = samples.len();
-    if n < 5 {
-        return (None, n);
+    let distinct_bids = anchors.len();
+    if n < MIN_SAMPLES || distinct_bids < MIN_DISTINCT_BIDS {
+        return (None, n, distinct_bids);
     }
-    (Some(crate::costs::percentile(&samples, 0.5)), n)
+    (
+        Some(crate::costs::percentile(&samples, 0.5)),
+        n,
+        distinct_bids,
+    )
 }
 
 /// Accumulates one minute's aggTrades rows into the fields `FlowMinute`
@@ -327,7 +354,7 @@ impl MinuteAcc {
     }
 
     fn finish(self) -> FlowMinute {
-        let (spread_bps_med, n_spread_samples) =
+        let (spread_bps_med, n_spread_samples, distinct_bids) =
             spread_estimate_bps(&self.ask_trades, &self.bid_trades);
         let taker_buy_ratio = if self.total_notional > 0.0 {
             self.buy_notional / self.total_notional
@@ -338,10 +365,27 @@ impl MinuteAcc {
             ts_s: self.minute,
             spread_bps_med,
             n_spread_samples,
+            distinct_bids,
             taker_buy_ratio,
             n_trades: self.n_trades,
             notional: self.total_notional,
         }
+    }
+}
+
+/// Case-insensitive true/false parse for `is_buyer_maker`. Binance's own
+/// archive families have varied casing historically (lowercase `true`/
+/// `false` is the UM daily convention seen live, but other archive
+/// families - and possibly future UM revisions - have used `True`/`False`),
+/// so this doesn't assume one casing convention; anything else is still a
+/// parse error.
+fn parse_bool_ci(raw: &str) -> Option<bool> {
+    if raw.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -351,7 +395,8 @@ impl MinuteAcc {
 /// `agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,
 /// is_buyer_maker`; a header row (some files carry one, starting with
 /// `agg`) is skipped. `transact_time` uses the same ms/µs autodetect as
-/// klines' `open_time` (`binance_um::epoch_utc`).
+/// klines' `open_time` (`binance_um::epoch_utc`); `is_buyer_maker` is
+/// parsed case-insensitively (`parse_bool_ci`).
 fn parse_agg_trades_lines<I>(lines: I, asset: &str) -> Result<Vec<FlowMinute>, String>
 where
     I: Iterator<Item = std::io::Result<String>>,
@@ -380,10 +425,9 @@ where
             .parse()
             .map_err(|e| format!("{asset}: transact_time: {e}: {line}"))?;
         let ts = epoch_utc(raw_ts)?;
-        let is_buyer_maker: bool = cols[6]
-            .trim()
-            .parse()
-            .map_err(|e| format!("{asset}: is_buyer_maker: {e}: {line}"))?;
+        let is_buyer_maker = parse_bool_ci(cols[6].trim()).ok_or_else(|| {
+            format!("{asset}: is_buyer_maker: bad value {:?}: {line}", cols[6])
+        })?;
 
         let ts_epoch = ts.timestamp();
         let ts_ms = ts.timestamp_millis();
@@ -650,11 +694,13 @@ mod tests {
         // Median of the three is the middle one, ~19.96..19.98.
         let asks = vec![(1_000, 100.10), (2_000, 100.20), (3_000, 100.30)];
         let bids = vec![(1_100, 100.00), (2_050, 100.00), (3_400, 100.10)];
-        let (median, n) = spread_estimate_bps(&asks, &bids);
+        let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
         assert_eq!(n, 3);
+        assert_eq!(distinct_bids, 3);
         assert!(median.is_none(), "n=3 < 5 required samples, so no estimate");
 
-        // Pad past the 5-sample floor with two more clean pairs.
+        // Pad past the 5-sample floor with two more clean pairs, each with
+        // its own distinct bid anchor.
         let asks2 = vec![
             (1_000, 100.10),
             (2_000, 100.20),
@@ -669,9 +715,10 @@ mod tests {
             (4_200, 100.00),
             (5_300, 100.00),
         ];
-        let (median2, n2) = spread_estimate_bps(&asks2, &bids2);
+        let (median2, n2, distinct_bids2) = spread_estimate_bps(&asks2, &bids2);
         assert_eq!(n2, 5);
-        let m = median2.expect("5 samples clears the floor");
+        assert_eq!(distinct_bids2, 5);
+        let m = median2.expect("5 samples across 5 distinct anchors clears both floors");
         assert!(m > 0.0 && m < 30.0, "got {m}");
     }
 
@@ -681,8 +728,9 @@ mod tests {
         // is 5000ms away), so it contributes no sample.
         let asks = vec![(10_000, 100.10)];
         let bids = vec![(5_000, 100.00)];
-        let (median, n) = spread_estimate_bps(&asks, &bids);
+        let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
         assert_eq!(n, 0);
+        assert_eq!(distinct_bids, 0);
         assert!(median.is_none());
     }
 
@@ -692,8 +740,9 @@ mod tests {
         // quotes) and must be dropped, not folded into the median.
         let asks = vec![(1_000, 99.90)];
         let bids = vec![(1_050, 100.00)];
-        let (median, n) = spread_estimate_bps(&asks, &bids);
+        let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
         assert_eq!(n, 0, "the only candidate sample was negative and got discarded");
+        assert_eq!(distinct_bids, 0);
         assert!(median.is_none());
     }
 
@@ -701,9 +750,35 @@ mod tests {
     fn spread_estimator_below_five_samples_reports_none_but_keeps_the_count() {
         let asks = vec![(1_000, 100.10), (2_000, 100.10), (3_000, 100.10)];
         let bids = vec![(1_100, 100.00), (2_100, 100.00), (3_100, 100.00)];
-        let (median, n) = spread_estimate_bps(&asks, &bids);
+        let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
         assert_eq!(n, 3);
+        assert_eq!(distinct_bids, 3);
         assert!(median.is_none());
+    }
+
+    #[test]
+    fn spread_estimator_many_asks_one_bid_anchor_reports_none_despite_five_plus_samples() {
+        // A burst of one-sided (ask/taker-buy) flow with a single bid trade
+        // sitting nearby: every ask pairs with that SAME bid, so n climbs
+        // past 5 but distinct_bids stays at 1 - exactly the stale-anchor
+        // bias the distinct-anchor floor exists to catch. Prices vary
+        // slightly so samples are non-negative and non-degenerate.
+        let asks = vec![
+            (1_000, 100.05),
+            (1_100, 100.06),
+            (1_200, 100.04),
+            (1_300, 100.07),
+            (1_400, 100.05),
+            (1_500, 100.06),
+        ];
+        let bids = vec![(1_000, 100.00)]; // one stale anchor for the whole burst
+        let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
+        assert_eq!(n, 6, "all six asks found the lone bid within 1000ms");
+        assert_eq!(distinct_bids, 1);
+        assert!(
+            median.is_none(),
+            "n>=5 alone isn't enough - a single anchor must not produce an estimate"
+        );
     }
 
     // -- aggTrades --------------------------------------------------------
@@ -746,8 +821,10 @@ mod tests {
         let expected_buy = 100.10 + 100.20 + 100.30 * 2.0;
         assert!((m0.taker_buy_ratio - expected_buy / expected_notional).abs() < 1e-9);
         // 3 ask trades each pair with a close-in-time bid trade -> 3
-        // samples, below the 5-sample floor, so no median yet.
+        // samples across 3 distinct anchors, below the 5-sample floor, so
+        // no median yet.
         assert_eq!(m0.n_spread_samples, 3);
+        assert_eq!(m0.distinct_bids, 3);
         assert!(m0.spread_bps_med.is_none());
 
         let m1 = &rows[1];
@@ -755,6 +832,7 @@ mod tests {
         assert_eq!(m1.n_trades, 1);
         assert_eq!(m1.taker_buy_ratio, 1.0);
         assert_eq!(m1.n_spread_samples, 0);
+        assert_eq!(m1.distinct_bids, 0);
         assert!(m1.spread_bps_med.is_none());
     }
 
@@ -769,6 +847,24 @@ mod tests {
         let rows = parse_agg_trades_zip(&bytes, "BTCUSDT").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts_s, 1_754_956_800);
+    }
+
+    #[test]
+    fn agg_trades_stream_accepts_capitalized_is_buyer_maker() {
+        // Binance's archive families have varied casing historically (e.g.
+        // spot uses `True`/`False`) - the UM parser must not assume
+        // lowercase.
+        let csv = "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n\
+            1,100.10,1.0,1,1,1754956800100,False\n\
+            2,100.00,1.0,2,2,1754956800150,True\n";
+        let bytes = zip_with_one_file("BTCUSDT-aggTrades-2026-08-12.csv", csv.as_bytes());
+        let rows = parse_agg_trades_zip(&bytes, "BTCUSDT").unwrap();
+        assert_eq!(rows.len(), 1);
+        // Row 1 (`False`) is a taker buy -> ask-side notional; row 2
+        // (`True`) is a taker sell -> bid-side. If casing were mishandled
+        // this would either error out or misclassify both as one side.
+        assert_eq!(rows[0].n_trades, 2);
+        assert!((rows[0].taker_buy_ratio - 100.10 / (100.10 + 100.00)).abs() < 1e-9);
     }
 
     // -- fundingRate ------------------------------------------------------
