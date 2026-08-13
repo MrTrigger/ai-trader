@@ -16,7 +16,12 @@ pub const FORMAT_VERSION: &str = "stockholm-model-json-2";
 pub const LEGACY_FORMAT_VERSION: &str = "stockholm-lightgbm-json-1";
 pub const MODEL_VERSION: &str = "stockholm-ranker-1";
 pub const DIRECTION_FORMAT_VERSION: &str = "stockholm-direction-model-json-1";
-pub const DIRECTION_MODEL_VERSION: &str = "stockholm-direction-model-1";
+/// v2: `score_scale`'s `absolute_return` semantics changed from
+/// `std(target)` to `std(train_predictions)` (the score-suppression fix in
+/// `train_stockholm_direction.py`). A v1 document would silently reproduce
+/// the defect under the current `predict` contract, so the version bump
+/// makes `load` refuse it outright.
+pub const DIRECTION_MODEL_VERSION: &str = "stockholm-direction-model-2";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4494,6 +4499,29 @@ mod tests {
             .map(|row| buggy_model.predict(row).unwrap().score)
             .collect::<Vec<_>>();
         assert!((population_std(&buggy_scores) - 0.1).abs() < 1e-9);
+    }
+
+    /// A document still carrying the pre-fix `stockholm-direction-model-1`
+    /// version (score_scale = std(target) under absolute_return) must be
+    /// refused outright, not silently loaded and mis-scaled.
+    #[test]
+    fn stale_v1_direction_model_version_is_refused() {
+        let mut model = direction_model_with_leaf(0.005, 0.005);
+        model.model_version = "stockholm-direction-model-1".into();
+        let bytes = serde_json::to_vec(&model).expect("serialize fixture");
+        let path = std::env::temp_dir().join(format!(
+            "stockholm-direction-model-v1-fixture-{}-{}.json",
+            std::process::id(),
+            "stale_v1_direction_model_version_is_refused"
+        ));
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let result = DirectionModel::load(&path);
+        std::fs::remove_file(&path).ok();
+        let error = result.expect_err("stale v1 model_version must be refused");
+        assert!(
+            error.contains("format or version"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

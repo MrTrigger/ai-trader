@@ -255,8 +255,9 @@ convention, an order of magnitude short of even the 0.4 entry threshold. The
 book would have parked at `neutral_gross = 0.30 × max_gross`, `net = 0`
 almost every session, regardless of what the model actually believed.
 
-**The fix.** `score_scale` is now the model's own in-sample prediction spread
-— `std(booster.predict(x))` on the training rows — instead of the target's.
+**The fix.** For the `absolute_return` reward — the one this defect affects —
+`score_scale` is now the model's own in-sample prediction spread —
+`std(booster.predict(x))` on the training rows — instead of the target's.
 Rust's formula is unchanged (`score = clip(prediction / score_scale, −1, 1)`);
 only the scale Python hands it changed. With the fix, the same 0.005-std
 predictions against a 0.05-std target now produce scores with population std
@@ -269,6 +270,21 @@ and a Python test asserting the exported `score_scale` equals
 direction model — it corrects a normalization bug that was independently
 suppressing any signal the model might have had, on top of a model that has
 no validated signal to suppress.
+
+`score_scale` means something different for the `direction_sign` reward:
+there, Rust's raw (already bounded) prediction *is* the score directly, and
+`score_scale` only converts it into a return-scale `predicted_return`
+(`predicted_return = clamp(prediction, −1, 1) * score_scale`). Nothing
+divides the score by it, so that branch was never affected by the
+score-suppression defect and correctly remains `std(absolute_y)` — the
+trainer's `score_scale` export is now reward-conditional, and a second
+Python test pins the `direction_sign` branch to its unchanged formula
+(`test_direction_sign_score_scale_is_target_std_not_prediction_spread`).
+Because the `absolute_return` semantics changed, `model_version` bumped
+`stockholm-direction-model-1` → `-2`; Rust's `DirectionModel::load` refuses
+any document still carrying the old version, so a pre-fix model.json cannot
+be loaded and silently reproduce the defect
+(`stockholm-portfolio::tests::stale_v1_direction_model_version_is_refused`).
 
 **Disposition.** `stockholm-portfolio backtest` (the only promotable replay
 path) now refuses `--market-forecast-matrix`/`--market-forecast-model`

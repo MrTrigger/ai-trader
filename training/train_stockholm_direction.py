@@ -12,12 +12,24 @@ docs/stockholm-portfolio-status.md, Task 8). Rust refuses to reach this
 model family from any promotable configuration; this trainer stays only for
 research/diagnostics replays that explicitly ask for it.
 
-`score_scale` is exported as the fitted booster's own in-sample prediction
-spread (`std` of its train-set predictions), not the target's. Rust computes
-`score = clip(prediction / score_scale, -1, 1)` against fixed 0.4/0.8 policy
-thresholds; anchoring the scale to the (shrunk) predictions rather than the
-wider target means a score now spans the threshold range by construction,
-instead of a heavily L2-shrunk model parking near zero forever.
+`score_scale` means two different things to Rust depending on `reward`
+(`stockholm-portfolio::DirectionModel::predict`), so this trainer exports it
+differently per reward:
+
+- `absolute_return`: Rust divides the raw prediction by `score_scale` to get
+  the bounded `score` compared against the 0.4/0.8 policy thresholds
+  (`score = clip(prediction / score_scale, -1, 1)`). Here `score_scale` is
+  the fitted booster's own in-sample prediction spread (`std` of its
+  train-set predictions), not the target's. A heavily L2-shrunk booster's
+  predictions sit at a small fraction of the target's spread; anchoring the
+  scale to the predictions rather than the wider target makes a score span
+  the threshold range by construction, instead of parking near zero forever.
+- `direction_sign`: the raw (already Rust-bounded, [-1, 1]) prediction *is*
+  the score directly; `score_scale` instead converts it into a return-scale
+  `predicted_return` (`predicted_return = clamp(prediction, -1, 1) *
+  score_scale`). Here `score_scale` is the target's own return std
+  (`std(absolute_y)`), unchanged from before — there is no score-suppression
+  defect on this branch, since nothing divides the score by it.
 """
 
 from __future__ import annotations
@@ -31,7 +43,11 @@ import lightgbm as lgb
 import numpy as np
 
 FORMAT_VERSION = "stockholm-direction-model-json-1"
-MODEL_VERSION = "stockholm-direction-model-1"
+# v2: score_scale's absolute_return semantics changed from std(target) to
+# std(train_predictions) (the score-suppression fix). A v1 model.json would
+# silently reproduce the defect if loaded under the new Rust contract, so the
+# version bump makes Rust refuse it outright rather than mis-scale scores.
+MODEL_VERSION = "stockholm-direction-model-2"
 FEATURE_SET_VERSIONS = {
     "fs-rust-stockholm-direction-1",
     "fs-rust-stockholm-direction-2",
@@ -129,17 +145,26 @@ def main() -> None:
         dataset,
         num_boost_round=NUM_ROUNDS,
     )
-    # The scale must come from what the model actually outputs, not from the
-    # target it was trying to hit: a heavily L2-shrunk booster's predictions
-    # can sit at a small fraction of the target's spread, and normalizing by
-    # the wider target left scores parked near zero, never reaching the
-    # policy's 0.4/0.8 thresholds. Normalizing by the model's own train-set
-    # prediction spread instead makes a score span the threshold range by
-    # construction.
-    train_predictions = booster.predict(x)
-    score_scale = float(np.std(train_predictions))
+    if args.reward == "absolute_return":
+        # Rust divides the raw prediction by this to get the bounded score
+        # compared against the 0.4/0.8 policy thresholds. The scale must
+        # come from what the model actually outputs, not from the target it
+        # was trying to hit: a heavily L2-shrunk booster's predictions can
+        # sit at a small fraction of the target's spread, and normalizing by
+        # the wider target left scores parked near zero, never reaching the
+        # thresholds. Normalizing by the model's own train-set prediction
+        # spread instead makes a score span the threshold range by
+        # construction.
+        score_scale = float(np.std(booster.predict(x)))
+    else:
+        # direction_sign: the raw (already Rust-bounded) prediction is the
+        # score directly, and this only converts it into a return-scale
+        # predicted_return. That is a return-unit conversion, not a score
+        # normalization, so it is correctly the target's own return std -
+        # this branch has no score-suppression defect to fix.
+        score_scale = float(np.std(absolute_y))
     if not np.isfinite(score_scale) or score_scale <= 0.0:
-        raise ValueError("direction model prediction spread is not finite and positive")
+        raise ValueError("direction model score scale is not finite and positive")
     document = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,

@@ -87,3 +87,42 @@ def test_score_scale_is_prediction_spread_not_target_spread(tmp_path, monkeypatc
     # The old, buggy convention exported std(target) instead; guard against
     # silently reverting to it.
     assert document["score_scale"] != pytest.approx(target_scale, rel=0.2)
+
+
+def test_direction_sign_score_scale_is_target_std_not_prediction_spread(
+    tmp_path, monkeypatch
+):
+    # direction_sign is the other branch of the same export: Rust's raw
+    # (already bounded) prediction *is* the score there, and score_scale
+    # only converts it into a return-scale predicted_return. That is
+    # correctly the target's own return std, unlike absolute_return - this
+    # branch has no score-suppression defect and must not change.
+    matrix_path = tmp_path / "direction-matrix.jsonl"
+    write_direction_matrix(matrix_path)
+    through = date(2016, 1, 1) + timedelta(days=10_000)
+    out_path = tmp_path / "model.json"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_stockholm_direction.py",
+            "--matrix",
+            str(matrix_path),
+            "--through",
+            through.isoformat(),
+            "--out",
+            str(out_path),
+            "--clip-quantile",
+            "0",
+            "--reward",
+            "direction_sign",
+        ],
+    )
+    direction_trainer.main()
+    document = json.loads(out_path.read_text())
+
+    _, _, _, _, _, absolute_y, _ = direction_trainer.load_training_prefix(
+        matrix_path, through, clip_quantile=0.0, reward="direction_sign"
+    )
+    assert document["score_scale"] == pytest.approx(float(np.std(absolute_y)), rel=1e-9)
