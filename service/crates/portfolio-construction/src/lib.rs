@@ -801,6 +801,149 @@ pub fn allocate_with_group_cap(
     Ok(allocation)
 }
 
+/// Budget for an index-core-plus-overlay portfolio: a fixed core position in
+/// the benchmark instrument, topped up by a self-funding long/short overlay
+/// built from candidates. `core_weight` is always fully allocated — it is
+/// never reduced by overlay activity — and unfilled overlay capacity is left
+/// as nothing rather than added to the core.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OverlayBudget {
+    /// Weight always allocated to the benchmark instrument, e.g. 1.0 for a
+    /// full beta-one floor.
+    pub core_weight: f64,
+    /// Maximum combined |long| + |short| overlay weight.
+    pub overlay_gross: f64,
+    /// Maximum |overlay long − overlay short|.
+    pub overlay_net_cap: f64,
+}
+
+impl OverlayBudget {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.core_weight.is_finite()
+            || self.core_weight <= 0.0
+            || self.core_weight > 1.5 + EPSILON
+        {
+            return Err("core weight must be finite and in (0, 1.5]".into());
+        }
+        if !self.overlay_gross.is_finite() || self.overlay_gross < 0.0 {
+            return Err("overlay gross must be finite and non-negative".into());
+        }
+        if !self.overlay_net_cap.is_finite() || self.overlay_net_cap < 0.0 {
+            return Err("overlay net cap must be finite and non-negative".into());
+        }
+        Ok(())
+    }
+}
+
+/// An index-core-plus-overlay allocation. `core_weight` is a fixed weight in
+/// the benchmark instrument, tracked separately from `overlay.weights` so an
+/// overlay candidate id can never collide with the core position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayAllocation {
+    pub core_weight: f64,
+    pub overlay: Allocation,
+}
+
+/// Allocate an index-core-plus-overlay portfolio. The core is always fully
+/// allocated to `budget.core_weight`, independent of the overlay. The
+/// overlay reuses the ordinary scale-down-only `allocate` pipeline under
+/// `budget.overlay_gross`, then applies one further scale-down-only pass
+/// that shrinks only the heavier sleeve so the overlay's realised
+/// |long − short| never exceeds `budget.overlay_net_cap`. As with `allocate`,
+/// capped or net-capped excess is never redistributed and unfilled capacity
+/// is left as nothing — the core is not topped up with unused overlay room.
+pub fn allocate_overlay(
+    proposals: &[Proposal],
+    budget: &OverlayBudget,
+) -> Result<OverlayAllocation, String> {
+    budget.validate()?;
+    let overlay_budget = Budget::gross_only(budget.overlay_gross)?;
+    let mut allocation = allocate(proposals, overlay_budget)?;
+
+    let realised_long = allocation.diagnostics.realised_long;
+    let realised_short = allocation.diagnostics.realised_short;
+    let excess = (realised_long - realised_short).abs() - budget.overlay_net_cap;
+    if excess > EPSILON {
+        let heavier = if realised_long > realised_short {
+            Direction::Long
+        } else {
+            Direction::Short
+        };
+        let heavier_total = if heavier == Direction::Long {
+            realised_long
+        } else {
+            realised_short
+        };
+        // excess > 0 guarantees target_total = lighter + net_cap is both
+        // non-negative and strictly less than heavier_total.
+        let target_total = heavier_total - excess;
+        let scale = scale_down(heavier_total, target_total);
+
+        for weight in allocation.weights.values_mut() {
+            let direction = if *weight > 0.0 {
+                Direction::Long
+            } else {
+                Direction::Short
+            };
+            if direction == heavier {
+                *weight *= scale;
+            }
+        }
+
+        // Scaling the heavier sleeve down can push one of its positions
+        // below its own economic minimum. Drop it to cash rather than carry
+        // a sub-minimum sliver; the freed weight is not redistributed
+        // (scale-down only), matching the ordinary allocate() contract.
+        let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
+            .iter()
+            .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
+            .collect();
+        let mut newly_dropped = Vec::new();
+        allocation.weights.retain(|id, weight| {
+            let minimum = min_abs_weight_by_id
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            if weight.abs() + EPSILON < minimum {
+                newly_dropped.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        allocation
+            .diagnostics
+            .dropped_below_minimum
+            .extend(newly_dropped);
+
+        let realised_long = allocation
+            .weights
+            .values()
+            .copied()
+            .filter(|weight| *weight > 0.0)
+            .sum::<f64>();
+        let realised_short = -allocation
+            .weights
+            .values()
+            .copied()
+            .filter(|weight| *weight < 0.0)
+            .sum::<f64>();
+        let realised_gross = realised_long + realised_short;
+        allocation.diagnostics.realised_long = realised_long;
+        allocation.diagnostics.realised_short = realised_short;
+        allocation.diagnostics.realised_gross = realised_gross;
+        allocation.diagnostics.realised_net = realised_long - realised_short;
+        allocation.diagnostics.unused_long = (overlay_budget.max_long - realised_long).max(0.0);
+        allocation.diagnostics.unused_short = (overlay_budget.max_short - realised_short).max(0.0);
+        allocation.diagnostics.unused_gross = (overlay_budget.max_gross - realised_gross).max(0.0);
+    }
+
+    Ok(OverlayAllocation {
+        core_weight: budget.core_weight,
+        overlay: allocation,
+    })
+}
+
 fn side_total(capped: &[(&Proposal, f64)], direction: Direction) -> f64 {
     capped
         .iter()
@@ -1393,6 +1536,116 @@ mod tests {
             smoothed_sharpe > best_phase_period_sharpe,
             "period-index averaging was expected to inflate Sharpe ({smoothed_sharpe} vs {best_phase_period_sharpe})"
         );
+    }
+
+    #[test]
+    fn overlay_budget_validate_rejects_out_of_range_values() {
+        assert!(OverlayBudget {
+            core_weight: 0.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.6,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: -0.1,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: -0.1,
+        }
+        .validate()
+        .is_err());
+        assert!(OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn zero_candidates_leave_the_portfolio_exactly_at_the_core_floor() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.6,
+            overlay_net_cap: 0.1,
+        };
+        let allocation = allocate_overlay(&[], &budget).unwrap();
+        assert_eq!(allocation.core_weight, 1.0);
+        assert!(allocation.overlay.weights.is_empty());
+        assert_eq!(allocation.overlay.diagnostics.realised_gross, 0.0);
+        assert_eq!(allocation.overlay.diagnostics.realised_net, 0.0);
+    }
+
+    #[test]
+    fn overlay_net_cap_scales_down_only_the_heavier_sleeve() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.0,
+            overlay_net_cap: 0.1,
+        };
+        let proposals = [
+            proposal("long", Direction::Long, 0.3, 0.3),
+            proposal("short", Direction::Short, 0.1, 0.1),
+        ];
+        // Unconstrained the sleeves would be 0.3 long / 0.1 short (net 0.2),
+        // which violates the 0.1 net cap. Only the heavier long sleeve may be
+        // scaled down; the lighter short sleeve must be untouched.
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        assert!((allocation.overlay.weights["long"] - 0.2).abs() < EPSILON);
+        assert!((allocation.overlay.weights["short"] + 0.1).abs() < EPSILON);
+        let realised_net = allocation.overlay.diagnostics.realised_net;
+        assert!(realised_net.abs() <= budget.overlay_net_cap + EPSILON);
+        assert!((realised_net - 0.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn overlay_caps_never_redistribute_excess_to_other_candidates() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 0.9,
+            overlay_net_cap: 1.0, // wide enough not to bind
+        };
+        let proposals = [
+            proposal("a", Direction::Long, 0.8, 0.4),
+            proposal("b", Direction::Short, 0.1, 0.4),
+            proposal("c", Direction::Long, 0.1, 0.4),
+        ];
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        assert!((allocation.overlay.weights["a"] - 0.4).abs() < EPSILON);
+        assert!((allocation.overlay.weights["b"] + 0.1).abs() < EPSILON);
+        assert!((allocation.overlay.weights["c"] - 0.1).abs() < EPSILON);
+        assert_eq!(allocation.overlay.diagnostics.capped_positions, ["a"]);
+    }
+
+    #[test]
+    fn realised_combined_net_is_core_plus_overlay_net() {
+        let budget = OverlayBudget {
+            core_weight: 1.0,
+            overlay_gross: 1.0,
+            overlay_net_cap: 0.1,
+        };
+        let proposals = [
+            proposal("long", Direction::Long, 0.3, 0.3),
+            proposal("short", Direction::Short, 0.1, 0.1),
+        ];
+        let allocation = allocate_overlay(&proposals, &budget).unwrap();
+        let combined_net = allocation.core_weight + allocation.overlay.diagnostics.realised_net;
+        assert!((combined_net - 1.1).abs() < EPSILON);
     }
 
     #[test]
