@@ -4848,18 +4848,16 @@ fn sharpe_standard_error(
     se_periodic * periods_per_year.sqrt()
 }
 
-/// Mean per-period active (bot minus benchmark) return over its own standard
-/// error: `mean(active) / (population_std(active) / sqrt(N))`. `None` when the
-/// two series do not pair up one-for-one — different lengths mean they were
-/// not measured on the same observation grid, most commonly a daily bot series
-/// compared against a benchmark still on holding-period frequency — or when
-/// there are no observations to compare.
-/// The active-return t-stat bar a fold summary's `passed` gate requires.
-/// Named so the value in `passed`'s formula and the value reported in
-/// `RebalancePhaseFoldSummary.active_tstat_threshold` cannot drift apart; it
-/// is unrelated to `target_sharpe` (also `2.0`) despite the coincidence.
+/// Active-return t-stat threshold for a fold summary's `passed` gate.
 const ACTIVE_TSTAT_THRESHOLD: f64 = 2.0;
 
+/// Mean per-period active (bot minus benchmark) return over its own standard
+/// error: `mean(active) / (sample_std(active) / sqrt(N))`, where `sample_std`
+/// uses the N−1 Bessel-corrected divisor. `None` when the two series do not
+/// pair up one-for-one — different lengths mean they were not measured on the
+/// same observation grid, most commonly a daily bot series compared against a
+/// benchmark still on holding-period frequency — or when there are no
+/// observations to compare.
 fn active_tstat(bot_returns: &[f64], benchmark_returns: &[f64]) -> Option<f64> {
     if bot_returns.len() < 2 || bot_returns.len() != benchmark_returns.len() {
         return None;
