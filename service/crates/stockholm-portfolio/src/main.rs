@@ -147,19 +147,21 @@ usage: stockholm-portfolio <command>
 
   backtest --matrix <jsonl> --model <json> --start YYYY-MM-DD --end YYYY-MM-DD
            --out <json> [--benchmark <json>] [--cadence-sessions 5]
-           [--max-positions 20]
+           [--max-positions 20 (directional) | 40 per sleeve (overlay)]
            [--rebalance-offset-sessions 0]
            [--retention-rank 20]
            [--max-sector-gross 0.25]
            [--ranking edge|edge_volatility]
            [--sizing equal|conviction|inverse_volatility|edge_volatility]
-           [--max-gross 1] [--target-net <N>] [--direction-overlay]
+           [--max-gross 1 (directional) | 0.6 (overlay)] [--target-net <N>]
+           [--direction-overlay]
            [--allocation-mode directional|overlay]
            [--core-weight 1] [--overlay-net-cap 0]
            [--core-tracking-cost-bps 10]
            [--market-forecast-matrix <jsonl> --market-forecast-model <json>
             --trained-direction-diagnostic]
-           [--position-weight 0.05] [--min-position-weight 0]
+           [--position-weight 0.05 (directional) | 0.015 (overlay)]
+           [--min-position-weight 0]
            [--reference-edge 0.01] [--reference-volatility 0.02]
            [--aggregate-short-horizon-forecast]
            [--cost-multiple 1] [--bars-root <dir>]
@@ -180,6 +182,17 @@ usage: stockholm-portfolio <command>
       the report attributes core and overlay separately, with the overlay's
       alpha t-stat taken against zero. It requires --benchmark and cannot be
       combined with --direction-overlay, --target-net or --max-sector-gross.
+      Overlay mode also switches three defaults, unless the flag is passed
+      explicitly (an explicit flag always wins, in either mode):
+      --max-positions defaults to 40 PER SLEEVE (long and short are ranked
+      and admitted against separate 40-name caps, so up to 80 names total,
+      instead of directional's single 20-name cap shared by both directions);
+      --position-weight defaults to 0.015 (vs 0.05); --max-gross defaults to
+      0.6 (100% core + up to 30% long / 30% short overlay, vs 1.0). Rationale:
+      the audit found the 20-name overlay book's phase-to-phase dispersion
+      (-21%..+6%) was uncompensated concentration noise; more names at
+      smaller size shrinks it roughly sqrt(2)-sqrt(3) while spending the same
+      gross.
       Trained direction forecasts (--market-forecast-matrix/-model) are
       retired from every promotable configuration - every tested variant
       lost to controls on the available sample - and additionally require
@@ -364,6 +377,39 @@ where
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
+}
+
+/// `true` when `--allocation-mode overlay` was passed. `backtest`'s overlay
+/// mode widens the book (see `overlay_aware_number`) at the same total
+/// gross, so several of its flags default differently from directional
+/// mode's; this is checked before the `AllocationMode` enum itself is built
+/// (that construction needs `max_gross`, one of the values this decides).
+fn is_overlay_mode(args: &[String]) -> bool {
+    matches!(get(args, "--allocation-mode").as_deref(), Some("overlay"))
+}
+
+/// Resolve a flag whose default depends on `--allocation-mode`. An explicit
+/// flag always wins over either default, in either mode — this only chooses
+/// which default `number` falls back to when the flag is absent.
+fn overlay_aware_number<T: std::str::FromStr>(
+    args: &[String],
+    name: &str,
+    overlay: bool,
+    directional_default: T,
+    overlay_default: T,
+) -> Result<T, String>
+where
+    T::Err: std::fmt::Display,
+{
+    number(
+        args,
+        name,
+        if overlay {
+            overlay_default
+        } else {
+            directional_default
+        },
+    )
 }
 
 fn collect(args: &[String]) -> Result<(), String> {
@@ -2575,14 +2621,28 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     let ranking = get(args, "--ranking")
         .unwrap_or_else(|| "edge".into())
         .parse()?;
+    // Overlay mode's defaults differ from directional's (see the
+    // `--allocation-mode` block below for the rationale): widen the book at
+    // the same total gross to shrink concentration noise. Peeking at the raw
+    // flag here (before the enum is built, since building it needs
+    // `max_gross`) only decides which default applies — an explicit flag,
+    // in either mode, always wins over any default.
+    let overlay_mode = is_overlay_mode(args);
     // Accept the old spelling while existing experiment commands migrate. It
     // is a maximum, never an instruction to spend the whole amount.
     let max_gross = if let Some(value) = get(args, "--max-gross") {
         value
             .parse::<f64>()
             .map_err(|error| format!("bad --max-gross: {error}"))?
+    } else if let Some(value) = get(args, "--target-gross") {
+        value
+            .parse::<f64>()
+            .map_err(|error| format!("bad --target-gross: {error}"))?
+    } else if overlay_mode {
+        // Overlay default: 100% core + up to 30% long / 30% short overlay.
+        0.6
     } else {
-        number(args, "--target-gross", 1.0_f64)?
+        1.0
     };
     let allocation_budget = match get(args, "--target-net") {
         Some(value) => portfolio_construction::Budget::from_gross_net(
@@ -2727,7 +2787,15 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
                     .into(),
             ),
         };
-    let max_positions = number(args, "--max-positions", 20_usize)?;
+    // Overlay's book is wider (40 names PER SLEEVE, i.e. up to 80 total) at a
+    // smaller per-name weight than directional's combined 20-name cap: the
+    // audit found the 20-name overlay's phase dispersion (-21%..+6%) was
+    // uncompensated concentration noise, and more names at smaller size
+    // shrinks it ~sqrt(2)-sqrt(3) while spending the same gross. An explicit
+    // --max-positions/--position-weight always overrides this default,
+    // whichever mode is chosen.
+    let max_positions =
+        overlay_aware_number(args, "--max-positions", overlay_mode, 20_usize, 40_usize)?;
     // Daily NAV marks need the adjusted closes between the executable entry and
     // exit opens; the matrix carries only those two prices per label.
     let mark_prices = match get(args, "--bars-root") {
@@ -2770,7 +2838,13 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             sizing,
             allocation_budget,
             allocation_mode,
-            position_weight: number(args, "--position-weight", 0.05_f64)?,
+            position_weight: overlay_aware_number(
+                args,
+                "--position-weight",
+                overlay_mode,
+                0.05_f64,
+                0.015_f64,
+            )?,
             min_position_weight: number(args, "--min-position-weight", 0.0_f64)?,
             reference_edge: number(args, "--reference-edge", 0.01_f64)?,
             reference_volatility: number(args, "--reference-volatility", 0.02_f64)?,
@@ -3047,5 +3121,151 @@ fn main() -> ExitCode {
             eprintln!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_default_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_mode_default_applies_only_when_the_flag_is_absent() {
+        let overlay_args = vec!["--allocation-mode".to_string(), "overlay".to_string()];
+        let directional_args = vec!["--allocation-mode".to_string(), "directional".to_string()];
+        let no_mode_args: Vec<String> = vec![];
+
+        assert!(is_overlay_mode(&overlay_args));
+        assert!(!is_overlay_mode(&directional_args));
+        assert!(
+            !is_overlay_mode(&no_mode_args),
+            "directional is the default mode"
+        );
+
+        // Absent flag: each mode falls back to its own default.
+        assert_eq!(
+            overlay_aware_number(
+                &overlay_args,
+                "--max-positions",
+                is_overlay_mode(&overlay_args),
+                20_usize,
+                40_usize
+            )
+            .unwrap(),
+            40
+        );
+        assert_eq!(
+            overlay_aware_number(
+                &directional_args,
+                "--max-positions",
+                is_overlay_mode(&directional_args),
+                20_usize,
+                40_usize
+            )
+            .unwrap(),
+            20
+        );
+
+        // An explicit flag always wins, in either mode.
+        let overlay_explicit = vec![
+            "--allocation-mode".to_string(),
+            "overlay".to_string(),
+            "--max-positions".to_string(),
+            "7".to_string(),
+        ];
+        assert_eq!(
+            overlay_aware_number(
+                &overlay_explicit,
+                "--max-positions",
+                is_overlay_mode(&overlay_explicit),
+                20_usize,
+                40_usize
+            )
+            .unwrap(),
+            7
+        );
+        let directional_explicit = vec![
+            "--allocation-mode".to_string(),
+            "directional".to_string(),
+            "--max-positions".to_string(),
+            "99".to_string(),
+        ];
+        assert_eq!(
+            overlay_aware_number(
+                &directional_explicit,
+                "--max-positions",
+                is_overlay_mode(&directional_explicit),
+                20_usize,
+                40_usize
+            )
+            .unwrap(),
+            99
+        );
+    }
+
+    #[test]
+    fn overlay_position_weight_and_max_gross_defaults_match_the_brief() {
+        let overlay_args = vec!["--allocation-mode".to_string(), "overlay".to_string()];
+        let directional_args: Vec<String> = vec![];
+        let overlay = is_overlay_mode(&overlay_args);
+        let directional = is_overlay_mode(&directional_args);
+
+        assert_eq!(
+            overlay_aware_number(
+                &overlay_args,
+                "--position-weight",
+                overlay,
+                0.05_f64,
+                0.015_f64
+            )
+            .unwrap(),
+            0.015
+        );
+        assert_eq!(
+            overlay_aware_number(
+                &directional_args,
+                "--position-weight",
+                directional,
+                0.05_f64,
+                0.015_f64
+            )
+            .unwrap(),
+            0.05
+        );
+        assert_eq!(
+            overlay_aware_number(&overlay_args, "--max-gross", overlay, 1.0_f64, 0.6_f64).unwrap(),
+            0.6
+        );
+        assert_eq!(
+            overlay_aware_number(
+                &directional_args,
+                "--max-gross",
+                directional,
+                1.0_f64,
+                0.6_f64
+            )
+            .unwrap(),
+            1.0
+        );
+
+        // An explicit flag wins even when it's the same value as the other
+        // mode's default, so the precedence is genuinely flag-first, not
+        // just "does it differ from the default".
+        let overlay_explicit_at_directional_default = vec![
+            "--allocation-mode".to_string(),
+            "overlay".to_string(),
+            "--position-weight".to_string(),
+            "0.05".to_string(),
+        ];
+        assert_eq!(
+            overlay_aware_number(
+                &overlay_explicit_at_directional_default,
+                "--position-weight",
+                is_overlay_mode(&overlay_explicit_at_directional_default),
+                0.05_f64,
+                0.015_f64
+            )
+            .unwrap(),
+            0.05
+        );
     }
 }

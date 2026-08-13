@@ -1958,7 +1958,14 @@ pub struct BacktestConfig {
     /// return over `cadence_sessions`. This affects economic hurdles and
     /// reported predictions, never realised labels.
     pub prediction_horizon_scale: f64,
+    /// Candidate admission cap. In `AllocationMode::Directional` this is a
+    /// single combined cap shared by both directions (no side quota). In
+    /// `AllocationMode::Overlay` it applies PER SLEEVE: the long and short
+    /// books are ranked and admitted independently, each against this cap,
+    /// so the overlay book can hold up to twice this many names.
     pub max_positions: usize,
+    /// Retention buffer width, same per-sleeve/combined split as
+    /// `max_positions` above.
     pub retention_rank: usize,
     pub max_sector_gross: Option<f64>,
     pub ranking: portfolio_construction::RankingMethod,
@@ -2331,13 +2338,44 @@ pub fn backtest(
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        let ranked = portfolio_construction::buffered_ranked_ids(
-            &construction_candidates,
-            ranking,
-            &incumbents,
-            max_positions,
-            retention_rank,
-        )?;
+        // In overlay mode `max_positions`/`retention_rank` apply PER SLEEVE:
+        // long and short candidates are ranked and admitted against separate
+        // caps, so a run of one-sided edges cannot crowd the other sleeve
+        // below the intended book width. Directional mode keeps the
+        // historical combined cap, where both directions compete for the
+        // same slots (there is no side quota there, by design).
+        let ranked = if core.is_some() {
+            let (long_candidates, short_candidates): (Vec<_>, Vec<_>) =
+                construction_candidates.into_iter().partition(|candidate| {
+                    candidate.direction == portfolio_construction::Direction::Long
+                });
+            let (long_incumbents, short_incumbents): (BTreeMap<_, _>, BTreeMap<_, _>) = incumbents
+                .into_iter()
+                .partition(|(_, direction)| *direction == portfolio_construction::Direction::Long);
+            let mut ranked = portfolio_construction::buffered_ranked_ids(
+                &long_candidates,
+                ranking,
+                &long_incumbents,
+                max_positions,
+                retention_rank,
+            )?;
+            ranked.extend(portfolio_construction::buffered_ranked_ids(
+                &short_candidates,
+                ranking,
+                &short_incumbents,
+                max_positions,
+                retention_rank,
+            )?);
+            ranked
+        } else {
+            portfolio_construction::buffered_ranked_ids(
+                &construction_candidates,
+                ranking,
+                &incumbents,
+                max_positions,
+                retention_rank,
+            )?
+        };
         let mut by_id = candidates
             .into_iter()
             .map(|candidate| (candidate.row.instrument_id.clone(), candidate))
@@ -6883,5 +6921,145 @@ mod tests {
             )
         )
         .is_err());
+    }
+
+    /// Builds a chain of `<=` splits on feature index 0 so each `(x, leaf)`
+    /// rung maps to its own leaf, in ascending-`x` order. Lets a test hand
+    /// every instrument its own distinct model prediction without a real
+    /// trained tree.
+    fn ladder_model(rungs: &[(f64, f64)]) -> Model {
+        fn build(rungs: &[(f64, f64)]) -> lightgbm_json::Node {
+            if rungs.len() == 1 {
+                return direction_leaf(rungs[0].1);
+            }
+            let threshold = (rungs[0].0 + rungs[1].0) / 2.0;
+            lightgbm_json::Node {
+                split_feature: Some(0),
+                threshold: Some(threshold),
+                decision_type: Some("<=".into()),
+                default_left: Some(true),
+                missing_type: None,
+                left_child: Some(Box::new(direction_leaf(rungs[0].1))),
+                right_child: Some(Box::new(build(&rungs[1..]))),
+                leaf_value: None,
+                diagnostics: Default::default(),
+            }
+        }
+        let mut model = constant_model(0.0);
+        model.tree_info = vec![lightgbm_json::Tree {
+            tree_index: 0,
+            num_leaves: rungs.len(),
+            num_cat: Some(0),
+            shrinkage: Some(1.0),
+            tree_structure: build(rungs),
+        }];
+        model
+    }
+
+    /// Task 15: in overlay mode, `max_positions` admits candidates PER
+    /// SLEEVE. Six candidates are set up so three longs strictly out-rank
+    /// all three shorts by edge (0.06/0.05/0.04 versus 0.03/0.02/0.01); with
+    /// a combined cap of 2 the old ranking would fill both slots from the
+    /// long sleeve and admit zero shorts (the un-hedged, un-diversified
+    /// admission the fix removes). With the per-sleeve cap the two
+    /// strongest names on EACH side are admitted, so the book holds two
+    /// longs and two shorts.
+    #[test]
+    fn overlay_mode_admits_candidates_per_sleeve_not_from_one_combined_ranking() {
+        let sessions = overlay_sessions();
+        let date = sessions[1];
+        let named = |id: &str, x_ret_1: f64| {
+            let mut value = row(date);
+            value.instrument_id = id.into();
+            value.symbol = id.into();
+            value.features = BTreeMap::from([("x_ret_1".into(), x_ret_1)]);
+            value
+        };
+        // Ascending by x_ret_1: three shorts (weakest to strongest edge),
+        // then three longs (weakest to strongest edge).
+        let rows = vec![
+            named("TS3", -5.0), // short edge 0.01 (weakest)
+            named("TS2", -4.0), // short edge 0.02
+            named("TS1", -3.0), // short edge 0.03 (strongest short)
+            named("TL3", 3.0),  // long edge 0.04 (weakest long)
+            named("TL2", 4.0),  // long edge 0.05
+            named("TL1", 5.0),  // long edge 0.06 (strongest overall)
+        ];
+        let model = ladder_model(&[
+            (-5.0, -0.01),
+            (-4.0, -0.02),
+            (-3.0, -0.03),
+            (3.0, 0.04),
+            (4.0, 0.05),
+            (5.0, 0.06),
+        ]);
+        let result = backtest(
+            &model,
+            &rows,
+            &BacktestConfig {
+                start: date,
+                end: date,
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Overlay {
+                    budget: portfolio_construction::OverlayBudget {
+                        core_weight: 1.0,
+                        overlay_gross: 0.6,
+                        overlay_net_cap: 0.1,
+                    },
+                    core_tracking_cost_bps: 10.0,
+                },
+                position_weight: 0.1,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: Some(rising_benchmark(8)),
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 1);
+        let mut ids = result.steps[0]
+            .positions
+            .iter()
+            .map(|position| position.instrument_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["TL1", "TL2", "TS1", "TS2"],
+            "expected the two strongest names on each sleeve, not the four \
+             strongest names overall (which would starve the short sleeve): {ids:?}"
+        );
+        let longs = result.steps[0]
+            .positions
+            .iter()
+            .filter(|position| matches!(position.direction, Direction::Long))
+            .count();
+        let shorts = result.steps[0]
+            .positions
+            .iter()
+            .filter(|position| matches!(position.direction, Direction::Short))
+            .count();
+        assert_eq!(longs, 2, "the long sleeve must fill its own cap");
+        assert_eq!(
+            shorts, 2,
+            "the short sleeve must fill its own cap, unstarved by the longs"
+        );
     }
 }
