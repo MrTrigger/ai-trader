@@ -1042,6 +1042,60 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             tokio::spawn(rithmic_feed_task(v.clone(), bar_tx, feed_health.clone()));
         }
     }
+    // Price the book off the CONTRACT the broker resolved, not off a constant.
+    //
+    // `Costs::default()` is NQ economics ($20 a point) and the venue was
+    // filling MNQ ($2 a point), so every figure the bot published — net, the
+    // kill rail's rolling total, every fill — was ten times the money that
+    // actually moved. The broker knows what its own contract is worth; asking
+    // it is the only way that number is ever right, including when the front
+    // month rolls into a differently specified one.
+    //
+    // Replay and shadow keep the default, which is what parity is measured
+    // against: nothing here changes a backtest.
+    if live {
+        match trading.adapter().get_markets().await {
+            Ok(markets) => {
+                if let Some(m) = markets.iter().find(|m| m.asset.to_string() == symbol) {
+                    let pv: f64 = m.multiplier.try_into().unwrap_or(book.costs.point_value);
+                    let tick: f64 = m.tick.try_into().unwrap_or(book.costs.tick_size);
+                    if pv > 0.0 {
+                        book.costs.point_value = pv;
+                    }
+                    if tick > 0.0 {
+                        book.costs.tick_size = tick;
+                    }
+                    // The commission is the one cost the contract spec does not
+                    // carry — it is on the broker's execution reports, which
+                    // this adapter discards today. Until it is captured, it is
+                    // stated rather than guessed.
+                    if let Ok(c) = std::env::var("IB_COMMISSION_ROUND_TURN") {
+                        if let Ok(c) = c.parse::<f64>() {
+                            book.costs.commission = c;
+                        }
+                    }
+                    let line = format!(
+                        "costs from the contract: {} at ${}/point, tick {}, commission ${} \
+                         round-turn",
+                        m.venue_symbol,
+                        book.costs.point_value,
+                        book.costs.tick_size,
+                        book.costs.commission
+                    );
+                    eprintln!("{line}");
+                    let _ = rec.log_line(&bot_id, "info", &line);
+                }
+            }
+            // Trading on the wrong multiplier is worse than not trading: every
+            // number, including the kill rail's, would be wrong by the ratio.
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the contract spec ({e}) — refusing to trade on assumed economics"
+                ))
+            }
+        }
+    }
+
     // Reconcile before the first bar, not just at the next session boundary.
     // A restored snapshot is a claim about what we were holding when the
     // process died, and the broker is the only party who can confirm it. Left

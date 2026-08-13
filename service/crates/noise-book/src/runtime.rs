@@ -20,7 +20,13 @@ use crate::scanner::Scanner;
 use crate::Sleeve;
 
 pub const KILL_ROLLING_SESSIONS: usize = 60;
+/// The validated rolling drawdown limit, in the dollars it was MEASURED in:
+/// one NQ contract at $20 a point. See [`Book::kill_dollars`] — the limit that
+/// actually applies is this scaled to whatever contract is being traded.
 pub const KILL_DRAWDOWN_DOLLARS: f64 = -70_500.0;
+/// The point value the research was run at. `KILL_DRAWDOWN_DOLLARS` is only
+/// meaningful relative to it.
+pub const RESEARCH_POINT_VALUE: f64 = 20.0;
 
 fn r2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
@@ -248,6 +254,18 @@ impl Book {
         self.disabled = c.disabled_sleeves.clone();
     }
 
+    /// The drawdown limit for the contract actually being traded.
+    ///
+    /// The validated number is a number of POINTS wearing dollars: -70,500 was
+    /// measured on one NQ contract at $20 a point, i.e. 3,525 points. Trading a
+    /// micro at $2 a point and keeping the dollar figure would let the book
+    /// lose ten times the drawdown the research sanctioned before the rail
+    /// noticed — the limit has to follow the contract, or it is not the limit
+    /// that was tested.
+    pub fn kill_dollars(&self) -> f64 {
+        KILL_DRAWDOWN_DOLLARS * (self.costs.point_value / RESEARCH_POINT_VALUE)
+    }
+
     fn kill_check(&mut self) {
         if self.halted.is_some() || self.daily_net.len() < KILL_ROLLING_SESSIONS {
             return;
@@ -255,7 +273,7 @@ impl Book {
         let days: Vec<&NaiveDate> = self.daily_net.keys().collect();
         let tail = &days[days.len() - KILL_ROLLING_SESSIONS..];
         let rolling: f64 = tail.iter().map(|d| self.daily_net[*d]).sum();
-        if rolling < KILL_DRAWDOWN_DOLLARS {
+        if rolling < self.kill_dollars() {
             self.halted = Some(tail.last().expect("nonempty").to_string());
         }
     }
@@ -497,7 +515,7 @@ impl Book {
             "kill": {
                 "rolling_sessions": tail_n,
                 "rolling_net": r2(rolling),
-                "limit": KILL_DRAWDOWN_DOLLARS,
+                "limit": self.kill_dollars(),
             },
             "sleeves": sleeves,
             "recent_daily_net": recent,
@@ -850,6 +868,30 @@ mod halt_semantics_tests {
             (daily - (daily_before + booked_net)).abs() < 1e-6,
             "daily net missed the reconciled fills: {daily} vs {}",
             daily_before + booked_net
+        );
+    }
+
+    /// The kill rail is a POINTS drawdown wearing dollars. -70,500 was measured
+    /// on one NQ contract at $20 a point; trading a micro at $2 and keeping the
+    /// dollar figure would let the book lose ten times the sanctioned drawdown
+    /// before the rail noticed.
+    #[test]
+    fn the_kill_line_follows_the_contract() {
+        let mut b = Book::new(book_sleeves());
+        assert_eq!(
+            b.costs.point_value, RESEARCH_POINT_VALUE,
+            "default is the research contract"
+        );
+        assert_eq!(b.kill_dollars(), KILL_DRAWDOWN_DOLLARS);
+
+        // The same strategy on a micro: a tenth of the dollars, the SAME points.
+        b.costs.point_value = 2.0;
+        assert_eq!(b.kill_dollars(), KILL_DRAWDOWN_DOLLARS / 10.0);
+        let points_nq = KILL_DRAWDOWN_DOLLARS / RESEARCH_POINT_VALUE;
+        let points_micro = b.kill_dollars() / b.costs.point_value;
+        assert!(
+            (points_nq - points_micro).abs() < 1e-9,
+            "the rail must be the same drawdown in points: {points_nq} vs {points_micro}"
         );
     }
 

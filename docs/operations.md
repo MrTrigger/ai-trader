@@ -418,6 +418,32 @@ Suspend the schedule entirely:
 kubectl patch cronjob aitrader-paper-cycle -n trader -p '{"spec":{"suspend":true}}'
 ```
 
+### The broker is the ground truth
+
+Where the model and the account disagree, the account wins and the bot moves to
+it — by itself, without stopping for a person. That applies to positions
+(below) and to the economics of the contract:
+
+**Point value and tick come from the contract the broker resolved.** They used
+to be constants — NQ's $20 a point — while the venue filled MNQ at $2, so every
+number the bot published was ten times the money that actually moved. The bot
+now reads them from `get_markets` at startup and **refuses to trade** if it
+cannot: assumed economics make every figure wrong by the ratio, including the
+kill rail's.
+
+**The kill rail follows the contract.** `-70,500` was measured on one NQ
+contract, so it is really 3,525 points; it is scaled by `point_value /
+RESEARCH_POINT_VALUE` at use. Keeping the dollar figure on a micro would have
+let the book lose ten times the sanctioned drawdown before the rail noticed.
+
+**Commission is the exception, and it is stated rather than guessed.** The
+contract spec does not carry it and the adapter still discards IB's commission
+reports, so `IB_COMMISSION_ROUND_TURN` sets it (the manifest carries MNQ's).
+Capturing it from the execution reports is the honest fix and is not done yet.
+
+Replay and shadow keep the research contract's economics, which is what parity
+is measured against — none of this changes a backtest.
+
 ### Reconciliation: the broker is the truth about what we hold
 
 At startup and at every session boundary the bot compares its book against the
