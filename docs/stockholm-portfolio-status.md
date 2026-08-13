@@ -312,19 +312,19 @@ one implementation defect (score normalization) that was independently
 capable of hiding whatever signal, if any, a differently-scaled version might
 have shown.
 
-## 2026-08-13 Task 15: overlay book widened; Phase 2 control replay BLOCKED
+## 2026-08-13 Task 15: overlay book widened; Phase 2 constructor control replayed
 
-**Step 1 (done).** `stockholm-portfolio backtest --allocation-mode overlay`
-now defaults `--max-positions` to 40 **per sleeve** (long and short are
-ranked and admitted against separate 40-name caps, so up to 80 names total),
+**Step 1.** `stockholm-portfolio backtest --allocation-mode overlay` now
+defaults `--max-positions` to 40 **per sleeve** (long and short are ranked
+and admitted against separate 40-name caps, so up to 80 names total),
 `--position-weight` to 0.015, and `--max-gross` (the overlay's gross budget)
 to 0.6 — 100% core plus up to 30% long / 30% short overlay at the same total
-gross as before. Directional mode's defaults (20 combined names, 0.05,
-1.0) are unchanged; any explicit flag, in either mode, overrides its
-default. Rationale, from the earlier overlay audit: the 20-name overlay
-book's phase-to-phase dispersion (−21%..+6%) was uncompensated concentration
-noise; more names at smaller size shrinks it roughly √2–√3 while spending the
-same gross.
+gross as before. Directional mode's defaults (20 combined names, 0.05, 1.0)
+are unchanged; any explicit flag, in either mode, overrides its default.
+Rationale, from the earlier overlay audit: the 20-name overlay book's
+phase-to-phase dispersion (−21%..+6%) was uncompensated concentration noise;
+more names at smaller size shrinks it roughly √2–√3 while spending the same
+gross.
 
 Candidate admission was also fixed to match: `max_positions` previously fed
 one combined ranking across both directions even in overlay mode (via
@@ -335,50 +335,83 @@ long and short pools independently in overlay mode, each against its own
 cap; directional mode's historical combined-cap behaviour (no side quota) is
 unchanged.
 
-**Step 2 (BLOCKED).** The brief asked for the frozen lean model
-(`baseline-membership-prenorm-v2/model-{1..4}.json`, the same artifacts
-Task 2/3 replayed) to be replayed in overlay mode, unrefit, as the Phase 2
-constructor control. The fold-1 smoke test specified before the full sweep
-caught the problem immediately: `Model::load` refuses the model outright —
+**Step 2: two blockers, both resolved by controller ruling, in this task.**
 
-```
-unsupported Stockholm feature version "fs-rust-stockholm-1"
-```
+*Blocker 1 — every frozen model refused.* The fold-1 smoke test specified
+before the full sweep first hit `Model::load` refusing the frozen lean model
+outright (`unsupported Stockholm feature version "fs-rust-stockholm-1"`):
+Task 5 deliberately moved every reachable stock `feature_set_version`
+constant past the pre-membership-fix block, and every model file under
+`var/stockholm/` predates that bump. Controller ruling: the safety property
+is CONSISTENCY between a model and the matrix it is paired with (checked
+already, unchanged), not currency with the binary — an old model on a
+matching old matrix is an internally consistent frozen replay; a mismatched
+pair (old model / current matrix or vice versa) stays refused.
+`Model::load` no longer hard-rejects a `feature_set_version` outside the
+current registry; `stockholm-portfolio`'s existing model/matrix agreement
+check (`main.rs`'s `model_agrees_with_matrix`) is what actually gates the
+replay. Every report replayed on a pre-registry version now carries an
+explicit disclosure naming the version and stating it predates the
+2026-08-13 corrections and is a constructor re-baseline only, not evidence
+about the corrected pipeline.
 
-Task 5 (`673219b`) deliberately moved every reachable stock
-`feature_set_version` constant past the pre-membership-fix block (old
-version `n` → `n + 16`) specifically so a model or matrix built with the
-latent cross-section look-ahead can never again be loaded and silently
-replayed as if unaffected. That is a correct and deliberate safety rail, but
-its consequence is total: every stock model file under `var/stockholm/`
-predates the bump (checked all `model.json`/`model-*.json` files present —
-every one declares `fs-rust-stockholm-1` through `-16`, or a `-direction-*`
-version; none matches a currently-registered constant). The exact
-directional-mode command from `var/stockholm-remediation/task2/regenerate.sh`
-— no overlay flags at all — fails identically on this same worktree at the
-current HEAD, confirming the block is general, not overlay-specific, and not
-a consequence of the Step 1 change above (verified with only Step 1's two
-files staged). No currently existing frozen model can be replayed fresh by
-`stockholm-portfolio backtest` under today's binary; the earlier
-Task 2/3/4 numbers in this document survive only because they were produced
-before Task 5 landed and are read back as saved JSON, never reloaded through
-`Model::load`.
+*Blocker 2 — the index calendar drifted from the equity calendar.* With
+Blocker 1 fixed, the full sweep hit a second, unrelated defect: `the index
+core's session 20 after 2023-05-08 falls on 2023-06-06, but the book is
+marked on 2023-06-07`. The OMXSGI archive carries a bar for 2023-06-06
+(Sweden's National Day, an equity holiday) even though the equity market was
+closed; the old code found the index's entry/exit/mark closes by counting
+`cadence_sessions` **rows** forward in the benchmark archive from the
+decision date, so an archive row on a date the equity market is closed
+shifts every later mark and the period return itself onto the wrong
+calendar day. Controller ruling: the book's own equity-session dates are
+authoritative; the index leg is now looked up **by date** against them
+wherever a real equity calendar is in scope (a mark-price universe, or a
+frozen report's own recorded daily marks in `add_benchmark`'s retrofit
+path) — a date the archive has no bar for is still refused, loudly. Where no
+equity calendar is in scope (no `--bars-root`, or the fixed-momentum
+diagnostic control, which never had one), the count-based lookup is
+unchanged, a pre-existing and still-disclosed limitation.
 
-Fitting a new lean model is out of scope here twice over — it would be a
-refit, which the brief explicitly forbids, and model fitting is a Python job
-per this project's Rust/Python split. Loosening `Model::load`'s version
-check to let this one replay through is also out of scope: that check is a
-cross-cutting safety rail Task 5 debated and hardened across two review
-rounds, and weakening it is a controller-level call, not something to bundle
-into a CLI-default change. No overlay-vs-directional numbers for the Phase 2
-constructor control are reported below; the overlay mechanism itself is
-verified only by the unit test added in Step 1
-(`overlay_mode_admits_candidates_per_sleeve_not_from_one_combined_ranking`).
-Unblocking Step 2 needs one of: a fresh model fit on the corrected feature
-pipeline (a Phase-1/controller decision, not "no refit" in the sense the
-brief meant it), or an explicit, disclosed, narrowly-scoped exception for
-read-only comparison replays that does not weaken the check for any
-promotion-relevant path.
+Replayed the existing frozen lean model, unrefit, in overlay mode on the
+same matrix/model/benchmark/fold boundaries/costs as the directional
+corrected numbers above (`--bars-root`, calendar-aligned combination), all 4
+folds × 20 phases, base scenario, two `--overlay-net-cap` variants (0.0, the
+strict default, and 0.1). Script:
+`var/stockholm-remediation/task15/run_fold.sh`, one fold per invocation (not
+`xargs -P`: this environment denies permission to parallel subprocess
+spawning), ~2 minutes per fold, ~16 minutes total.
+
+| variant | return | Sharpe ± SE (rf 2%) | max DD | active t-stat vs OMXSGI | overlay_alpha_tstat (80 phases: median / mean / range) | passed |
+|---|---:|---:|---:|---:|---:|---:|
+| directional corrected (for comparison, from the Task 3/4 sections above) | — | **1.16 ± 0.60** | — | **1.08** | n/a | false |
+| overlay, `--overlay-net-cap 0.0` (default) | +58.85% | **0.99 ± 0.60** | -20.94% | **0.47** | 0.24 / 0.41 / [-3.01, 4.80] | false |
+| overlay, `--overlay-net-cap 0.1` | +68.38% | **1.03 ± 0.60** | -22.90% | **2.20** | 1.02 / 0.96 / [-1.23, 2.92] | false |
+
+`overlay_alpha_tstat` is each phase's own self-funding-overlay-vs-zero
+t-stat (`BacktestResult.overlay_attribution.overlay_alpha_tstat`); no
+calendar-aligned aggregator for it exists in the current summarizer tooling
+(unlike `active_tstat`, which the fold-folds summary computes correctly on
+the combined daily series), so pooling all 80 phases' per-step values into
+one t-stat would repeat the overlapping-window inflation Task 2's fix
+removed from the portfolio return series itself. The median/mean/range
+above are a descriptive check across the 80 independent phase replays, not
+a single properly-aggregated statistic.
+
+Both variants stay `passed: false` under the active-tstat/Sharpe-floor gate:
+`--overlay-net-cap 0.1`'s active t-stat (2.20) clears the 2.0 threshold, but
+`sharpe - 1.64*sharpe_se` (1.03 - 1.64×0.60 = 0.04) is well short of the
+1.0 floor; `--overlay-net-cap 0.0`'s active t-stat (0.47) does not clear the
+threshold at all. These are constructor re-baselines on
+`SURVIVORSHIP_CONTAMINATED`, pre-2026-08-13-correction data (every report's
+disclosures name the `fs-rust-stockholm-1` feature version explicitly) —
+they compare the overlay constructor's mechanics against the directional
+constructor's on the same contaminated inputs, not new evidence toward the
+promotion gate.
+
+Full artifacts: `var/stockholm-remediation/task15/{netcap0,netcap01}/` (80
+phase reports, 4 fold summaries, 1 fold-folds report per variant), scripts
+`run_fold.sh`, `smoke.sh`, `smoke_fold1.sh` beside them.
 
 ## Current verdict
 
