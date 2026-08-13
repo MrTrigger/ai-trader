@@ -190,10 +190,15 @@ exactly this and nothing more:**
 
 - After the first full run (all three horizons, full mapped universe), a
   symbol may be dropped **only** if it has negative `total_net_bps` in the
-  `per_asset` breakdown of that run's gate report — the pre-registered rule,
-  no other reason.
+  `per_asset` breakdown of **all three** horizon reports from that run — the
+  pre-registered rule, no other reason. Requiring unanimity across horizons
+  is the strictest evidence standard for exclusion, which minimizes
+  universe-selection overfitting, and it's the only reading consistent with
+  the single shared `--exclude` list and matrix rebuild below: there is one
+  exclude list, not one per horizon.
 - Drop exactly those symbols (`universe --exclude <symbol>,...`), rebuild
-  the matrix, refit the folds, and rerun the gate **once**.
+  the matrix, refit the folds, and rerun the gate **once** — the same
+  exclude list, and the same rebuilt matrix, feeding all three horizons.
 - That is the entire allowed process. No second round of dropping. No
   rerunning with a different `--threshold-mult` or `--notional` to see if
   the number moves. No cherry-picking a horizon that happened to pass while
