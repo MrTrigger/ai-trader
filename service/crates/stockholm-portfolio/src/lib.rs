@@ -761,6 +761,11 @@ pub struct DirectionLayerMetrics {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This overlay diagnostic is out of Task 3's gated-evaluation scope and
+    /// stays nominal (non-excess); `0.0` is the true rate, not a
+    /// missing-field default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub mean_budget_gross: f64,
     pub mean_budget_net: f64,
@@ -783,6 +788,11 @@ pub struct SelectionLayerMetrics {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This selection diagnostic is out of Task 3's gated-evaluation scope
+    /// and stays nominal (non-excess); `0.0` is the true rate, not a
+    /// missing-field default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
     pub gross_return_before_costs: f64,
@@ -875,6 +885,11 @@ pub struct DirectionPerformance {
     pub annualised_return: f64,
     pub annualised_volatility: f64,
     pub sharpe: f64,
+    /// This diagnostic is out of Task 3's gated-evaluation scope and stays
+    /// nominal (non-excess); `0.0` is the true rate, not a missing-field
+    /// default.
+    #[serde(default)]
+    pub risk_free_annual: f64,
     pub max_drawdown: f64,
     pub positive_periods: usize,
 }
@@ -1264,6 +1279,7 @@ fn direction_performance(returns: &[f64], cadence: usize) -> DirectionPerformanc
         annualised_return: metrics.annualised_return,
         annualised_volatility: metrics.annualised_volatility,
         sharpe: metrics.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: metrics.max_drawdown,
         positive_periods: returns.iter().filter(|value| **value > 0.0).count(),
     }
@@ -1507,6 +1523,19 @@ pub struct RebalancePhaseDiagnostic {
     pub periods: usize,
     pub total_return: f64,
     pub sharpe: f64,
+    /// The rf basis `sharpe` was computed under. In the calendar-aligned
+    /// branch this is the summary's own `--risk-free-annual`. In the legacy
+    /// (period-index) branch it is copied straight from the frozen phase
+    /// report's own `metrics.risk_free_annual` rather than the summary's rate
+    /// — a phase replayed under a different `--risk-free-annual` (or one that
+    /// predates Task 3, which reads `0.0`, truthfully) can disagree with the
+    /// summary it is now inside, and this field is what lets a reader see
+    /// that rather than silently overwriting it with the summary's own rate.
+    #[serde(default)]
+    pub risk_free_annual: f64,
+    /// `0.0` on a phase report predating this field, in either branch.
+    #[serde(default)]
+    pub sharpe_se: f64,
     pub max_drawdown: f64,
     pub mean_rank_ic: f64,
 }
@@ -1622,8 +1651,18 @@ pub struct RebalancePhaseFoldSummary {
     pub active_tstat: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_tstat_status: Option<String>,
+    /// The bar `active_tstat` must clear for `passed`. Named explicitly rather
+    /// than left as a bare `2.0` in `passed`'s formula, so it isn't confused
+    /// with `target_sharpe` (also `2.0`, but unrelated — a coincidence, not a
+    /// shared constant).
+    #[serde(default = "default_active_tstat_threshold")]
+    pub active_tstat_threshold: f64,
     pub passed: bool,
     pub disclosures: Vec<String>,
+}
+
+fn default_active_tstat_threshold() -> f64 {
+    ACTIVE_TSTAT_THRESHOLD
 }
 
 fn default_target_sharpe_floor() -> f64 {
@@ -2627,28 +2666,38 @@ pub fn summarize_rebalance_phases(
             // The phase's replay opens at NAV 1.0, so its first mark already
             // carries a session's return: the series has to start there or the
             // diagnostic would silently drop one session.
-            let (periods, total_return, sharpe, max_drawdown) = if calendar_aligned {
-                let returns = daily_returns(navs);
-                let values = return_metrics(&returns, SESSIONS_PER_YEAR, risk_free_annual);
-                (
-                    returns.len(),
-                    values.total_return,
-                    values.sharpe,
-                    values.max_drawdown,
-                )
-            } else {
-                (
-                    report.metrics.periods,
-                    report.metrics.total_return,
-                    report.metrics.sharpe,
-                    report.metrics.max_drawdown,
-                )
-            };
+            let (periods, total_return, sharpe, phase_risk_free_annual, sharpe_se, max_drawdown) =
+                if calendar_aligned {
+                    let returns = daily_returns(navs);
+                    let values = return_metrics(&returns, SESSIONS_PER_YEAR, risk_free_annual);
+                    (
+                        returns.len(),
+                        values.total_return,
+                        values.sharpe,
+                        risk_free_annual,
+                        values.sharpe_se,
+                        values.max_drawdown,
+                    )
+                } else {
+                    // The frozen phase report's own rf basis, not the
+                    // summary's — see the field doc on
+                    // `RebalancePhaseDiagnostic::risk_free_annual`.
+                    (
+                        report.metrics.periods,
+                        report.metrics.total_return,
+                        report.metrics.sharpe,
+                        report.metrics.risk_free_annual,
+                        report.metrics.sharpe_se,
+                        report.metrics.max_drawdown,
+                    )
+                };
             RebalancePhaseDiagnostic {
                 offset_sessions: report.rebalance_offset_sessions,
                 periods,
                 total_return,
                 sharpe,
+                risk_free_annual: phase_risk_free_annual,
+                sharpe_se,
                 max_drawdown,
                 mean_rank_ic: report
                     .diagnostics
@@ -2817,7 +2866,7 @@ pub fn summarize_rebalance_phase_folds(
     let passed = first.survivorship_status == "POINT_IN_TIME"
         && performance.total_return > 0.0
         && positive_folds * 2 > ordered.len()
-        && active_tstat.is_some_and(|value| value >= 2.0)
+        && active_tstat.is_some_and(|value| value >= ACTIVE_TSTAT_THRESHOLD)
         && performance.sharpe - 1.64 * performance.sharpe_se >= target_sharpe_floor;
     Ok(RebalancePhaseFoldSummary {
         kind: "stockholm_equal_weight_rebalance_phase_walk_forward".into(),
@@ -2841,6 +2890,7 @@ pub fn summarize_rebalance_phase_folds(
         benchmark_period_returns,
         active_tstat,
         active_tstat_status,
+        active_tstat_threshold: ACTIVE_TSTAT_THRESHOLD,
         passed,
         disclosures: {
             let mut disclosures = vec![
@@ -2967,6 +3017,7 @@ fn direction_layer_metrics(steps: &[Step], cadence: usize) -> Option<DirectionLa
         annualised_return: metrics.annualised_return,
         annualised_volatility: metrics.annualised_volatility,
         sharpe: metrics.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: metrics.max_drawdown,
         mean_budget_gross: attributed
             .iter()
@@ -3106,6 +3157,7 @@ fn selection_layer_metrics(
         annualised_return: net.annualised_return,
         annualised_volatility: net.annualised_volatility,
         sharpe: net.sharpe,
+        risk_free_annual: 0.0,
         max_drawdown: net.max_drawdown,
         positive_periods: net_returns.iter().filter(|value| **value > 0.0).count(),
         gross_return_before_costs: gross.total_return,
@@ -3744,8 +3796,14 @@ fn sharpe_standard_error(
 /// not measured on the same observation grid, most commonly a daily bot series
 /// compared against a benchmark still on holding-period frequency — or when
 /// there are no observations to compare.
+/// The active-return t-stat bar a fold summary's `passed` gate requires.
+/// Named so the value in `passed`'s formula and the value reported in
+/// `RebalancePhaseFoldSummary.active_tstat_threshold` cannot drift apart; it
+/// is unrelated to `target_sharpe` (also `2.0`) despite the coincidence.
+const ACTIVE_TSTAT_THRESHOLD: f64 = 2.0;
+
 fn active_tstat(bot_returns: &[f64], benchmark_returns: &[f64]) -> Option<f64> {
-    if bot_returns.is_empty() || bot_returns.len() != benchmark_returns.len() {
+    if bot_returns.len() < 2 || bot_returns.len() != benchmark_returns.len() {
         return None;
     }
     let active = bot_returns
@@ -3753,8 +3811,28 @@ fn active_tstat(bot_returns: &[f64], benchmark_returns: &[f64]) -> Option<f64> {
         .zip(benchmark_returns)
         .map(|(bot, benchmark)| bot - benchmark)
         .collect::<Vec<_>>();
-    let standard_error = population_std(&active) / (active.len() as f64).sqrt();
+    let standard_error = sample_std(&active) / (active.len() as f64).sqrt();
     (standard_error > 0.0).then(|| mean(&active) / standard_error)
+}
+
+/// Sample standard deviation (Bessel-corrected, `N-1` divisor) — the
+/// standard-error convention a one-sample t-test uses. The population
+/// (`N` divisor) convention `population_std` provides elsewhere in this
+/// module suits Sharpe/volatility, but here it would understate the standard
+/// error by `sqrt(N/(N-1))` and overstate significance — worst at exactly the
+/// small N (a handful of folds) this task exists to stop driving decisions.
+/// `0.0` below `N=2`, where a sample variance is undefined.
+fn sample_std(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let average = mean(values);
+    (values
+        .iter()
+        .map(|value| (value - average).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64)
+        .sqrt()
 }
 
 /// `periods_per_year` is the observation frequency of `returns`, not a property
@@ -4259,6 +4337,9 @@ mod tests {
         assert_eq!(diagnostic.cost_drag, 0.0);
         assert_eq!(diagnostic.steps[0].long_positions, 2);
         assert_eq!(diagnostic.steps[0].short_positions, 2);
+        // Out of Task 3's gated-evaluation scope: self-discloses nominal (rf
+        // 0.0), not silently non-excess with no field saying so.
+        assert_eq!(diagnostic.risk_free_annual, 0.0);
     }
 
     #[test]
@@ -4638,6 +4719,31 @@ mod tests {
     }
 
     #[test]
+    fn calendar_aligned_phase_diagnostics_report_the_summarys_own_rf() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(true), 0.02).unwrap();
+        for diagnostic in &summary.phase_diagnostics {
+            assert_eq!(diagnostic.risk_free_annual, 0.02);
+        }
+    }
+
+    #[test]
+    fn legacy_phase_diagnostics_keep_the_frozen_phase_reports_own_rf_not_the_summarys() {
+        // The phase reports were replayed at rf 0.0 (two_phase_replay's fixed
+        // BacktestConfig.risk_free_annual); the summary itself is asked for a
+        // different rate. In the legacy (period-index) branch, a phase
+        // diagnostic's sharpe was never recomputed at the summary's rate — it
+        // is read straight from the frozen phase report — so its
+        // risk_free_annual must disclose the phase's own 0.0, not silently
+        // inherit the summary's 0.05, or a reader could not tell the two
+        // bases differ.
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.05).unwrap();
+        assert_eq!(summary.performance.risk_free_annual, 0.05);
+        for diagnostic in &summary.phase_diagnostics {
+            assert_eq!(diagnostic.risk_free_annual, 0.0);
+        }
+    }
+
+    #[test]
     fn phases_without_daily_marks_disclose_the_legacy_period_index_average() {
         let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
         assert_eq!(summary.combination_method, LEGACY_PERIOD_INDEX_AVERAGE);
@@ -4691,6 +4797,34 @@ mod tests {
         for diagnostic in &folds.fold_diagnostics {
             assert_eq!(diagnostic.performance.periods_per_year, 126.0);
         }
+    }
+
+    #[test]
+    fn fold_summary_names_the_active_tstat_threshold_the_gate_uses() {
+        let summary = summarize_rebalance_phases(&two_phase_replay(false), 0.02).unwrap();
+        let folds = summarize_rebalance_phase_folds(
+            &[
+                shift_fold(&summary, "2024-01-02", "2024-01-16"),
+                shift_fold(&summary, "2024-02-01", "2024-02-15"),
+            ],
+            0.02,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(folds.active_tstat_threshold, 2.0);
+        // `passed`'s active-tstat condition is exactly this named threshold,
+        // not a second, possibly-drifted literal.
+        assert_eq!(
+            folds.passed,
+            folds.survivorship_status == "POINT_IN_TIME"
+                && folds.performance.total_return > 0.0
+                && folds.positive_folds * 2 > folds.folds
+                && folds
+                    .active_tstat
+                    .is_some_and(|value| value >= folds.active_tstat_threshold)
+                && folds.performance.sharpe - 1.64 * folds.performance.sharpe_se
+                    >= folds.target_sharpe_floor
+        );
     }
 
     #[test]
@@ -5142,6 +5276,9 @@ mod tests {
         assert_eq!(direction.periods, 2);
         assert_eq!(direction.strong_up_periods, 2);
         assert!(direction.total_return > 0.0);
+        // Out of Task 3's gated-evaluation scope: self-discloses nominal (rf
+        // 0.0), not silently non-excess with no field saying so.
+        assert_eq!(direction.risk_free_annual, 0.0);
     }
 
     #[test]
@@ -5249,16 +5386,16 @@ mod tests {
     fn active_tstat_matches_a_hand_computed_value_when_grids_agree() {
         let bot = [0.02, 0.01, 0.03, -0.01];
         let benchmark = [0.01, 0.015, 0.005, -0.02];
-        // active = [0.01, -0.005, 0.025, 0.01]; mean = 0.01, population std
-        // computed independently below.
+        // active = [0.01, -0.005, 0.025, 0.01]; mean = 0.01, sample
+        // (N-1-divisor) std computed independently below.
         let active = [0.01_f64, -0.005, 0.025, 0.01];
         let active_mean = active.iter().sum::<f64>() / 4.0;
-        let variance = active
+        let sample_variance = active
             .iter()
             .map(|value| (value - active_mean).powi(2))
             .sum::<f64>()
-            / 4.0;
-        let expected = active_mean / (variance.sqrt() / 4.0_f64.sqrt());
+            / 3.0;
+        let expected = active_mean / (sample_variance.sqrt() / 4.0_f64.sqrt());
         let value = active_tstat(&bot, &benchmark).unwrap();
         assert!(
             (value - expected).abs() < 1e-9,

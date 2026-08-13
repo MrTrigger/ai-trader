@@ -43,16 +43,27 @@ def sharpe_standard_error(
     return se_periodic * math.sqrt(periods_per_year)
 
 
+#: The active-return t-stat bar `passed` requires. Named so the value in the
+#: gate and the value reported in `active_tstat_threshold` cannot drift apart;
+#: unrelated to `target_sharpe` (also 2.0) despite the coincidence.
+ACTIVE_TSTAT_THRESHOLD = 2.0
+
+
 def active_return_tstat(bot_returns: np.ndarray, benchmark_returns: np.ndarray) -> float | None:
     """Mean per-period active (bot minus benchmark) return over its own SE.
 
-    Mirrors `active_tstat` in `stockholm-portfolio/src/lib.rs`. `None` when the
-    two series do not pair up one-for-one, or there is nothing to compare.
+    Mirrors `active_tstat` in `stockholm-portfolio/src/lib.rs`, including its
+    sample (ddof=1, N-1 divisor) standard error: the population (ddof=0)
+    convention used elsewhere in this file for Sharpe/volatility would
+    understate the standard error by sqrt(N/(N-1)) and overstate significance,
+    worst at exactly the small N this task exists to stop driving decisions.
+    `None` when the two series do not pair up one-for-one, or N < 2 (a sample
+    standard deviation is undefined below that).
     """
-    if len(bot_returns) == 0 or len(bot_returns) != len(benchmark_returns):
+    if len(bot_returns) < 2 or len(bot_returns) != len(benchmark_returns):
         return None
     active = bot_returns - benchmark_returns
-    standard_error = float(active.std()) / math.sqrt(len(active))
+    standard_error = float(active.std(ddof=1)) / math.sqrt(len(active))
     if standard_error <= 0:
         return None
     return float(active.mean()) / standard_error
@@ -251,6 +262,7 @@ def summarize(
         # here — unlike the Rust combined-phase reports, which can carry a
         # daily bot series against a still-holding-period benchmark.
         "active_tstat": active_return_tstat(returns, benchmark_returns),
+        "active_tstat_threshold": ACTIVE_TSTAT_THRESHOLD,
         "diagnostics": {
             "observations": sum(item["observations"] for item in diagnostics),
             "decision_dates": sum(item["decision_dates"] for item in diagnostics),
@@ -528,7 +540,7 @@ def summarize(
         and report["total_return"] > 0
         and report["positive_folds"] >= math.ceil(len(folds) / 2)
         and report["active_tstat"] is not None
-        and report["active_tstat"] >= 2.0
+        and report["active_tstat"] >= report["active_tstat_threshold"]
         and report["sharpe"] - 1.64 * report["sharpe_se"] >= report["target_sharpe_floor"]
     )
     return report

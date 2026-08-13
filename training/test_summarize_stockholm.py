@@ -82,15 +82,15 @@ def two_fold_summary(**kwargs):
 def test_active_tstat_matches_a_hand_computed_value_across_two_folds():
     # Concatenated: returns = [0.02, 0.01, 0.03, -0.01],
     # benchmark = [0.01, 0.015, 0.005, -0.02].
-    # active = [0.01, -0.005, 0.025, 0.01]; mean 0.01, population std
-    # 0.010606601717798212, SE = std/sqrt(4); t = mean/SE.
+    # active = [0.01, -0.005, 0.025, 0.01]; mean 0.01, sample (N-1-divisor)
+    # std, SE = std/sqrt(4); t = mean/SE.
     report = two_fold_summary()
     active = [0.01, -0.005, 0.025, 0.01]
     mean_active = sum(active) / 4
-    variance = sum((a - mean_active) ** 2 for a in active) / 4
-    expected = mean_active / (math.sqrt(variance) / math.sqrt(4))
+    sample_variance = sum((a - mean_active) ** 2 for a in active) / 3
+    expected = mean_active / (math.sqrt(sample_variance) / math.sqrt(4))
     assert report["active_tstat"] == pytest.approx(expected, abs=1e-9)
-    assert report["active_tstat"] == pytest.approx(1.885618083164127, abs=1e-9)
+    assert report["active_tstat"] == pytest.approx(1.632993161855452, abs=1e-9)
 
 
 def test_sharpe_and_sharpe_se_reflect_the_risk_free_rate():
@@ -107,8 +107,9 @@ def test_both_thresholds_appear_and_passed_uses_the_new_formula():
     report = two_fold_summary(risk_free_annual=0.02, target_sharpe_floor=1.0)
     assert report["target_sharpe"] == 2.0
     assert report["target_sharpe_floor"] == 1.0
+    assert report["active_tstat_threshold"] == 2.0
     expected_passed = (
-        report["active_tstat"] >= 2.0
+        report["active_tstat"] >= report["active_tstat_threshold"]
         and report["sharpe"] - 1.64 * report["sharpe_se"] >= report["target_sharpe_floor"]
     )
     assert report["passed"] == expected_passed
