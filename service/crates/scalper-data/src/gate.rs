@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::costs::CostSummary;
+use crate::costs::{percentile, CostSummary};
 use crate::matrix::MatrixRow;
 use crate::{get, need};
 
@@ -57,16 +57,18 @@ pub struct Trade {
 /// The house artifact envelope (Task 3's `train_scalper.py` /
 /// `walk_forward_scalper.py` output): metadata plus LightGBM's raw
 /// `dump_model()`. Unknown fields (trained_through, trained_at, n_rows,
-/// label, feature_set_version, model_version, horizon_min, and everything
-/// LightGBM stuffs into `model` besides `tree_info`) are intentionally
-/// ignored here - this loader's only job is trees plus the feature order
-/// they were fit against, mirroring `crypto_portfolio::model::Model::load`'s
-/// parsing idiom without inheriting its crypto-portfolio-specific checks
-/// (model_version, feature_set_version, x_-prefix convention) that don't
-/// apply to the scalper's artifact.
+/// label, model_version, horizon_min, and everything LightGBM stuffs into
+/// `model` besides `tree_info`) are intentionally ignored here - this
+/// loader's only job is trees, the feature order they were fit against, and
+/// (as of the version cross-check below) the feature-set version they were
+/// fit against, mirroring `crypto_portfolio::model::Model::load`'s parsing
+/// idiom without inheriting its crypto-portfolio-specific checks
+/// (model_version, x_-prefix convention) that don't apply to the scalper's
+/// artifact.
 #[derive(Debug, Deserialize)]
 struct ModelArtifact {
     format_version: String,
+    feature_set_version: String,
     features: Vec<String>,
     model: ModelDump,
 }
@@ -77,13 +79,17 @@ struct ModelDump {
 }
 
 /// Load a fold artifact and return its trees, having verified the artifact
-/// is the expected format and that its feature order matches
-/// `expected_features` exactly - order-exact, because `lightgbm_json::Tree`
-/// addresses features by index, not name. A mismatch is a hard error: it
-/// means the model would silently score the wrong inputs.
+/// is the expected format, that its `feature_set_version` matches
+/// `expected_version` (the matrix manifest's), and that its feature order
+/// matches `expected_features` exactly - order-exact, because
+/// `lightgbm_json::Tree` addresses features by index, not name. Every
+/// mismatch is a hard error: a stale fold artifact scored against a matrix
+/// built from a different feature set would silently score the wrong
+/// inputs, or the right inputs under the wrong semantics.
 pub fn load_model(
     path: &Path,
     expected_features: &[String],
+    expected_version: &str,
 ) -> Result<Vec<lightgbm_json::Tree>, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("cannot read model {}: {e}", path.display()))?;
@@ -94,6 +100,14 @@ pub fn load_model(
             "{}: model format {:?}, expected {MODEL_FORMAT_VERSION:?}",
             path.display(),
             art.format_version
+        ));
+    }
+    if art.feature_set_version != expected_version {
+        return Err(format!(
+            "{}: model feature_set_version {:?} != matrix feature_set_version {:?}",
+            path.display(),
+            art.feature_set_version,
+            expected_version
         ));
     }
     if art.features != expected_features {
@@ -257,6 +271,100 @@ pub fn annualized_sharpe(daily: &BTreeMap<NaiveDate, f64>) -> Option<f64> {
     Some(mean / sd * 365f64.sqrt())
 }
 
+/// Pearson correlation of two equal-length series, `None` when either has
+/// zero variance (a flat series has no correlation to report, not a
+/// divide-by-zero NaN).
+fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    let n = xs.len() as f64;
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut var_x = 0.0;
+    let mut var_y = 0.0;
+    for (&x, &y) in xs.iter().zip(ys) {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        cov += dx * dy;
+        var_x += dx * dx;
+        var_y += dy * dy;
+    }
+    if var_x <= 0.0 || var_y <= 0.0 {
+        return None;
+    }
+    Some(cov / (var_x.sqrt() * var_y.sqrt()))
+}
+
+/// Average (fractional, tie-averaged) rank of each value, 1-based - the
+/// standard input to Spearman's rank correlation.
+fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+    let mut ranks = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && values[order[j + 1]] == values[order[i]] {
+            j += 1;
+        }
+        // Ranks i..=j (0-based) tie; their shared rank is the average of the
+        // 1-based ranks they'd otherwise occupy.
+        let avg_rank = (i + j) as f64 / 2.0 + 1.0;
+        for &k in &order[i..=j] {
+            ranks[k] = avg_rank;
+        }
+        i = j + 1;
+    }
+    ranks
+}
+
+/// Minimum sample size below which an IC number is noise dressed up as a
+/// finding, not a real correlation estimate.
+const MIN_IC_PREDS: usize = 30;
+
+/// Pearson correlation of `pred_bps` against realized `fwd_bps` - the
+/// simplest "does the model's score track what actually happened" check.
+/// `None` under `MIN_IC_PREDS` predictions or zero variance on either side
+/// (a flat prediction stream or a flat market has no correlation to
+/// report).
+pub fn pearson_ic(preds: &[Pred]) -> Option<f64> {
+    if preds.len() < MIN_IC_PREDS {
+        return None;
+    }
+    let xs: Vec<f64> = preds.iter().map(|p| p.pred_bps).collect();
+    let ys: Vec<f64> = preds.iter().map(|p| p.fwd_bps).collect();
+    pearson(&xs, &ys)
+}
+
+/// Spearman rank correlation of `pred_bps` against `fwd_bps`: Pearson
+/// correlation over average ranks (ties averaged), which cares only that the
+/// model's ordering tracks reality, not the scale of its predictions. Same
+/// `None` rules as `pearson_ic`.
+pub fn rank_ic(preds: &[Pred]) -> Option<f64> {
+    if preds.len() < MIN_IC_PREDS {
+        return None;
+    }
+    let xs: Vec<f64> = preds.iter().map(|p| p.pred_bps).collect();
+    let ys: Vec<f64> = preds.iter().map(|p| p.fwd_bps).collect();
+    pearson(&average_ranks(&xs), &average_ranks(&ys))
+}
+
+/// (p50, p90, p99) of `|pred_bps|` across `preds` - how large the model's
+/// signals actually get, which is what makes a NO-TRADES report
+/// self-explaining next to the entry threshold. `None` when `preds` is
+/// empty (there's no distribution to summarize).
+pub fn pred_magnitude_quantiles(preds: &[Pred]) -> Option<(f64, f64, f64)> {
+    if preds.is_empty() {
+        return None;
+    }
+    let abs_vals: Vec<f64> = preds.iter().map(|p| p.pred_bps.abs()).collect();
+    Some((
+        percentile(&abs_vals, 0.50),
+        percentile(&abs_vals, 0.90),
+        percentile(&abs_vals, 0.99),
+    ))
+}
+
 // ---------------------------------------------------------------------
 // CLI driver: everything below touches the filesystem. The pure functions
 // above (`load_model`, `simulate`, `daily_returns_bps`, `annualized_sharpe`)
@@ -320,10 +428,12 @@ fn merge_daily(stitched: &mut BTreeMap<NaiveDate, f64>, fold_daily: &BTreeMap<Na
     }
 }
 
-/// The training matrix: manifest feature order plus every row. Reuses
-/// `matrix::MatrixRow` (Task 2's row type) rather than redefining it.
+/// The training matrix: manifest feature order, the feature-set version it
+/// was built against, plus every row. Reuses `matrix::MatrixRow` (Task 2's
+/// row type) rather than redefining it.
 struct Matrix {
     features: Vec<String>,
+    feature_set_version: String,
     rows: Vec<MatrixRow>,
 }
 
@@ -352,13 +462,22 @@ fn load_matrix(path: &Path) -> Result<Matrix, String> {
                 .ok_or_else(|| format!("{}: feature name not a string", path.display()))
         })
         .collect::<Result<_, _>>()?;
+    let feature_set_version = manifest
+        .get("feature_set_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{}: manifest has no feature_set_version", path.display()))?
+        .to_string();
 
     let rows: Vec<MatrixRow> = lines
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).map_err(|e| format!("{}: row: {e}", path.display())))
         .collect::<Result<_, _>>()?;
 
-    Ok(Matrix { features, rows })
+    Ok(Matrix {
+        features,
+        feature_set_version,
+        rows,
+    })
 }
 
 /// `round_trip_bps(asset) = 2 * (taker_fee_bps + spread_bps_median / 2 +
@@ -397,6 +516,12 @@ struct FoldReport {
     test_span: [i64; 2],
     n_trades: usize,
     sharpe: Option<f64>,
+    ic: Option<f64>,
+    rank_ic: Option<f64>,
+    pred_abs_p50: Option<f64>,
+    pred_abs_p90: Option<f64>,
+    pred_abs_p99: Option<f64>,
+    n_preds: usize,
 }
 
 #[derive(Serialize)]
@@ -412,6 +537,9 @@ struct OverallReport {
     sharpe_annualized: Option<f64>,
     gate: String,
     gate_threshold: f64,
+    ic: Option<f64>,
+    rank_ic: Option<f64>,
+    threshold_bps_by_asset: BTreeMap<String, f64>,
 }
 
 #[derive(Serialize)]
@@ -483,6 +611,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
 
     let mut fold_reports = Vec::with_capacity(ordered_folds.len());
     let mut all_trades: Vec<Trade> = Vec::new();
+    let mut all_preds: Vec<Pred> = Vec::new();
     let mut stitched_daily: BTreeMap<NaiveDate, f64> = BTreeMap::new();
     // Per-asset "flat again at this ts", carried across fold seams so a
     // position opened near the end of fold k can't be silently re-opened by
@@ -493,7 +622,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
 
     for fold in &ordered_folds {
         let model_path = folds_dir.join(&fold.model);
-        let trees = load_model(&model_path, &matrix.features)?;
+        let trees = load_model(&model_path, &matrix.features, &matrix.feature_set_version)?;
 
         let mut preds: Vec<Pred> = Vec::new();
         for row in matrix
@@ -538,16 +667,29 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         let daily = daily_returns_bps(&trades, n_assets, (fold.test_start_ts, fold.test_end_ts));
         let sharpe = annualized_sharpe(&daily);
 
+        let (pred_abs_p50, pred_abs_p90, pred_abs_p99) =
+            match pred_magnitude_quantiles(&preds) {
+                Some((p50, p90, p99)) => (Some(p50), Some(p90), Some(p99)),
+                None => (None, None, None),
+            };
+
         fold_reports.push(FoldReport {
             i: fold.i,
             train_span: [fold.train_start_ts, fold.train_end_ts],
             test_span: [fold.test_start_ts, fold.test_end_ts],
             n_trades: trades.len(),
             sharpe,
+            ic: pearson_ic(&preds),
+            rank_ic: rank_ic(&preds),
+            pred_abs_p50,
+            pred_abs_p90,
+            pred_abs_p99,
+            n_preds: preds.len(),
         });
 
         merge_daily(&mut stitched_daily, &daily);
         all_trades.extend(trades);
+        all_preds.extend(preds);
     }
 
     let mut per_asset_acc: BTreeMap<String, (usize, f64, usize)> = BTreeMap::new();
@@ -603,6 +745,12 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             sharpe_annualized: overall_sharpe,
             gate: gate.to_string(),
             gate_threshold: GATE_THRESHOLD,
+            ic: pearson_ic(&all_preds),
+            rank_ic: rank_ic(&all_preds),
+            threshold_bps_by_asset: round_trip
+                .iter()
+                .map(|(asset, rt)| (asset.clone(), threshold_mult * rt))
+                .collect(),
         },
     };
 
@@ -647,7 +795,13 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        let trees = load_model(Path::new(&format!("{dir}/model.json")), &features).unwrap();
+        let feature_set_version = art["feature_set_version"].as_str().unwrap();
+        let trees = load_model(
+            Path::new(&format!("{dir}/model.json")),
+            &features,
+            feature_set_version,
+        )
+        .unwrap();
         let expected: Vec<f64> =
             serde_json::from_str(&std::fs::read_to_string(format!("{dir}/expected.json")).unwrap())
                 .unwrap();
@@ -819,5 +973,83 @@ mod tests {
             "the row inside the carried hold window must not re-enter"
         );
         assert_eq!(trades_k1[0].entry_ts, hold_ends + 1);
+    }
+
+    #[test]
+    fn ic_matches_a_hand_computed_correlation() {
+        // pred = 2·fwd exactly -> both ICs are 1; anti-correlated -> -1.
+        let mk = |sign: f64| -> Vec<Pred> {
+            (0..40)
+                .map(|i| {
+                    let f = (i as f64) - 20.0 + ((i % 3) as f64) * 0.1;
+                    pred("A", i * 60, sign * 2.0 * f, f)
+                })
+                .collect()
+        };
+        assert!((pearson_ic(&mk(1.0)).unwrap() - 1.0).abs() < 1e-9);
+        assert!((pearson_ic(&mk(-1.0)).unwrap() + 1.0).abs() < 1e-9);
+        assert!((rank_ic(&mk(1.0)).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rank_ic_ignores_scale_but_pearson_does_not() {
+        // Monotone but convex mapping: rank IC stays 1, Pearson dips below 1.
+        let preds: Vec<Pred> = (0..40)
+            .map(|i| {
+                let f = i as f64;
+                pred("A", i * 60, f * f, f)
+            })
+            .collect();
+        assert!((rank_ic(&preds).unwrap() - 1.0).abs() < 1e-9);
+        assert!(pearson_ic(&preds).unwrap() < 0.999);
+    }
+
+    #[test]
+    fn too_few_or_degenerate_preds_yield_no_ic() {
+        let few: Vec<Pred> = (0..10).map(|i| pred("A", i * 60, 1.0, 1.0)).collect();
+        assert!(pearson_ic(&few).is_none(), "under 30 preds");
+        let flat: Vec<Pred> = (0..40).map(|i| pred("A", i * 60, 5.0, i as f64)).collect();
+        assert!(pearson_ic(&flat).is_none(), "zero pred variance");
+    }
+
+    #[test]
+    fn magnitude_quantiles_are_ordered() {
+        let preds: Vec<Pred> = (0..100)
+            .map(|i| pred("A", i * 60, (i as f64) - 50.0, 0.0))
+            .collect();
+        let (p50, p90, p99) = pred_magnitude_quantiles(&preds).unwrap();
+        assert!(p50 <= p90 && p90 <= p99);
+        assert!(p50 > 0.0);
+    }
+
+    #[test]
+    fn a_feature_set_version_mismatch_is_refused() {
+        // Build a minimal artifact JSON on disk with feature_set_version
+        // "fs-other" and call load_model against expected version
+        // "fs-rust-scalper-1" (the matrix manifest's) - the error must name
+        // both versions.
+        let path = std::env::temp_dir().join(format!(
+            "scalper-gate-version-mismatch-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+                "format_version": "crypto-lightgbm-json-1",
+                "feature_set_version": "fs-other",
+                "features": ["f0"],
+                "model": { "tree_info": [] }
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_model(&path, &["f0".to_string()], "fs-rust-scalper-1").unwrap_err();
+
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            err.contains("fs-other") && err.contains("fs-rust-scalper-1"),
+            "expected the error to name both versions, got: {err}"
+        );
     }
 }

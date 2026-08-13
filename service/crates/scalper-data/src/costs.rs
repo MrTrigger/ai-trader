@@ -160,7 +160,7 @@ fn median(values: &[f64]) -> f64 {
 }
 
 /// Linear-interpolation percentile (`p` in [0, 1]) over the sorted values.
-fn percentile(values: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(values: &[f64], p: f64) -> f64 {
     if values.is_empty() {
         return f64::NAN;
     }

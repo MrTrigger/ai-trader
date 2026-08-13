@@ -141,6 +141,11 @@ for horizon in 15 30 60; do
 done
 ```
 
+Deepening `data/perp` between a gate run and its re-run changes the
+matrix's stride phase and warmup window and therefore its rows - pull any
+new history *before* a gate cycle starts, never between a run and its
+re-run.
+
 `training-matrix` skips any universe candidate with no bars in
 `data/perp` — a one-line `<coin>: skipped (no bars in data/perp)` warning,
 not a fatal error (verified against `training_matrix_skips_a_universe_

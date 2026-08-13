@@ -69,7 +69,7 @@ usage: scalper-data <command>
       window via lightgbm-json, and simulate a threshold-gated long/short
       strategy net of measured round-trip costs from the plan-2 cost summary.
       Stitches per-fold daily P&L into one series and reports the
-      annualized Sharpe gate (>= 2.0 to PASS) to --out.
+      annualized Sharpe gate (> 2.0 to PASS) to --out.
 ";
 
 pub(crate) fn get(args: &[String], name: &str) -> Option<String> {
