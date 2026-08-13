@@ -537,7 +537,15 @@ struct OverallReport {
     sharpe_annualized: Option<f64>,
     gate: String,
     gate_threshold: f64,
+    /// Pearson IC over test-window predictions POOLED across every fold -
+    /// and every fold is a DIFFERENT model (walk-forward refits per fold).
+    /// This is deliberately a walk-forward-aggregate skill estimate, not any
+    /// single model's skill: a reader wanting "how good is fold N's model"
+    /// wants `FoldReport::ic`, not this field.
     ic: Option<f64>,
+    /// Same pooling caveat as `ic`: Spearman rank IC over ALL folds' test
+    /// predictions combined, not one model's. See `FoldReport::rank_ic` for
+    /// the per-model number.
     rank_ic: Option<f64>,
     threshold_bps_by_asset: BTreeMap<String, f64>,
 }
@@ -689,6 +697,10 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
 
         merge_daily(&mut stitched_daily, &daily);
         all_trades.extend(trades);
+        // Pooled deliberately: `all_preds` feeds `overall.ic`/`overall.rank_ic`
+        // below, a walk-forward-aggregate skill estimate across every fold's
+        // DISTINCT model - not one model's skill. `FoldReport::ic`/`rank_ic`
+        // above are where a single model's skill lives.
         all_preds.extend(preds);
     }
 

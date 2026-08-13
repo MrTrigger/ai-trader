@@ -190,6 +190,14 @@ been produced, specifically so no future number gets to argue with it.
    out-of-sample folds only), with measured per-symbol costs at the
    notional the strategy actually intends to trade.
 
+Reading the diagnostics fields the gate report also carries: each
+`folds[].ic`/`rank_ic` is that fold's own model's skill (Pearson / Spearman
+IC of its predictions against realized returns), while `overall.ic`/`rank_ic`
+pools predictions across ALL folds — and every fold is a different,
+independently-fit model — into one walk-forward-aggregate number. Don't read
+`overall.ic` as "the model's" IC; there is no single model to attribute it
+to.
+
 **Universe selection is the one place iteration is allowed, and it is
 exactly this and nothing more:**
 
