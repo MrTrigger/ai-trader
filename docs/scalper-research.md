@@ -24,26 +24,30 @@ walk_forward_scalper.py ...` from `training/`, per its `pyproject.toml`.
 ## 1. Nightly: pull Binance perp bars
 
 ```bash
-service/target/release/scalper-data pull-binance-perp \
-  --data-root data/perp \
-  --assets BTC,ETH,SOL,DOGE,XRP,kPEPE,... \
-  --start 2026-08-01 --end 2026-08-14
+bin/scalper-pull.sh [days]   # default 3
 ```
 
-The asset list is the universe's **mapped** candidates only — every coin in
-`data/scalper-universe.json` whose `binance_um` field is non-null. Pass the
-coins in Hyperliquid's own casing (`kPEPE`, not `KPEPE`): `resolve_asset`
-needs the original case to recognize HL's lowercase-`k` thousandths prefix
-before it uppercases for the store key. A coin with no UM listing is skipped
-with a warning by the command itself, not silently substituted with spot —
-but it's cheaper to just not pass it, since it can never contribute a matrix
-row.
+Cron it:
+
+```
+20 0 * * *  cd /path/to/ai-trader && bin/scalper-pull.sh >> var/live/scalper-pull.log 2>&1
+```
+
+The script reads `data/scalper-universe.json` itself, takes every coin whose
+`binance_um` field is non-null — the universe's **mapped** candidates only —
+and calls `pull-binance-perp --data-root data/perp --assets <that list>
+--start <today - days> --end <tomorrow>` in Hyperliquid's own casing
+(`kPEPE`, not `KPEPE`): `resolve_asset` needs the original case to recognize
+HL's lowercase-`k` thousandths prefix before it uppercases for the store
+key. A coin with no UM listing is skipped with a warning by the command
+itself, not silently substituted with spot — but it's cheaper to just not
+pass it, since it can never contribute a matrix row.
 
 `pull-binance-perp` has no cache-skip: it always re-fetches every month in
 `[--start, --end]`, even ones already on disk. The smoke run confirmed this
 is harmless, just redundant bandwidth (Task 5: BTC/ETH's already-cached
 2026-06/07 months were re-fetched without incident). So the nightly job is
-simple — re-pull the current month, every night, for every mapped asset. No
+simple — re-pull the last few days, every night, for every mapped asset. No
 incremental logic to get wrong.
 
 `--data-root data/perp` is mandatory and must stay separate from the frozen
@@ -62,18 +66,22 @@ training.
 ## 2. Hourly: record book costs
 
 ```bash
-service/target/release/scalper-data record-books \
-  --data-root data \
-  --top 25 --seconds 3600 --interval 10
+bin/scalper-record.sh [top] [seconds] [interval]   # default 25 3600 10
 ```
 
-Cron this hourly. Each invocation polls Hyperliquid L2 books for the live
-top-25 markets by `day_volume_usd()` (recomputed at invocation time, not
-pinned to the last universe refresh) at 10-second intervals for a full hour
-— 360 rounds per coin — then exits. The next hour's cron tick starts the
-next invocation. Running it as back-to-back hour-long jobs rather than one
-free-running process means a hung recorder gets replaced by the next tick
-instead of silently stopping coverage for the rest of the day.
+Cron it:
+
+```
+0 * * * *  cd /path/to/ai-trader && bin/scalper-record.sh >> var/live/scalper-record.log 2>&1
+```
+
+Each invocation polls Hyperliquid L2 books for the live top-25 markets by
+`day_volume_usd()` (recomputed at invocation time, not pinned to the last
+universe refresh) at 10-second intervals for a full hour — 360 rounds per
+coin — then exits. The next hour's cron tick starts the next invocation.
+Running it as back-to-back hour-long jobs rather than one free-running
+process means a hung recorder gets replaced by the next tick instead of
+silently stopping coverage for the rest of the day.
 
 Snapshots accrue at `data/books/{YYYY-MM-DD}.jsonl`, one UTC-day file,
 flushed every round. A coin's fetch or book error is a warning, not a reason
