@@ -1,3 +1,4 @@
+mod binance_costs;
 mod binance_micro;
 mod binance_um;
 mod books;
@@ -91,13 +92,35 @@ usage: scalper-data <command>
       unlimited lookback covers from day one while book/flow/metrics (the
       sources that actually gate row survival) typically start later.
 
-  gate --matrix <path> --folds <path/folds.json> --costs <path> [--threshold-mult 1.5] [--notional 5000] --out <path>
+  binance-costs --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--notional 5000]
+      Turn {data-root}/binance-micro/{book,flow}/{SYMBOL}/ (pull-binance-micro's
+      output) into a per-asset, per-day cost estimate: spread_bps_p75 (p75 of
+      that day's minute spread estimates) and impact_bps (a pre-registered
+      walk-cost model over the day's median ±0.2% band depth, None when the
+      book was too thin to absorb --notional that day). Joins Binance symbol
+      to HL coin via --universe (same join training-matrix uses) and writes
+      output keyed by coin: {asset: {day: {spread_bps_p75, impact_bps,
+      samples}}}. A candidate with no Binance UM listing is skipped.
+
+  gate --matrix <path> --folds <path/folds.json> (--costs <path> | --binance-costs <path> --fee-taker-bps F --fee-maker-bps F) [--threshold-mult 1.5] [--notional 5000] --out <path>
       Walk-forward gate: for each fold in folds.json, load fold-N.json (a
       LightGBM JSON dump), predict every matrix row in that fold's test
       window via lightgbm-json, and simulate a threshold-gated long/short
-      strategy net of measured round-trip costs from the plan-2 cost summary.
-      Stitches per-fold daily P&L into one series and reports the
-      annualized Sharpe gate (> 2.0 to PASS) to --out.
+      strategy net of measured round-trip costs. --costs uses the plan-2
+      flat per-asset cost summary (2*4.5bps taker + spread/2 + cross, same
+      every day). --binance-costs uses binance-costs' time-varying per-day
+      output instead: round_trip_bps = 2*fee_taker_bps + spread_bps_p75 +
+      2*impact_bps, looked up by the trade's ENTRY day, falling back to the
+      nearest PRIOR day within 14 days when the entry day is missing or
+      thin (impact_bps null); no day found within that window makes the
+      asset untradeable that day (reported per-asset as
+      days_without_costs). --fee-maker-bps is recorded in the report for
+      the protocol's future use but unused by today's taker-only
+      simulation (both legs are charged the taker fee). The two cost flags
+      are mutually exclusive; exactly one is required. Stitches per-fold
+      daily P&L into one series and reports the annualized Sharpe gate
+      (> 2.0 to PASS), plus overall.projected_30d_volume_usd and
+      overall.fee_bps_used, to --out.
 ";
 
 pub(crate) fn get(args: &[String], name: &str) -> Option<String> {
@@ -111,7 +134,7 @@ pub(crate) fn need(args: &[String], name: &str) -> Result<String, String> {
     get(args, name).ok_or_else(|| format!("{name} is required"))
 }
 
-fn parse_date(text: &str) -> Result<DateTime<Utc>, String> {
+pub(crate) fn parse_date(text: &str) -> Result<DateTime<Utc>, String> {
     format!("{text}T00:00:00Z")
         .parse()
         .map_err(|e| format!("bad date {text:?}: {e}"))
@@ -1033,6 +1056,7 @@ fn main() -> ExitCode {
         }
         Some("summarize-costs") => cmd_summarize_costs(&args[1..]),
         Some("training-matrix") => cmd_training_matrix(&args[1..]),
+        Some("binance-costs") => binance_costs::cmd_binance_costs(&args[1..]),
         Some("gate") => gate::cmd_gate(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
