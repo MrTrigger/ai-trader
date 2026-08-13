@@ -4381,6 +4381,121 @@ mod tests {
         }
     }
 
+    fn direction_leaf(value: f64) -> lightgbm_json::Node {
+        lightgbm_json::Node {
+            split_feature: None,
+            threshold: None,
+            decision_type: None,
+            default_left: None,
+            missing_type: None,
+            left_child: None,
+            right_child: None,
+            leaf_value: Some(value),
+            diagnostics: Default::default(),
+        }
+    }
+
+    /// A single-split tree on one feature: below the threshold predicts
+    /// `-leaf_abs`, at/above it predicts `+leaf_abs`. Feeding it a
+    /// population evenly split across the threshold produces predictions
+    /// whose population std is exactly `leaf_abs`, so the fixture's own
+    /// prediction spread is fixed by construction.
+    fn direction_model_with_leaf(leaf_abs: f64, score_scale: f64) -> DirectionModel {
+        DirectionModel {
+            format_version: DIRECTION_FORMAT_VERSION.into(),
+            model_version: DIRECTION_MODEL_VERSION.into(),
+            feature_set_version: features_stockholm::DIRECTION_FEATURE_SET_VERSION.into(),
+            label_version: features_stockholm::direction_label_version(20).unwrap(),
+            trained_through: day("2023-12-31"),
+            trained_at: "fixture".into(),
+            n_rows: 1,
+            n_dates: 1,
+            features: vec!["m_ret_20".into()],
+            model_family: "lightgbm".into(),
+            reward: "absolute_return".into(),
+            objective: "l2".into(),
+            target_clip: None,
+            score_scale,
+            tree_info: vec![lightgbm_json::Tree {
+                tree_index: 0,
+                num_leaves: 2,
+                num_cat: Some(0),
+                shrinkage: Some(1.0),
+                tree_structure: lightgbm_json::Node {
+                    split_feature: Some(0),
+                    threshold: Some(0.0),
+                    decision_type: Some("<=".into()),
+                    default_left: Some(true),
+                    missing_type: None,
+                    left_child: Some(Box::new(direction_leaf(-leaf_abs))),
+                    right_child: Some(Box::new(direction_leaf(leaf_abs))),
+                    leaf_value: None,
+                    diagnostics: Default::default(),
+                },
+            }],
+            model_id: "fixture".into(),
+        }
+    }
+
+    fn direction_row(date: Date, feature_value: f64) -> DirectionTrainingRow {
+        let mut features = BTreeMap::new();
+        features.insert("m_ret_20".to_string(), feature_value);
+        DirectionTrainingRow {
+            date,
+            target: 0.0,
+            sign_target: 0.0,
+            entry_value: 100.0,
+            exit_value: 100.0,
+            annualised_volatility_20: 0.15,
+            features,
+        }
+    }
+
+    fn population_std(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance =
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        variance.sqrt()
+    }
+
+    /// A model whose predictions have std 0.005 against targets with std
+    /// 0.05: normalizing by the model's own prediction spread (the new
+    /// convention) must produce scores with std ~= 1 (near-full threshold
+    /// range), not ~= 0.1 as normalizing by the wider target's std would.
+    #[test]
+    fn score_scale_from_prediction_spread_spans_threshold_range() {
+        let rows = (0..10_i64)
+            .map(|i| {
+                direction_row(
+                    day("2024-01-02") + time::Duration::days(i),
+                    if i % 2 == 0 { -1.0 } else { 1.0 },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // New convention: score_scale is the model's own prediction spread
+        // (0.005), matching what Python now exports.
+        let fixed_model = direction_model_with_leaf(0.005, 0.005);
+        let fixed_scores = rows
+            .iter()
+            .map(|row| fixed_model.predict(row).unwrap().score)
+            .collect::<Vec<_>>();
+        assert!((population_std(&fixed_scores) - 1.0).abs() < 1e-9);
+        for score in &fixed_scores {
+            assert!((score.abs() - 1.0).abs() < 1e-9);
+        }
+
+        // Old, buggy convention: score_scale was the target's std (0.05),
+        // roughly ten times the model's actual prediction spread, so the
+        // same predictions produced scores parked near zero.
+        let buggy_model = direction_model_with_leaf(0.005, 0.05);
+        let buggy_scores = rows
+            .iter()
+            .map(|row| buggy_model.predict(row).unwrap().score)
+            .collect::<Vec<_>>();
+        assert!((population_std(&buggy_scores) - 0.1).abs() < 1e-9);
+    }
+
     #[test]
     fn per_risk_model_score_is_converted_back_to_return() {
         let mut model = constant_model(0.5);

@@ -154,7 +154,8 @@ usage: stockholm-portfolio <command>
            [--ranking edge|edge_volatility]
            [--sizing equal|conviction|inverse_volatility|edge_volatility]
            [--max-gross 1] [--target-net <N>] [--direction-overlay]
-           [--market-forecast-matrix <jsonl> --market-forecast-model <json>]
+           [--market-forecast-matrix <jsonl> --market-forecast-model <json>
+            --trained-direction-diagnostic]
            [--position-weight 0.05] [--min-position-weight 0]
            [--reference-edge 0.01] [--reference-volatility 0.02]
            [--aggregate-short-horizon-forecast]
@@ -166,6 +167,13 @@ usage: stockholm-portfolio <command>
       holding-period NAV alone. --risk-free-annual (a Riksbank policy-rate
       approximation until a SWESTR series is wired) is subtracted before
       Sharpe is computed, for both the portfolio and any benchmark.
+      --direction-overlay sizes gross/net exposure off the fixed five-vote
+      OMX trend state only; it is an optional drawdown guard, off by default.
+      Trained direction forecasts (--market-forecast-matrix/-model) are
+      retired from every promotable configuration - every tested variant
+      lost to controls on the available sample - and additionally require
+      --trained-direction-diagnostic, a loud, explicit research/diagnostics
+      opt-in.
 
   direction-backtest --matrix <jsonl> --model <json>
                      --start YYYY-MM-DD --end YYYY-MM-DD --out <json>
@@ -2605,6 +2613,16 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     }
     let market_forecast_matrix = get(args, "--market-forecast-matrix");
     let market_forecast_model = get(args, "--market-forecast-model");
+    // Trained direction is retired from every promotable configuration: it
+    // failed every economic test on the ~250 independent 20-session market
+    // outcomes available (22% directional accuracy, ~zero forecast
+    // correlation, lost to both a fixed trend control and buy-and-hold
+    // OMXSGI). --trained-direction-diagnostic exists only so an explicit
+    // research/diagnostics replay can still ask for it; it must never be a
+    // default a promotable config reaches by accident.
+    let trained_direction_diagnostic = args
+        .iter()
+        .any(|argument| argument == "--trained-direction-diagnostic");
     let (market_return_forecasts, market_forecast_model_id) =
         match (market_forecast_matrix, market_forecast_model) {
             (None, None) => (None, None),
@@ -2614,6 +2632,21 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
                         "market-return forecast composition requires --direction-overlay".into(),
                     );
                 }
+                if !trained_direction_diagnostic {
+                    return Err(
+                        "trained direction forecasts require --trained-direction-diagnostic: \
+                         the model failed every economic test and is retired from promotable \
+                         configurations; this flag exists only for explicit research/diagnostics \
+                         replays"
+                            .into(),
+                    );
+                }
+                eprintln!(
+                    "backtest: TRAINED DIRECTION forecast in use (--trained-direction-diagnostic) \
+                     - retired from promotable configurations, every tested variant lost to a \
+                     fixed trend control and to buy-and-hold OMXSGI. Diagnostics/research replay \
+                     ONLY."
+                );
                 let (direction_manifest, direction_rows) =
                     load_direction_matrix(Path::new(&matrix_path))?;
                 let direction_model =

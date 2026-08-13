@@ -5,6 +5,12 @@ calculation. It derives session-aligned fold boundaries from the Rust matrix,
 invokes the fitting-only Python entry point, invokes the Rust replay for each
 strictly-forward test block, and asks the existing summary script to stitch the
 Rust reports.
+
+This whole harness is a research/development tool, not a promotable
+configuration path (see README.md). Trained direction is retired: every
+tested variant lost to controls, and Rust refuses --market-forecast-matrix
+composition without an explicit diagnostic opt-in, which this module supplies
+automatically when the caller asks for it.
 """
 
 from __future__ import annotations
@@ -333,6 +339,12 @@ def main() -> None:
                             str(args.market_forecast_matrix),
                             "--market-forecast-model",
                             str(market_model),
+                            # Trained direction is retired from every
+                            # promotable configuration; Rust refuses this
+                            # composition without an explicit diagnostic
+                            # opt-in. This whole harness is a research tool
+                            # (see README), so it asks for it automatically.
+                            "--trained-direction-diagnostic",
                         ]
                         if args.market_forecast_matrix is not None
                         else []

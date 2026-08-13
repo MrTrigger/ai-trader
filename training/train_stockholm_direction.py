@@ -4,6 +4,20 @@ Rust owns every feature, missing flag, label, and date alignment. This module
 only selects the declared training prefix, applies training-only target
 winsorisation, fits one deliberately shallow LightGBM regressor, and exports
 the generic tree dump for Rust inference.
+
+Retirement notice: every trained direction variant tested against this
+project's ~250 independent 20-session market outcomes lost to a fixed
+five-vote trend control and to buy-and-hold OMXSGI (see
+docs/stockholm-portfolio-status.md, Task 8). Rust refuses to reach this
+model family from any promotable configuration; this trainer stays only for
+research/diagnostics replays that explicitly ask for it.
+
+`score_scale` is exported as the fitted booster's own in-sample prediction
+spread (`std` of its train-set predictions), not the target's. Rust computes
+`score = clip(prediction / score_scale, -1, 1)` against fixed 0.4/0.8 policy
+thresholds; anchoring the scale to the (shrunk) predictions rather than the
+wider target means a score now spans the threshold range by construction,
+instead of a heavily L2-shrunk model parking near zero forever.
 """
 
 from __future__ import annotations
@@ -115,9 +129,17 @@ def main() -> None:
         dataset,
         num_boost_round=NUM_ROUNDS,
     )
-    score_scale = float(np.std(absolute_y))
+    # The scale must come from what the model actually outputs, not from the
+    # target it was trying to hit: a heavily L2-shrunk booster's predictions
+    # can sit at a small fraction of the target's spread, and normalizing by
+    # the wider target left scores parked near zero, never reaching the
+    # policy's 0.4/0.8 thresholds. Normalizing by the model's own train-set
+    # prediction spread instead makes a score span the threshold range by
+    # construction.
+    train_predictions = booster.predict(x)
+    score_scale = float(np.std(train_predictions))
     if not np.isfinite(score_scale) or score_scale <= 0.0:
-        raise ValueError("direction target scale is not finite and positive")
+        raise ValueError("direction model prediction spread is not finite and positive")
     document = {
         "format_version": FORMAT_VERSION,
         "model_version": MODEL_VERSION,

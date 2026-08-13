@@ -17,6 +17,11 @@
 > aggregate, **-1.93** on the recent diagnostic — the promotion gate needs 2.0  
 > **Direction-model results:** **all void** — every one was measured with a
 > label that credited the untradable overnight gap (see the Task 4 section)  
+> **Direction forecasting:** **retired** pending fundamentally new information
+> — structurally unlearnable at ~250 independent 20-session outcomes, and a
+> score-normalization defect independently suppressed any signal it might
+> have had (see the Task 8 section); removed from every promotable
+> configuration, research-only behind an explicit diagnostic flag  
 > **Data status:** `SURVIVORSHIP_CONTAMINATED`  
 > **Execution status:** no Stockholm paper or live orders; no deployment
 
@@ -212,6 +217,84 @@ legs are now marked at closes, on identical dates, at the same annualisation,
 excess of the same risk-free rate. It says the lean development book's
 outperformance is not statistically distinguishable from zero, and that the
 recent book underperforms the index at roughly 2 sigma.
+
+## 2026-08-13 Task 8: trained direction forecasting retired, score-scale defect fixed
+
+Task 8 was the "decides the direction layer's fate" step promised in the Task
+4 section above. **The decision is retirement.** Trained market-direction
+forecasting is removed from every promotable Stockholm configuration.
+
+**Why.** Independent of the void v1 label, the trained direction model (any
+tested response, any tested feature set) never produced a validated forecast:
+best case 22.2% directional accuracy and −0.037 forecast correlation on the
+Stockholm-close v3 arm, every arm losing to both a fixed five-vote trend
+control and buy-and-hold OMXSGI (see "Direction models tested" above; those
+specific numbers are void under the v1 label, but the qualitative verdict —
+every tested variant lost to controls — was consistent across all of them,
+old label and new). Ten years of daily EOD data supplies roughly 250
+independent 20-session market outcomes. That sample size cannot support a
+high-capacity model learning a market-timing signal, regardless of feature
+set or reward. This is the "no validated direction signal, structurally
+unlearnable at this sample size" audit finding. Retraining on the corrected
+v4 label would not change this: the constraint is sample size, not label
+timing.
+
+**A separate, compounding defect: broken score normalization.** Independent
+of whether the direction model had any skill, its scores could never have
+reached the policy's decision thresholds. `train_stockholm_direction.py`
+exported `score_scale = std(target)` — the label's own spread, roughly 0.05
+for the 20-session absolute return. Rust computes
+`score = clip(prediction / score_scale, −1, 1)` and compares it against
+`DirectionConfig` thresholds `enter_threshold=0.4` / `strong_threshold=0.8`
+(`portfolio-construction/src/lib.rs`). But `PARAMS` fits a deliberately
+shallow, heavily L2-regularized (`lambda_l2=25`) tree ensemble, so its
+predictions are shrunk to a small fraction of the target's spread — in the
+regression test added for this task, predictions with std 0.005 against a
+target std 0.05 produced scores with population std ≈ 0.1 under the old
+convention, an order of magnitude short of even the 0.4 entry threshold. The
+book would have parked at `neutral_gross = 0.30 × max_gross`, `net = 0`
+almost every session, regardless of what the model actually believed.
+
+**The fix.** `score_scale` is now the model's own in-sample prediction spread
+— `std(booster.predict(x))` on the training rows — instead of the target's.
+Rust's formula is unchanged (`score = clip(prediction / score_scale, −1, 1)`);
+only the scale Python hands it changed. With the fix, the same 0.005-std
+predictions against a 0.05-std target now produce scores with population std
+≈ 1 (near-full threshold range), confirmed by a Rust unit test at the
+score-computation boundary
+(`stockholm-portfolio::tests::score_scale_from_prediction_spread_spans_threshold_range`)
+and a Python test asserting the exported `score_scale` equals
+`std(booster.predict(x))` on the training design matrix, not `std(target)`
+(`training/test_train_stockholm_direction.py`). This fix does not rescue the
+direction model — it corrects a normalization bug that was independently
+suppressing any signal the model might have had, on top of a model that has
+no validated signal to suppress.
+
+**Disposition.** `stockholm-portfolio backtest` (the only promotable replay
+path) now refuses `--market-forecast-matrix`/`--market-forecast-model`
+composition unless the caller also passes
+`--trained-direction-diagnostic`, an explicit, loud opt-in that prints a
+retirement warning to stderr. No promotable configuration passes that flag;
+it exists only so a future research/diagnostics replay can still ask for the
+trained model deliberately. `training/walk_forward_stockholm.py` — itself a
+research harness, not a promotable path (its output is stamped
+`SURVIVORSHIP_CONTAMINATED` and explicitly may not authorize capital) —
+supplies the flag automatically when a caller asks it to fit a market
+forecast model, since that whole script is already diagnostics by
+construction. The fixed five-vote OMX trend state (`market_trend`,
+`fixed_direction_score`) is unaffected: it remains available behind
+`--direction-overlay`, off by default, as an optional drawdown-guard sizing
+input, not a return-seeking forecast. It is not a trained model and carries
+none of the sample-size or score-scale defects above; whether it belongs in
+a promoted book is Task 13–15's overlay-budget-mode work, not this one.
+
+Every direction-model result in this document, under either label, remains
+what it always was: research history, not evidence for a promotable
+direction layer. This section does not reopen or rehabilitate any of those
+numbers; it records why the direction *model* is retired and confirms the
+one implementation defect (score normalization) that was independently
+capable of hiding whatever signal, if any, a differently-scaled version might
+have shown.
 
 ## Current verdict
 
