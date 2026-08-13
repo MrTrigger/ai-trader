@@ -12,15 +12,37 @@
 //! timestamp; for BTC itself the caller passes the same slice for both
 //! arguments, so `btc_ret_5` degenerates to `ret_5` and `rel_ret_5` to 0.0
 //! with no special-casing.
+//!
+//! fs-2 (`fs-rust-scalper-2`) appends 12 microstructure features (spread,
+//! depth imbalance/slope, taker flow, open interest, funding) built from
+//! `MicroMinute` - a per-bar-aligned view the CALLER assembles from Binance
+//! book/flow/metrics/funding files (see `scalper-data::micro_join`) and
+//! passes in as `micro: &[Option<MicroMinute>]`, one slot per bar. This
+//! module never touches those files; it only reads whatever `MicroMinute`
+//! it is handed. The original 26 fs-1 features are computed by the exact
+//! same code path as before (untouched), so a `micro` slice that is all
+//! `None` reproduces fs-1's outputs bit-for-bit - the regression test below
+//! asserts this. `MicroMinute`'s own fields are each independently
+//! `Option<f64>` (a source can be absent even when the caller found SOME
+//! micro data for that minute, e.g. funding without book coverage), so the
+//! per-field discipline is: any input to a feature being `None` makes that
+//! feature `None`, never a fabricated value.
+//!
+//! The four rolling micro features (`depth_02_z_60`, `taker_buy_ratio_m15`,
+//! `oi_change_60`, `spread_z_60`) use trailing windows reset by the same
+//! 120s bar-gap rule as fs-1's windows, and only ever contribute a value
+//! once the window is both full AND has no `None` entries in it - the same
+//! `trades_z_60` discipline fs-1 already established for a source that can
+//! itself be missing.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use features_crypto::Bar;
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-1";
+pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-2";
 
-pub const FEATURE_NAMES: [&str; 26] = [
+pub const FEATURE_NAMES: [&str; 38] = [
     "ret_1",
     "ret_3",
     "ret_5",
@@ -47,12 +69,45 @@ pub const FEATURE_NAMES: [&str; 26] = [
     "dow",
     "btc_ret_5",
     "rel_ret_5",
+    "spread_bps",
+    "depth_imb_02",
+    "depth_imb_10",
+    "depth_02_z_60",
+    "taker_buy_ratio",
+    "taker_buy_ratio_m15",
+    "oi_change_60",
+    "taker_ls_ratio",
+    "funding_rate_bps",
+    "funding_x_mom",
+    "spread_z_60",
+    "depth_slope",
 ];
 
 const EPS: f64 = 1e-12;
 const GAP_LIMIT_S: i64 = 120;
 const VOL_WINDOW: usize = 60;
 const CLOSE_WINDOW: usize = VOL_WINDOW + 1;
+const TBR_WINDOW: usize = 15;
+
+/// One bar's worth of Binance microstructure, aligned by the caller so that
+/// every field reflects only data with timestamp <= this bar's close (the
+/// causal snap-downward rule). Assembled from four independent sources
+/// (book depth, aggTrades-derived flow, 5m metrics, funding), so each field
+/// is independently `Option<f64>` - a source can be stale/absent for this
+/// minute even when others are present.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MicroMinute {
+    pub ts_s: i64,
+    pub spread_bps: Option<f64>,
+    pub taker_buy_ratio: Option<f64>,
+    pub bid_02: Option<f64>,
+    pub ask_02: Option<f64>,
+    pub bid_10: Option<f64>,
+    pub ask_10: Option<f64>,
+    pub oi_value: Option<f64>,
+    pub taker_ls_ratio: Option<f64>,
+    pub funding_rate: Option<f64>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeatureRow {
@@ -61,13 +116,27 @@ pub struct FeatureRow {
     pub values: Vec<Option<f64>>,
 }
 
-/// Compute the 26-feature row set for `bars` (one asset's ascending 1m
+/// Compute the 38-feature row set for `bars` (one asset's ascending 1m
 /// bars), using `btc_bars` (BTC's ascending 1m bars, ascending) as context
-/// for `btc_ret_5` / `rel_ret_5`. Pass the same slice for both to compute
-/// BTC's own rows.
-pub fn compute(bars: &[Bar], btc_bars: &[Bar]) -> Result<Vec<FeatureRow>, String> {
+/// for `btc_ret_5` / `rel_ret_5`, and `micro` (one slot per bar, same
+/// length as `bars`) for the 12 fs-2 microstructure features. Pass the
+/// same slice for `bars`/`btc_bars` to compute BTC's own rows. `micro[i]
+/// == None` means no micro data was available that minute, so all 12 new
+/// features are `None` at that row; the 26 fs-1 features are unaffected.
+pub fn compute(
+    bars: &[Bar],
+    btc_bars: &[Bar],
+    micro: &[Option<MicroMinute>],
+) -> Result<Vec<FeatureRow>, String> {
     validate_ascending(bars)?;
     validate_ascending(btc_bars)?;
+    if micro.len() != bars.len() {
+        return Err(format!(
+            "micro.len() ({}) must equal bars.len() ({})",
+            micro.len(),
+            bars.len()
+        ));
+    }
 
     let ret5 = r5_series(bars);
     let btc_ret5 = r5_series(btc_bars);
@@ -85,6 +154,11 @@ pub fn compute(bars: &[Bar], btc_bars: &[Bar]) -> Result<Vec<FeatureRow>, String
     let mut vwap_terms: VecDeque<(f64, f64)> = VecDeque::new(); // (typical*volume, volume), up to 60
     let mut volumes: VecDeque<f64> = VecDeque::new(); // up to 60
     let mut trades: VecDeque<Option<i64>> = VecDeque::new(); // up to 60
+                                                             // fs-2 rolling micro state, reset by the same gap rule.
+    let mut depth_02_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 60
+    let mut spread_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 60
+    let mut tbr_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 15
+    let mut oi_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 61
     let mut prev_ts: Option<DateTime<Utc>> = None;
 
     for (idx, b) in bars.iter().enumerate() {
@@ -98,6 +172,10 @@ pub fn compute(bars: &[Bar], btc_bars: &[Bar]) -> Result<Vec<FeatureRow>, String
             vwap_terms.clear();
             volumes.clear();
             trades.clear();
+            depth_02_window.clear();
+            spread_window.clear();
+            tbr_window.clear();
+            oi_window.clear();
         }
         prev_ts = Some(b.ts_utc);
 
@@ -231,6 +309,81 @@ pub fn compute(bars: &[Bar], btc_bars: &[Bar]) -> Result<Vec<FeatureRow>, String
             _ => None,
         };
 
+        // fs-2 microstructure features (26..37). Every field of
+        // `MicroMinute` is read independently: a missing field makes only
+        // the feature(s) that need it `None`, never the whole row.
+        let mi = micro[idx].as_ref();
+        let spread_bps = mi.and_then(|m| m.spread_bps);
+        let taker_buy_ratio = mi.and_then(|m| m.taker_buy_ratio);
+        let bid_02 = mi.and_then(|m| m.bid_02);
+        let ask_02 = mi.and_then(|m| m.ask_02);
+        let bid_10 = mi.and_then(|m| m.bid_10);
+        let ask_10 = mi.and_then(|m| m.ask_10);
+        let oi_value = mi.and_then(|m| m.oi_value);
+        let taker_ls_ratio = mi.and_then(|m| m.taker_ls_ratio);
+        let funding_rate = mi.and_then(|m| m.funding_rate);
+
+        let depth_02_sum = match (bid_02, ask_02) {
+            (Some(bid), Some(ask)) => Some(bid + ask),
+            _ => None,
+        };
+        depth_02_window.push_back(depth_02_sum);
+        if depth_02_window.len() > VOL_WINDOW {
+            depth_02_window.pop_front();
+        }
+        spread_window.push_back(spread_bps);
+        if spread_window.len() > VOL_WINDOW {
+            spread_window.pop_front();
+        }
+        tbr_window.push_back(taker_buy_ratio);
+        if tbr_window.len() > TBR_WINDOW {
+            tbr_window.pop_front();
+        }
+        oi_window.push_back(oi_value);
+        if oi_window.len() > CLOSE_WINDOW {
+            oi_window.pop_front();
+        }
+
+        values[26] = spread_bps;
+        values[27] = match (bid_02, ask_02) {
+            (Some(bid), Some(ask)) => Some((bid - ask) / (bid + ask + EPS)),
+            _ => None,
+        };
+        values[28] = match (bid_10, ask_10) {
+            (Some(bid), Some(ask)) => Some((bid - ask) / (bid + ask + EPS)),
+            _ => None,
+        };
+        values[29] = rolling_zscore(&depth_02_window, VOL_WINDOW);
+        values[30] = taker_buy_ratio;
+        values[31] = if tbr_window.len() == TBR_WINDOW && tbr_window.iter().all(Option::is_some) {
+            let vals: Vec<f64> = tbr_window.iter().map(|v| v.unwrap()).collect();
+            Some(mean(vals.iter().copied()))
+        } else {
+            None
+        };
+        values[32] = if oi_window.len() == CLOSE_WINDOW {
+            match (oi_window.front().copied().flatten(), oi_value) {
+                (Some(old), Some(cur)) => Some((cur / old).ln()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        values[33] = taker_ls_ratio;
+        let funding_rate_bps = funding_rate.map(|r| r * 1e4);
+        values[34] = funding_rate_bps;
+        values[35] = match (funding_rate_bps, ret_15) {
+            (Some(fbps), Some(r15)) => Some(fbps * sign(r15)),
+            _ => None,
+        };
+        values[36] = rolling_zscore(&spread_window, VOL_WINDOW);
+        values[37] = match (bid_10, ask_10, bid_02, ask_02) {
+            (Some(bid10), Some(ask10), Some(bid02), Some(ask02)) => {
+                Some(((bid10 + ask10 + EPS) / (bid02 + ask02 + EPS)).ln())
+            }
+            _ => None,
+        };
+
         rows.push(FeatureRow {
             ts_utc: b.ts_utc,
             asset: b.asset.clone(),
@@ -264,6 +417,36 @@ fn ret_k(closes: &VecDeque<f64>, k: usize) -> Option<f64> {
     let cur = *closes.back().unwrap();
     let back = closes[closes.len() - 1 - k];
     Some((cur / back).ln())
+}
+
+/// `sign(x)`: 1.0 / -1.0 / 0.0. Used by `funding_x_mom`'s crowding
+/// interaction; an exact-zero `ret_15` is deliberately neutral rather than
+/// arbitrarily signed positive.
+fn sign(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// z-score of the LAST entry in `window` against the window's own mean/std,
+/// only once `window` holds exactly `required_len` entries AND every one of
+/// them is `Some` (a `None` anywhere in the window - including the current
+/// minute - means the window is not clean, so the z-score is `None` rather
+/// than computed over a gappy series). Mirrors fs-1's `trades_z_60`
+/// discipline for a rolling source that can itself be missing.
+fn rolling_zscore(window: &VecDeque<Option<f64>>, required_len: usize) -> Option<f64> {
+    if window.len() != required_len || window.iter().any(Option::is_none) {
+        return None;
+    }
+    let vals: Vec<f64> = window.iter().map(|v| v.unwrap()).collect();
+    let m = mean(vals.iter().copied());
+    let std = population_std(vals.iter().copied());
+    let cur = *vals.last().unwrap();
+    Some((cur - m) / (std + EPS))
 }
 
 /// r_5 series aligned 1:1 with `bars`, using the same 120s gap-reset rule
@@ -352,14 +535,24 @@ mod tests {
             .collect()
     }
 
+    fn no_micro(n: usize) -> Vec<Option<MicroMinute>> {
+        vec![None; n]
+    }
+
+    fn i(name: &str) -> usize {
+        FEATURE_NAMES.iter().position(|n| *n == name).unwrap()
+    }
+
     #[test]
     fn one_row_per_bar_and_cold_windows_are_none_not_zero() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
         assert_eq!(rows.len(), 70);
-        let i = |name: &str| FEATURE_NAMES.iter().position(|n| *n == name).unwrap();
         assert!(rows[0].values[i("ret_1")].is_none(), "no history yet");
-        assert!(rows[30].values[i("ret_60")].is_none(), "60m window not warm at t=30");
+        assert!(
+            rows[30].values[i("ret_60")].is_none(),
+            "60m window not warm at t=30"
+        );
         assert!(rows[65].values[i("ret_60")].is_some());
         assert!(rows[65].values[i("mom_15")].is_some());
         assert!(rows[65].values[i("vwap_dist_60")].is_some());
@@ -370,10 +563,42 @@ mod tests {
     fn appending_bars_never_changes_emitted_rows() {
         let long = ramp(200);
         let short: Vec<Bar> = long[..150].to_vec();
-        let a = compute(&short, &short).unwrap();
-        let b = compute(&long, &long).unwrap();
+        let a = compute(&short, &short, &no_micro(150)).unwrap();
+        let b = compute(&long, &long, &no_micro(200)).unwrap();
         for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.ts_utc, y.ts_utc);
+            assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
+        }
+    }
+
+    /// Same append-safety property, but with every fs-2 field populated -
+    /// the new rolling windows must not peek ahead either.
+    #[test]
+    fn appending_bars_never_changes_emitted_rows_with_micro_data() {
+        let long = ramp(200);
+        let long_micro: Vec<Option<MicroMinute>> = long
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    spread_bps: Some(3.0 + (idx % 5) as f64),
+                    taker_buy_ratio: Some(0.5 + (idx % 3) as f64 * 0.01),
+                    bid_02: Some(100.0 + idx as f64),
+                    ask_02: Some(90.0),
+                    bid_10: Some(400.0 + idx as f64),
+                    ask_10: Some(390.0),
+                    oi_value: Some(1000.0 + idx as f64),
+                    taker_ls_ratio: Some(1.1),
+                    funding_rate: Some(0.00003),
+                })
+            })
+            .collect();
+        let short: Vec<Bar> = long[..150].to_vec();
+        let short_micro: Vec<Option<MicroMinute>> = long_micro[..150].to_vec();
+        let a = compute(&short, &short, &short_micro).unwrap();
+        let b = compute(&long, &long, &long_micro).unwrap();
+        for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
         }
     }
@@ -385,35 +610,208 @@ mod tests {
         for b in bars.iter_mut().skip(65) {
             b.ts_utc += Duration::minutes(10);
         }
-        let rows = compute(&bars, &bars).unwrap();
-        let i = |name: &str| FEATURE_NAMES.iter().position(|n| *n == name).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
         assert!(rows[64].values[i("ret_1")].is_some(), "warm before the gap");
-        assert!(rows[65].values[i("ret_1")].is_none(), "the gap resets state");
         assert!(
-            rows[69].values[i("ret_1")].is_none() || rows[69].values[i("ret_60")].is_none()
+            rows[65].values[i("ret_1")].is_none(),
+            "the gap resets state"
         );
+        assert!(rows[69].values[i("ret_1")].is_none() || rows[69].values[i("ret_60")].is_none());
     }
 
     #[test]
     fn btc_context_aligns_by_timestamp_and_rel_ret_is_zero_for_btc_itself() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars).unwrap();
-        let i = |name: &str| FEATURE_NAMES.iter().position(|n| *n == name).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
         let last = &rows[69];
         assert_eq!(last.values[i("btc_ret_5")], last.values[i("ret_5")]);
         assert_eq!(last.values[i("rel_ret_5")], Some(0.0));
         // Missing BTC ts -> None
         let mut btc = ramp(70);
         btc.retain(|b| b.ts_utc != bars[69].ts_utc);
-        let rows2 = compute(&bars, &btc).unwrap();
+        let rows2 = compute(&bars, &btc, &no_micro(70)).unwrap();
         assert!(rows2[69].values[i("btc_ret_5")].is_none());
         assert!(rows2[69].values[i("rel_ret_5")].is_none());
     }
 
     #[test]
     fn the_catalog_is_the_contract() {
-        assert_eq!(FEATURE_NAMES.len(), 26);
-        let rows = compute(&ramp(70), &ramp(70)).unwrap();
+        assert_eq!(FEATURE_NAMES.len(), 38);
+        let rows = compute(&ramp(70), &ramp(70), &no_micro(70)).unwrap();
         assert_eq!(rows[0].values.len(), FEATURE_NAMES.len());
+    }
+
+    #[test]
+    fn micro_length_mismatch_is_rejected() {
+        let bars = ramp(10);
+        let err = compute(&bars, &bars, &no_micro(9)).unwrap_err();
+        assert!(err.contains("micro.len()"), "got: {err}");
+    }
+
+    /// The regression fs-2 exists to protect: an all-`None` micro slice
+    /// must leave every one of the 26 fs-1 features exactly as fs-1 would
+    /// have computed them (proven here by reusing fs-1's own assertions),
+    /// and every one of the 12 new features must be `None`.
+    #[test]
+    fn micro_all_none_reproduces_fs1_and_nones_the_rest() {
+        let bars = ramp(70);
+        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
+        assert!(rows[65].values[i("ret_60")].is_some());
+        assert!(rows[65].values[i("mom_15")].is_some());
+        assert!(rows[65].values[i("vwap_dist_60")].is_some());
+        for (idx, row) in rows.iter().enumerate() {
+            for name in FEATURE_NAMES.iter().skip(26) {
+                assert!(
+                    row.values[i(name)].is_none(),
+                    "row {idx} feature {name} should be None with no micro data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth_imbalance_and_slope_are_hand_computed() {
+        let bars = ramp(5);
+        let mut micro = no_micro(5);
+        micro[4] = Some(MicroMinute {
+            ts_s: bars[4].ts_utc.timestamp(),
+            bid_02: Some(120.0),
+            ask_02: Some(80.0),
+            bid_10: Some(500.0),
+            ask_10: Some(300.0),
+            ..Default::default()
+        });
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        let expect_imb02 = (120.0 - 80.0) / (120.0 + 80.0 + EPS);
+        let expect_imb10 = (500.0 - 300.0) / (500.0 + 300.0 + EPS);
+        let expect_slope = ((500.0 + 300.0 + EPS) / (120.0 + 80.0 + EPS)).ln();
+        assert!((rows[4].values[i("depth_imb_02")].unwrap() - expect_imb02).abs() < 1e-12);
+        assert!((rows[4].values[i("depth_imb_10")].unwrap() - expect_imb10).abs() < 1e-12);
+        assert!((rows[4].values[i("depth_slope")].unwrap() - expect_slope).abs() < 1e-12);
+        // No micro data at all that minute -> None, not a fabricated ratio.
+        assert!(rows[0].values[i("depth_imb_02")].is_none());
+        assert!(rows[0].values[i("depth_slope")].is_none());
+    }
+
+    #[test]
+    fn funding_and_taker_fields_pass_through_and_funding_x_mom_uses_the_sign_of_ret_15() {
+        let bars = ramp(20); // monotonically increasing -> ret_15 > 0 by t=19
+        let mut micro = no_micro(20);
+        micro[19] = Some(MicroMinute {
+            ts_s: bars[19].ts_utc.timestamp(),
+            funding_rate: Some(0.0001),
+            taker_buy_ratio: Some(0.62),
+            taker_ls_ratio: Some(1.4),
+            ..Default::default()
+        });
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        assert_eq!(rows[19].values[i("funding_rate_bps")], Some(0.0001 * 1e4));
+        assert_eq!(rows[19].values[i("taker_buy_ratio")], Some(0.62));
+        assert_eq!(rows[19].values[i("taker_ls_ratio")], Some(1.4));
+        let ret15 = rows[19].values[i("ret_15")].unwrap();
+        assert!(ret15 > 0.0, "ramp is monotonic increasing");
+        let expect = 0.0001 * 1e4; // funding_rate_bps * sign(+1)
+        assert!((rows[19].values[i("funding_x_mom")].unwrap() - expect).abs() < 1e-9);
+    }
+
+    #[test]
+    fn oi_change_60_compares_against_the_bar_exactly_60_minutes_earlier() {
+        let bars = ramp(65);
+        let micro: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    oi_value: Some(1000.0 + idx as f64 * 10.0),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        assert!(
+            rows[58].values[i("oi_change_60")].is_none(),
+            "not yet 61 minutes of history since the last reset"
+        );
+        let expect = ((1000.0 + 60.0 * 10.0) / 1000.0_f64).ln();
+        let got = rows[60].values[i("oi_change_60")].unwrap();
+        assert!((got - expect).abs() < 1e-12);
+
+        // A missing endpoint breaks the feature rather than fabricating a
+        // ratio against a stale substitute.
+        let mut micro2 = micro.clone();
+        micro2[0] = None;
+        let rows2 = compute(&bars, &bars, &micro2).unwrap();
+        assert!(rows2[60].values[i("oi_change_60")].is_none());
+    }
+
+    #[test]
+    fn taker_buy_ratio_m15_is_the_trailing_15_minute_mean() {
+        let bars = ramp(20);
+        let micro: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    taker_buy_ratio: Some(0.5 + idx as f64 * 0.01),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        assert!(
+            rows[13].values[i("taker_buy_ratio_m15")].is_none(),
+            "only 14 minutes of history"
+        );
+        let expect: f64 = (5..20).map(|idx| 0.5 + idx as f64 * 0.01).sum::<f64>() / 15.0;
+        let got = rows[19].values[i("taker_buy_ratio_m15")].unwrap();
+        assert!((got - expect).abs() < 1e-12);
+    }
+
+    /// `depth_02_z_60` needs a full, gap-free 60-minute window: warm right
+    /// before the gap, `None` immediately after (the window was cleared),
+    /// and warm again only once 60 fresh clean minutes have accumulated
+    /// post-reset. `spread_z_60` is checked at the same two points since it
+    /// follows the identical rolling-window discipline.
+    #[test]
+    fn depth_and_spread_z_scores_require_a_clean_full_window_and_reset_on_a_gap() {
+        let mut bars = ramp(130);
+        for b in bars.iter_mut().skip(65) {
+            b.ts_utc += Duration::minutes(10);
+        }
+        let micro: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    bid_02: Some(100.0 + idx as f64),
+                    ask_02: Some(90.0),
+                    spread_bps: Some(5.0 + (idx % 3) as f64),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        assert!(
+            rows[64].values[i("depth_02_z_60")].is_some(),
+            "60-wide clean window before the gap"
+        );
+        assert!(rows[64].values[i("spread_z_60")].is_some());
+        assert!(
+            rows[65].values[i("depth_02_z_60")].is_none(),
+            "the gap resets the window"
+        );
+        assert!(rows[65].values[i("spread_z_60")].is_none());
+        assert!(
+            rows[123].values[i("depth_02_z_60")].is_none(),
+            "only 59 clean minutes since the reset"
+        );
+        assert!(
+            rows[124].values[i("depth_02_z_60")].is_some(),
+            "60 clean minutes accumulated post-reset"
+        );
+        assert!(rows[124].values[i("spread_z_60")].is_some());
     }
 }

@@ -4,6 +4,7 @@ mod books;
 mod costs;
 mod gate;
 mod matrix;
+mod micro_join;
 mod universe;
 
 use std::collections::BTreeMap;
@@ -71,16 +72,21 @@ usage: scalper-data <command>
       in --exclude. Writes {data-root}/scalper-universe.json and prints a table
       with a NO-BINANCE marker on unmapped coins.
 
-  training-matrix --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--stride 5] [--horizons 15,30,60]
+  training-matrix --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--stride 5] [--horizons 15,30,60] [--micro-root <dir>]
       Build the trainer's JSONL matrix: for each universe candidate with a
       Binance UM listing, read 1m bars from {data-root}/perp (store key =
-      coin.to_uppercase()), compute features-scalper's feature set (BTC
+      coin.to_uppercase()), compute features-scalper's fs-2 feature set (BTC
       context from store key BTC - a hard requirement, since btc_ret_5 and
       rel_ret_5 need it), join with forward returns at the given horizons,
       keep every --stride-th fully-warm row, and write a manifest line
       followed by one JSON row per line to --out. A candidate with no bars
-      in the store is skipped with a warning, not a fatal error. Prints
-      per-asset row counts.
+      in the store is skipped with a warning, not a fatal error.
+      --micro-root <dir> joins each candidate's Binance book/flow/metrics/
+      funding files (read from {micro-root}/binance-micro/, same layout
+      pull-binance-micro writes) into the 12 fs-2 microstructure features;
+      omit it to run fs-2 with those 12 features all None (still a valid,
+      just uninformative, matrix). Prints per-asset 'kept N of M (micro
+      coverage from DATE|none)'.
 
   gate --matrix <path> --folds <path/folds.json> --costs <path> [--threshold-mult 1.5] [--notional 5000] --out <path>
       Walk-forward gate: for each fold in folds.json, load fold-N.json (a
@@ -312,8 +318,7 @@ fn write_jsonl<T: serde::Serialize>(path: &std::path::Path, rows: &[T]) -> Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut file =
-        std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for row in rows {
         writeln!(
             file,
@@ -328,9 +333,7 @@ fn write_jsonl<T: serde::Serialize>(path: &std::path::Path, rows: &[T]) -> Resul
 /// Read a symbol's existing funding file (if any) so a fresh pull can merge
 /// into it rather than clobbering earlier months. A missing file is an
 /// empty history, not an error.
-fn read_funding_jsonl(
-    path: &std::path::Path,
-) -> Result<Vec<binance_micro::FundingRow>, String> {
+fn read_funding_jsonl(path: &std::path::Path) -> Result<Vec<binance_micro::FundingRow>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => text
             .lines()
@@ -384,15 +387,22 @@ async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
 
         if sources.iter().any(|s| s == "book") {
             for &day in &days {
-                let bytes =
-                    binance_micro::fetch_daily(&client, binance_micro::KIND_BOOK_DEPTH, &symbol, day)
-                        .await?;
+                let bytes = binance_micro::fetch_daily(
+                    &client,
+                    binance_micro::KIND_BOOK_DEPTH,
+                    &symbol,
+                    day,
+                )
+                .await?;
                 match bytes {
                     None => println!("{symbol} book {day}: skipped (404: not yet published)"),
                     Some(bytes) => {
                         let rows = binance_micro::parse_book_depth_zip(&bytes, &symbol)?;
                         println!("{symbol} book {day}: {} minute(s)", rows.len());
-                        let path = micro_root.join("book").join(&symbol).join(format!("{day}.jsonl"));
+                        let path = micro_root
+                            .join("book")
+                            .join(&symbol)
+                            .join(format!("{day}.jsonl"));
                         write_jsonl(&path, &rows)?;
                         *totals.entry("book").or_default() += rows.len();
                     }
@@ -402,15 +412,22 @@ async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
 
         if sources.iter().any(|s| s == "flow") {
             for &day in &days {
-                let bytes =
-                    binance_micro::fetch_daily(&client, binance_micro::KIND_AGG_TRADES, &symbol, day)
-                        .await?;
+                let bytes = binance_micro::fetch_daily(
+                    &client,
+                    binance_micro::KIND_AGG_TRADES,
+                    &symbol,
+                    day,
+                )
+                .await?;
                 match bytes {
                     None => println!("{symbol} flow {day}: skipped (404: not yet published)"),
                     Some(bytes) => {
                         let rows = binance_micro::parse_agg_trades_zip(&bytes, &symbol)?;
                         println!("{symbol} flow {day}: {} minute(s)", rows.len());
-                        let path = micro_root.join("flow").join(&symbol).join(format!("{day}.jsonl"));
+                        let path = micro_root
+                            .join("flow")
+                            .join(&symbol)
+                            .join(format!("{day}.jsonl"));
                         write_jsonl(&path, &rows)?;
                         *totals.entry("flow").or_default() += rows.len();
                     }
@@ -428,8 +445,10 @@ async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
                     Some(bytes) => {
                         let rows = binance_micro::parse_metrics_zip(&bytes, &symbol)?;
                         println!("{symbol} metrics {day}: {} row(s)", rows.len());
-                        let path =
-                            micro_root.join("metrics").join(&symbol).join(format!("{day}.jsonl"));
+                        let path = micro_root
+                            .join("metrics")
+                            .join(&symbol)
+                            .join(format!("{day}.jsonl"));
                         write_jsonl(&path, &rows)?;
                         *totals.entry("metrics").or_default() += rows.len();
                     }
@@ -450,9 +469,9 @@ async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
                 )
                 .await?;
                 match bytes {
-                    None => println!(
-                        "{symbol} funding {year:04}-{month:02}: skipped (404: not listed)"
-                    ),
+                    None => {
+                        println!("{symbol} funding {year:04}-{month:02}: skipped (404: not listed)")
+                    }
                     Some(bytes) => {
                         let rows = binance_micro::parse_funding_rate_zip(&bytes, &symbol)?;
                         println!(
@@ -580,7 +599,8 @@ async fn cmd_record_books(args: &[String]) -> Result<(), String> {
                 Err(e) => eprintln!("{e}"),
             }
         }
-        file.flush().map_err(|e| format!("{}: {e}", path.display()))?;
+        file.flush()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
 
         let sleep_for = next_sleep(interval_dur, round_started.elapsed());
         if !sleep_for.is_zero() {
@@ -729,15 +749,9 @@ async fn cmd_universe(args: &[String]) -> Result<(), String> {
     std::fs::write(&out_path, &json).map_err(|e| format!("{}: {e}", out_path.display()))?;
 
     // Print table
-    println!(
-        "{:<12} {:>15}  {}",
-        "coin", "day_volume_usd", "binance_um"
-    );
+    println!("{:<12} {:>15}  {}", "coin", "day_volume_usd", "binance_um");
     for candidate in &candidates {
-        let binance_marker = candidate
-            .binance_um
-            .as_deref()
-            .unwrap_or("NO-BINANCE");
+        let binance_marker = candidate.binance_um.as_deref().unwrap_or("NO-BINANCE");
         println!(
             "{:<12} {:>15.0}  {}",
             candidate.coin, candidate.day_volume_usd, binance_marker
@@ -790,6 +804,7 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     if horizons.is_empty() {
         return Err("--horizons produced no values".into());
     }
+    let micro_root: Option<PathBuf> = get(args, "--micro-root").map(PathBuf::from);
 
     let text = std::fs::read_to_string(&universe_path)
         .map_err(|e| format!("{}: {e}", universe_path.display()))?;
@@ -831,12 +846,62 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             continue;
         }
 
-        let feature_rows = features_scalper::compute(&bars, &btc_bars)?;
+        let micro: Vec<Option<features_scalper::MicroMinute>> = match &micro_root {
+            Some(root) => {
+                // `binance_um.is_none()` skipped this candidate above, so
+                // the symbol is always present here.
+                let symbol = candidate.binance_um.as_ref().expect("checked above");
+                micro_join::load_micro_series(root, symbol, &bars)?
+            }
+            None => vec![None; bars.len()],
+        };
+        let coverage_start = bars
+            .iter()
+            .zip(micro.iter())
+            .find(|(_, m)| {
+                m.as_ref().is_some_and(|mm| {
+                    mm.spread_bps.is_some()
+                        || mm.taker_buy_ratio.is_some()
+                        || mm.bid_02.is_some()
+                        || mm.ask_02.is_some()
+                        || mm.bid_10.is_some()
+                        || mm.ask_10.is_some()
+                        || mm.oi_value.is_some()
+                        || mm.taker_ls_ratio.is_some()
+                        || mm.funding_rate.is_some()
+                })
+            })
+            .map(|(b, _)| b.ts_utc.date_naive());
+
+        let feature_rows = features_scalper::compute(&bars, &btc_bars, &micro)?;
         let fwd = matrix::forward_returns_bps(&bars, &horizons);
         let mut rows = matrix::matrix_rows(&feature_rows, &fwd, stride, &candidate.coin);
         rows.retain(|r| r.ts >= start_ts && r.ts < end_ts);
 
-        println!("{}: {} rows", candidate.coin, rows.len());
+        // "M" = every stride-sampled bar in the requested window, before
+        // the fully-warm/micro-coverage filter matrix_rows applies - so a
+        // low N/M ratio reads as "coverage/warm-up ate rows", not "the
+        // window itself is small".
+        let m = bars
+            .iter()
+            .enumerate()
+            .filter(|(idx, b)| {
+                idx % stride.max(1) == 0
+                    && b.ts_utc.timestamp() >= start_ts
+                    && b.ts_utc.timestamp() < end_ts
+            })
+            .count();
+        let coverage_note = match coverage_start {
+            Some(d) => d.to_string(),
+            None => "none".to_string(),
+        };
+        println!(
+            "{}: kept {} of {} (micro coverage from {})",
+            candidate.coin,
+            rows.len(),
+            m,
+            coverage_note
+        );
         assets.push(candidate.coin.clone());
         all_rows.extend(rows);
     }
@@ -996,10 +1061,7 @@ mod tests {
         // Capital-K tickers (KAITO, KAVA, ...) are real HL coins, not the
         // 1000-prefix shorthand - a case-insensitive `k` match would corrupt
         // them into a nonexistent "1000AITOUSDT" symbol.
-        assert_eq!(
-            resolve_asset("KAITO").1,
-            Some("KAITOUSDT".to_string())
-        );
+        assert_eq!(resolve_asset("KAITO").1, Some("KAITOUSDT".to_string()));
     }
 
     #[tokio::test]
@@ -1048,6 +1110,84 @@ mod tests {
             .collect()
     }
 
+    /// Writes book/flow/metrics rows for every minute `[base, base+n)` and
+    /// one funding row well before `base`, so `micro_join::load_micro_series`
+    /// finds full coverage across the whole span - fs-2 needs every one of
+    /// the 12 microstructure features Some to keep a matrix row, so a test
+    /// exercising "rows survive" needs this, not just bars.
+    fn write_full_micro_coverage(
+        data_root: &std::path::Path,
+        symbol: &str,
+        base: DateTime<Utc>,
+        n: i64,
+    ) {
+        let micro_root = data_root.join("binance-micro");
+        let day = base.date_naive();
+        let mut book_lines = String::new();
+        let mut flow_lines = String::new();
+        let mut metrics_lines = String::new();
+        for i in 0..n {
+            let ts = (base + chrono::Duration::minutes(i)).timestamp();
+            let mut bands = std::collections::BTreeMap::new();
+            bands.insert("-0.2".to_string(), 100.0);
+            bands.insert("0.2".to_string(), 90.0);
+            bands.insert("-1.0".to_string(), 500.0);
+            bands.insert("1.0".to_string(), 480.0);
+            let book = binance_micro::BookMinute { ts_s: ts, bands };
+            book_lines.push_str(&serde_json::to_string(&book).unwrap());
+            book_lines.push('\n');
+
+            let flow = binance_micro::FlowMinute {
+                ts_s: ts,
+                spread_bps_med: Some(4.0),
+                n_spread_samples: 10,
+                distinct_bids: 5,
+                taker_buy_ratio: 0.55,
+                n_trades: 50,
+                notional: 1_000.0,
+            };
+            flow_lines.push_str(&serde_json::to_string(&flow).unwrap());
+            flow_lines.push('\n');
+
+            let metrics = binance_micro::MetricsRow {
+                ts_s: ts,
+                sum_open_interest: 1.0,
+                sum_open_interest_value: 5_000.0 + i as f64,
+                count_toptrader_long_short_ratio: 1.0,
+                sum_toptrader_long_short_ratio: 1.0,
+                count_long_short_ratio: 1.0,
+                sum_taker_long_short_vol_ratio: 1.2,
+            };
+            metrics_lines.push_str(&serde_json::to_string(&metrics).unwrap());
+            metrics_lines.push('\n');
+        }
+
+        let book_dir = micro_root.join("book").join(symbol);
+        std::fs::create_dir_all(&book_dir).unwrap();
+        std::fs::write(book_dir.join(format!("{day}.jsonl")), book_lines).unwrap();
+
+        let flow_dir = micro_root.join("flow").join(symbol);
+        std::fs::create_dir_all(&flow_dir).unwrap();
+        std::fs::write(flow_dir.join(format!("{day}.jsonl")), flow_lines).unwrap();
+
+        let metrics_dir = micro_root.join("metrics").join(symbol);
+        std::fs::create_dir_all(&metrics_dir).unwrap();
+        std::fs::write(metrics_dir.join(format!("{day}.jsonl")), metrics_lines).unwrap();
+
+        let funding_dir = micro_root.join("funding");
+        std::fs::create_dir_all(&funding_dir).unwrap();
+        let funding = binance_micro::FundingRow {
+            ts_s: (base - chrono::Duration::hours(1)).timestamp(),
+            funding_interval_hours: 8.0,
+            funding_rate: 0.0001,
+        };
+        std::fs::write(
+            funding_dir.join(format!("{symbol}.jsonl")),
+            serde_json::to_string(&funding).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn training_matrix_skips_a_universe_candidate_with_no_bars_in_the_store() {
         use chrono::TimeZone;
@@ -1067,6 +1207,8 @@ mod tests {
         // "KMISSING" deliberately has no bars written anywhere: its
         // asset=KMISSING directory never gets created, exercising the
         // skip-with-warning path rather than a hard error.
+        write_full_micro_coverage(&root, "BTCUSDT", base, 300);
+        write_full_micro_coverage(&root, "TESTUSDT", base, 300);
 
         let universe_path = root.join("scalper-universe.json");
         let universe_json = serde_json::json!([
@@ -1096,6 +1238,8 @@ mod tests {
             "5".to_string(),
             "--horizons".to_string(),
             "15".to_string(),
+            "--micro-root".to_string(),
+            root.to_string_lossy().to_string(),
         ];
         cmd_training_matrix(&args).expect("a missing store dir must be a warning, not a failure");
 
@@ -1107,10 +1251,77 @@ mod tests {
 
         let rows: Vec<matrix::MatrixRow> =
             lines.map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert!(!rows.is_empty(), "kTEST has enough bars to be fully warm");
+        assert!(
+            !rows.is_empty(),
+            "kTEST has enough bars and full micro coverage to be fully warm"
+        );
         assert!(rows.iter().any(|r| r.asset == "kTEST"));
         assert!(rows.iter().all(|r| r.asset == "BTC" || r.asset == "kTEST"));
-        assert!(rows.iter().all(|r| r.features.len() == 26));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without `--micro-root`, fs-2's matrix requires all 38 features Some
+    /// to keep a row, and the 12 microstructure features are None
+    /// everywhere with no micro data - so the matrix builds successfully
+    /// (not an error) but keeps zero rows. This is the intended, if harsh,
+    /// behavior: a matrix built with no microstructure coverage is not
+    /// silently missing 12 columns, it produces no trainable rows at all.
+    #[test]
+    fn training_matrix_without_micro_root_keeps_zero_rows() {
+        use chrono::TimeZone;
+
+        let root = std::env::temp_dir().join(format!(
+            "scalper-training-matrix-{}-{}",
+            std::process::id(),
+            "no-micro-root"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let perp_root = root.join("perp");
+        let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        store::write(&perp_root, &synthetic_bars("BTC", base, 300)).unwrap();
+
+        let universe_path = root.join("scalper-universe.json");
+        std::fs::write(
+            &universe_path,
+            serde_json::to_string(&serde_json::json!([
+                {"coin": "BTC", "day_volume_usd": 3.0, "binance_um": "BTCUSDT"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out_path = root.join("matrix.jsonl");
+        let args = vec![
+            "--data-root".to_string(),
+            root.to_string_lossy().to_string(),
+            "--universe".to_string(),
+            universe_path.to_string_lossy().to_string(),
+            "--start".to_string(),
+            "2026-06-01".to_string(),
+            "--end".to_string(),
+            "2026-06-02".to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+            "--stride".to_string(),
+            "5".to_string(),
+            "--horizons".to_string(),
+            "15".to_string(),
+        ];
+        cmd_training_matrix(&args).expect("no --micro-root is a valid, just uninformative, run");
+
+        let content = std::fs::read_to_string(&out_path).unwrap();
+        let mut lines = content.lines();
+        let manifest: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-2");
+        let rows: Vec<matrix::MatrixRow> =
+            lines.map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(
+            rows.is_empty(),
+            "no micro coverage anywhere -> no fully-warm rows"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -139,7 +139,14 @@ pub fn simulate(
     horizon_min: i64,
     threshold_mult: f64,
 ) -> Vec<Trade> {
-    simulate_with_state(preds, round_trip_bps, horizon_min, threshold_mult, &BTreeMap::new()).0
+    simulate_with_state(
+        preds,
+        round_trip_bps,
+        horizon_min,
+        threshold_mult,
+        &BTreeMap::new(),
+    )
+    .0
 }
 
 /// Per-asset threshold-gated long/short simulation, carrying and returning
@@ -409,7 +416,12 @@ fn validate_no_ts_overlap(folds: &[FoldSpec]) -> Result<Vec<&FoldSpec>, String> 
             return Err(format!(
                 "fold {} test window [{}, {}) overlaps fold {}'s [{}, {}) - folds.json is not a \
                  valid walk-forward split",
-                next.i, next.test_start_ts, next.test_end_ts, prev.i, prev.test_start_ts, prev.test_end_ts
+                next.i,
+                next.test_start_ts,
+                next.test_end_ts,
+                prev.i,
+                prev.test_start_ts,
+                prev.test_end_ts
             ));
         }
     }
@@ -675,11 +687,10 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         let daily = daily_returns_bps(&trades, n_assets, (fold.test_start_ts, fold.test_end_ts));
         let sharpe = annualized_sharpe(&daily);
 
-        let (pred_abs_p50, pred_abs_p90, pred_abs_p99) =
-            match pred_magnitude_quantiles(&preds) {
-                Some((p50, p90, p99)) => (Some(p50), Some(p90), Some(p99)),
-                None => (None, None, None),
-            };
+        let (pred_abs_p50, pred_abs_p90, pred_abs_p99) = match pred_magnitude_quantiles(&preds) {
+            Some((p50, p90, p99)) => (Some(p50), Some(p90), Some(p99)),
+            None => (None, None, None),
+        };
 
         fold_reports.push(FoldReport {
             i: fold.i,
@@ -968,14 +979,13 @@ mod tests {
         let costs = BTreeMap::from([("A".to_string(), 10.0)]);
 
         let preds_k = vec![pred("A", e - 60, 100.0, 8.0)];
-        let (trades_k, state) =
-            simulate_with_state(&preds_k, &costs, 30, 1.5, &BTreeMap::new());
+        let (trades_k, state) = simulate_with_state(&preds_k, &costs, 30, 1.5, &BTreeMap::new());
         assert_eq!(trades_k.len(), 1);
         assert_eq!(trades_k[0].entry_ts, e - 60);
 
         let hold_ends = (e - 60) + 30 * 60; // flat again at e + 1740
         let preds_k1 = vec![
-            pred("A", e + 300, 1_000.0, 8.0),      // still inside the carried hold window
+            pred("A", e + 300, 1_000.0, 8.0), // still inside the carried hold window
             pred("A", hold_ends + 1, 1_000.0, 8.0), // first eligible entry
         ];
         let (trades_k1, _) = simulate_with_state(&preds_k1, &costs, 30, 1.5, &state);
@@ -1062,6 +1072,136 @@ mod tests {
         assert!(
             err.contains("fs-other") && err.contains("fs-rust-scalper-1"),
             "expected the error to name both versions, got: {err}"
+        );
+    }
+
+    /// The version cross-check proven end-to-end through `cmd_gate` itself
+    /// (not just `load_model` in isolation): a REAL fs-1-versioned model
+    /// artifact - fs-1's historical `feature_set_version` and its actual
+    /// 26-feature order, exactly as they were before this task bumped
+    /// `features_scalper::FEATURE_SET_VERSION` to `fs-rust-scalper-2` -
+    /// scored against a matrix built from the current (fs-2) feature
+    /// catalog must be refused, not silently scored against the wrong 26
+    /// columns of a 38-column row.
+    #[test]
+    fn a_stale_fs1_artifact_is_refused_end_to_end_against_an_fs2_matrix() {
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-gate-e2e-version-cross-check-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An fs-2 matrix: the manifest and one fully-populated row use the
+        // real, current feature catalog (38 names), not a hand-picked
+        // stand-in.
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest",
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "horizons_min": [15],
+            "stride_min": 1,
+            "assets": ["BTC"],
+        });
+        let row = serde_json::json!({
+            "ts": 0,
+            "asset": "BTC",
+            "features": features,
+            "fwd_bps": {"15": 5.0},
+        });
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row}\n")).unwrap();
+
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0,
+                    "train_start_ts": 0,
+                    "train_end_ts": 0,
+                    "test_start_ts": 0,
+                    "test_end_ts": 3600,
+                    "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Empty costs: the lone asset falls back to DEFAULT_ROUND_TRIP_BPS,
+        // so the gate still has a tradable asset to reach the model-loading
+        // step - this test is about the version check, not cost lookup.
+        let costs_path = dir.join("costs.json");
+        std::fs::write(&costs_path, "{}").unwrap();
+
+        const FS1_FEATURES: [&str; 26] = [
+            "ret_1",
+            "ret_3",
+            "ret_5",
+            "ret_15",
+            "ret_30",
+            "ret_60",
+            "mom_5",
+            "mom_15",
+            "mom_30",
+            "mom_60",
+            "vol_15",
+            "vol_60",
+            "vol_ratio_15_60",
+            "vwap_dist_60",
+            "volume_z_60",
+            "volume_ratio_5_60",
+            "trades_z_60",
+            "hl_range",
+            "body_frac",
+            "upper_wick_frac",
+            "lower_wick_frac",
+            "tod_sin",
+            "tod_cos",
+            "dow",
+            "btc_ret_5",
+            "rel_ret_5",
+        ];
+        let fs1_artifact = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION,
+            "feature_set_version": "fs-rust-scalper-1",
+            "features": FS1_FEATURES,
+            "model": { "tree_info": [] },
+        });
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&fs1_artifact).unwrap(),
+        )
+        .unwrap();
+
+        let out_path = dir.join("report.json");
+        let args = vec![
+            "--matrix".to_string(),
+            matrix_path.to_string_lossy().to_string(),
+            "--folds".to_string(),
+            folds_path.to_string_lossy().to_string(),
+            "--costs".to_string(),
+            costs_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+        ];
+        let err = cmd_gate(&args).unwrap_err();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            err.contains("fs-rust-scalper-1") && err.contains(FEATURE_SET_VERSION),
+            "expected the gate to refuse the stale fs-1 artifact against the fs-2 matrix, \
+             got: {err}"
         );
     }
 }

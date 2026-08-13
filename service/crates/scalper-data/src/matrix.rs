@@ -110,7 +110,7 @@ pub fn matrix_rows(
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
-    use features_scalper::compute;
+    use features_scalper::{compute, MicroMinute};
 
     fn bar(ts_min: i64, close: f64, volume: f64) -> Bar {
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + Duration::minutes(ts_min);
@@ -147,10 +147,34 @@ mod tests {
         assert!(!fwd[85].contains_key("15"));
     }
 
+    /// fs-2's matrix rows require ALL 38 features Some, so a full micro
+    /// series (every field covered every minute) is what makes any row
+    /// warm here - an all-`None` micro slice would drop every row (that
+    /// behavior has its own dedicated test elsewhere: `training-matrix`
+    /// without `--micro-root`).
+    fn full_micro(bars: &[Bar]) -> Vec<Option<MicroMinute>> {
+        bars.iter()
+            .map(|b| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    spread_bps: Some(4.0),
+                    taker_buy_ratio: Some(0.55),
+                    bid_02: Some(100.0),
+                    ask_02: Some(90.0),
+                    bid_10: Some(500.0),
+                    ask_10: Some(480.0),
+                    oi_value: Some(5_000.0),
+                    taker_ls_ratio: Some(1.2),
+                    funding_rate: Some(0.0001),
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn matrix_rows_drop_cold_rows_and_stride_samples() {
         let bars = ramp(200);
-        let rows = compute(&bars, &bars).unwrap();
+        let rows = compute(&bars, &bars, &full_micro(&bars)).unwrap();
         let fwd = forward_returns_bps(&bars, &[15]);
         let m = matrix_rows(&rows, &fwd, 5, "kTEST");
         assert!(!m.is_empty());
@@ -164,6 +188,19 @@ mod tests {
         assert!(
             ts.windows(2).all(|w| w[1] - w[0] >= 300),
             "stride 5 = >=300s apart"
+        );
+    }
+
+    #[test]
+    fn no_micro_coverage_at_all_drops_every_row_under_fs2() {
+        let bars = ramp(200);
+        let rows = compute(&bars, &bars, &vec![None; bars.len()]).unwrap();
+        let fwd = forward_returns_bps(&bars, &[15]);
+        let m = matrix_rows(&rows, &fwd, 5, "kTEST");
+        assert!(
+            m.is_empty(),
+            "fs-2 rows require all 38 features Some; no micro data means the 12 \
+             microstructure features are None everywhere, so nothing survives"
         );
     }
 }
