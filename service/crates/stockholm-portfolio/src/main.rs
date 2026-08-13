@@ -157,8 +157,11 @@ usage: stockholm-portfolio <command>
            [--position-weight 0.05] [--min-position-weight 0]
            [--reference-edge 0.01] [--reference-volatility 0.02]
            [--aggregate-short-horizon-forecast]
-           [--cost-multiple 1]
+           [--cost-multiple 1] [--bars-root <dir>]
       Replay one strictly-forward model fold with no long/short quota.
+      --bars-root reads the same adjusted daily history the matrix was built
+      from and marks NAV on every held session; without it a step reports its
+      holding-period NAV alone.
 
   direction-backtest --matrix <jsonl> --model <json>
                      --start YYYY-MM-DD --end YYYY-MM-DD --out <json>
@@ -2556,6 +2559,22 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             ),
         };
     let max_positions = number(args, "--max-positions", 20_usize)?;
+    // Daily NAV marks need the adjusted closes between the executable entry and
+    // exit opens; the matrix carries only those two prices per label.
+    let mark_prices = match get(args, "--bars-root") {
+        Some(root) => {
+            let (_, histories) = equity_data::load_stockholm(Path::new(&root))?;
+            let mut prices = stockholm_portfolio::MarkPrices::default();
+            for history in &histories {
+                prices.insert_history(
+                    &history.instrument.orderbook_id,
+                    history.bars.iter().map(|bar| (bar.date, bar.adjusted_close)),
+                )?;
+            }
+            Some(prices)
+        }
+        None => None,
+    };
     let result = stockholm_portfolio::backtest(
         &model,
         &rows,
@@ -2588,6 +2607,7 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
             market_forecast_model_id,
             costs,
             benchmark,
+            mark_prices,
         },
     )?;
     let path = PathBuf::from(need(args, "--out")?);

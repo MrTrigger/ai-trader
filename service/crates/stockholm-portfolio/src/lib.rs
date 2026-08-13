@@ -697,6 +697,16 @@ pub struct PositionResult {
     pub pnl: f64,
 }
 
+/// Portfolio NAV at one session inside a holding period. The rebalance-phase
+/// combination needs a calendar-dated series, not one value per holding
+/// period, so every session between entry and exit is marked here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DailyMark {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub nav: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     #[serde(with = "date_serde")]
@@ -732,6 +742,10 @@ pub struct Step {
     #[serde(default)]
     pub active_return: Option<f64>,
     pub positions: Vec<PositionResult>,
+    /// One NAV per session held, empty when the replay was given no mark
+    /// prices. Frozen reports predate the field and default to empty.
+    #[serde(default)]
+    pub daily_marks: Vec<DailyMark>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1537,6 +1551,58 @@ fn default_prediction_horizon_scale() -> f64 {
     1.0
 }
 
+/// Session adjusted closes for the instruments a replay can hold. The matrix
+/// only carries the two executable open prices a label spans, so marking the
+/// sessions in between needs the same adjusted daily history the labels were
+/// built from. Nothing here reaches a feature, a label, or a decision.
+#[derive(Debug, Clone, Default)]
+pub struct MarkPrices {
+    sessions: BTreeSet<Date>,
+    closes: BTreeMap<String, BTreeMap<Date, f64>>,
+}
+
+impl MarkPrices {
+    /// Record one instrument's session adjusted closes.
+    pub fn insert_history(
+        &mut self,
+        instrument_id: &str,
+        closes: impl IntoIterator<Item = (Date, f64)>,
+    ) -> Result<(), String> {
+        let instrument = self.closes.entry(instrument_id.to_owned()).or_default();
+        for (date, close) in closes {
+            if !close.is_finite() || close <= 0.0 {
+                return Err(format!(
+                    "mark price for {instrument_id} on {date} is not a positive adjusted close"
+                ));
+            }
+            instrument.insert(date, close);
+            self.sessions.insert(date);
+        }
+        Ok(())
+    }
+
+    fn is_session(&self, date: Date) -> bool {
+        self.sessions.contains(&date)
+    }
+
+    /// The session `offset` trading days after `date` on the union exchange
+    /// calendar of the recorded histories.
+    fn session_after(&self, date: Date, offset: usize) -> Option<Date> {
+        self.sessions.range(date..).nth(offset).copied()
+    }
+
+    /// Most recent adjusted close at or before `date`. An instrument that did
+    /// not trade on a session keeps its last observed mark instead of dropping
+    /// out of the portfolio value.
+    fn close_at(&self, instrument_id: &str, date: Date) -> Option<f64> {
+        self.closes
+            .get(instrument_id)?
+            .range(..=date)
+            .next_back()
+            .map(|(_, close)| *close)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
     pub start: Date,
@@ -1572,6 +1638,10 @@ pub struct BacktestConfig {
     pub market_forecast_model_id: Option<String>,
     pub costs: CostConfig,
     pub benchmark: Option<BenchmarkHistory>,
+    /// Session closes used only to mark open positions between the executable
+    /// entry and exit opens. Absent means the replay reports holding-period
+    /// NAV alone, exactly as every frozen report already does.
+    pub mark_prices: Option<MarkPrices>,
 }
 
 #[derive(Debug)]
@@ -1912,6 +1982,9 @@ pub fn backtest(
         let mut long_pnl = 0.0;
         let mut short_pnl = 0.0;
         let mut cost_drag = 0.0;
+        // Costs paid at this period's entry open, separated from the terminal
+        // liquidation so daily marks charge each leg on the session it happens.
+        let mut entry_leg_costs = 0.0;
         let mut net = 0.0;
         let mut allocated_costs: BTreeMap<String, f64> = BTreeMap::new();
         let mut identities = previous
@@ -1960,6 +2033,7 @@ pub fn backtest(
                     borrow_diagnostics.fallback_holding_cost_drag += holding_cost;
                 }
             }
+            entry_leg_costs += amount;
             // The last measured holding period includes the terminal close so
             // the backtest does not leave a free liquidation outside the NAV.
             if date_index + 1 == selected_dates.len() {
@@ -1987,10 +2061,16 @@ pub fn backtest(
             .values()
             .filter(|(_, _, cost)| cost.observed_spread)
             .count();
+        let mut held = Vec::new();
         for candidate in candidates {
             let Some(&signed_weight) = weights.get(&candidate.row.instrument_id) else {
                 continue;
             };
+            held.push((
+                candidate.row.instrument_id.clone(),
+                signed_weight,
+                candidate.row.entry_price,
+            ));
             let sign = signed_weight.signum();
             let absolute_weight = signed_weight.abs();
             let cost_amount = allocated_costs
@@ -2022,6 +2102,23 @@ pub fn backtest(
         }
         let gross = positions.iter().map(|position| position.weight.abs()).sum();
         let period_return = long_pnl + short_pnl;
+        let daily_marks = config
+            .mark_prices
+            .as_ref()
+            .map(|prices| {
+                daily_nav_marks(
+                    prices,
+                    date,
+                    cadence_sessions,
+                    selected_dates.get(date_index + 1).copied(),
+                    &held,
+                    nav,
+                    entry_leg_costs,
+                    period_return,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         nav *= 1.0 + period_return;
         let benchmark_period_return = config
             .benchmark
@@ -2054,6 +2151,7 @@ pub fn backtest(
             benchmark_nav,
             active_return: benchmark_period_return.map(|value| period_return - value),
             positions,
+            daily_marks,
         });
         previous = target;
     }
@@ -2164,6 +2262,75 @@ pub fn backtest(
         steps,
         disclosures,
     })
+}
+
+/// Mark the open book at every session of one holding period, one NAV per
+/// session so phases can later be combined on calendar dates.
+///
+/// The book is bought at the open after `date` and sold at the open after the
+/// last held session. Every held session but the last is therefore marked at
+/// its own adjusted close; the last one is the rebalance session, and it is
+/// marked at the realised period close because that is where the book is
+/// actually liquidated. That final mark consequently spans the previous close
+/// through the following open rather than a single session, which is the price
+/// of executing at opens while marking at closes.
+///
+/// Entry-leg costs are charged on the first marked session; the exit leg is
+/// already inside `period_return` and therefore lands on the rebalance session
+/// alone.
+#[allow(clippy::too_many_arguments)]
+fn daily_nav_marks(
+    prices: &MarkPrices,
+    date: Date,
+    cadence_sessions: usize,
+    next_decision_date: Option<Date>,
+    held: &[(String, f64, f64)],
+    opening_nav: f64,
+    entry_leg_costs: f64,
+    period_return: f64,
+) -> Result<Vec<DailyMark>, String> {
+    if !prices.is_session(date) {
+        return Err(format!("mark prices have no {date} exchange session"));
+    }
+    let mut marks = Vec::with_capacity(cadence_sessions);
+    for session in 1..=cadence_sessions {
+        let mark_date = prices
+            .session_after(date, session)
+            .ok_or_else(|| format!("mark prices end before session {session} after {date}"))?;
+        let value = if session == cadence_sessions {
+            period_return
+        } else {
+            let mut marked_return = 0.0;
+            for (instrument_id, weight, entry_price) in held {
+                if !entry_price.is_finite() || *entry_price <= 0.0 {
+                    return Err(format!(
+                        "matrix row {instrument_id} on {date} has a non-positive entry price"
+                    ));
+                }
+                let close = prices.close_at(instrument_id, mark_date).ok_or_else(|| {
+                    format!("mark prices have no {instrument_id} close through {mark_date}")
+                })?;
+                marked_return += weight * (close / entry_price - 1.0);
+            }
+            marked_return - entry_leg_costs
+        };
+        marks.push(DailyMark {
+            date: mark_date,
+            nav: opening_nav * (1.0 + value),
+        });
+    }
+    // A mark calendar that disagrees with the replay's own session grid would
+    // silently misdate every NAV, so require the last mark to be the session
+    // the next decision is taken on.
+    if let (Some(next), Some(last)) = (next_decision_date, marks.last()) {
+        if last.date != next {
+            return Err(format!(
+                "mark calendar puts session {cadence_sessions} after {date} on {}, but the replay rebalances on {next}",
+                last.date
+            ));
+        }
+    }
+    Ok(marks)
 }
 
 pub fn summarize_rebalance_phases(
@@ -3746,6 +3913,7 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -3759,6 +3927,123 @@ mod tests {
         // One 50 bp entry and one 50 bp terminal exit on a 5% position.
         assert!((result.metrics.cost_drag - 0.0005).abs() < 1e-12);
         assert!((result.steps.iter().map(|step| step.turnover).sum::<f64>() - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn daily_marks_price_the_book_on_every_held_session() {
+        let decision = day("2024-01-02");
+        let mut first = row(decision);
+        first.entry_price = 100.0;
+        first.exit_price = 120.0;
+        first.target = 0.20;
+        let mut second = row(decision);
+        second.instrument_id = "TX2".into();
+        second.symbol = "OTHER".into();
+        second.entry_price = 50.0;
+        second.exit_price = 55.0;
+        second.target = 0.10;
+        // Decision session plus the three held sessions; the position is bought
+        // at the open after the decision and sold at the open after the last.
+        let sessions = [
+            decision,
+            day("2024-01-03"),
+            day("2024-01-04"),
+            day("2024-01-05"),
+            day("2024-01-08"),
+        ];
+        let mut mark_prices = MarkPrices::default();
+        mark_prices
+            .insert_history(
+                "TX1",
+                sessions.iter().copied().zip([98.0, 110.0, 105.0, 118.0, 121.0]),
+            )
+            .unwrap();
+        mark_prices
+            .insert_history(
+                "TX2",
+                sessions.iter().copied().zip([51.0, 45.0, 48.0, 54.0, 56.0]),
+            )
+            .unwrap();
+        let costs = CostConfig {
+            round_trip_bps: 100.0,
+            round_trip_commission_bps: 100.0,
+            ..zero_execution_costs()
+        };
+        let result = backtest(
+            &constant_model(0.02),
+            &[first, second],
+            &BacktestConfig {
+                start: decision,
+                end: decision,
+                cadence_sessions: 3,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 3,
+                prediction_horizon_scale: 1.0,
+                max_positions: 2,
+                retention_rank: 2,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                position_weight: 0.5,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs,
+                benchmark: None,
+                mark_prices: Some(mark_prices),
+            },
+        )
+        .unwrap();
+        let step = &result.steps[0];
+        assert_eq!(step.daily_marks.len(), 3);
+        assert_eq!(
+            step.daily_marks
+                .iter()
+                .map(|mark| mark.date)
+                .collect::<Vec<_>>(),
+            sessions[1..4].to_vec(),
+        );
+        // Equal 50% legs: the first session's closes offset each other exactly,
+        // so only the 25 bp entry leg on each position shows up.
+        assert!((step.daily_marks[0].nav - 0.995).abs() < 1e-12);
+        assert!((step.daily_marks[1].nav - 1.0).abs() < 1e-12);
+        // The rebalance session is marked at the realised exit, which already
+        // carries the terminal exit leg.
+        assert!((step.daily_marks[2].nav - step.nav).abs() < 1e-12);
+        let mut compounded = 1.0;
+        let mut previous = 1.0;
+        for mark in &step.daily_marks {
+            compounded *= mark.nav / previous;
+            previous = mark.nav;
+        }
+        assert!((compounded - 1.0 - step.period_return).abs() < 1e-12);
+    }
+
+    #[test]
+    fn frozen_reports_without_daily_marks_stay_readable() {
+        let step: Step = serde_json::from_str(
+            r#"{
+                "date": "2024-01-02",
+                "nav": 1.01,
+                "period_return": 0.01,
+                "gross": 0.5,
+                "net": 0.1,
+                "turnover": 0.5,
+                "long_pnl": 0.02,
+                "short_pnl": -0.01,
+                "cost_drag": 0.001,
+                "positions": []
+            }"#,
+        )
+        .unwrap();
+        assert!(step.daily_marks.is_empty());
+        let round_trip: Step = serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
+        assert!(round_trip.daily_marks.is_empty());
     }
 
     #[test]
@@ -3794,6 +4079,7 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -3838,6 +4124,7 @@ mod tests {
                     market_forecast_model_id: None,
                     costs: zero_execution_costs(),
                     benchmark: None,
+                    mark_prices: None,
                 },
             )
             .unwrap()
@@ -3889,6 +4176,7 @@ mod tests {
                 market_forecast_model_id: Some("market-fixture".into()),
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -3931,6 +4219,7 @@ mod tests {
                 market_forecast_model_id: Some("market-fixture".into()),
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -3975,6 +4264,7 @@ mod tests {
                 market_forecast_model_id: None,
                 costs,
                 benchmark: None,
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -4043,6 +4333,7 @@ mod tests {
                     ..zero_execution_costs()
                 },
                 benchmark: None,
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -4088,6 +4379,7 @@ mod tests {
                 market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(benchmark),
+                mark_prices: None,
             },
         )
         .unwrap();
@@ -4156,6 +4448,7 @@ mod tests {
                 market_forecast_model_id: None,
                 costs: zero_execution_costs(),
                 benchmark: Some(history),
+                mark_prices: None,
             },
         )
         .unwrap();
