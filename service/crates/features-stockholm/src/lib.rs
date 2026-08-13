@@ -12,25 +12,32 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-2";
-pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-1";
-pub const BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-14";
-pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-3";
-pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-4";
-pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-5";
-pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-6";
-pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-7";
-pub const QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-15";
-pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-8";
-pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-9";
-pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-10";
-pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-11";
+// Every stock feature set shares one candidate-building and cross-section
+// path, so a change to how decision-date membership or its labels are settled
+// changes all of them at once. Versions 1-16 are the contracts in force before
+// decision-date membership stopped depending on future label availability;
+// each advanced by the same offset of sixteen, so old version `n` is new
+// version `n + 16` and no number is ever reused. The separate direction matrix
+// has its own builder and keeps its own `fs-rust-stockholm-direction-*` line.
+pub const FEATURE_SET_VERSION: &str = "fs-rust-stockholm-18";
+pub const BASELINE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-17";
+pub const BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-30";
+pub const RESIDUAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-19";
+pub const PUBLIC_SHORT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-20";
+pub const PDMR_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-21";
+pub const REPORT_EVENT_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-22";
+pub const FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-23";
+pub const QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-31";
+pub const PDMR_MACRO_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-24";
+pub const PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-25";
+pub const PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-26";
+pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-27";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-17";
+    "fs-rust-stockholm-32";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-12";
+    "fs-rust-stockholm-28";
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION: &str =
-    "fs-rust-stockholm-13";
+    "fs-rust-stockholm-29";
 pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
 pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
 pub const DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-2";
@@ -3742,6 +3749,28 @@ pub struct TrainingRow {
     pub features: BTreeMap<String, f64>,
 }
 
+impl TrainingRow {
+    /// Whether a replay can both open this position and observe what it
+    /// returned. Cross-section membership deliberately does not depend on
+    /// either fact, so every consumer that turns rows into positions has to
+    /// ask, and every one of them must ask the same question.
+    ///
+    /// A member with no entry bar was never enterable. A member with an entry
+    /// bar but no exit bar is a survivorship gap: it stopped trading inside
+    /// the holding period and this crate has no terminal value for it, so a
+    /// replay cannot honour the position. Once delisted histories carry
+    /// terminal values, that second case becomes a labelled row again.
+    pub fn is_replayable(&self) -> bool {
+        self.entry_price.is_some() && self.target.is_some()
+    }
+
+    /// A member that could have been entered but whose outcome is unobserved.
+    /// Disclosed rather than silently dropped.
+    pub fn entered_without_an_observed_exit(&self) -> bool {
+        self.entry_price.is_some() && self.target.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrainingMatrix {
@@ -5259,29 +5288,10 @@ mod tests {
     #[test]
     fn cross_section_membership_ignores_whether_a_peer_survives_the_horizon() {
         let (peers, instruments) = invariance_universe("X");
-        // `bars` leaves adjusted_close equal to raw_close, so the executable
-        // adjusted open of a fixture bar is exactly its raw open.
-        let peer_mean = peers
-            .iter()
-            .map(|history| {
-                history[INVARIANCE_EXIT_INDEX].raw_open
-                    / history[INVARIANCE_DECISION_INDEX + 1].raw_open
-                    - 1.0
-            })
-            .sum::<f64>()
-            / peers.len() as f64;
+        // X gets its own ordinary phase; nothing about its forward return is
+        // arranged to flatter the market label.
         let truncated_x = dispersed_bars("X", 5, INVARIANCE_DECISION_INDEX + 4);
-        let mut full_x = dispersed_bars("X", 5, INVARIANCE_EXIT_INDEX + 1);
-        // Give the surviving arm exactly the peers' average forward return so
-        // the market label is comparable between the arms and only
-        // cross-section membership is under test.
-        let exit_open = full_x[INVARIANCE_DECISION_INDEX + 1].raw_open * (1.0 + peer_mean);
-        let exit_bar = &mut full_x[INVARIANCE_EXIT_INDEX];
-        exit_bar.raw_open = exit_open;
-        exit_bar.raw_close = exit_open;
-        exit_bar.adjusted_close = exit_open;
-        exit_bar.raw_high = exit_open * 1.005;
-        exit_bar.raw_low = exit_open * 0.995;
+        let full_x = dispersed_bars("X", 5, INVARIANCE_EXIT_INDEX + 1);
 
         let build = |x_history: &[DailyBar]| {
             let mut all_bars = peers.concat();
@@ -5308,19 +5318,14 @@ mod tests {
             assert_eq!(left.vol60, right.vol60);
             assert_eq!(left.adv20_sek, right.adv20_sek);
         }
-        // The surviving arm averages one extra, exactly-average term, so the
-        // two market labels agree to summation rounding rather than bitwise.
-        assert!(
-            (truncated.rows[0].market_target.unwrap() - full.rows[0].market_target.unwrap()).abs()
-                < 1e-12
-        );
-        assert!((truncated.rows[0].market_target.unwrap() - peer_mean).abs() < 1e-12);
-        // A degenerate cross-section would make the invariance vacuous.
+        // A degenerate cross-section ranks every member at 0.0 whatever its
+        // size, which would make the identity above vacuous.
         assert!(truncated
             .rows
             .iter()
-            .filter_map(|row| row.target)
-            .any(|target| (target - peer_mean).abs() > 1e-6));
+            .any(|row| row.features["x_ret_21"] != truncated.rows[0].features["x_ret_21"]));
+        // Each row's own executable prices and absolute outcome are its own
+        // history, so they cannot move either.
         for (left, right) in truncated
             .rows
             .iter()
@@ -5328,13 +5333,41 @@ mod tests {
             .filter(|(row, _)| row.instrument_id != "X")
         {
             assert_eq!(left.target, right.target);
-            assert!(
-                (left.relative_target.unwrap() - right.relative_target.unwrap()).abs() < 1e-12,
-                "market-relative labels must follow the invariant market label"
-            );
             assert_eq!(left.entry_price, right.entry_price);
             assert_eq!(left.exit_price, right.exit_price);
         }
+
+        // market_target is label space, not decision space: it is the
+        // equal-weight outcome of the members whose outcome was observed. When
+        // X's outcome is unobservable it drops out of that average, and the
+        // peers' market-relative labels follow it. That is not a decision-time
+        // leak - no live decision reads a label - and pretending otherwise
+        // would mean inventing a return for a stock that stopped trading.
+        let mean = |matrix: &TrainingMatrix| {
+            let observed = matrix
+                .rows
+                .iter()
+                .filter_map(|row| row.target)
+                .collect::<Vec<_>>();
+            observed.iter().sum::<f64>() / observed.len() as f64
+        };
+        for matrix in [&truncated, &full] {
+            assert!((matrix.rows[0].market_target.unwrap() - mean(matrix)).abs() < 1e-12);
+        }
+        assert_eq!(
+            truncated.rows.iter().filter_map(|row| row.target).count(),
+            5
+        );
+        assert_eq!(full.rows.iter().filter_map(|row| row.target).count(), 6);
+        assert_ne!(
+            truncated.rows[0].market_target, full.rows[0].market_target,
+            "the market label averages the observed outcomes, so it must move \
+             when one member's outcome ceases to exist"
+        );
+        assert_ne!(
+            truncated.rows[0].relative_target, full.rows[0].relative_target,
+            "market-relative labels follow their market label"
+        );
 
         let row = truncated
             .rows
@@ -6171,6 +6204,42 @@ mod tests {
         validate_selection(&["g_es_ret_21".into()]).unwrap();
         assert!(validate_selection(&["ret_21".into()]).is_err());
         assert!(validate_selection(&["x_made_up".into()]).is_err());
+    }
+
+    #[test]
+    fn every_stock_feature_set_version_is_distinct_and_past_the_pre_membership_fix_block() {
+        let versions = [
+            FEATURE_SET_VERSION,
+            BASELINE_FEATURE_SET_VERSION,
+            BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION,
+            RESIDUAL_FEATURE_SET_VERSION,
+            PUBLIC_SHORT_FEATURE_SET_VERSION,
+            PDMR_FEATURE_SET_VERSION,
+            REPORT_EVENT_FEATURE_SET_VERSION,
+            FUNDAMENTAL_FEATURE_SET_VERSION,
+            QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION,
+            PDMR_MACRO_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION,
+            PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION,
+        ];
+        assert_eq!(
+            versions.iter().collect::<BTreeSet<_>>().len(),
+            versions.len()
+        );
+        // Every set shares the candidate-building path, so none may still
+        // carry a number issued before decision-date membership was fixed.
+        for version in versions {
+            let ordinal: usize = version
+                .strip_prefix("fs-rust-stockholm-")
+                .expect("stock feature-set versions share one prefix")
+                .parse()
+                .expect("stock feature-set versions end in an ordinal");
+            assert!(ordinal > 16, "{version} predates the membership fix");
+        }
     }
 
     #[test]

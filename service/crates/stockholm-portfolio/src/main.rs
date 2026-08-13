@@ -1573,16 +1573,21 @@ fn matrix(args: &[String]) -> Result<(), String> {
         .into(),
         label_version: features_stockholm::label_version(horizon)?,
         label_policy: Some(
-            "Decision-date cross-section membership uses information available on the decision date alone. A member whose entry (t+1) or exit (t+1+H) session is missing keeps its features, cross-sectional ranks, sector medians and sample weight, and carries null targets; market and relative labels average only the members whose outcome was observed. Each decision date's sample weight is one divided by every emitted row of that date, labelled or not, so weights describe the decision cross-section rather than the trainable subset."
+            "Decision-date cross-section membership uses information available on the decision date alone. A member whose entry (t+1) or exit (t+1+H) session is missing keeps its features, cross-sectional ranks, sector medians and sample weight, and carries null targets. Each decision date's sample weight is one divided by every emitted row of that date, labelled or not, so weights describe the decision cross-section rather than the trainable subset. The label-space fields (market_target, relative_target, relative_rank_target, return_per_risk_target, relative_return_per_risk_target) are averages, centerings and ranks over the members whose outcome was observed, so they do move when a member's outcome ceases to exist; inventing a return for a security that stopped trading would be the alternative. That is a labelling limit, not a decision-time leak: no live decision reads a label."
                 .into(),
         ),
         label_coverage: Some(format!(
-            "{labelled_rows}/{} emitted rows carry an observed forward return; {} could never have been entered",
+            "{labelled_rows}/{} emitted rows carry an observed forward return; {} had no entry bar and could never have been entered; {} had an entry bar but no exit bar, so the security stopped trading inside the holding period and no terminal value exists for it",
             matrix.rows.len(),
             matrix
                 .rows
                 .iter()
                 .filter(|row| row.entry_price.is_none())
+                .count(),
+            matrix
+                .rows
+                .iter()
+                .filter(|row| row.entered_without_an_observed_exit())
                 .count()
         )),
         features: matrix.features,

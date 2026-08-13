@@ -2019,6 +2019,12 @@ pub fn backtest(
     };
     let mut previous: BTreeMap<String, (f64, UniverseBucket, ExecutionCost)> = BTreeMap::new();
     let mut diagnostic_blocks = Vec::with_capacity(selected_dates.len());
+    // Candidate-periods this replay would have opened but had to drop because
+    // the security stopped trading inside the holding period and no terminal
+    // value exists for it. Temporary: Phase 1 wires delisted terminal values,
+    // after which these become ordinary labelled rows. Until then the count is
+    // disclosed rather than absorbed into the result.
+    let mut unpriceable_candidate_periods = 0_usize;
     let mut borrow_diagnostics = BorrowDiagnostics {
         matrix_rows: by_date.values().map(Vec::len).sum(),
         matrix_rows_with_fee: by_date
@@ -2107,11 +2113,16 @@ pub fn backtest(
             } else {
                 (Direction::Short, short_edge)
             };
-            // A row without an entry bar could not have been opened, and one
-            // without an exit bar has no outcome this replay could honour.
-            // Both still shaped the cross-section above; neither is tradable.
-            let (Some(entry_price), Some(realised_return)) = (row.entry_price, row.target) else {
+            // The row shaped the cross-section above whatever happened next,
+            // but only a replayable one can become a position.
+            if !row.is_replayable() {
+                if row.entered_without_an_observed_exit() {
+                    unpriceable_candidate_periods += 1;
+                }
                 continue;
+            }
+            let (Some(entry_price), Some(realised_return)) = (row.entry_price, row.target) else {
+                unreachable!("a replayable row has both an entry price and an outcome")
             };
             if edge > 0.0 {
                 candidates.push(Candidate {
@@ -2492,6 +2503,11 @@ pub fn backtest(
         disclosures.push("Execution spread uses each security's causal 20-session median Nasdaq closing bid/ask spread when at least ten observations exist; it is a next-open execution proxy, not a fill record. Missing rows use the configured fallback.".into());
     }
     disclosures.push("IBKR Sweden percentage commission is modeled as 0.05% per side. The tiered SEK 10 and fixed SEK 49 per-order minima require NAV-aware minimum-trade-value enforcement and are not represented by a constant-bps replay.".into());
+    if unpriceable_candidate_periods > 0 {
+        disclosures.push(format!(
+            "{unpriceable_candidate_periods} rebalance-date row(s) shaped the decision cross-section but could not be selected by this replay or its selection-layer diagnostic: the security had an entry price and then stopped trading inside the holding period, leaving no terminal value to price the exit. Excluding them biases both toward securities that survived the horizon. This is temporary until delisted terminal values are wired in."
+        ));
+    }
     Ok(BacktestResult {
         kind: "stockholm_walk_forward_fold".into(),
         model_id: model.model_id.clone(),
@@ -3242,13 +3258,12 @@ fn selection_layer_metrics(
     let mut previous: BTreeMap<String, (f64, ExecutionCost)> = BTreeMap::new();
     let mut steps = Vec::with_capacity(selected_dates.len());
     for (date_index, date) in selected_dates.iter().copied().enumerate() {
-        // Only a row with an executable entry and an observed outcome can be
-        // replayed. The others were cross-section members that shaped the
-        // ranks; they were never tradable names.
+        // The others were cross-section members that shaped the ranks; they
+        // were never tradable names.
         let rows = by_date[&date]
             .iter()
             .copied()
-            .filter(|row| row.entry_price.is_some() && row.target.is_some())
+            .filter(|row| row.is_replayable())
             .collect::<Vec<_>>();
         if rows.len() < positions_per_side * 2 {
             continue;
@@ -3395,13 +3410,18 @@ pub fn fixed_momentum_backtest(
         );
     }
     let mut by_date: BTreeMap<Date, Vec<&TrainingRow>> = BTreeMap::new();
+    // See `backtest`: entered-then-delisted rows are dropped and disclosed
+    // until delisted terminal values exist.
+    let mut unpriceable_rows = 0_usize;
     for row in rows {
         if row.date < config.start || row.date > config.end {
             continue;
         }
-        // The control replays executable positions only. A cross-section
-        // member with no entry bar or no observed outcome is not one.
-        if row.entry_price.is_none() || row.target.is_none() {
+        // The control replays executable positions only.
+        if !row.is_replayable() {
+            if row.entered_without_an_observed_exit() {
+                unpriceable_rows += 1;
+            }
             continue;
         }
         match row.momentum_12_1 {
@@ -3459,13 +3479,21 @@ pub fn fixed_momentum_backtest(
         directional,
         long_only,
         long_short_diagnostic,
-        disclosures: vec![
-            "The fixed rule and its 12-1 lookback were declared before this replay; it is an acceptance control, not a newly fitted model.".into(),
-            "The directional arm chooses the strongest absolute positive or negative stock trends without a long/short quota. Each name keeps the fixed maximum weight and unused capacity stays cash.".into(),
-            "The long/short arm is a dollar-neutral ranking diagnostic only; it is not the intended live allocation policy.".into(),
-            "Historical borrow quantity is unavailable. Short holding fees use causal IB FEE_RATE where present and the configured fallback otherwise; new shorts also pay an availability penalty.".into(),
-            "The current-security history still omits many inactive and delisted shares, so survivorship contamination prevents capital authorization.".into(),
-        ],
+        disclosures: {
+            let mut disclosures = vec![
+                "The fixed rule and its 12-1 lookback were declared before this replay; it is an acceptance control, not a newly fitted model.".into(),
+                "The directional arm chooses the strongest absolute positive or negative stock trends without a long/short quota. Each name keeps the fixed maximum weight and unused capacity stays cash.".into(),
+                "The long/short arm is a dollar-neutral ranking diagnostic only; it is not the intended live allocation policy.".into(),
+                "Historical borrow quantity is unavailable. Short holding fees use causal IB FEE_RATE where present and the configured fallback otherwise; new shorts also pay an availability penalty.".into(),
+                "The current-security history still omits many inactive and delisted shares, so survivorship contamination prevents capital authorization.".into(),
+            ];
+            if unpriceable_rows > 0 {
+                disclosures.push(format!(
+                    "{unpriceable_rows} matrix row(s) were excluded from ranking: the security had an entry price and then stopped trading inside the holding period, and no terminal value exists for it. Dropping them biases this control toward securities that survived the horizon. This is temporary until delisted terminal values are wired in."
+                ));
+            }
+            disclosures
+        },
     })
 }
 
@@ -4610,6 +4638,62 @@ mod tests {
         assert_eq!(result.long_only.steps[0].long_positions, 2);
         assert_eq!(result.long_only.steps[0].short_positions, 0);
         assert!((result.long_only.steps[0].net_return - 0.075).abs() < 1e-12);
+        assert!(!result
+            .disclosures
+            .iter()
+            .any(|line| line.contains("no terminal value")));
+    }
+
+    #[test]
+    fn the_fixed_momentum_control_discloses_the_rows_it_could_not_price() {
+        let date = day("2024-02-01");
+        let mut rows = [("A", 0.40, 0.10), ("B", 0.20, 0.05), ("C", -0.30, -0.08)]
+            .into_iter()
+            .map(|(instrument, momentum, target)| {
+                let mut value = row(date);
+                value.instrument_id = instrument.into();
+                value.symbol = instrument.into();
+                value.momentum_12_1 = Some(momentum);
+                value.target = Some(target);
+                value
+            })
+            .collect::<Vec<_>>();
+        // The strongest trend of the date stopped trading inside the holding
+        // period. The control cannot price its exit, so it silently would
+        // have ranked a weaker name instead.
+        let mut delisted = row(date);
+        delisted.instrument_id = "GONE".into();
+        delisted.symbol = "GONE".into();
+        delisted.momentum_12_1 = Some(0.90);
+        delisted.target = None;
+        rows.push(delisted);
+
+        let result = fixed_momentum_backtest(
+            &rows,
+            &FixedMomentumConfig {
+                start: date,
+                end: date,
+                cadence_sessions: 20,
+                max_positions: 2,
+                position_weight: 0.5,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                survivorship_status: "test".into(),
+            },
+        )
+        .unwrap();
+
+        // A (+0.40) and C (-0.30) are taken, not the stronger unpriceable
+        // GONE (+0.90): 0.5 * 0.10 + 0.5 * 0.08.
+        assert_eq!(result.directional.steps[0].long_positions, 1);
+        assert_eq!(result.directional.steps[0].short_positions, 1);
+        assert!((result.directional.steps[0].net_return - 0.09).abs() < 1e-12);
+        let disclosure = result
+            .disclosures
+            .iter()
+            .find(|line| line.contains("no terminal value"))
+            .expect("an unpriceable exit must be disclosed");
+        assert!(disclosure.starts_with("1 matrix row(s)"), "{disclosure}");
     }
 
     fn row(date: Date) -> TrainingRow {
@@ -4679,11 +4763,11 @@ mod tests {
 
     #[test]
     fn the_replay_never_trades_a_cross_section_member_it_cannot_price() {
-        let unlabelled = |date: Date, instrument: &str| {
+        let unlabelled = |date: Date, instrument: &str, entry_price: Option<f64>| {
             let mut value = row(date);
             value.instrument_id = instrument.into();
             value.symbol = instrument.into();
-            value.entry_price = None;
+            value.entry_price = entry_price;
             value.exit_price = None;
             value.target = None;
             value.relative_target = None;
@@ -4692,10 +4776,20 @@ mod tests {
             value.relative_rank_target = None;
             value
         };
+        // Never entered at all versus entered and then delisted mid-horizon.
+        // Neither is replayable; only the second is a survivorship gap worth
+        // disclosing, because that position would otherwise have been opened.
+        let never_entered = unlabelled(day("2024-01-02"), "NOENTRY", None);
+        let delisted = unlabelled(day("2024-01-02"), "GONE", Some(100.0));
+        assert!(!never_entered.is_replayable());
+        assert!(!never_entered.entered_without_an_observed_exit());
+        assert!(!delisted.is_replayable());
+        assert!(delisted.entered_without_an_observed_exit());
+        assert!(row(day("2024-01-02")).is_replayable());
         // A new matrix carries decision-date rows whose forward outcome was
         // never observed. They must survive deserialization, stay out of the
         // book, and never turn a labelless date into a rebalance.
-        let encoded = serde_json::to_string(&unlabelled(day("2024-01-02"), "GONE")).unwrap();
+        let encoded = serde_json::to_string(&never_entered).unwrap();
         assert!(encoded.contains("\"target\":null"));
         assert!(encoded.contains("\"entry_price\":null"));
         let decoded: TrainingRow = serde_json::from_str(&encoded).unwrap();
@@ -4703,9 +4797,10 @@ mod tests {
 
         let rows = [
             row(day("2024-01-02")),
-            unlabelled(day("2024-01-02"), "GONE"),
+            never_entered.clone(),
+            delisted.clone(),
             row(day("2024-01-03")),
-            unlabelled(day("2024-01-04"), "GONE"),
+            unlabelled(day("2024-01-04"), "GONE", Some(100.0)),
         ];
         let result = backtest(
             &constant_model(0.02),
@@ -4748,9 +4843,21 @@ mod tests {
             .steps
             .iter()
             .flat_map(|step| &step.positions)
-            .all(|position| position.instrument_id != "GONE"));
+            .all(|position| !["GONE", "NOENTRY"].contains(&position.instrument_id.as_str())));
         // Skipped rather than scored as a zero realized return.
         assert_eq!(result.diagnostics.unwrap().observations, 2);
+        // The one entered-then-delisted row on a replayed rebalance date is
+        // disclosed, not absorbed. The 2024-01-04 row is not counted because
+        // that whole date has no observed outcome and is never replayed.
+        let disclosure = result
+            .disclosures
+            .iter()
+            .find(|line| line.contains("no terminal value"))
+            .expect("an unpriceable exit must be disclosed");
+        assert!(
+            disclosure.starts_with("1 rebalance-date row(s)"),
+            "{disclosure}"
+        );
     }
 
     #[test]
