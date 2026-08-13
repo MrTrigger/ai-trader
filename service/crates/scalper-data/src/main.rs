@@ -1,6 +1,7 @@
 mod binance_um;
 mod books;
 mod costs;
+mod gate;
 mod matrix;
 mod universe;
 
@@ -61,16 +62,24 @@ usage: scalper-data <command>
       followed by one JSON row per line to --out. A candidate with no bars
       in the store is skipped with a warning, not a fatal error. Prints
       per-asset row counts.
+
+  gate --matrix <path> --folds <path/folds.json> --costs <path> [--threshold-mult 1.5] [--notional 5000] --out <path>
+      Walk-forward gate: for each fold in folds.json, load fold-N.json (a
+      LightGBM JSON dump), predict every matrix row in that fold's test
+      window via lightgbm-json, and simulate a threshold-gated long/short
+      strategy net of measured round-trip costs from the plan-2 cost summary.
+      Stitches per-fold daily P&L into one series and reports the
+      annualized Sharpe gate (>= 2.0 to PASS) to --out.
 ";
 
-fn get(args: &[String], name: &str) -> Option<String> {
+pub(crate) fn get(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|v| v == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
 
-fn need(args: &[String], name: &str) -> Result<String, String> {
+pub(crate) fn need(args: &[String], name: &str) -> Result<String, String> {
     get(args, name).ok_or_else(|| format!("{name} is required"))
 }
 
@@ -630,6 +639,7 @@ fn main() -> ExitCode {
         }
         Some("summarize-costs") => cmd_summarize_costs(&args[1..]),
         Some("training-matrix") => cmd_training_matrix(&args[1..]),
+        Some("gate") => gate::cmd_gate(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

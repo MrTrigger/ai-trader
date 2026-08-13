@@ -3181,6 +3181,7 @@ dependencies = [
  "features-crypto",
  "features-scalper",
  "hyperliquid",
+ "lightgbm-json",
  "reqwest",
  "serde",
  "serde_json",
