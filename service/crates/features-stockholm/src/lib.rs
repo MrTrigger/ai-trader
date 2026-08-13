@@ -39,6 +39,15 @@ pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION: &str 
 pub const PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION: &str =
     "fs-rust-stockholm-29";
 pub const MARKET_TREND_VERSION: &str = "stockholm-market-trend-1";
+/// Diagnostics-only: the FI historical short-register is keyed by
+/// `position_date`, and late filings backfill that date, so any candidate
+/// model built on it risks look-ahead. This line keeps the full
+/// `PublicShortCursor` family reachable for research (e.g. quantifying the
+/// look-ahead itself) without it ever appearing in a candidate contract; see
+/// `FeatureSet::DiagnosticsPublicShortLookahead`. It intentionally does not
+/// share the `fs-rust-stockholm-<ordinal>` candidate line or numbering.
+pub const DIAGNOSTICS_PUBLIC_SHORT_LOOKAHEAD_FEATURE_SET_VERSION: &str =
+    "fs-rust-stockholm-diagnostics-public-short-lookahead-1";
 pub const DIRECTION_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-1";
 pub const DIRECTION_GLOBAL_RISK_FEATURE_SET_VERSION: &str = "fs-rust-stockholm-direction-2";
 pub const DIRECTION_STOCKHOLM_CLOSE_GLOBAL_RISK_FEATURE_SET_VERSION: &str =
@@ -1055,7 +1064,24 @@ pub fn residual_model_feature_names() -> Vec<String> {
         .collect()
 }
 
+/// Task 7(d): amended in place to drop the position-date-keyed FI public-short
+/// family (late filings backfill `position_date`, a real look-ahead risk for
+/// a candidate model). No version bump: Task 5 just renumbered every
+/// candidate set and no real matrix has been built under the new numbers
+/// yet, so this amendment breaks nothing that exists. The contract is now
+/// identical to `residual_model_feature_names`; it survives as a distinct
+/// `FeatureSet`/version string for continuity, not because its content
+/// still differs. The retired family lives on only behind
+/// `diagnostics_public_short_lookahead_model_feature_names`.
 pub fn public_short_model_feature_names() -> Vec<String> {
+    residual_model_feature_names()
+}
+
+/// Diagnostics-only counterpart of `public_short_model_feature_names` that
+/// keeps the retired, position-date-keyed FI public-short family. Never use
+/// this for a candidate model; it exists so the look-ahead-prone family and
+/// its `PublicShortCursor` stay reachable for research.
+pub fn diagnostics_public_short_lookahead_model_feature_names() -> Vec<String> {
     FEATURE_NAMES
         .iter()
         .chain(RESIDUAL_FEATURE_NAMES)
@@ -1430,7 +1456,16 @@ pub enum FeatureSet {
     BaselineGlobalRisk,
     Context,
     Residual,
+    /// The candidate contract. Amended in place (see
+    /// `DIAGNOSTICS_PUBLIC_SHORT_LOOKAHEAD_FEATURE_SET_VERSION`'s doc
+    /// comment) to no longer carry the position-date-keyed public-short
+    /// family; its feature list is now identical to `Residual`.
     ResidualPublicShort,
+    /// Diagnostics-only: keeps the retired public-short family and its
+    /// `PublicShortCursor` reachable for research. Never a candidate
+    /// contract -- not wired into `validate_selection`, the runtime, or the
+    /// CLI's `--feature-set` flag.
+    DiagnosticsPublicShortLookahead,
     ResidualPdmr,
     ResidualPdmrReports,
     ResidualFundamentals,
@@ -4132,6 +4167,7 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         feature_set,
         FeatureSet::Residual
             | FeatureSet::ResidualPublicShort
+            | FeatureSet::DiagnosticsPublicShortLookahead
             | FeatureSet::ResidualPdmr
             | FeatureSet::ResidualPdmrReports
             | FeatureSet::ResidualFundamentals
@@ -4283,6 +4319,9 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
         FeatureSet::Context => model_feature_names(),
         FeatureSet::Residual => residual_model_feature_names(),
         FeatureSet::ResidualPublicShort => public_short_model_feature_names(),
+        FeatureSet::DiagnosticsPublicShortLookahead => {
+            diagnostics_public_short_lookahead_model_feature_names()
+        }
         FeatureSet::ResidualPdmr => pdmr_model_feature_names(),
         FeatureSet::ResidualPdmrReports => pdmr_report_model_feature_names(),
         FeatureSet::ResidualFundamentals => fundamental_model_feature_names(),
@@ -4303,7 +4342,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             pdmr_microstructure_borrow_news_report_text_model_feature_names()
         }
     };
-    let mut public_short_cursor = (feature_set == FeatureSet::ResidualPublicShort)
+    // Only the diagnostics-labeled feature set may build the position-date-
+    // keyed cursor now; the ResidualPublicShort candidate contract no longer
+    // requests these features at all (see public_short_model_feature_names).
+    let mut public_short_cursor = (feature_set == FeatureSet::DiagnosticsPublicShortLookahead)
         .then(|| PublicShortCursor::new(public_short_events))
         .transpose()?;
     let mut pdmr_cursor = (feature_set == FeatureSet::ResidualPdmr)
@@ -4571,7 +4613,10 @@ pub fn training_matrix_for_named_feature_set_with_all_sources_and_eligibility(
             )?,
             FeatureSet::Context => model_cross_section(&context)?,
             FeatureSet::Residual => residual_cross_section(&context, &residual)?,
-            FeatureSet::ResidualPublicShort => {
+            // Same feature list as Residual now; see
+            // public_short_model_feature_names.
+            FeatureSet::ResidualPublicShort => residual_cross_section(&context, &residual)?,
+            FeatureSet::DiagnosticsPublicShortLookahead => {
                 residual_public_short_cross_section(&context, &residual, &public_short)?
             }
             FeatureSet::ResidualPdmr => residual_pdmr_cross_section(&context, &residual, &pdmr)?,
@@ -6298,6 +6343,66 @@ mod tests {
                 .expect("stock feature-set versions end in an ordinal");
             assert!(ordinal > 16, "{version} predates the membership fix");
         }
+    }
+
+    #[test]
+    fn residual_public_short_no_longer_carries_the_lookahead_prone_short_family() {
+        // Task 7(d): FI's historical short-register events are keyed by
+        // position_date, and late filings backfill that date -- a real
+        // look-ahead risk for any candidate model trained on it. The
+        // ResidualPublicShort candidate contract (fs-rust-stockholm-20) is
+        // amended in place (no version bump: Task 5 just renumbered every
+        // set and no real matrix has been built under the new numbers yet)
+        // to drop the family entirely. The historical cursor survives only
+        // behind the explicitly diagnostics-labeled FeatureSet.
+        let names = public_short_model_feature_names();
+        for short_name in PUBLIC_SHORT_FEATURE_NAMES {
+            assert!(
+                !names.iter().any(|name| name.ends_with(short_name)),
+                "candidate public-short contract still carries {short_name}"
+            );
+        }
+        assert_eq!(names, residual_model_feature_names());
+
+        // The diagnostics-only path still carries the full family.
+        let diagnostics_names = diagnostics_public_short_lookahead_model_feature_names();
+        for short_name in PUBLIC_SHORT_FEATURE_NAMES {
+            assert!(
+                diagnostics_names
+                    .iter()
+                    .any(|name| name.ends_with(short_name)),
+                "diagnostics contract lost {short_name}"
+            );
+        }
+
+        // A candidate matrix under the amended contract builds with no
+        // public-short events at all -- it no longer needs (or accepts) them.
+        let mut all_bars = Vec::new();
+        let mut instruments = Vec::new();
+        for index in 0..20 {
+            let id = format!("P{index}");
+            all_bars.extend(bars(&id, 330, 1.0 + index as f64 / 100.0));
+            instruments.push(InstrumentMeta {
+                instrument_id: id,
+                symbol: format!("PS{index}"),
+                isin: format!("SE{index:010}"),
+                sector: if index < 10 { "A" } else { "B" }.into(),
+                bucket: UniverseBucket::LargeCap,
+            });
+        }
+        let cutoff =
+            Date::from_calendar_date(2024, Month::January, 1).unwrap() + Duration::days(299);
+        let matrix = training_matrix_for_named_feature_set(
+            &all_bars,
+            &instruments,
+            cutoff,
+            cutoff + Duration::days(20),
+            5,
+            0.0,
+            FeatureSet::ResidualPublicShort,
+        )
+        .unwrap();
+        assert_eq!(matrix.features, residual_model_feature_names());
     }
 
     #[test]

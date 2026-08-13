@@ -548,8 +548,19 @@ pub struct CostConfig {
     pub market_friction_multiple: f64,
     /// Extra First North round-trip spread/impact in basis points.
     pub first_north_extra_bps: f64,
-    /// Borrow fee charged over one holding period in basis points.
-    pub short_borrow_bps: f64,
+    /// Fallback borrow fee, in ANNUAL basis points, charged only when a row
+    /// lacks a causal measured `borrow_fee_annualized`. The realized
+    /// per-holding-period charge is `short_borrow_annual_bps/10_000 *
+    /// cadence_sessions/252`; cadence must always be passed explicitly (see
+    /// `holding_borrow_cost`). Renamed from the old `short_borrow_bps`, which
+    /// was an implicit per-5-session charge only correct because CLI call
+    /// sites separately rescaled it by `cadence/5` -- that rescale is gone
+    /// now that this field is unambiguously annual.
+    #[serde(
+        alias = "short_borrow_bps",
+        default = "default_short_borrow_annual_bps"
+    )]
+    pub short_borrow_annual_bps: f64,
     /// Conservative penalty for unobserved historical availability.
     pub short_availability_bps: f64,
     pub safety_margin_bps: f64,
@@ -566,7 +577,7 @@ impl Default for CostConfig {
             fallback_spread_bps: default_fallback_spread_bps(),
             market_friction_multiple: default_market_friction_multiple(),
             first_north_extra_bps: 35.0,
-            short_borrow_bps: 10.0,
+            short_borrow_annual_bps: default_short_borrow_annual_bps(),
             short_availability_bps: 25.0,
             safety_margin_bps: 10.0,
         }
@@ -587,6 +598,17 @@ fn default_fallback_spread_bps() -> f64 {
 
 fn default_market_friction_multiple() -> f64 {
     1.0
+}
+
+/// Old frozen reports and configs recorded a fallback short-borrow charge of
+/// 10.0 bps that the CLI implicitly treated as "per 5 sessions" (rescaling it
+/// by `cadence/5` before use, i.e. 2 bps/session). The annual equivalent that
+/// keeps every already-realized charge unchanged is `2 bps/session * 252
+/// sessions/year = 504 bps/year`; equivalently, the frozen 20-session default
+/// of `10.0 * 20/5 = 40 bps` per holding period annualizes to `40 * 252/20 =
+/// 504 bps`.
+fn default_short_borrow_annual_bps() -> f64 {
+    504.0
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -630,7 +652,7 @@ fn execution_cost(row: &TrainingRow, costs: &CostConfig) -> Result<ExecutionCost
         costs.fallback_spread_bps,
         costs.market_friction_multiple,
         costs.first_north_extra_bps,
-        costs.short_borrow_bps,
+        costs.short_borrow_annual_bps,
         costs.short_availability_bps,
         costs.safety_margin_bps,
     ];
@@ -671,7 +693,7 @@ fn holding_borrow_cost(
     costs: &CostConfig,
 ) -> Result<f64, String> {
     let Some(annual_rate) = row.borrow_fee_annualized else {
-        return Ok(costs.short_borrow_bps / 10_000.0);
+        return Ok(costs.short_borrow_annual_bps / 10_000.0 * cadence_sessions as f64 / 252.0);
     };
     if !annual_rate.is_finite() || annual_rate < 0.0 {
         return Err(format!(
@@ -2292,7 +2314,10 @@ pub fn backtest(
             let (borrow_rate, observed) = holding_borrow_costs
                 .get(&instrument_id)
                 .copied()
-                .unwrap_or((costs.short_borrow_bps / 10_000.0, false));
+                .unwrap_or((
+                    costs.short_borrow_annual_bps / 10_000.0 * cadence_sessions as f64 / 252.0,
+                    false,
+                ));
             let holding_cost = target_short * borrow_rate;
             amount += holding_cost;
             if target_short > 0.0 {
@@ -4402,10 +4427,31 @@ mod tests {
         observed.borrow_fee_annualized = None;
         assert!(
             (holding_borrow_cost(&observed, 10, &costs).unwrap()
-                - costs.short_borrow_bps / 10_000.0)
+                - costs.short_borrow_annual_bps / 10_000.0 * 10.0 / 252.0)
                 .abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn library_caller_with_explicit_cadence_charges_the_annual_rate_prorated_without_a_cli_rescale()
+    {
+        // Before this fix, the CLI multiplied the fallback `short_borrow_bps`
+        // by `cadence/5` before calling into the library, making the field
+        // implicitly "per 5 sessions" -- correct only because of that
+        // external rescale. The library now takes the cadence explicitly and
+        // prorates an annual rate itself: the frozen realized charge at
+        // cadence 20 was 40 bps per holding period (10.0 default *
+        // 20/5 CLI rescale). The equivalent annual rate is
+        // 40 bps * 252/20 = 504 bps, so a caller that passes cadence
+        // straight into the library -- no CLI rescale involved -- must still
+        // realize 504 bps * 20/252 = 40 bps over a 20-session holding period.
+        let mut unobserved = row(day("2024-01-02"));
+        unobserved.borrow_fee_annualized = None;
+        let costs = CostConfig::default();
+        assert!((costs.short_borrow_annual_bps - 504.0).abs() < 1e-9);
+        let charge = holding_borrow_cost(&unobserved, 20, &costs).unwrap();
+        assert!((charge - 0.0040).abs() < 1e-12, "got {charge}");
     }
 
     #[test]
@@ -4730,7 +4776,7 @@ mod tests {
             fallback_spread_bps: 0.0,
             market_friction_multiple: 1.0,
             first_north_extra_bps: 0.0,
-            short_borrow_bps: 0.0,
+            short_borrow_annual_bps: 0.0,
             short_availability_bps: 0.0,
             safety_margin_bps: 0.0,
         }
@@ -5725,6 +5771,29 @@ mod tests {
     }
 
     #[test]
+    fn cost_config_still_reads_the_legacy_short_borrow_bps_field_name() {
+        // Frozen reports on disk (e.g. var/stockholm-remediation/phase-0-v3.json)
+        // still serialize the old `short_borrow_bps` key under `deny_unknown_fields`.
+        // They must stay readable, even though their number was the old
+        // per-holding-period convention rather than the new annual rate.
+        let costs: CostConfig = serde_json::from_str(
+            r#"{
+                "round_trip_bps": 35.0,
+                "round_trip_commission_bps": 10.0,
+                "round_trip_impact_bps": 5.0,
+                "fallback_spread_bps": 20.0,
+                "market_friction_multiple": 1.0,
+                "first_north_extra_bps": 35.0,
+                "short_borrow_bps": 40.0,
+                "short_availability_bps": 25.0,
+                "safety_margin_bps": 10.0
+            }"#,
+        )
+        .unwrap();
+        assert!((costs.short_borrow_annual_bps - 40.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn borrow_diagnostics_separate_observed_cost_from_availability_penalty() {
         let mut observed = row(day("2024-01-02"));
         observed.borrow_fee_annualized = Some(0.252);
@@ -5753,7 +5822,7 @@ mod tests {
                 market_return_forecasts: None,
                 market_forecast_model_id: None,
                 costs: CostConfig {
-                    short_borrow_bps: 10.0,
+                    short_borrow_annual_bps: 10.0,
                     short_availability_bps: 20.0,
                     ..zero_execution_costs()
                 },

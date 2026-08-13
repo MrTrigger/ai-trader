@@ -753,6 +753,31 @@ pub fn allocate_with_group_cap(
     for (id, weight) in &mut allocation.weights {
         *weight *= scales[groups[id].as_str()];
     }
+    // Group scaling can push a position that survived the ordinary
+    // per-name minimum below it again. Drop it to cash rather than carry a
+    // sub-minimum sliver; the freed weight is not redistributed (scale-down
+    // only), matching the ordinary allocate() contract.
+    let min_abs_weight_by_id: BTreeMap<&str, f64> = proposals
+        .iter()
+        .map(|proposal| (proposal.id.as_str(), proposal.min_abs_weight))
+        .collect();
+    let mut dropped_by_group_cap = Vec::new();
+    allocation.weights.retain(|id, weight| {
+        let minimum = min_abs_weight_by_id
+            .get(id.as_str())
+            .copied()
+            .unwrap_or(0.0);
+        if weight.abs() + EPSILON < minimum {
+            dropped_by_group_cap.push(id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    allocation
+        .diagnostics
+        .dropped_below_minimum
+        .extend(dropped_by_group_cap);
     let realised_long = allocation
         .weights
         .values()
@@ -1049,6 +1074,32 @@ mod tests {
         assert!((allocation.weights["c"] - 0.1).abs() < EPSILON);
         assert!((allocation.diagnostics.realised_gross - 0.6).abs() < EPSILON);
         assert_eq!(allocation.diagnostics.capped_positions, ["a"]);
+    }
+
+    #[test]
+    fn group_cap_drops_positions_scaled_below_minimum_instead_of_keeping_them_tiny() {
+        // Both survive the ordinary per-name allocate() pass on their own
+        // minimums (0.05 and 0.03). The sector cap then scales the whole
+        // "one" group down by 3/7 (0.15 / 0.35), which pushes "b" under its
+        // own minimum (0.05*3/7 ~= 0.0214 < 0.03) while leaving "a" above
+        // (0.30*3/7 ~= 0.1286 > 0.05). "b" must be dropped to cash, not kept
+        // as a sub-minimum sliver, and the dropped weight must not inflate
+        // "a" (scale-down-only: no redistribution).
+        let mut a = proposal("a", Direction::Long, 0.30, 0.30);
+        a.min_abs_weight = 0.05;
+        let mut b = proposal("b", Direction::Long, 0.05, 0.05);
+        b.min_abs_weight = 0.03;
+        let proposals = [a, b];
+        let groups = BTreeMap::from([("a".into(), "one".into()), ("b".into(), "one".into())]);
+        let allocation =
+            allocate_with_group_cap(&proposals, Budget::gross_only(1.0).unwrap(), &groups, 0.15)
+                .unwrap();
+        let expected_a = 0.30 * 3.0 / 7.0;
+        assert!(!allocation.weights.contains_key("b"));
+        assert!((allocation.weights["a"] - expected_a).abs() < EPSILON);
+        assert_eq!(allocation.diagnostics.dropped_below_minimum, ["b"]);
+        assert!((allocation.diagnostics.realised_long - expected_a).abs() < EPSILON);
+        assert!((allocation.diagnostics.realised_gross - expected_a).abs() < EPSILON);
     }
 
     #[test]

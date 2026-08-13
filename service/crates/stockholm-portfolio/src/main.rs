@@ -397,6 +397,22 @@ fn collect_fi_net_shorts(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Prospective, publication-timestamped counterpart to `collect_fi_net_shorts`.
+/// Run this on a schedule: it stamps each register row with the wall-clock
+/// time it was first seen, building a causal history the position-date-keyed
+/// register cannot give retroactively. No feature reads it yet.
+fn collect_fi_net_short_observations(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let collection = equity_data::collect_fi_net_short_observations(&root)?;
+    println!(
+        "collected {} new FI net-short observations, {} total -> {}",
+        collection.observations_added,
+        collection.observations_total,
+        collection.log_path.display(),
+    );
+    Ok(())
+}
+
 fn collect_skv_equity_history(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let collection = equity_data::collect_skv_equity_history_catalogue(&root)?;
@@ -420,11 +436,12 @@ fn collect_skv_listing_events(args: &[String]) -> Result<(), String> {
         number(args, "--limit", 0_usize)?,
     )?;
     println!(
-        "archived {}/{} Skatteverket company pages, {} listing rows, {} failures -> {}",
+        "archived {}/{} Skatteverket company pages, {} listing rows, {} failures, {} rows with an unparsed admission date -> {}",
         collection.companies_archived,
         collection.companies_requested,
         collection.listing_rows,
         collection.failures,
+        collection.admission_date_unparsed,
         collection.dataset_path.display(),
     );
     Ok(())
@@ -1268,14 +1285,13 @@ fn matrix(args: &[String]) -> Result<(), String> {
     } else {
         Vec::new()
     };
+    // residual-public-short no longer builds any public-short feature (see
+    // features_stockholm::public_short_model_feature_names), so --fi-net-shorts
+    // is accepted but never required here; the diagnostics-only feature set
+    // that still uses it is not reachable from this flag at all.
     let public_short_dataset = get(args, "--fi-net-shorts")
         .map(|path| equity_data::load_fi_net_shorts(Path::new(&path)))
         .transpose()?;
-    if feature_set == features_stockholm::FeatureSet::ResidualPublicShort
-        && public_short_dataset.is_none()
-    {
-        return Err("--fi-net-shorts is required for residual-public-short features".into());
-    }
     let public_short_events = public_short_dataset
         .as_ref()
         .map(|dataset| {
@@ -1535,6 +1551,11 @@ fn matrix(args: &[String]) -> Result<(), String> {
             }
             features_stockholm::FeatureSet::ResidualPublicShort => {
                 features_stockholm::PUBLIC_SHORT_FEATURE_SET_VERSION
+            }
+            // Diagnostics-only; the `--feature-set` flag above never
+            // produces this variant. Handled here only for exhaustiveness.
+            features_stockholm::FeatureSet::DiagnosticsPublicShortLookahead => {
+                features_stockholm::DIAGNOSTICS_PUBLIC_SHORT_LOOKAHEAD_FEATURE_SET_VERSION
             }
             features_stockholm::FeatureSet::ResidualPdmr => {
                 features_stockholm::PDMR_FEATURE_SET_VERSION
@@ -2305,7 +2326,9 @@ fn run_fixed_momentum_backtest(args: &[String]) -> Result<(), String> {
     costs.market_friction_multiple = multiple;
     costs.round_trip_bps = costs.round_trip_commission_bps
         + multiple * (costs.round_trip_impact_bps + costs.fallback_spread_bps);
-    costs.short_borrow_bps *= cadence as f64 / 5.0;
+    // No borrow-fallback rescale here: short_borrow_annual_bps is an annual
+    // rate and the library prorates it by cadence/252 itself from the
+    // cadence_sessions it is already given below.
     let benchmark = get(args, "--benchmark")
         .map(|path| equity_data::load_benchmark(Path::new(&path)))
         .transpose()?;
@@ -2521,7 +2544,9 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     costs.market_friction_multiple = multiple;
     costs.round_trip_bps = costs.round_trip_commission_bps
         + multiple * (costs.round_trip_impact_bps + costs.fallback_spread_bps);
-    costs.short_borrow_bps *= cadence as f64 / 5.0;
+    // No borrow-fallback rescale here: short_borrow_annual_bps is an annual
+    // rate and the library prorates it by cadence/252 itself from the
+    // cadence_sessions it is already given below.
     let benchmark = get(args, "--benchmark")
         .map(|path| equity_data::load_benchmark(Path::new(&path)))
         .transpose()?;
@@ -2893,6 +2918,7 @@ fn main() -> ExitCode {
         Some("collect") => collect(&args[1..]),
         Some("collect-benchmark") => collect_benchmark(&args[1..]),
         Some("collect-fi-net-shorts") => collect_fi_net_shorts(&args[1..]),
+        Some("collect-fi-net-short-observations") => collect_fi_net_short_observations(&args[1..]),
         Some("collect-skv-equity-history") => collect_skv_equity_history(&args[1..]),
         Some("collect-skv-listing-events") => collect_skv_listing_events(&args[1..]),
         Some("collect-fi-pdmr") => collect_fi_pdmr(&args[1..]),
