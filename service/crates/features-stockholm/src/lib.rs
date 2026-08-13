@@ -403,8 +403,10 @@ pub struct BorrowFeeBar {
 }
 
 /// Provider-neutral official index session used by the trained market
-/// direction layer. Features use EOD values through the decision date; labels
-/// use later SOD values so the research action remains executable.
+/// direction layer. Features and labels both use EOD values: `start_value` is
+/// the provider's start-of-day level, which is the prior session's close plus
+/// any dividend adjustment rather than an opening-auction print, so it is kept
+/// for provenance and never priced against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketIndexBar {
@@ -426,7 +428,8 @@ pub struct MarketIndexSeries {
 pub struct DirectionTrainingRow {
     #[serde(with = "date_serde")]
     pub date: Date,
-    /// OMXSGI next-session SOD to SOD after the declared horizon.
+    /// OMXSGI close of the first tradable session to the close of the session
+    /// the declared horizon ends on.
     pub target: f64,
     /// Direction-only secondary label finalized in Rust. Zero returns remain
     /// neutral; Python may select this value for fitting but may not derive it.
@@ -446,17 +449,23 @@ pub struct DirectionTrainingMatrix {
     pub rows: Vec<DirectionTrainingRow>,
 }
 
+/// v4 anchors both legs on official closing levels. The retired
+/// `omxsgi-forward-start-value-*-v1` versions anchored on the archive's SOD,
+/// which is the prior session's close, so their labels credited the untradable
+/// gap into the first held session. The prefix changes with the convention, so
+/// a matrix or model carrying the old contract cannot be parsed — let alone
+/// silently mixed — by anything built here.
 pub fn direction_label_version(horizon_sessions: usize) -> Result<String, String> {
     if horizon_sessions == 0 {
         return Err("direction label horizon must be positive".into());
     }
-    Ok(format!("omxsgi-forward-start-value-{horizon_sessions}-v1"))
+    Ok(format!("omxsgi-forward-close-{horizon_sessions}-v4"))
 }
 
 pub fn direction_label_horizon(version: &str) -> Option<usize> {
     version
-        .strip_prefix("omxsgi-forward-start-value-")?
-        .strip_suffix("-v1")?
+        .strip_prefix("omxsgi-forward-close-")?
+        .strip_suffix("-v4")?
         .parse()
         .ok()
         .filter(|horizon| *horizon > 0)
@@ -501,7 +510,7 @@ pub fn direction_stockholm_close_global_risk_model_feature_names() -> Vec<String
 
 /// Build the finalized absolute-return direction matrix. No later observation
 /// can change a row's features: all inputs end at `date`, while only the label
-/// reads the primary index's following SOD values.
+/// reads the primary index's following closing levels.
 pub fn direction_training_matrix(
     series: &[MarketIndexSeries],
     start: Date,
@@ -701,8 +710,14 @@ fn direction_training_matrix_with_global_risk_sources(
         if finalized.iter().any(|value| !value.is_finite()) {
             return Err(format!("non-finite direction feature on {decision}"));
         }
-        let entry_value = primary.bars[index + 1].start_value;
-        let exit_value = primary.bars[exit_index].start_value;
+        // The first tradable session's own close, not its `start_value`: the
+        // archive's SOD is the prior session's close (dividend-adjusted), so a
+        // label anchored there begins at the decision close and collects the
+        // overnight gap into the first held session, which nobody deciding at
+        // that close can trade. One full session of gap is deliberately
+        // forfeited in exchange for a label the replay can act on.
+        let entry_value = primary.bars[index + 1].end_value;
+        let exit_value = primary.bars[exit_index].end_value;
         let target = exit_value / entry_value - 1.0;
         if !target.is_finite() {
             return Err(format!("non-finite OMXSGI direction label on {decision}"));
@@ -5649,8 +5664,70 @@ mod tests {
         assert!(market_trend(&bars).is_err());
     }
 
+    /// Every index in the direction set, flat except for a single 1% move that
+    /// happens entirely in the gap into `gap_session`. `start_value` is the
+    /// prior session's close throughout — the OMXSGI archive's actual
+    /// convention — so the archive's SOD cannot see that gap at all.
+    fn overnight_gap_direction_indexes(count: usize, gap_session: usize) -> Vec<MarketIndexSeries> {
+        let start = Date::from_calendar_date(2020, Month::January, 1).unwrap();
+        DIRECTION_INDEX_SYMBOLS
+            .iter()
+            .map(|symbol| {
+                let mut close = 100.0;
+                let bars = (0..count)
+                    .map(|index| {
+                        let previous_close = close;
+                        if index == gap_session {
+                            close *= 1.01;
+                        }
+                        MarketIndexBar {
+                            date: start + Duration::days(index as i64),
+                            start_value: previous_close,
+                            end_value: close,
+                        }
+                    })
+                    .collect();
+                MarketIndexSeries {
+                    symbol: (*symbol).into(),
+                    bars,
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn direction_matrix_is_causal_and_uses_forward_sod_label() {
+    fn direction_label_starts_at_the_first_tradable_close_not_the_prior_close() {
+        // The decision is taken at the close of session 252; the whole 1% move
+        // into session 253 is an opening gap nobody holding cash overnight can
+        // capture. A label anchored at `start_value` on session 253 is anchored
+        // at the close of session 252 and collects that gap; the label must
+        // start at session 253's own close instead.
+        let indexes = overnight_gap_direction_indexes(480, 253);
+        let primary = indexes
+            .iter()
+            .find(|series| series.symbol == "OMXSGI")
+            .unwrap();
+        let decision = primary.bars[252].date;
+        let matrix = direction_training_matrix(&indexes, decision, decision, 20).unwrap();
+        let row = &matrix.rows[0];
+        assert_eq!(row.date, decision);
+        assert_eq!(row.entry_value, primary.bars[253].end_value);
+        assert_eq!(row.exit_value, primary.bars[273].end_value);
+        assert!(
+            row.target.abs() < 1e-12,
+            "the only move in the window is the untradable gap into the first held session, so the label must be flat, not {}",
+            row.target
+        );
+        let prior_close_anchored =
+            primary.bars[273].start_value / primary.bars[253].start_value - 1.0;
+        assert!(
+            (prior_close_anchored - 0.01).abs() < 1e-12,
+            "the retired SOD-anchored label credited the full 1% gap, got {prior_close_anchored}"
+        );
+    }
+
+    #[test]
+    fn direction_matrix_is_causal_and_uses_a_forward_close_label() {
         let indexes = direction_indexes(480, 300);
         let primary = indexes
             .iter()
@@ -5661,11 +5738,11 @@ mod tests {
                 .unwrap();
         assert_eq!(full.features, direction_model_feature_names());
         assert_eq!(full.rows[0].date, primary.bars[252].date);
-        assert_eq!(full.rows[0].entry_value, primary.bars[253].start_value);
-        assert_eq!(full.rows[0].exit_value, primary.bars[273].start_value);
+        assert_eq!(full.rows[0].entry_value, primary.bars[253].end_value);
+        assert_eq!(full.rows[0].exit_value, primary.bars[273].end_value);
         assert!(
             (full.rows[0].target
-                - (primary.bars[273].start_value / primary.bars[253].start_value - 1.0))
+                - (primary.bars[273].end_value / primary.bars[253].end_value - 1.0))
                 .abs()
                 < 1e-12
         );

@@ -10,8 +10,13 @@
 > phase-combination fix)  
 > **Latest 2025-10–2026-07 diagnostic Sharpe:** -0.47 ± 1.22 SE, excess of a 2%
 > risk-free rate (was -0.35 non-excess, was -0.89)  
-> **Latest comparable OMXSGI Sharpe:** 0.79 ± 0.58 SE, excess (was 1.25
-> non-excess, was 2.38)  
+> **Latest comparable OMXSGI Sharpe:** 0.95 ± 0.60 SE, excess, measured daily
+> on the bot's own session grid (was 0.79 ± 0.58 on holding-period frequency,
+> was 1.25 non-excess, was 2.38)  
+> **Latest active-return t-stat vs OMXSGI:** **1.08** on the lean development
+> aggregate, **-1.93** on the recent diagnostic — the promotion gate needs 2.0  
+> **Direction-model results:** **all void** — every one was measured with a
+> label that credited the untradable overnight gap (see the Task 4 section)  
 > **Data status:** `SURVIVORSHIP_CONTAMINATED`  
 > **Execution status:** no Stockholm paper or live orders; no deployment
 
@@ -116,7 +121,10 @@ lean development aggregate and **-2.47** for the recent diagnostic — both well
 short of even the provisional 1.0 floor, before the active-t-stat condition is
 considered at all.
 
-**The active-return t-stat is not yet computable for either headline number.**
+**The active-return t-stat was not yet computable for either headline number
+when this section was written.** Task 4 below delivered the daily benchmark
+mark and both t-stats; the paragraph is kept as the record of why the Task 3
+artifacts carry `null`.
 Both are `calendar_aligned_daily_nav` combined reports: the bot series is
 daily (252 obs/yr) while the benchmark stays on holding-period frequency
 (`single_phase_index_path`, 12.6 obs/yr) until Task 4 delivers a daily
@@ -138,6 +146,72 @@ non-excess corrected numbers and the frozen originals are unchanged.
 standard errors only makes the existing failure more precise: the lean
 aggregate's Sharpe lower bound is close to zero, not two, and the recent
 diagnostic's is solidly negative.
+
+## 2026-08-13 Task 4: both legs priced at tradable closes
+
+The OMXSGI archive's `start_value` is not an opening-auction level. It is the
+prior session's close plus any dividend adjustment: 2,092 of 2,535 session
+transitions have `start_value` *exactly* equal to the previous `end_value`, and
+the 443 that differ do so by a median 0.05 bp, concentrated in the March–May
+dividend season. Two things were priced off it, and both are fixed:
+
+**1. The direction-model label is void for every result this document reports.**
+The label was `SOD(t+1+h) / SOD(t+1) - 1`, which — given what SOD actually is —
+is `close(t) / close(t+h)`, i.e. it began at the *decision* close and therefore
+credited the model with the entire overnight gap into the first session it
+could trade. A model deciding at Monday's close cannot own the Tuesday-open
+gap. The label is now `EOD(t+1+h) / EOD(t+1) - 1`: the first tradable session's
+close to the exit close, deliberately forfeiting one full session of gap in
+exchange for a number a replay can act on. Its `label_version` moves from
+`omxsgi-forward-start-value-{h}-v1` to `omxsgi-forward-close-{h}-v4`, and the
+replay refuses any matrix or model still carrying the old contract rather than
+mixing conventions.
+
+Every direction number in "Direction models tested" below, and every
+direction-overlay and market-forecast-composition result anywhere in this
+document, was produced under the old label. **They are void, not merely
+imprecise**, and their bias has a known sign: overnight drift is the larger
+half of equity returns, so the old label systematically flattered any model
+that could predict the *market's* next-session direction at all. None of them
+may be cited or compared against a v4 number, and none may be re-used as
+evidence for or against the direction layer. They have not been regenerated —
+Task 8 in the remediation plan decides the direction layer's fate.
+
+**2. The replay's benchmark leg is now on the portfolio's own daily grid.**
+`benchmark_period_return` was `SOD(entry) → SOD(entry+h)` while the portfolio
+was open-to-open with daily NAV marks at session closes. It is now
+`EOD(decision session) → EOD(exit session)` — the same calendar span the daily
+NAV marks cover — and each replay step also records the index's closing level
+on every session in between (`benchmark_daily_marks`). A combined phase report
+therefore compares bot daily NAV against benchmark daily close on one shared
+session grid (`benchmark_combination_method: calendar_aligned_daily_index_close`),
+which finally makes the active-return t-stat computable; it was `null` /
+`unavailable_mixed_frequencies_pending_task4` in the Task 3 numbers above.
+
+On the 2022-09–2025-09 replay window every `start_value` equals the prior
+close exactly, so the **period** benchmark returns are numerically unchanged;
+what changes is the frequency the benchmark is measured and annualised at, and
+the window it covers (the combined window, not the lowest-offset phase's own).
+
+Regenerated with the new benchmark path (`var/stockholm-remediation/task4/`,
+`regenerate.sh` beside it; same matrices, models, folds and costs):
+
+| interval | bot Sharpe (excess, rf 2%) | OMXSGI Sharpe, daily grid | active t-stat | previously |
+|---|---:|---:|---:|---|
+| 2022-09–2025-09, lean 20-phase (4 folds) | 1.16 ± 0.60 | **0.95 ± 0.60** | **1.08** | index 0.79 at 12.6/yr, t-stat unavailable |
+| 2025-10–2026-07, rich v11 20-phase diagnostic | -0.47 ± 1.22 | **0.82 ± 1.22** | **-1.93** | index 1.11 at 12.6/yr, t-stat unavailable |
+
+Per lean fold, active t-stat: 0.60, -0.07, 1.56, 0.11. The bot's own return,
+Sharpe, standard error and drawdown are unchanged from the Task 3 table — only
+the index leg moved — and `passed` remains `false`: the aggregate active t-stat
+of 1.08 is barely half the 2.0 the gate requires, and the recent diagnostic is
+significantly *negative* against the index.
+
+**This is the first honest bot-versus-index comparison in the project.** Both
+legs are now marked at closes, on identical dates, at the same annualisation,
+excess of the same risk-free rate. It says the lean development book's
+outperformance is not statistically distinguishable from zero, and that the
+recent book underperforms the index at roughly 2 sigma.
 
 ## Current verdict
 
@@ -437,6 +511,13 @@ which a correction or stop rule was applied.
 
 ## Direction models tested
 
+> **Every number in this section is void.** All of it was measured with the
+> retired `omxsgi-forward-start-value-*-v1` label, which began at the decision
+> session's close and so credited the model with the untradable overnight gap
+> into the first held session — see the 2026-08-13 Task 4 section. The results
+> are kept only as a record of what was tried; none of them may be cited, and
+> none may be compared against a `omxsgi-forward-close-*-v4` number.
+
 The portfolio is intended to make money in sustained up and down markets, so
 direction was tested as a separate problem rather than forcing neutrality.
 None of the direction sleeves below is used in a promoted model.
@@ -642,7 +723,17 @@ source of NQ trades does not exist automatically in daily Stockholm bars.
 
 The principal local artifacts are:
 
-- calendar-aligned regeneration of the two headline runs (2026-08-13):
+- close-priced benchmark regeneration of the two headline runs, the current
+  reference (2026-08-13, Task 4):
+  `var/stockholm-remediation/task4/lean-report-base.json`,
+  `var/stockholm-remediation/task4/rich-pseudo-holdout-summary.json`, the
+  per-fold summaries and 100 phase replays beside them, produced by
+  `var/stockholm-remediation/task4/regenerate.sh`;
+- excess-return re-summarisation of Task 2's replays (2026-08-13, Task 3),
+  superseded for the benchmark leg only:
+  `var/stockholm-remediation/task3/lean-report-base.json` and the summaries
+  beside it, produced by `var/stockholm-remediation/task3/resummarize.sh`;
+- calendar-aligned regeneration of the two headline runs (2026-08-13, Task 2):
   `var/stockholm-remediation/task2/lean-report-base.json`,
   `var/stockholm-remediation/task2/rich-pseudo-holdout-summary.json`, and the
   per-fold summaries and 100 phase replays beside them, produced by

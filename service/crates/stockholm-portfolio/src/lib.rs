@@ -707,6 +707,19 @@ pub struct DailyMark {
     pub nav: f64,
 }
 
+/// The benchmark index's official closing level at one session inside a holding
+/// period, on the same session dates as `DailyMark`.
+///
+/// A level, not a NAV: every rebalance phase reads the same index archive, so
+/// the combined benchmark book is defined by the level series on the calendar
+/// and needs no phase-specific anchor to be chained onto.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BenchmarkMark {
+    #[serde(with = "date_serde")]
+    pub date: Date,
+    pub close: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     #[serde(with = "date_serde")]
@@ -746,6 +759,12 @@ pub struct Step {
     /// prices. Frozen reports predate the field and default to empty.
     #[serde(default)]
     pub daily_marks: Vec<DailyMark>,
+    /// The index's closing level on those same sessions, empty when the replay
+    /// was given no benchmark. Frozen reports predate the field and default to
+    /// empty, which is what puts their benchmark back on holding-period
+    /// frequency in a combined summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_daily_marks: Vec<BenchmarkMark>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1043,7 +1062,7 @@ pub fn direction_backtest(
         omxsgi_long_only: direction_performance(&omxsgi_returns, cadence),
         disclosures: vec![
             "The direction layer applies target net exposure to official OMXSGI returns before execution, financing, tax, and short-borrow costs; it is a timing diagnostic, not a directly tradable result.".into(),
-            "All model inputs are official Nasdaq index EOD values known on the decision date; the label begins at the following official SOD value.".into(),
+            "All model inputs are official Nasdaq index EOD values known on the decision date; the label begins at the official close of the following session, so the untradable gap into it is not credited to the model.".into(),
             "The trained model is compared on identical non-overlapping sessions with the predeclared fixed five-vote trend control and long-only OMXSGI.".into(),
         ],
     })
@@ -1681,8 +1700,49 @@ pub const LEGACY_PERIOD_INDEX_AVERAGE: &str = "legacy_period_index_average";
 
 /// The benchmark is one continuously held index in every phase, so no averaging
 /// across phases is meaningful: the lowest-offset phase's own series is the
-/// combined book's benchmark path, sampled at holding-period frequency.
+/// combined book's benchmark path, sampled at holding-period frequency. Only
+/// reports written before the index was marked daily need this.
 pub const SINGLE_PHASE_INDEX_PATH: &str = "single_phase_index_path";
+
+/// The index's official close on every session the combined book itself is
+/// marked on. Both legs are then one daily series on one calendar, which is
+/// what makes an active-return t-stat between them meaningful.
+pub const CALENDAR_ALIGNED_DAILY_INDEX_CLOSE: &str = "calendar_aligned_daily_index_close";
+
+/// `active_tstat_status` when the phase reports predate benchmark daily marks:
+/// the bot is daily and the index is still on holding-period frequency, so the
+/// two series are not paired observations and no t-stat can be formed. Rerun
+/// the phases to get one.
+pub const LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS: &str =
+    "unavailable_legacy_benchmark_without_daily_index_marks";
+
+/// `active_tstat_status` when both legs share a grid but it is too short for a
+/// sample standard error.
+pub const TOO_FEW_ACTIVE_OBSERVATIONS: &str = "unavailable_too_few_observations";
+
+/// `active_tstat_status` when the active return never varies, so its standard
+/// error is zero and the ratio is undefined rather than infinite.
+pub const NO_ACTIVE_DISPERSION: &str = "unavailable_active_return_has_no_dispersion";
+
+/// Observations per year in a benchmark block combined by `method`.
+fn benchmark_periods_per_year(method: Option<&str>, cadence: usize) -> f64 {
+    if method == Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE) {
+        SESSIONS_PER_YEAR
+    } else {
+        sessions_per_year(cadence)
+    }
+}
+
+/// Why a benchmarked report has no active-return t-stat.
+fn active_tstat_unavailable(portfolio: &[f64], benchmark: &[f64]) -> String {
+    if portfolio.len() != benchmark.len() {
+        LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS.to_owned()
+    } else if portfolio.len() < 2 {
+        TOO_FEW_ACTIVE_OBSERVATIONS.to_owned()
+    } else {
+        NO_ACTIVE_DISPERSION.to_owned()
+    }
+}
 
 fn legacy_combination_method() -> String {
     LEGACY_PERIOD_INDEX_AVERAGE.into()
@@ -2289,11 +2349,15 @@ pub fn backtest(
             .transpose()?
             .unwrap_or_default();
         nav *= 1.0 + period_return;
-        let benchmark_period_return = config
+        let benchmark_period = config
             .benchmark
             .as_ref()
-            .map(|history| benchmark_return(history, date, cadence_sessions))
+            .map(|history| benchmark_period(history, date, cadence_sessions))
             .transpose()?;
+        let (benchmark_period_return, benchmark_daily_marks) = match benchmark_period {
+            Some((value, marks)) => (Some(value), marks),
+            None => (None, Vec::new()),
+        };
         let direction_market_return = direction.as_ref().map(|attribution| {
             attribution.decision.budget.target_net.unwrap_or(0.0)
                 * benchmark_period_return.unwrap_or(0.0)
@@ -2321,6 +2385,7 @@ pub fn backtest(
             active_return: benchmark_period_return.map(|value| period_return - value),
             positions,
             daily_marks,
+            benchmark_daily_marks,
         });
         previous = target;
     }
@@ -2352,7 +2417,7 @@ pub fn backtest(
         "SURVIVORSHIP_CONTAMINATED: current 2026 constituents are projected backward; this result cannot authorize capital.".into(),
         "Historical borrow quantity is unavailable; shorts carry a configured availability penalty but feasibility is not proven.".into(),
         "Yahoo adjusted daily history is research input; production collection remains IB plus a licensed point-in-time universe.".into(),
-        "OMXSGI comparison uses official Nasdaq gross-index SOD levels from the next exchange session through the configured holding horizon; it is a broad market reference, not a forced exposure target.".into(),
+        "OMXSGI comparison uses official Nasdaq gross-index closing levels from the decision session's close through the close of the session the position is exited on, the same sessions the portfolio's daily NAV marks use; the archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against. It is a broad market reference, not a forced exposure target.".into(),
     ];
     if config.direction_config.is_some() {
         disclosures.push("The standalone direction-layer series applies smoothed target net exposure to OMXSGI before execution costs; it diagnoses timing only and cannot be treated as a tradable net result.".into());
@@ -2573,30 +2638,33 @@ pub fn summarize_rebalance_phases(
     // reports can support. The combined path is normalised to 1.0 on its first
     // session, so that session's return is genuinely outside the window every
     // phase shares and is not dropped by accident.
-    let (period_returns, combined_start, combined_end, periods_per_year) = if calendar_aligned {
-        let combined = portfolio_construction::equal_weight_phase_daily_navs(&daily_navs)?;
-        let returns = combined
-            .windows(2)
-            .map(|pair| pair[1].1 / pair[0].1 - 1.0)
-            .collect::<Vec<_>>();
-        let start = combined.first().map(|(date, _)| *date);
-        let end = combined.last().map(|(date, _)| *date);
-        (returns, start, end, SESSIONS_PER_YEAR)
-    } else {
-        let return_series = ordered
-            .iter()
-            .map(|report| {
-                report
-                    .steps
-                    .iter()
-                    .map(|step| step.period_return)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        #[allow(deprecated)]
-        let returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
-        (returns, None, None, sessions_per_year(cadence))
-    };
+    let combined = calendar_aligned
+        .then(|| portfolio_construction::equal_weight_phase_daily_navs(&daily_navs))
+        .transpose()?;
+    let (period_returns, combined_start, combined_end, periods_per_year) =
+        if let Some(combined) = &combined {
+            let returns = combined
+                .windows(2)
+                .map(|pair| pair[1].1 / pair[0].1 - 1.0)
+                .collect::<Vec<_>>();
+            let start = combined.first().map(|(date, _)| *date);
+            let end = combined.last().map(|(date, _)| *date);
+            (returns, start, end, SESSIONS_PER_YEAR)
+        } else {
+            let return_series = ordered
+                .iter()
+                .map(|report| {
+                    report
+                        .steps
+                        .iter()
+                        .map(|step| step.period_return)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            #[allow(deprecated)]
+            let returns = portfolio_construction::equal_weight_phase_returns(&return_series)?;
+            (returns, None, None, sessions_per_year(cadence))
+        };
     let benchmark_presence = ordered
         .iter()
         .map(|report| report.benchmark.is_some())
@@ -2617,45 +2685,85 @@ pub fn summarize_rebalance_phases(
             })
             .collect::<Result<Vec<_>, String>>()
     };
+    // Every phase reads the same index archive, so the benchmark's daily closes
+    // are one calendar series regardless of which phase recorded them.
+    let benchmark_marks = ordered
+        .iter()
+        .map(|report| {
+            report
+                .steps
+                .iter()
+                .flat_map(|step| step.benchmark_daily_marks.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let marked_benchmarks = benchmark_marks
+        .iter()
+        .filter(|phase| !phase.is_empty())
+        .count();
+    if marked_benchmarks != 0 && marked_benchmarks != benchmark_marks.len() {
+        return Err(format!(
+            "{marked_benchmarks} of {} phases carry daily benchmark marks; combine either all or none",
+            benchmark_marks.len()
+        ));
+    }
     // Every phase holds the same index continuously, so the equal-capital
     // combined benchmark book is that index — there is nothing to average, and
-    // averaging overlapping windows is the defect being removed here. Until the
-    // index itself is marked daily the benchmark stays on holding-period
+    // averaging overlapping windows is the defect being removed here. With the
+    // index marked daily it rides the same session grid as the combined book;
+    // without those marks (a frozen report) it stays on holding-period
     // frequency, which `benchmark_combination_method` and `periods_per_year`
     // both state outright.
-    let (benchmark_period_returns, benchmark_combination_method) =
-        match (has_benchmark, calendar_aligned) {
-            (false, _) => (Vec::new(), None),
-            (true, true) => (
-                phase_benchmark_returns(ordered[0])?,
-                Some(SINGLE_PHASE_INDEX_PATH.to_owned()),
-            ),
-            (true, false) => {
-                let phases = ordered
-                    .iter()
-                    .map(|report| phase_benchmark_returns(report))
-                    .collect::<Result<Vec<_>, String>>()?;
-                #[allow(deprecated)]
-                let returns = portfolio_construction::equal_weight_phase_returns(&phases)?;
-                (returns, Some(LEGACY_PERIOD_INDEX_AVERAGE.to_owned()))
-            }
-        };
+    let (benchmark_period_returns, benchmark_combination_method) = match (has_benchmark, &combined)
+    {
+        (false, _) => (Vec::new(), None),
+        (true, Some(combined)) if marked_benchmarks == benchmark_marks.len() => {
+            let closes = combined_benchmark_closes(&benchmark_marks)?;
+            let levels = combined
+                .iter()
+                .map(|(date, _)| {
+                    closes.get(date).copied().ok_or_else(|| {
+                        format!("the benchmark has no close on {date}, a session the combined book is marked on")
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let returns = levels
+                .windows(2)
+                .map(|pair| pair[1] / pair[0] - 1.0)
+                .collect::<Vec<_>>();
+            (returns, Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE.to_owned()))
+        }
+        (true, Some(_)) => (
+            phase_benchmark_returns(ordered[0])?,
+            Some(SINGLE_PHASE_INDEX_PATH.to_owned()),
+        ),
+        (true, None) => {
+            let phases = ordered
+                .iter()
+                .map(|report| phase_benchmark_returns(report))
+                .collect::<Result<Vec<_>, String>>()?;
+            #[allow(deprecated)]
+            let returns = portfolio_construction::equal_weight_phase_returns(&phases)?;
+            (returns, Some(LEGACY_PERIOD_INDEX_AVERAGE.to_owned()))
+        }
+    };
     let performance = phase_performance(&period_returns, periods_per_year, risk_free_annual);
+    let benchmark_periods_per_year =
+        benchmark_periods_per_year(benchmark_combination_method.as_deref(), cadence);
     let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
         phase_performance(
             &benchmark_period_returns,
-            sessions_per_year(cadence),
+            benchmark_periods_per_year,
             risk_free_annual,
         )
     });
     // The active-return t-stat is only meaningful where the bot and benchmark
-    // series share one observation grid. Once daily NAV marks are the norm
-    // (`calendar_aligned`) the benchmark stays on holding-period frequency
-    // (`single_phase_index_path`) until Task 4 delivers a daily benchmark mark,
-    // so the two series differ in both frequency and length here.
+    // series share one observation grid, which they do exactly when both are
+    // marked on the same sessions.
     let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
     let active_tstat_status = (has_benchmark && active_tstat.is_none())
-        .then(|| "unavailable_mixed_frequencies_pending_task4".to_owned());
+        .then(|| active_tstat_unavailable(&period_returns, &benchmark_period_returns));
+    let disclosures = phase_disclosures(calendar_aligned, benchmark_combination_method.as_deref());
     // Phase diagnostics exist to be compared with the combined result — an
     // aggregate that beats every one of its parts is the smoothing artefact
     // this fix removes — so they are measured at the same frequency.
@@ -2734,19 +2842,57 @@ pub fn summarize_rebalance_phases(
         benchmark_period_returns,
         active_tstat,
         active_tstat_status,
-        disclosures: phase_disclosures(calendar_aligned, has_benchmark),
+        disclosures,
     })
 }
 
-fn phase_disclosures(calendar_aligned: bool, has_benchmark: bool) -> Vec<String> {
+/// One index close per session, from every phase's benchmark marks.
+///
+/// The phases overlap by construction, so most sessions are reported several
+/// times. They must agree: two different closes for one session would mean the
+/// phases were replayed against different archives, and averaging them away
+/// would hide that.
+fn combined_benchmark_closes(phases: &[Vec<BenchmarkMark>]) -> Result<BTreeMap<Date, f64>, String> {
+    let mut closes: BTreeMap<Date, f64> = BTreeMap::new();
+    for marks in phases {
+        for mark in marks {
+            if !mark.close.is_finite() || mark.close <= 0.0 {
+                return Err(format!(
+                    "benchmark mark on {} is not a positive index level",
+                    mark.date
+                ));
+            }
+            match closes.entry(mark.date) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(mark.close);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if (slot.get() - mark.close).abs() > slot.get().abs() * 1e-12 {
+                        return Err(format!(
+                            "phases disagree about the benchmark close on {}: {} versus {}",
+                            mark.date,
+                            slot.get(),
+                            mark.close
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(closes)
+}
+
+fn phase_disclosures(calendar_aligned: bool, benchmark_method: Option<&str>) -> Vec<String> {
     let mut disclosures = vec![
         "Every possible rebalance offset receives equal capital; no calendar phase is selected by performance.".to_owned(),
     ];
     if calendar_aligned {
         disclosures.push("Phases are combined on the session date from each phase's daily NAV marks, so no two overlapping holding windows are averaged against each other. Performance is measured on daily returns and annualised over 252 sessions.".into());
         disclosures.push("Capital is split equally at the first session every phase is invested in and the combined book is then held without transfers between phases; sessions before that and after the earliest-ending phase lie outside combined_start..combined_end and are excluded.".into());
-        if has_benchmark {
-            disclosures.push("Every phase holds the same index continuously, so the benchmark is reported from the lowest-offset phase's own holding-period series rather than averaged across phases. Its annualisation is 252/cadence, not 252: benchmark and portfolio Sharpe are not measured at the same frequency until the index is marked daily.".into());
+        if benchmark_method == Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE) {
+            disclosures.push("The benchmark is the index's own official close on every session the combined book is marked on, so both legs are one daily series on one calendar and are annualised over the same 252 sessions. The archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against.".into());
+        } else if benchmark_method.is_some() {
+            disclosures.push("Every phase holds the same index continuously, so the benchmark is reported from the lowest-offset phase's own holding-period series rather than averaged across phases. These phase reports carry no daily benchmark marks, so its annualisation is 252/cadence, not 252: benchmark and portfolio Sharpe are not measured at the same frequency and no active-return t-stat can be formed. Rerun the phases against the index to get one.".into());
         }
     } else {
         disclosures.push("These phase reports carry no daily NAV marks, so phases are averaged by period index. Phase j's period k spans different sessions than phase j+1's, so the average smooths overlapping windows and its annualised volatility is understated and its Sharpe overstated. Rerun the phases with daily marks before citing this number.".into());
@@ -2790,6 +2936,14 @@ pub fn summarize_rebalance_phase_folds(
     {
         return Err("rebalance-phase folds combine their phases differently".into());
     }
+    // A daily index leg concatenated onto a holding-period one is one series
+    // with two meanings, exactly as for the portfolio leg above.
+    if ordered
+        .iter()
+        .any(|fold| fold.benchmark_combination_method != first.benchmark_combination_method)
+    {
+        return Err("rebalance-phase folds combine their benchmark differently".into());
+    }
     // A fold's last daily mark falls after its declared end — the terminal book
     // is still priced — so non-overlapping fold bounds do not by themselves
     // prove the daily series do not share a session.
@@ -2829,14 +2983,17 @@ pub fn summarize_rebalance_phase_folds(
     let benchmark_performance = (!benchmark_period_returns.is_empty()).then(|| {
         phase_performance(
             &benchmark_period_returns,
-            sessions_per_year(first.cadence_sessions),
+            benchmark_periods_per_year(
+                first.benchmark_combination_method.as_deref(),
+                first.cadence_sessions,
+            ),
             risk_free_annual,
         )
     });
     let active_tstat = active_tstat(&period_returns, &benchmark_period_returns);
     let has_benchmark = !benchmark_period_returns.is_empty();
     let active_tstat_status = (has_benchmark && active_tstat.is_none())
-        .then(|| "unavailable_mixed_frequencies_pending_task4".to_owned());
+        .then(|| active_tstat_unavailable(&period_returns, &benchmark_period_returns));
     let fold_diagnostics = ordered
         .iter()
         .map(|fold| {
@@ -3582,11 +3739,12 @@ pub fn add_benchmark(
 ) -> Result<BacktestResult, String> {
     let mut nav = 1.0;
     for step in &mut result.steps {
-        let value = benchmark_return(history, step.date, result.cadence_sessions)?;
+        let (value, marks) = benchmark_period(history, step.date, result.cadence_sessions)?;
         nav *= 1.0 + value;
         step.benchmark_period_return = Some(value);
         step.benchmark_nav = Some(nav);
         step.active_return = Some(step.period_return - value);
+        step.benchmark_daily_marks = marks;
     }
     result.benchmark = Some(benchmark_comparison(
         &result.steps,
@@ -3595,7 +3753,7 @@ pub fn add_benchmark(
         history,
         result.metrics.risk_free_annual,
     )?);
-    let disclosure = "OMXSGI comparison uses official Nasdaq gross-index SOD levels from the next exchange session through the configured holding horizon; it is a broad market reference, not a forced exposure target.";
+    let disclosure = "OMXSGI comparison uses official Nasdaq gross-index closing levels from the decision session's close through the close of the session the position is exited on, the same sessions the portfolio's daily NAV marks use; the archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against. It is a broad market reference, not a forced exposure target.";
     if !result.disclosures.iter().any(|value| value == disclosure) {
         result.disclosures.push(disclosure.into());
     }
@@ -3607,6 +3765,24 @@ fn benchmark_return(
     decision_date: Date,
     horizon: usize,
 ) -> Result<f64, String> {
+    Ok(benchmark_period(history, decision_date, horizon)?.0)
+}
+
+/// One holding period of the index leg: the return from the decision session's
+/// official close to the close `horizon` sessions later, plus that period's
+/// closing level on every session in between.
+///
+/// Closes on both legs, on the same dates: the portfolio's daily NAV marks run
+/// from the decision session's close through the close of the session it
+/// rebalances on, so the index has to be read on exactly those sessions to be
+/// comparable. The archive's `start_value` is the prior session's close plus a
+/// dividend adjustment, not an opening print, so pricing either leg off it
+/// would shift the index a session away from the book it is measured against.
+fn benchmark_period(
+    history: &BenchmarkHistory,
+    decision_date: Date,
+    horizon: usize,
+) -> Result<(f64, Vec<BenchmarkMark>), String> {
     if history
         .bars
         .windows(2)
@@ -3617,32 +3793,41 @@ fn benchmark_return(
             history.symbol
         ));
     }
-    let entry_index = history
-        .bars
-        .partition_point(|bar| bar.date <= decision_date);
+    let entry_index = history.bars.partition_point(|bar| bar.date < decision_date);
     let exit_index = entry_index
         .checked_add(horizon)
         .ok_or("benchmark horizon overflow")?;
-    let entry = history.bars.get(entry_index).ok_or_else(|| {
-        format!(
-            "benchmark {} has no session after {decision_date}",
-            history.symbol
-        )
-    })?;
+    let entry = history
+        .bars
+        .get(entry_index)
+        .filter(|bar| bar.date == decision_date)
+        .ok_or_else(|| {
+            format!(
+                "benchmark {} has no session on {decision_date} to price the decision close from",
+                history.symbol
+            )
+        })?;
     let exit = history.bars.get(exit_index).ok_or_else(|| {
         format!(
             "benchmark {} lacks {horizon} sessions after {}",
             history.symbol, entry.date
         )
     })?;
-    let value = exit.start_value / entry.start_value - 1.0;
+    let value = exit.end_value / entry.end_value - 1.0;
     if !value.is_finite() {
         return Err(format!(
             "benchmark {} has invalid values on {} or {}",
             history.symbol, entry.date, exit.date
         ));
     }
-    Ok(value)
+    let marks = history.bars[entry_index + 1..=exit_index]
+        .iter()
+        .map(|bar| BenchmarkMark {
+            date: bar.date,
+            close: bar.end_value,
+        })
+        .collect();
+    Ok((value, marks))
 }
 
 fn benchmark_comparison(
@@ -4604,6 +4789,41 @@ mod tests {
     /// the case where a combined result that beats every phase can only be an
     /// artefact of the combination.
     fn two_phase_replay(with_marks: bool) -> Vec<BacktestResult> {
+        two_phase_replay_against(with_marks, false)
+    }
+
+    /// The index the fifteen-session replay is compared against: its own close
+    /// path, with `start_value` set to the previous close exactly as the OMXSGI
+    /// archive does, so a leg priced off SOD is visibly a session behind.
+    fn two_phase_benchmark(sessions: &[Date]) -> BenchmarkHistory {
+        let closes = [
+            1000.0, 1004.0, 998.0, 1006.0, 1012.0, 1002.0, 1000.0, 1015.0, 1008.0, 1020.0, 1010.0,
+            1025.0, 1014.0, 1028.0, 1018.0,
+        ];
+        BenchmarkHistory {
+            format_version: "fixture".into(),
+            symbol: "OMXSGI".into(),
+            name: "fixture".into(),
+            return_type: "gross_total_return".into(),
+            currency: "SEK".into(),
+            source: "fixture".into(),
+            generated_at: "fixture".into(),
+            bars: sessions
+                .iter()
+                .zip(closes)
+                .enumerate()
+                .map(|(index, (date, close))| equity_data::BenchmarkBar {
+                    date: *date,
+                    start_value: closes[index.saturating_sub(1)],
+                    end_value: close,
+                    high_value: None,
+                    low_value: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn two_phase_replay_against(with_marks: bool, with_benchmark: bool) -> Vec<BacktestResult> {
         let sessions = [
             "2024-01-02",
             "2024-01-03",
@@ -4669,7 +4889,7 @@ mod tests {
                         market_return_forecasts: None,
                         market_forecast_model_id: None,
                         costs: zero_execution_costs(),
-                        benchmark: None,
+                        benchmark: with_benchmark.then(|| two_phase_benchmark(&sessions)),
                         mark_prices: with_marks.then(|| mark_prices.clone()),
                         risk_free_annual: 0.0,
                     },
@@ -4691,6 +4911,83 @@ mod tests {
         assert_eq!(summary.period_returns.len(), 9);
         assert_eq!(summary.common_complete_periods, 9);
         assert!(summary.benchmark_combination_method.is_none());
+    }
+
+    #[test]
+    fn the_benchmark_rides_the_bots_own_daily_grid_and_the_active_tstat_follows() {
+        let summary =
+            summarize_rebalance_phases(&two_phase_replay_against(true, true), 0.02).unwrap();
+        assert_eq!(
+            summary.benchmark_combination_method.as_deref(),
+            Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE)
+        );
+        // The combined book is marked 2024-01-04..01-17; the index leg is its
+        // own closing level on exactly those sessions, independently listed
+        // here rather than read back out of the replay.
+        let closes = [
+            998.0, 1006.0, 1012.0, 1002.0, 1000.0, 1015.0, 1008.0, 1020.0, 1010.0, 1025.0,
+        ];
+        let expected = closes
+            .windows(2)
+            .map(|pair| pair[1] / pair[0] - 1.0)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.benchmark_period_returns.len(), expected.len());
+        for (actual, expected) in summary.benchmark_period_returns.iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1e-12, "{actual} vs {expected}");
+        }
+        assert_eq!(
+            summary.benchmark_period_returns.len(),
+            summary.period_returns.len(),
+            "both legs must be measured on one grid"
+        );
+        let benchmark = summary.benchmark_performance.as_ref().unwrap();
+        assert_eq!(benchmark.periods_per_year, SESSIONS_PER_YEAR);
+        assert!((benchmark.total_return - (1025.0 / 998.0 - 1.0)).abs() < 1e-12);
+        // The whole point of the shared grid: the active t-stat is computable.
+        let observed = summary
+            .active_tstat
+            .expect("active t-stat on a shared grid");
+        let hand = active_tstat(&summary.period_returns, &summary.benchmark_period_returns)
+            .expect("paired series");
+        assert!((observed - hand).abs() < 1e-12);
+        assert_eq!(summary.active_tstat_status, None);
+    }
+
+    #[test]
+    fn a_report_without_benchmark_daily_marks_falls_back_and_says_why() {
+        // Exactly what a frozen pre-Task-4 phase report looks like: bot daily
+        // marks, no benchmark ones, and the field absent from the JSON.
+        let mut phases = two_phase_replay_against(true, true)
+            .into_iter()
+            .map(|report| {
+                let mut value = serde_json::to_value(&report).unwrap();
+                for step in value["steps"].as_array_mut().unwrap() {
+                    assert!(step
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("benchmark_daily_marks")
+                        .is_some());
+                }
+                serde_json::from_value::<BacktestResult>(value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_rebalance_phases(&phases, 0.02).unwrap();
+        assert_eq!(summary.combination_method, CALENDAR_ALIGNED_DAILY_NAV);
+        assert_eq!(
+            summary.benchmark_combination_method.as_deref(),
+            Some(SINGLE_PHASE_INDEX_PATH)
+        );
+        assert_eq!(summary.active_tstat, None);
+        assert_eq!(
+            summary.active_tstat_status.as_deref(),
+            Some(LEGACY_BENCHMARK_WITHOUT_DAILY_MARKS)
+        );
+
+        // Half-marked is neither: it would compare a daily index leg in one
+        // phase against a holding-period one in the next.
+        phases[0] = two_phase_replay_against(true, true).remove(0);
+        let error = summarize_rebalance_phases(&phases, 0.02).unwrap_err();
+        assert!(error.contains("benchmark"), "{error}");
     }
 
     #[test]
@@ -4844,6 +5141,28 @@ mod tests {
         assert!(
             error.contains("no observation frequency and no cadence"),
             "expected a underivable-frequency error, got {error}"
+        );
+    }
+
+    #[test]
+    fn folds_that_price_their_index_differently_may_not_be_concatenated() {
+        let daily =
+            summarize_rebalance_phases(&two_phase_replay_against(true, true), 0.02).unwrap();
+        assert_eq!(
+            daily.benchmark_combination_method.as_deref(),
+            Some(CALENDAR_ALIGNED_DAILY_INDEX_CLOSE)
+        );
+        let mut legacy = shift_fold(&daily, "2024-02-01", "2024-02-15");
+        legacy.benchmark_combination_method = Some(SINGLE_PHASE_INDEX_PATH.into());
+        let error = summarize_rebalance_phase_folds(
+            &[shift_fold(&daily, "2024-01-02", "2024-01-16"), legacy],
+            0.02,
+            1.0,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("combine their benchmark differently"),
+            "expected a mixed-benchmark error, got {error}"
         );
     }
 
@@ -5281,9 +5600,11 @@ mod tests {
         assert_eq!(direction.risk_free_annual, 0.0);
     }
 
-    #[test]
-    fn benchmark_uses_next_session_sod_over_the_same_horizon() {
-        let history = BenchmarkHistory {
+    /// Four sessions whose start-of-day level is *not* the previous close, so a
+    /// leg priced off `start_value` cannot accidentally agree with one priced
+    /// off the close.
+    fn sod_eod_benchmark() -> BenchmarkHistory {
+        BenchmarkHistory {
             format_version: "fixture".into(),
             symbol: "OMXSGI".into(),
             name: "fixture".into(),
@@ -5292,21 +5613,42 @@ mod tests {
             source: "fixture".into(),
             generated_at: "fixture".into(),
             bars: [
-                ("2024-01-02", 99.0),
-                ("2024-01-03", 100.0),
-                ("2024-01-04", 102.0),
-                ("2024-01-05", 103.0),
+                ("2024-01-02", 90.0, 100.0),
+                ("2024-01-03", 95.0, 102.0),
+                ("2024-01-04", 97.0, 105.0),
+                ("2024-01-05", 99.0, 107.0),
             ]
             .into_iter()
-            .map(|(date, value)| equity_data::BenchmarkBar {
+            .map(|(date, start_value, end_value)| equity_data::BenchmarkBar {
                 date: day(date),
-                start_value: value,
-                end_value: value,
+                start_value,
+                end_value,
                 high_value: None,
                 low_value: None,
             })
             .collect(),
-        };
+        }
+    }
+
+    #[test]
+    fn benchmark_period_return_spans_session_closes_not_the_archives_sod() {
+        let history = sod_eod_benchmark();
+        // Decide at the close of 01-02, exit at the close of 01-03: the index
+        // leg is EOD(exit)/EOD(entry) - 1 = 102/100 - 1, on the same session
+        // closes the portfolio's daily NAV marks use. The retired convention
+        // read SOD(01-04)/SOD(01-03) - 1 = 97/95 - 1.
+        let value = benchmark_return(&history, day("2024-01-02"), 1).unwrap();
+        assert!((value - 0.02).abs() < 1e-12, "got {value}");
+        let two_sessions = benchmark_return(&history, day("2024-01-02"), 2).unwrap();
+        assert!((two_sessions - 0.05).abs() < 1e-12, "got {two_sessions}");
+        // The index has no session before 01-02, so a decision taken there
+        // cannot be priced rather than silently sliding to another anchor.
+        assert!(benchmark_return(&history, day("2024-01-01"), 1).is_err());
+    }
+
+    #[test]
+    fn benchmark_uses_session_closes_over_the_same_horizon() {
+        let history = sod_eod_benchmark();
         let result = backtest(
             &constant_model(0.02),
             &[row(day("2024-01-02"))],
@@ -5339,6 +5681,15 @@ mod tests {
         )
         .unwrap();
         assert!((result.steps[0].benchmark_period_return.unwrap() - 0.02).abs() < 1e-12);
+        // The same period, marked session by session at the index's own closes.
+        assert_eq!(
+            result.steps[0]
+                .benchmark_daily_marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+            vec![(day("2024-01-03"), 102.0)]
+        );
         assert_eq!(result.benchmark.unwrap().symbol, "OMXSGI");
     }
 

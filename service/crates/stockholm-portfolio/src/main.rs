@@ -123,7 +123,8 @@ usage: stockholm-portfolio <command>
                             [--cme-bars-root <dir>]
                             [--stockholm-close-cme-bars-root <dir>]
       Emit causal Rust-owned market-direction features and executable OMXSGI
-      SOD-to-SOD absolute-return labels from official Nasdaq index histories.
+      close-to-close absolute-return labels from official Nasdaq index
+      histories.
       The Stockholm-close option adds ES/NQ/ZN/GC context known by 17:30 local
       time and is mutually exclusive with the prior-UTC-day ES option.
 
@@ -2083,7 +2084,7 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
             "all features use official index EOD values no later than the decision date; unavailable early histories have zero values plus explicit missing flags"
                 .into(),
         label_policy:
-            "OMXSGI next-session official SOD value to official SOD value after the declared holding horizon"
+            "OMXSGI official close of the first tradable session to the official close after the declared holding horizon; the archive's start-of-day value is the prior session's close plus a dividend adjustment and is never priced against"
                 .into(),
         global_risk_source: global_risk_dataset
             .as_ref()
@@ -2110,7 +2111,7 @@ fn direction_matrix(args: &[String]) -> Result<(), String> {
             )
         } else if !stockholm_close_global_risk.is_empty() {
             Some(
-                "Rust uses the last CME bar completed by 17:30 Europe/Stockholm on the decision date; archived timestamps identify bar opens, timezone conversion follows historical CET/CEST, and the OMXSGI label enters at the next session SOD"
+                "Rust uses the last CME bar completed by 17:30 Europe/Stockholm on the decision date; archived timestamps identify bar opens, timezone conversion follows historical CET/CEST, and the OMXSGI label enters at the close of the next session"
                     .into(),
             )
         } else {
@@ -2340,10 +2341,32 @@ fn load_direction_matrix(
     Ok((manifest, rows))
 }
 
+/// Refuse a direction matrix or model built under a retired label convention.
+///
+/// The v1 label ran from the archive's start-of-day value, which is the prior
+/// session's close, so it credited the overnight gap into the first held
+/// session — a return no replay can execute. Mixing such a matrix into a replay
+/// that now prices its index leg at closes would compare two different games,
+/// so the mismatch is refused outright rather than silently reconciled.
+fn current_direction_label(
+    label_version: &str,
+    horizon_sessions: usize,
+    what: &str,
+) -> Result<(), String> {
+    let expected = features_stockholm::direction_label_version(horizon_sessions)?;
+    if label_version != expected {
+        return Err(format!(
+            "direction {what} carries label {label_version}, but this build produces {expected}; regenerate the direction matrix and refit before replaying it"
+        ));
+    }
+    Ok(())
+}
+
 fn run_direction_backtest(args: &[String]) -> Result<(), String> {
     let matrix_path = PathBuf::from(need(args, "--matrix")?);
     let (manifest, rows) = load_direction_matrix(&matrix_path)?;
     let model = stockholm_portfolio::DirectionModel::load(Path::new(&need(args, "--model")?))?;
+    current_direction_label(&manifest.label_version, manifest.horizon_sessions, "matrix")?;
     if manifest.features != model.features
         || manifest.feature_set_version != model.feature_set_version
         || manifest.label_version != model.label_version
@@ -2542,6 +2565,11 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
                     load_direction_matrix(Path::new(&matrix_path))?;
                 let direction_model =
                     stockholm_portfolio::DirectionModel::load(Path::new(&model_path))?;
+                current_direction_label(
+                    &direction_manifest.label_version,
+                    direction_manifest.horizon_sessions,
+                    "market forecast matrix",
+                )?;
                 if direction_manifest.features != direction_model.features
                     || direction_manifest.feature_set_version != direction_model.feature_set_version
                     || direction_manifest.label_version != direction_model.label_version
@@ -2712,6 +2740,13 @@ fn summarize_rebalance_phases(args: &[String]) -> Result<(), String> {
     if summary.combination_method != stockholm_portfolio::CALENDAR_ALIGNED_DAILY_NAV {
         eprintln!(
             "warning: these phase reports carry no daily NAV marks, so overlapping holding windows were averaged by period index and the Sharpe above is overstated. Rerun the phases with --bars-root."
+        );
+    }
+    if summary.benchmark_combination_method.as_deref()
+        == Some(stockholm_portfolio::SINGLE_PHASE_INDEX_PATH)
+    {
+        eprintln!(
+            "warning: these phase reports carry no daily benchmark marks, so the index leg stays on holding-period frequency, its Sharpe is not measured at the portfolio's frequency, and no active t-stat can be formed. Rerun the phases with --benchmark."
         );
     }
     Ok(())
