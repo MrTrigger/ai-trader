@@ -3179,6 +3179,7 @@ dependencies = [
  "chrono",
  "crypto-portfolio",
  "features-crypto",
+ "features-scalper",
  "hyperliquid",
  "reqwest",
  "serde",

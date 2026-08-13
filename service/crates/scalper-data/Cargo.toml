@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 crypto-portfolio.workspace = true
 features-crypto.workspace = true
+features-scalper.workspace = true
 hyperliquid.workspace = true
 venue.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
