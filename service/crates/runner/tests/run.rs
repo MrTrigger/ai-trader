@@ -1427,6 +1427,61 @@ async fn a_position_closed_by_the_next_run_still_gets_its_last_day() {
     );
 }
 
+/// Settling before the closing run is recorded settles nothing.
+///
+/// This is why every period was attributed a full cycle late: the cycle called
+/// settle at the top, when the newest run in the list was still yesterday's.
+/// Yesterday had no closer, so it was skipped, and only the day BEFORE it got
+/// a result. Recording today's run first is what closes yesterday's period.
+#[tokio::test]
+async fn a_period_settles_as_soon_as_the_run_that_closed_it_is_recorded() {
+    let dir = tmpdir("settle-timing");
+    let store = RunStore::new(&dir);
+    let ledger = Ledger::open(&dir);
+    let venue = FakeVenue::new();
+    let clock = TestClock::at("2026-08-03T00:00:00Z");
+    let run_settle = || async {
+        runner(
+            &venue,
+            &clock,
+            &store,
+            &ledger,
+            running_controls(&dir),
+            Schedule::default(),
+        )
+        .settle(t("2026-08-03T00:00:00Z"), 10)
+        .await
+        .expect("settles")
+    };
+
+    store
+        .record(&settled_fixture(
+            "mon",
+            "2026-08-01T00:00:00Z",
+            "1100",
+            &[("BTC", "10", "100")],
+        ))
+        .unwrap();
+    // Monday is the newest run: its period is still open, nothing to settle.
+    assert!(run_settle().await.is_empty(), "an open period is not a result");
+
+    // Tuesday runs and is recorded. Monday's period now has a closing mark.
+    store
+        .record(&settled_fixture(
+            "tue",
+            "2026-08-02T00:00:00Z",
+            "1180",
+            &[("BTC", "10", "110")],
+        ))
+        .unwrap();
+    assert_eq!(
+        run_settle().await,
+        vec!["mon".to_string()],
+        "recording the closer is what makes the period settleable - waiting for \
+         the cycle after that is a day of lag for nothing"
+    );
+}
+
 /// Running it twice must not double-count, so a missed day can be picked up by
 /// the day after without corrupting the days that were already settled.
 #[tokio::test]

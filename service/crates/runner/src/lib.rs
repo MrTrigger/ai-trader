@@ -1305,9 +1305,14 @@ impl<V: VenueAdapter + ?Sized, C: Timer> Runner<'_, V, C> {
 
     /// Attribute the period a past run opened, once it has closed.
     ///
-    /// Called at the top of the next cycle, before it trades: the book still
-    /// holds the previous run's positions and the marks have moved, which is
-    /// precisely the measurement. Returns the runs it settled.
+    /// Reads only recorded runs — each period's start marks come from the run
+    /// that opened it and its end marks from the run that closed it — so it
+    /// needs no live book and can run at any point. What it DOES need is the
+    /// closing run to be recorded already: called before this cycle executes,
+    /// the newest run in the list is yesterday's, which has no closer yet and
+    /// is skipped. That is how every day ended up settled a full cycle late.
+    /// The cycle now calls it after the run as well. Returns the runs it
+    /// settled.
     ///
     /// Idempotent. A run already carrying a result is skipped, so running this
     /// twice does not double-count and a missed day is picked up by the day

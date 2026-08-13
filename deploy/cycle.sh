@@ -14,12 +14,11 @@ say() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
 exec 9>"$STATE/cycle.lock"
 flock -n 9 || { say "a cycle is already running; leaving it alone"; exit 0; }
 
-# Before anything moves: write down what the period that just ended earned.
-# It has to happen here rather than at the end of the previous run, because the
-# answer does not exist until the period closes - and this is the moment it
-# does. Never fatal: a missing result is a gap in the record, not a reason to
-# skip a day's trading.
-say "settle"
+# Catch-up only. A period closes when the NEXT run is recorded, so at this
+# point today's run does not exist yet and yesterday's period is still open -
+# settling here can only pick up days a previous cycle missed. The settle that
+# does today's work runs after the execution below.
+say "settle (catch-up)"
 $BOT --config $BOTCFG settle || say "settle failed; continuing - the next cycle will pick it up"
 
 say "pull"
@@ -72,5 +71,14 @@ if [ "${BOOTSTRAP:-0}" = "1" ]; then
 else
   $BOT --config $BOTCFG run --plan "$STATE/plan.json"
 fi
+
+# Now that this run is recorded, the period the PREVIOUS run opened has a
+# closing mark and can be attributed. Doing this only at the top of the cycle
+# left every day settled twenty-four hours late: the run list at that moment
+# ends at yesterday, so yesterday had no closer and was skipped.
+#
+# Idempotent, so the catch-up pass above and this one cannot double-count.
+say "settle (the period this run just closed)"
+$BOT --config $BOTCFG settle || say "settle failed; continuing - the next cycle will pick it up"
 
 say "done"
