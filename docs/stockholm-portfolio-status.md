@@ -312,6 +312,74 @@ one implementation defect (score normalization) that was independently
 capable of hiding whatever signal, if any, a differently-scaled version might
 have shown.
 
+## 2026-08-13 Task 15: overlay book widened; Phase 2 control replay BLOCKED
+
+**Step 1 (done).** `stockholm-portfolio backtest --allocation-mode overlay`
+now defaults `--max-positions` to 40 **per sleeve** (long and short are
+ranked and admitted against separate 40-name caps, so up to 80 names total),
+`--position-weight` to 0.015, and `--max-gross` (the overlay's gross budget)
+to 0.6 — 100% core plus up to 30% long / 30% short overlay at the same total
+gross as before. Directional mode's defaults (20 combined names, 0.05,
+1.0) are unchanged; any explicit flag, in either mode, overrides its
+default. Rationale, from the earlier overlay audit: the 20-name overlay
+book's phase-to-phase dispersion (−21%..+6%) was uncompensated concentration
+noise; more names at smaller size shrinks it roughly √2–√3 while spending the
+same gross.
+
+Candidate admission was also fixed to match: `max_positions` previously fed
+one combined ranking across both directions even in overlay mode (via
+`buffered_ranked_ids`), so a run of one-sided edges could fill the whole cap
+from one sleeve and admit zero names on the other — the un-hedged outcome
+the widened book is supposed to avoid. `backtest()` now ranks and admits the
+long and short pools independently in overlay mode, each against its own
+cap; directional mode's historical combined-cap behaviour (no side quota) is
+unchanged.
+
+**Step 2 (BLOCKED).** The brief asked for the frozen lean model
+(`baseline-membership-prenorm-v2/model-{1..4}.json`, the same artifacts
+Task 2/3 replayed) to be replayed in overlay mode, unrefit, as the Phase 2
+constructor control. The fold-1 smoke test specified before the full sweep
+caught the problem immediately: `Model::load` refuses the model outright —
+
+```
+unsupported Stockholm feature version "fs-rust-stockholm-1"
+```
+
+Task 5 (`673219b`) deliberately moved every reachable stock
+`feature_set_version` constant past the pre-membership-fix block (old
+version `n` → `n + 16`) specifically so a model or matrix built with the
+latent cross-section look-ahead can never again be loaded and silently
+replayed as if unaffected. That is a correct and deliberate safety rail, but
+its consequence is total: every stock model file under `var/stockholm/`
+predates the bump (checked all `model.json`/`model-*.json` files present —
+every one declares `fs-rust-stockholm-1` through `-16`, or a `-direction-*`
+version; none matches a currently-registered constant). The exact
+directional-mode command from `var/stockholm-remediation/task2/regenerate.sh`
+— no overlay flags at all — fails identically on this same worktree at the
+current HEAD, confirming the block is general, not overlay-specific, and not
+a consequence of the Step 1 change above (verified with only Step 1's two
+files staged). No currently existing frozen model can be replayed fresh by
+`stockholm-portfolio backtest` under today's binary; the earlier
+Task 2/3/4 numbers in this document survive only because they were produced
+before Task 5 landed and are read back as saved JSON, never reloaded through
+`Model::load`.
+
+Fitting a new lean model is out of scope here twice over — it would be a
+refit, which the brief explicitly forbids, and model fitting is a Python job
+per this project's Rust/Python split. Loosening `Model::load`'s version
+check to let this one replay through is also out of scope: that check is a
+cross-cutting safety rail Task 5 debated and hardened across two review
+rounds, and weakening it is a controller-level call, not something to bundle
+into a CLI-default change. No overlay-vs-directional numbers for the Phase 2
+constructor control are reported below; the overlay mechanism itself is
+verified only by the unit test added in Step 1
+(`overlay_mode_admits_candidates_per_sleeve_not_from_one_combined_ranking`).
+Unblocking Step 2 needs one of: a fresh model fit on the corrected feature
+pipeline (a Phase-1/controller decision, not "no refit" in the sense the
+brief meant it), or an explicit, disclosed, narrowly-scoped exception for
+read-only comparison replays that does not weaken the check for any
+promotion-relevant path.
+
 ## Current verdict
 
 The strongest corrected development result is the lean LightGBM stock model
