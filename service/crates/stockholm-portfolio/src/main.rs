@@ -412,6 +412,37 @@ where
     )
 }
 
+/// Whether a loaded model and the matrix manifest it is paired with agree
+/// closely enough to replay together: identical declared feature-set
+/// version, identical feature order, identical survivorship status.
+///
+/// `stockholm_portfolio::Model::load` no longer refuses a model merely for
+/// declaring a `feature_set_version` this binary does not currently mint —
+/// that version may predate a later feature-set correction (see its own
+/// doc comment) and still be a legitimate frozen artifact. The safety
+/// property this function enforces instead is CONSISTENCY between the two
+/// artifacts, not currency with the binary: a model paired with a matrix
+/// recorded under the identical (possibly old) version and feature list is
+/// an internally consistent replay — the replay reads matrix rows from
+/// disk and recomputes no features, so an old-on-old pair cannot silently
+/// pick up the binary's current (different) feature semantics. A model and
+/// matrix that disagree — either declares a different version, feature
+/// order, or survivorship status than the other — are refused regardless
+/// of whether either version is current, so a stale model can never be
+/// quietly replayed against a freshly rebuilt matrix or vice versa.
+fn model_agrees_with_matrix(
+    model_features: &[String],
+    model_feature_set_version: &str,
+    model_survivorship_status: &str,
+    manifest_features: &[String],
+    manifest_feature_set_version: &str,
+    manifest_survivorship_status: &str,
+) -> bool {
+    model_features == manifest_features
+        && model_feature_set_version == manifest_feature_set_version
+        && model_survivorship_status == manifest_survivorship_status
+}
+
 fn collect(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(need(args, "--data-root")?);
     let manifest = equity_data::PublicEquityData::new()?.collect_stockholm(
@@ -2567,10 +2598,14 @@ fn run_backtest(args: &[String]) -> Result<(), String> {
     let (manifest, rows) = load_matrix(&matrix_path, start, end)?;
     let model = stockholm_portfolio::Model::load(Path::new(&need(args, "--model")?))?;
     let cadence = number(args, "--cadence-sessions", 5_usize)?;
-    if manifest.features != model.features
-        || manifest.feature_set_version != model.feature_set_version
-        || model.survivorship_status != manifest.survivorship_status
-    {
+    if !model_agrees_with_matrix(
+        &model.features,
+        &model.feature_set_version,
+        &model.survivorship_status,
+        &manifest.features,
+        &manifest.feature_set_version,
+        &manifest.survivorship_status,
+    ) {
         return Err("matrix/model/runtime contracts differ".into());
     }
     if manifest.horizon_sessions != cadence {
@@ -3267,5 +3302,76 @@ mod overlay_default_tests {
             .unwrap(),
             0.05
         );
+    }
+}
+
+#[cfg(test)]
+mod matrix_model_agreement_tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// Controller ruling: a model and matrix built under the identical old
+    /// (pre-correction) version are internally consistent and must load —
+    /// this is the case that unblocks Task 15 Step 2's re-baseline replay.
+    #[test]
+    fn old_model_and_matching_old_matrix_agree() {
+        let old_version = "fs-rust-stockholm-1";
+        let features = names(&["x_ret_1", "x_ret_5"]);
+        assert!(model_agrees_with_matrix(
+            &features,
+            old_version,
+            "SURVIVORSHIP_CONTAMINATED",
+            &features,
+            old_version,
+            "SURVIVORSHIP_CONTAMINATED",
+        ));
+    }
+
+    /// A stale model must not be silently replayed against a matrix rebuilt
+    /// under the binary's current feature semantics.
+    #[test]
+    fn old_model_against_a_current_version_matrix_is_refused() {
+        let features = names(&["x_ret_1", "x_ret_5"]);
+        assert!(!model_agrees_with_matrix(
+            &features,
+            "fs-rust-stockholm-1",
+            "SURVIVORSHIP_CONTAMINATED",
+            &features,
+            features_stockholm::BASELINE_FEATURE_SET_VERSION,
+            "SURVIVORSHIP_CONTAMINATED",
+        ));
+    }
+
+    /// A current model must not be silently replayed against a matrix still
+    /// built under an old, pre-correction version.
+    #[test]
+    fn current_model_against_an_old_matrix_is_refused() {
+        let features = names(&["x_ret_1", "x_ret_5"]);
+        assert!(!model_agrees_with_matrix(
+            &features,
+            features_stockholm::BASELINE_FEATURE_SET_VERSION,
+            "SURVIVORSHIP_CONTAMINATED",
+            &features,
+            "fs-rust-stockholm-1",
+            "SURVIVORSHIP_CONTAMINATED",
+        ));
+    }
+
+    /// Same declared version on both sides is not sufficient on its own —
+    /// the feature order must agree too (a version string alone does not
+    /// prove the matrix was built with today's ordering discipline).
+    #[test]
+    fn matching_version_with_different_feature_order_is_refused() {
+        assert!(!model_agrees_with_matrix(
+            &names(&["x_ret_1", "x_ret_5"]),
+            "fs-rust-stockholm-1",
+            "SURVIVORSHIP_CONTAMINATED",
+            &names(&["x_ret_5", "x_ret_1"]),
+            "fs-rust-stockholm-1",
+            "SURVIVORSHIP_CONTAMINATED",
+        ));
     }
 }

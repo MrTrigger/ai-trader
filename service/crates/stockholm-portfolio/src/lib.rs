@@ -148,7 +148,14 @@ impl Model {
                 model.model_version
             ));
         }
-        let expected_features = expected_features(&model.feature_set_version)?;
+        // A currently-registered version's feature order is checked against
+        // the registry, same as before. A version this binary no longer
+        // mints is not rejected outright here — see `expected_features`'s
+        // doc comment — but every caller that pairs a model with a matrix
+        // (`run_backtest`) still requires the two to declare the identical
+        // `feature_set_version` and feature list, which is the actual
+        // consistency proof for an old-on-old replay.
+        let expected_features = expected_features(&model.feature_set_version);
         if features_stockholm::label_horizon(&model.label_version).is_none() {
             return Err(format!(
                 "unsupported Stockholm label version {:?}",
@@ -156,8 +163,10 @@ impl Model {
             ));
         }
         features_stockholm::validate_selection(&model.features)?;
-        if model.features != expected_features {
-            return Err("model feature order does not match its declared version".into());
+        if let Some(expected_features) = expected_features {
+            if model.features != expected_features {
+                return Err("model feature order does not match its declared version".into());
+            }
         }
         let validate_linear = |model: &Model| -> Result<(), String> {
             let intercept = model
@@ -480,55 +489,66 @@ impl DirectionModel {
     }
 }
 
-fn expected_features(version: &str) -> Result<Vec<String>, String> {
+/// The canonical feature list for a *currently registered* feature-set
+/// version, or `None` when `version` predates the registry (an old
+/// `fs-rust-stockholm-N` from before a version bump, or anything else this
+/// binary does not currently mint). `None` is not itself a rejection: a
+/// version this binary no longer mints can still be a legitimate frozen
+/// artifact, provided the model and the matrix it is paired with agree with
+/// each other (checked by the caller, e.g. `run_backtest`'s
+/// `manifest.feature_set_version != model.feature_set_version` guard) — an
+/// old-on-old replay reads matrix rows from disk and recomputes nothing, so
+/// it stays internally consistent even though this binary can no longer
+/// regenerate that version's features from scratch.
+fn expected_features(version: &str) -> Option<Vec<String>> {
     match version {
         features_stockholm::BASELINE_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::baseline_model_feature_names())
+            Some(features_stockholm::baseline_model_feature_names())
         }
         features_stockholm::BASELINE_GLOBAL_RISK_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::baseline_global_risk_model_feature_names())
+            Some(features_stockholm::baseline_global_risk_model_feature_names())
         }
-        features_stockholm::FEATURE_SET_VERSION => Ok(features_stockholm::model_feature_names()),
+        features_stockholm::FEATURE_SET_VERSION => Some(features_stockholm::model_feature_names()),
         features_stockholm::RESIDUAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::residual_model_feature_names())
+            Some(features_stockholm::residual_model_feature_names())
         }
         features_stockholm::PUBLIC_SHORT_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::public_short_model_feature_names())
+            Some(features_stockholm::public_short_model_feature_names())
         }
         features_stockholm::PDMR_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_model_feature_names())
+            Some(features_stockholm::pdmr_model_feature_names())
         }
         features_stockholm::REPORT_EVENT_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_report_model_feature_names())
+            Some(features_stockholm::pdmr_report_model_feature_names())
         }
         features_stockholm::FUNDAMENTAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::fundamental_model_feature_names())
+            Some(features_stockholm::fundamental_model_feature_names())
         }
         features_stockholm::QUARTERLY_FUNDAMENTAL_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::quarterly_fundamental_model_feature_names())
+            Some(features_stockholm::quarterly_fundamental_model_feature_names())
         }
         features_stockholm::PDMR_MACRO_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_macro_model_feature_names())
+            Some(features_stockholm::pdmr_macro_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_borrow_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_borrow_model_feature_names())
         }
         features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_FEATURE_SET_VERSION => {
-            Ok(features_stockholm::pdmr_microstructure_borrow_news_model_feature_names())
+            Some(features_stockholm::pdmr_microstructure_borrow_news_model_feature_names())
         }
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_GLOBAL_RISK_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_global_risk_model_feature_names(),
         ),
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_TEXT_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
-        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION => Ok(
+        features_stockholm::PDMR_MICROSTRUCTURE_BORROW_NEWS_REPORT_ATTACHMENTS_FEATURE_SET_VERSION => Some(
             features_stockholm::pdmr_microstructure_borrow_news_report_text_model_feature_names(),
         ),
-        other => Err(format!("unsupported Stockholm feature version {other:?}")),
+        _ => None,
     }
 }
 
@@ -2572,11 +2592,24 @@ pub fn backtest(
             });
         }
         // The index leg is resolved before the book is marked: in overlay mode
-        // the core's own daily path comes from these same index closes.
+        // the core's own daily path comes from these same index closes. When
+        // the replay has an equity mark-price universe (`--bars-root`), the
+        // session dates it is priced on come from that same book calendar
+        // (`book_session_dates`) rather than by counting rows in the
+        // benchmark archive, which can carry bars on dates the equity market
+        // is closed. Without a mark-price universe there is no independent
+        // equity calendar in scope here, so the count-based lookup is the
+        // best available and is left as it was.
         let benchmark_period = config
             .benchmark
             .as_ref()
-            .map(|history| benchmark_period(history, date, cadence_sessions))
+            .map(|history| match config.mark_prices.as_ref() {
+                Some(prices) => {
+                    let session_dates = book_session_dates(prices, date, cadence_sessions)?;
+                    benchmark_period_on_dates(history, date, &session_dates)
+                }
+                None => benchmark_period(history, date, cadence_sessions),
+            })
             .transpose()?;
         let benchmark_period_return = benchmark_period.as_ref().map(|period| period.value);
         // Everything the candidate pipeline earned, net of its own costs. In
@@ -2692,6 +2725,19 @@ pub fn backtest(
         "Yahoo adjusted daily history is research input; production collection remains IB plus a licensed point-in-time universe.".into(),
         "OMXSGI comparison uses official Nasdaq gross-index closing levels from the decision session's close through the close of the session the position is exited on, the same sessions the portfolio's daily NAV marks use; the archive's start-of-day level is the prior close plus a dividend adjustment and is not priced against. It is a broad market reference, not a forced exposure target.".into(),
     ];
+    // A model whose declared `feature_set_version` is not one this binary
+    // currently mints predates the 2026-08-13 cross-section/feature
+    // corrections (current stock feature sets are fs-rust-stockholm-17 and
+    // later); `Model::load` still requires the matrix it is paired with to
+    // declare the identical version and feature list, so this is a
+    // consistent old-on-old replay, not a mixed-version one — but it still
+    // carries whatever pre-correction semantics that version had.
+    if expected_features(&model.feature_set_version).is_none() {
+        disclosures.push(format!(
+            "model feature_set_version {:?} predates the 2026-08-13 cross-section/feature corrections (current stock feature sets are fs-rust-stockholm-17 and later); this replay is a constructor re-baseline on pre-correction features, not evidence about the corrected pipeline.",
+            model.feature_set_version
+        ));
+    }
     if config.direction_config.is_some() {
         disclosures.push("The standalone direction-layer series applies smoothed target net exposure to OMXSGI before execution costs; it diagnoses timing only and cannot be treated as a tradable net result.".into());
     }
@@ -3969,6 +4015,11 @@ fn fixed_momentum_performance(
         }
         let net_return = gross_return_before_costs - cost_drag;
         nav *= 1.0 + net_return;
+        // This diagnostic control has no mark-price universe, so there is no
+        // independent equity calendar in scope to check the benchmark
+        // archive's own dates against; left as a count-based lookup (see
+        // `backtest`'s main loop for the by-date fix where a book calendar
+        // does exist).
         let benchmark_period_return = config
             .benchmark
             .as_ref()
@@ -4140,9 +4191,27 @@ pub fn add_benchmark(
     mut result: BacktestResult,
     history: &BenchmarkHistory,
 ) -> Result<BacktestResult, String> {
+    let cadence_sessions = result.cadence_sessions;
+    // The book's own equity-session dates for each step, read from its
+    // already-recorded daily marks when present (the exact calendar
+    // `daily_nav_marks` used) rather than by counting rows in the benchmark
+    // archive. A step with no daily marks (a report predating --bars-root)
+    // has no per-session calendar in this frozen report to align to; that
+    // case keeps the count-based lookup, unchanged.
+    let session_dates_per_step = result
+        .steps
+        .iter()
+        .map(|step| -> Option<Vec<Date>> {
+            (!step.daily_marks.is_empty())
+                .then(|| step.daily_marks.iter().map(|mark| mark.date).collect())
+        })
+        .collect::<Vec<_>>();
     let mut nav = 1.0;
-    for step in &mut result.steps {
-        let period = benchmark_period(history, step.date, result.cadence_sessions)?;
+    for (step, session_dates) in result.steps.iter_mut().zip(&session_dates_per_step) {
+        let period = match session_dates {
+            Some(session_dates) => benchmark_period_on_dates(history, step.date, session_dates)?,
+            None => benchmark_period(history, step.date, cadence_sessions)?,
+        };
         nav *= 1.0 + period.value;
         step.benchmark_period_return = Some(period.value);
         step.benchmark_nav = Some(nav);
@@ -4161,6 +4230,26 @@ pub fn add_benchmark(
         result.disclosures.push(disclosure.into());
     }
     Ok(result)
+}
+
+/// The book's own `cadence_sessions` equity-session dates strictly after
+/// `date`, in order — the calendar the index leg must be priced on when a
+/// mark-price universe exists. Never from the benchmark archive itself: an
+/// index can publish a level on a date the equity market is closed (e.g. a
+/// bank holiday), so counting `cadence_sessions` rows forward in the archive
+/// can land on the wrong calendar day entirely.
+fn book_session_dates(
+    prices: &MarkPrices,
+    date: Date,
+    cadence_sessions: usize,
+) -> Result<Vec<Date>, String> {
+    (1..=cadence_sessions)
+        .map(|session| {
+            prices
+                .session_after(date, session)
+                .ok_or_else(|| format!("mark prices end before session {session} after {date}"))
+        })
+        .collect()
 }
 
 fn benchmark_return(
@@ -4185,15 +4274,87 @@ struct BenchmarkPeriod {
 }
 
 /// One holding period of the index leg: the return from the decision session's
-/// official close to the close `horizon` sessions later, plus that period's
-/// closing level on every session in between.
+/// official close to the close on `session_dates`'s last entry, plus that
+/// period's closing level on every date in `session_dates` (one entry per
+/// held equity session, in order).
 ///
-/// Closes on both legs, on the same dates: the portfolio's daily NAV marks run
-/// from the decision session's close through the close of the session it
-/// rebalances on, so the index has to be read on exactly those sessions to be
-/// comparable. The archive's `start_value` is the prior session's close plus a
-/// dividend adjustment, not an opening print, so pricing either leg off it
-/// would shift the index a session away from the book it is measured against.
+/// Both legs are read BY DATE, never by counting rows in the archive: an
+/// index archive can carry bars on dates the equity market is closed (its
+/// own calendar need not agree with the exchange's), so counting rows
+/// forward from the decision date can land on the wrong calendar day.
+/// `session_dates` must already be the book's own equity-session dates (see
+/// `book_session_dates`); a `decision_date` or `session_dates` entry the
+/// archive has no bar for is refused rather than silently approximated.
+/// Used wherever a real equity calendar is in scope (a mark-price universe,
+/// or a frozen report's own recorded daily marks); see `benchmark_period`
+/// for the count-based fallback used where no such calendar is available.
+fn benchmark_period_on_dates(
+    history: &BenchmarkHistory,
+    decision_date: Date,
+    session_dates: &[Date],
+) -> Result<BenchmarkPeriod, String> {
+    if history
+        .bars
+        .windows(2)
+        .any(|pair| pair[0].date >= pair[1].date)
+    {
+        return Err(format!(
+            "benchmark {} sessions are not strictly increasing",
+            history.symbol
+        ));
+    }
+    if session_dates.is_empty() {
+        return Err("a benchmark period requires at least one session date".into());
+    }
+    let close_at = |target: Date| -> Option<f64> {
+        history
+            .bars
+            .binary_search_by_key(&target, |bar| bar.date)
+            .ok()
+            .map(|index| history.bars[index].end_value)
+    };
+    let entry_close = close_at(decision_date).ok_or_else(|| {
+        format!(
+            "benchmark {} has no session on {decision_date} to price the decision close from",
+            history.symbol
+        )
+    })?;
+    let marks = session_dates
+        .iter()
+        .map(|&date| {
+            close_at(date)
+                .map(|close| BenchmarkMark { date, close })
+                .ok_or_else(|| {
+                    format!(
+                        "benchmark {} has no session on {date}, one of the book's own equity-session dates, to mark the index leg against",
+                        history.symbol
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let exit = marks.last().expect("session_dates is non-empty");
+    let value = exit.close / entry_close - 1.0;
+    if !value.is_finite() {
+        return Err(format!(
+            "benchmark {} has invalid values on {decision_date} or {}",
+            history.symbol, exit.date
+        ));
+    }
+    Ok(BenchmarkPeriod {
+        value,
+        entry_close,
+        marks,
+    })
+}
+
+/// One holding period of the index leg: the return from the decision session's
+/// official close to the close `horizon` rows later in the archive, plus that
+/// period's closing level on every row in between. Used only where no real
+/// equity calendar is available to look the session dates up by (see
+/// `benchmark_period_on_dates`, which every caller with such a calendar in
+/// scope uses instead) — an archive that carries bars on dates the equity
+/// market is closed can make this land on the wrong calendar day, a
+/// pre-existing, disclosed limitation this function does not resolve.
 fn benchmark_period(
     history: &BenchmarkHistory,
     decision_date: Date,
@@ -4839,6 +5000,125 @@ mod tests {
         assert!(
             error.contains("format or version"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Controller ruling on the Task 15 blocker: `Model::load` must not
+    /// refuse a model merely for declaring a `feature_set_version` this
+    /// binary no longer mints. The safety property is CONSISTENCY between
+    /// the model and the matrix it is paired with (enforced by the
+    /// caller, e.g. `stockholm-portfolio`'s `run_backtest`), not currency
+    /// with the binary's current registry.
+    #[test]
+    fn model_load_accepts_a_pre_correction_feature_set_version_it_no_longer_mints() {
+        let mut model = constant_model(0.0);
+        model.feature_set_version = "fs-rust-stockholm-1".into();
+        let bytes = serde_json::to_vec(&model).expect("serialize fixture");
+        let path = std::env::temp_dir().join(format!(
+            "stockholm-model-pre-correction-fixture-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let result = Model::load(&path);
+        std::fs::remove_file(&path).ok();
+        let loaded =
+            result.expect("an unregistered feature_set_version must not be refused on its own");
+        assert_eq!(loaded.feature_set_version, "fs-rust-stockholm-1");
+    }
+
+    /// A `backtest()` replay run against such a model discloses that the
+    /// feature set predates the 2026-08-13 corrections, so a re-baseline
+    /// report is never mistaken for evidence about the corrected pipeline.
+    #[test]
+    fn backtest_discloses_when_the_models_feature_set_predates_the_current_registry() {
+        let mut model = constant_model(0.0);
+        model.feature_set_version = "fs-rust-stockholm-1".into();
+        let rows = [row(day("2024-01-02")), row(day("2024-01-03"))];
+        let result = backtest(
+            &model,
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-03"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 1.0,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("fs-rust-stockholm-1")
+                    && line.contains("predates")
+                    && line.contains("re-baseline")),
+            "expected a pre-correction disclosure naming the version: {:?}",
+            result.disclosures
+        );
+
+        // A model on a currently-registered version carries no such
+        // disclosure.
+        let current_model = constant_model(0.0);
+        let current_result = backtest(
+            &current_model,
+            &rows,
+            &BacktestConfig {
+                start: day("2024-01-02"),
+                end: day("2024-01-03"),
+                cadence_sessions: 1,
+                rebalance_offset_sessions: 0,
+                model_horizon_sessions: 1,
+                prediction_horizon_scale: 1.0,
+                max_positions: 1,
+                retention_rank: 1,
+                max_sector_gross: None,
+                ranking: portfolio_construction::RankingMethod::Edge,
+                sizing: portfolio_construction::SizingMethod::Equal,
+                allocation_budget: portfolio_construction::Budget::gross_only(1.0).unwrap(),
+                allocation_mode: AllocationMode::Directional,
+                position_weight: 1.0,
+                min_position_weight: 0.0,
+                reference_edge: 0.01,
+                reference_volatility: 0.02,
+                direction_config: None,
+                prediction_composition: PredictionComposition::Direct,
+                market_return_forecasts: None,
+                market_forecast_model_id: None,
+                costs: zero_execution_costs(),
+                benchmark: None,
+                mark_prices: None,
+                risk_free_annual: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            !current_result
+                .disclosures
+                .iter()
+                .any(|line| line.contains("predates the 2026-08-13")),
+            "a current-version model must not carry the pre-correction disclosure: {:?}",
+            current_result.disclosures
         );
     }
 
@@ -6411,6 +6691,90 @@ mod tests {
         // The index has no session before 01-02, so a decision taken there
         // cannot be priced rather than silently sliding to another anchor.
         assert!(benchmark_return(&history, day("2024-01-01"), 1).is_err());
+    }
+
+    /// Task 15 controller ruling: an index archive can carry a bar on a date
+    /// the equity market is closed (e.g. a bank holiday the index still
+    /// prices through) — 2023-06-06, Sweden's National Day, is the case that
+    /// broke the Task 15 overlay replay. `benchmark_period_on_dates` reads
+    /// the archive strictly by the book's own session dates, so such an
+    /// extra bar must never be consulted and must not change the result; a
+    /// bar genuinely missing on one of the book's own dates must still be
+    /// refused.
+    #[test]
+    fn benchmark_period_on_dates_ignores_extra_archive_bars_and_still_refuses_missing_ones() {
+        let index_bar = |date: Date, value: f64| equity_data::BenchmarkBar {
+            date,
+            start_value: value,
+            end_value: value,
+            high_value: None,
+            low_value: None,
+        };
+        // The book's own equity sessions skip 2024-01-03 entirely (the
+        // simulated holiday); the index archive below still has a bar for
+        // it.
+        let clean = BenchmarkHistory {
+            format_version: "fixture".into(),
+            symbol: "OMXSGI".into(),
+            name: "fixture".into(),
+            return_type: "gross_total_return".into(),
+            currency: "SEK".into(),
+            source: "fixture".into(),
+            generated_at: "fixture".into(),
+            bars: vec![
+                index_bar(day("2024-01-01"), 100.0),
+                index_bar(day("2024-01-02"), 100.5),
+                index_bar(day("2024-01-04"), 101.0),
+                index_bar(day("2024-01-05"), 101.5),
+            ],
+        };
+        let mut with_holiday_bar = clean.clone();
+        with_holiday_bar
+            .bars
+            .insert(2, index_bar(day("2024-01-03"), 999.0));
+
+        let session_dates = [day("2024-01-04"), day("2024-01-05")];
+        let clean_period =
+            benchmark_period_on_dates(&clean, day("2024-01-02"), &session_dates).unwrap();
+        let holiday_period =
+            benchmark_period_on_dates(&with_holiday_bar, day("2024-01-02"), &session_dates)
+                .unwrap();
+        assert_eq!(clean_period.value, holiday_period.value);
+        assert_eq!(clean_period.entry_close, holiday_period.entry_close);
+        assert_eq!(
+            clean_period
+                .marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+            holiday_period
+                .marks
+                .iter()
+                .map(|mark| (mark.date, mark.close))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !holiday_period
+                .marks
+                .iter()
+                .any(|mark| mark.date == day("2024-01-03")),
+            "the equity-closed date must never be consulted: {:?}",
+            holiday_period.marks
+        );
+
+        // A book session date the index genuinely has no bar for is still
+        // refused, not silently skipped or substituted.
+        let mut missing_a_book_date = clean.clone();
+        missing_a_book_date
+            .bars
+            .retain(|bar| bar.date != day("2024-01-04"));
+        let error =
+            benchmark_period_on_dates(&missing_a_book_date, day("2024-01-02"), &session_dates)
+                .unwrap_err();
+        assert!(
+            error.contains("2024-01-04"),
+            "expected the missing date named in the error: {error}"
+        );
     }
 
     #[test]
