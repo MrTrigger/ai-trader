@@ -427,13 +427,20 @@ symmetric, on purpose:
 
 | | what happens |
 |---|---|
-| **broker flat, model long** | adopt flat, automatically |
-| **broker holding something else** | flatten and halt for a human |
+| **broker flat, model long** | close the model's positions at the broker's own execution price |
+| **broker holding something** | adopt it at the broker's average cost and manage it normally |
 
-Adopting flat can only ever REDUCE what the bot believes it is carrying, so it
-is safe unattended — and believing in a position that does not exist is what
-makes a bot place exits for contracts nobody owns. Adopting a *position* is the
-opposite: it means trading a book something else is writing to.
+Both directions are the bot's own business. It does not stop at a disagreement
+with its own broker: a book that needs a human to agree with the account it
+trades is not running unattended, it is running until the first surprise. And
+halting protects nothing — the position stays open either way, only with
+nothing managing it.
+
+An adopted position is not a special kind of position. It gets the trail, the
+noise exit and the session flat like one the book opened itself, because every
+exit rule is priced off the bar stream rather than off how the position was
+acquired. The sleeve it lands in is arbitrary and does not need to be
+otherwise.
 
 Adopting books the money that really moved. The bot asks IB for its own
 executions since the oldest open entry, takes the quantity-weighted price of
@@ -443,6 +450,10 @@ it. If there is no such execution the entry never filled, so the position is
 dropped with **no fill at all**: inventing an exit price would put a number in
 the ledger that nothing traded at, and it would be indistinguishable from a
 real one forever.
+
+Adoption realises nothing — the money is still in the market — so it books no
+fill. It takes the broker's average cost as the basis, because that is what the
+position actually cost; the P&L then comes out true when the book exits it.
 
 Every reconciliation writes a line to the bot's log saying which sleeves were
 affected, at what price, and for how much.
@@ -503,11 +514,11 @@ curl -X POST localhost:7434/api/bots/futures-noise/halt   # or /stop, /resume
 
 ## 7. First principles worth not relearning
 
-**Reconciliation disagreements are never auto-corrected in the dangerous
-direction.** The futures bot adopts broker-FLAT automatically (§3) — it can only
-reduce believed exposure, and it books the broker's own execution price so the
-P&L stays true. Everything below still holds for a broker holding something the
-model does not, which is the case that means somebody else traded the account: The ledger is an
+**The futures bot reconciles itself to the broker, both directions** (§3): it
+closes what the broker no longer holds at the broker's own execution price, and
+adopts what the broker does hold at the broker's cost basis. The account is the
+truth and the bot moves to it without asking. What follows is the CRYPTO
+executor, which still stops for a human: The ledger is an
 independent record of what we authorised, written before orders go out. If the
 venue reports a fill the ledger does not know, the run stops. It could be another
 process, a stale order, a compromised key — or a lost ledger. Those look

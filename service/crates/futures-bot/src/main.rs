@@ -654,18 +654,23 @@ async fn clear_halt(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> 
     Ok(())
 }
 
-/// Make the model agree with the broker, or stop.
+/// Make the model agree with the broker. Always, and without waking anyone.
 ///
 /// The broker is the truth about what we hold — it is the only party that can
-/// actually be holding anything — so the two directions are NOT symmetric:
+/// actually be holding anything — so the model moves to it, in both
+/// directions:
 ///
-/// * **Broker flat, model long.** Adopt flat. The model is carrying a position
-///   that does not exist, and believing in it is what makes a bot place exits
-///   for contracts nobody owns. Adopting can only ever reduce what we think we
-///   are carrying, so it is safe to do unattended.
-/// * **Broker holding something else.** Flatten and halt. Adopting a position
-///   the model never planned means trading a book somebody or something else
-///   is writing to, and no amount of convenience is worth that.
+/// * **Broker flat.** Close the model's positions, booking the broker's own
+///   execution price so the realised P&L is the money that really moved.
+/// * **Broker holding something.** Adopt it at the broker's average cost and
+///   manage it like any other position: trail, noise exit, session flat. It is
+///   real open exposure, and the right thing to do with real open exposure is
+///   to work it, not to freeze in front of it.
+///
+/// Halting for a human was the old answer to the second case and it was the
+/// wrong one: a book that stops at its first disagreement with its own broker
+/// is not running unattended. It also does not protect anything — the position
+/// stays open either way, only now nothing is managing it.
 ///
 /// Read TWICE before believing a disagreement. Orders placed moments earlier
 /// on this very bar are still propagating — IB acknowledges an order before
@@ -753,10 +758,36 @@ async fn reconcile(
         }
         return Ok(());
     }
-    let _ = trading.flatten_all(bot_id).await;
-    let line = format!("reconcile-mismatch: broker {venue_net} vs model {model_net}");
-    let _ = rec.log_line(bot_id, "error", &line);
-    book.halted = Some(line);
+    // The broker holds something. Take it on at ITS cost basis and work it.
+    let avg = broker_avg_price(trading, symbol).await;
+    let Some(avg) = avg else {
+        // Without a cost basis every subsequent P&L number would be invented.
+        // Leave the model alone and say so; the next reconcile tries again,
+        // and the position is no worse off than it was a second ago.
+        let line = format!(
+            "reconcile: broker {venue_net} vs model {model_net}, but no average price to adopt at \
+             — leaving the model alone and retrying next cycle"
+        );
+        eprintln!("{line}");
+        let _ = rec.log_line(bot_id, "warn", &line);
+        return Ok(());
+    };
+    let taken = book.adopt_broker_position(venue_net, avg, chrono::Utc::now());
+    let line = format!(
+        "reconciled: broker {venue_net} vs model {model_net} — adopted the broker's {venue_net} \
+         at {avg} into {} ({}); managed from here like any other position",
+        taken.len(),
+        taken.join(", ")
+    );
+    eprintln!("{line}");
+    let _ = rec.log_line(bot_id, "warn", &line);
+    if book
+        .halted
+        .as_deref()
+        .is_some_and(|h| h.starts_with("reconcile-mismatch"))
+    {
+        book.halted = None;
+    }
     Ok(())
 }
 
@@ -803,6 +834,20 @@ async fn broker_exit_price(
         notional += q * p;
     }
     (qty > 0.0).then(|| notional / qty)
+}
+
+/// The broker's average cost for what it holds in `symbol` — the position's
+/// real basis, which is what an adopted position must be priced from.
+async fn broker_avg_price(trading: &Trading, symbol: &str) -> Option<f64> {
+    let positions = trading.adapter().get_positions().await.ok()?;
+    let (mut qty, mut notional) = (0.0f64, 0.0f64);
+    for p in positions.iter().filter(|p| p.asset.to_string() == symbol) {
+        let q: f64 = p.qty.try_into().unwrap_or(0.0);
+        let px: f64 = p.avg_price.try_into().unwrap_or(0.0);
+        qty += q.abs();
+        notional += q.abs() * px;
+    }
+    (qty > 0.0 && notional > 0.0).then(|| notional / qty)
 }
 
 /// The broker's net contracts in `symbol`, as the reconcile counts them.

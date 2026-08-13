@@ -13,8 +13,8 @@ use chrono::NaiveDate;
 use features_cme::EnrichedBar;
 
 use crate::exec::{
-    exit_all, force_flat_price, manage_noise, market_fill, noise_exit_price, Costs, Fill, Position,
-    Signal,
+    exit_all, force_flat_price, manage_noise, market_fill, noise_exit_price, Costs, Direction,
+    Fill, Position, Signal,
 };
 use crate::scanner::Scanner;
 use crate::Sleeve;
@@ -108,11 +108,10 @@ impl Book {
     /// would put a number in the P&L that nothing traded at, and it would be
     /// indistinguishable from a real one forever.
     ///
-    /// Only ever called for broker-flat. The opposite direction — the broker
-    /// holding something the model does not — is not adoptable: it is either
-    /// somebody else trading the account or a lost ledger, and both want a
-    /// human. This one is safe because it can only ever REDUCE what we believe
-    /// we are carrying.
+    /// The broker-flat half of reconciliation; [`Book::adopt_broker_position`]
+    /// is the other. Both directions are handled by the bot itself — a book
+    /// that needs waking someone up at 3am to agree with its own broker is not
+    /// running unattended, it is running until the first disagreement.
     pub fn adopt_broker_flat(
         &mut self,
         closed_at: Option<f64>,
@@ -151,6 +150,71 @@ impl Book {
             self.book_fill(f);
         }
         (cleared, booked)
+    }
+
+    /// Take on what the broker actually holds, and manage it like anything
+    /// else the book opened: trail, noise exit, session flat.
+    ///
+    /// The exposure is real and it is OPEN, so nothing is realised here and no
+    /// fill is booked — the money is still in the market. The cost basis comes
+    /// from the broker's own average price, because that is what the position
+    /// actually cost; a model entry price that disagrees was never the truth
+    /// about this trade, and using it would misstate the P&L on the way out.
+    ///
+    /// The sleeve a contract lands in is arbitrary — the broker reports a net
+    /// and has no idea about sleeves — and it does not need to be otherwise.
+    /// Every exit rule here is priced off the bar stream rather than off how
+    /// the position was acquired, and `flat_by` closes whatever is still open
+    /// at the end of the session regardless. So an adopted contract gets
+    /// managed and exited on its merits, which is the whole point.
+    pub fn adopt_broker_position(
+        &mut self,
+        target_net: i64,
+        avg_price: f64,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<&'static str> {
+        // Start from flat: the model's own positions are a claim about the same
+        // exposure the broker is reporting, so keeping both would double-count
+        // it. Nothing is booked — none of it closed.
+        for st in &mut self.sleeves {
+            st.position = None;
+            st.resting.clear();
+        }
+        let direction = if target_net >= 0 {
+            Direction::Long
+        } else {
+            Direction::Short
+        };
+        let mut remaining = target_net.unsigned_abs();
+        let per = self.units.max(1) as u64;
+        let mut taken = Vec::new();
+        // Sleeves that know their session first: a position has to be able to
+        // book its exit against one.
+        let order: Vec<usize> = (0..self.sleeves.len())
+            .filter(|i| self.sleeves[*i].session.is_some())
+            .chain((0..self.sleeves.len()).filter(|i| self.sleeves[*i].session.is_none()))
+            .collect();
+        for i in order {
+            if remaining == 0 {
+                break;
+            }
+            let n = remaining.min(per);
+            let st = &mut self.sleeves[i];
+            st.position = Some(Position {
+                direction,
+                entry_price: avg_price,
+                entry_ts: ts,
+                entry_index: st.bar_index.max(0) as usize,
+                contracts: n as u32,
+                // Replaced by the trail on the very next bar; manage_noise
+                // recomputes it outright rather than ratcheting.
+                stop_price: avg_price,
+                noise_exit_pending: false,
+            });
+            taken.push(st.cfg.key);
+            remaining -= n;
+        }
+        taken
     }
 
     pub fn apply_control(&mut self, c: &Control) {
@@ -786,6 +850,56 @@ mod halt_semantics_tests {
             (daily - (daily_before + booked_net)).abs() < 1e-6,
             "daily net missed the reconciled fills: {daily} vs {}",
             daily_before + booked_net
+        );
+    }
+
+    /// An adopted position is not a special kind of position. The broker's
+    /// exposure is real and open, so the book takes it at the broker's cost
+    /// basis and then trails it, noise-exits it and flattens it at session end
+    /// exactly like one it opened itself. Freezing in front of it would leave
+    /// real money in the market with nothing managing it.
+    #[test]
+    fn an_adopted_position_is_managed_and_exits_like_any_other() {
+        let all = bars();
+        let mut d = Driver::new();
+        // Warm the sleeves so sessions and bands exist to manage against.
+        let mut i = 0;
+        while i < all.len() && d.open_positions() == 0 {
+            d.feed(&all[i]);
+            i += 1;
+        }
+        assert!(d.open_positions() > 0, "never warmed up — test is vacuous");
+
+        // The broker says it is long 2 at a price the model never had.
+        let basis = all[i - 1].close + 40.0;
+        let taken = d.book.adopt_broker_position(2, basis, all[i - 1].ts_utc);
+        assert_eq!(taken.len(), 2, "two contracts should land in two sleeves");
+        assert_eq!(
+            d.open_positions(),
+            2,
+            "the model must now hold what the broker holds"
+        );
+        for st in d.book.sleeves.iter().filter(|s| s.position.is_some()) {
+            let p = st.position.as_ref().expect("position");
+            assert_eq!(p.entry_price, basis, "adopted at the wrong cost basis");
+            assert_eq!(p.contracts, 1);
+        }
+        // Nothing is realised by adopting: the money is still in the market.
+        let fills_after_adopt = d.book.fills.len();
+
+        // Now let the book run. The rails must close it like anything else.
+        let end = (i + 2016).min(all.len());
+        for b in &all[i..end] {
+            d.feed(b);
+        }
+        assert_eq!(
+            d.open_positions(),
+            0,
+            "an adopted position was never exited — it is not being managed"
+        );
+        assert!(
+            d.book.fills.len() > fills_after_adopt,
+            "exiting an adopted position must book a fill"
         );
     }
 
