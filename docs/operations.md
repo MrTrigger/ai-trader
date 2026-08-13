@@ -418,6 +418,35 @@ Suspend the schedule entirely:
 kubectl patch cronjob aitrader-paper-cycle -n trader -p '{"spec":{"suspend":true}}'
 ```
 
+### Reconciliation: the broker is the truth about what we hold
+
+At startup and at every session boundary the bot compares its book against the
+broker's positions, reading twice a few seconds apart so an order still
+propagating is not mistaken for a divergence. The two directions are NOT
+symmetric, on purpose:
+
+| | what happens |
+|---|---|
+| **broker flat, model long** | adopt flat, automatically |
+| **broker holding something else** | flatten and halt for a human |
+
+Adopting flat can only ever REDUCE what the bot believes it is carrying, so it
+is safe unattended — and believing in a position that does not exist is what
+makes a bot place exits for contracts nobody owns. Adopting a *position* is the
+opposite: it means trading a book something else is writing to.
+
+Adopting books the money that really moved. The bot asks IB for its own
+executions since the oldest open entry, takes the quantity-weighted price of
+the ones that CLOSE its side, and books a real exit at that price — through the
+same path as any other trade, so the session's net and the kill rail both see
+it. If there is no such execution the entry never filled, so the position is
+dropped with **no fill at all**: inventing an exit price would put a number in
+the ledger that nothing traded at, and it would be indistinguishable from a
+real one forever.
+
+Every reconciliation writes a line to the bot's log saying which sleeves were
+affected, at what price, and for how much.
+
 ### When the futures bot halts ITSELF
 
 Kill criterion, reconcile mismatch, refused order, feed stall: these are **rail
@@ -474,7 +503,11 @@ curl -X POST localhost:7434/api/bots/futures-noise/halt   # or /stop, /resume
 
 ## 7. First principles worth not relearning
 
-**Reconciliation disagreements are never auto-corrected.** The ledger is an
+**Reconciliation disagreements are never auto-corrected in the dangerous
+direction.** The futures bot adopts broker-FLAT automatically (§3) — it can only
+reduce believed exposure, and it books the broker's own execution price so the
+P&L stays true. Everything below still holds for a broker holding something the
+model does not, which is the case that means somebody else traded the account: The ledger is an
 independent record of what we authorised, written before orders go out. If the
 venue reports a fill the ledger does not know, the run stops. It could be another
 process, a stale order, a compromised key — or a lost ledger. Those look

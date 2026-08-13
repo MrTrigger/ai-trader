@@ -654,6 +654,157 @@ async fn clear_halt(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> 
     Ok(())
 }
 
+/// Make the model agree with the broker, or stop.
+///
+/// The broker is the truth about what we hold — it is the only party that can
+/// actually be holding anything — so the two directions are NOT symmetric:
+///
+/// * **Broker flat, model long.** Adopt flat. The model is carrying a position
+///   that does not exist, and believing in it is what makes a bot place exits
+///   for contracts nobody owns. Adopting can only ever reduce what we think we
+///   are carrying, so it is safe to do unattended.
+/// * **Broker holding something else.** Flatten and halt. Adopting a position
+///   the model never planned means trading a book somebody or something else
+///   is writing to, and no amount of convenience is worth that.
+///
+/// Read TWICE before believing a disagreement. Orders placed moments earlier
+/// on this very bar are still propagating — IB acknowledges an order before
+/// the position query reflects it — and a Gateway whose API is degraded
+/// answers "no positions" rather than failing. That cost a real halt: two
+/// entries fired on a roll bar, the reconcile ran in the same iteration, and
+/// the book latched `broker 0 vs model 2` against positions the broker was in
+/// the middle of taking on. A genuine divergence persists; a race resolves.
+/// How long to wait before believing a broker/model disagreement. Orders placed
+/// on this bar are still propagating, and a degraded Gateway API answers "no
+/// positions" rather than erroring — so the first read can be wrong in exactly
+/// the direction that acts.
+const RECONCILE_SETTLE_S: u64 = 5;
+
+async fn reconcile(
+    trading: &Trading,
+    book: &mut Book,
+    symbol: &str,
+    bot_id: &str,
+    rec: &records::blocking::Records,
+) -> Result<(), String> {
+    let model_net = live::model_net_contracts(book);
+    let mut venue_net = venue_net_contracts(trading, symbol).await?;
+    if venue_net != model_net {
+        tokio::time::sleep(std::time::Duration::from_secs(RECONCILE_SETTLE_S)).await;
+        venue_net = venue_net_contracts(trading, symbol).await?;
+    }
+    if venue_net == model_net {
+        // Agreement clears a halt this same check raised. Nothing else does:
+        // a kill criterion, a refused order or a stalled feed are still true
+        // whatever the positions say, and stay latched for a human.
+        if book
+            .halted
+            .as_deref()
+            .is_some_and(|h| h.starts_with("reconcile-mismatch"))
+        {
+            book.halted = None;
+            let line = format!("reconciled: broker and model both {model_net} — halt cleared");
+            eprintln!("{line}");
+            let _ = rec.log_line(bot_id, "warn", &line);
+        }
+        return Ok(());
+    }
+    if venue_net == 0 {
+        // At what price did the broker actually close it? Guessing would put a
+        // number in the P&L that nothing traded at, so ask: the executions are
+        // the only record of the money that really moved. Search from the
+        // oldest open entry, which is the earliest an exit could have happened.
+        let since = book
+            .sleeves
+            .iter()
+            .filter_map(|s| s.position.as_ref().map(|p| p.entry_ts))
+            .min();
+        let closed_at = broker_exit_price(trading, symbol, book, since).await;
+        let (cleared, booked) = book.adopt_broker_flat(closed_at, "reconciled-broker-flat");
+        let net: f64 = booked.iter().map(|f| f.dollars).sum();
+        let line = match closed_at {
+            Some(px) => format!(
+                "reconciled: broker flat, model was {model_net} — closed {} ({}) at the broker's \
+                 own {px}, booking {net:+.2}",
+                cleared.len(),
+                cleared.join(", ")
+            ),
+            // No execution at all: the entry never filled, so there was never
+            // a position and there is no money to book.
+            None => format!(
+                "reconciled: broker flat, model was {model_net} — dropped {} ({}) with no fill; \
+                 the broker has no execution for them, so the entry never filled",
+                cleared.len(),
+                cleared.join(", ")
+            ),
+        };
+        eprintln!("{line}");
+        let _ = rec.log_line(bot_id, "warn", &line);
+        // The fills themselves need no special path: they are in `book.fills`
+        // now, and the publish at the end of this cycle records every one of
+        // them under the same idempotent key as any other trade. A reconciled
+        // exit IS a trade — it should not look different in the ledger.
+        if book
+            .halted
+            .as_deref()
+            .is_some_and(|h| h.starts_with("reconcile-mismatch"))
+        {
+            book.halted = None;
+        }
+        return Ok(());
+    }
+    let _ = trading.flatten_all(bot_id).await;
+    let line = format!("reconcile-mismatch: broker {venue_net} vs model {model_net}");
+    let _ = rec.log_line(bot_id, "error", &line);
+    book.halted = Some(line);
+    Ok(())
+}
+
+/// The price the broker actually closed our position at, or `None` if it has
+/// no execution that could have closed it.
+///
+/// Quantity-weighted when the close was filled in pieces, because one contract
+/// out of three at a better price is not the price we got. The side is the one
+/// that CLOSES what the model holds — a long is closed by a sell — so an entry
+/// execution in the same window is not mistaken for an exit.
+async fn broker_exit_price(
+    trading: &Trading,
+    symbol: &str,
+    book: &Book,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<f64> {
+    let closing_side = book
+        .sleeves
+        .iter()
+        .filter_map(|s| s.position.as_ref())
+        .map(|p| match p.direction {
+            noise_book::exec::Direction::Long => venue::Side::Sell,
+            noise_book::exec::Direction::Short => venue::Side::Buy,
+        })
+        .next()?;
+    let since = since.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t.timestamp()).ok());
+    let fills = match trading.adapter().get_fills(since).await {
+        Ok(f) => f,
+        Err(e) => {
+            // Unreadable is not zero. Booking a fill we cannot price would be
+            // worse than leaving the P&L alone and saying so.
+            eprintln!("reconcile: cannot read broker executions ({e}) — no exit price");
+            return None;
+        }
+    };
+    let (mut qty, mut notional) = (0.0f64, 0.0f64);
+    for f in fills
+        .iter()
+        .filter(|f| f.asset.to_string() == symbol && f.side == closing_side)
+    {
+        let q: f64 = f.qty.try_into().unwrap_or(0.0);
+        let p: f64 = f.price.try_into().unwrap_or(0.0);
+        qty += q;
+        notional += q * p;
+    }
+    (qty > 0.0).then(|| notional / qty)
+}
+
 /// The broker's net contracts in `symbol`, as the reconcile counts them.
 async fn venue_net_contracts(trading: &Trading, symbol: &str) -> Result<i64, String> {
     Ok(trading
@@ -846,6 +997,16 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
             tokio::spawn(rithmic_feed_task(v.clone(), bar_tx, feed_health.clone()));
         }
     }
+    // Reconcile before the first bar, not just at the next session boundary.
+    // A restored snapshot is a claim about what we were holding when the
+    // process died, and the broker is the only party who can confirm it. Left
+    // to the boundary, a book could spend a whole session managing exits for
+    // contracts that were never there — and a mismatch latched before the
+    // restart would keep the bot halted until a human noticed, which is how it
+    // sat halted overnight.
+    if live {
+        reconcile(&trading, &mut book, &symbol, &bot_id, &rec).await?;
+    }
     eprintln!("run loop started ({mode}); ctrl-c to stop");
 
     // Never feed a bar the feature streams already consumed: warmup covers
@@ -877,11 +1038,6 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     // the order is market risk the operator thought they had cancelled.
     // The primary path is push (ctrl_rx, milliseconds); this tick is the
     // fallback for a dead listener, and the reason it exists at all.
-    /// How long to wait before believing a broker/model disagreement. Orders
-    /// placed on this bar are still propagating, and a degraded Gateway API
-    /// answers "no positions" rather than erroring — so the first read can be
-    /// wrong in exactly the direction that triggers a halt.
-    const RECONCILE_SETTLE_S: u64 = 5;
     const CONTROL_TICK_S: u64 = 5;
     // Status publishing stays at a human cadence; only the control read
     // needs to be quick, and a status row every 5s is noise in the DB.
@@ -1042,33 +1198,7 @@ async fn run_live(get: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
                 }
             }
             if outcome.session_rolled {
-                // Broker-vs-model reconciliation at the boundary. Mismatch is
-                // never auto-corrected: flatten and halt for a human.
-                //
-                // Read it TWICE. Orders placed moments earlier on this very bar
-                // are still propagating — IB acknowledges the order before the
-                // position query reflects it — and a Gateway whose API is
-                // degraded answers "no positions" rather than failing. Either
-                // way the first read can say zero while the account is not.
-                // That cost a real halt: two entries fired on the roll bar, the
-                // reconcile ran in the same iteration, and the book latched
-                // `broker 0 vs model 2` against positions the broker was in the
-                // middle of taking on.
-                //
-                // A genuine divergence persists; a race resolves. Confirming
-                // costs a few seconds at a session boundary and nothing else.
-                let model_net = live::model_net_contracts(&book);
-                let mut venue_net = venue_net_contracts(&trading, &symbol).await?;
-                if venue_net != model_net {
-                    tokio::time::sleep(std::time::Duration::from_secs(RECONCILE_SETTLE_S)).await;
-                    venue_net = venue_net_contracts(&trading, &symbol).await?;
-                }
-                if venue_net != model_net {
-                    let _ = trading.flatten_all(&bot_id).await;
-                    book.halted = Some(format!(
-                        "reconcile-mismatch: broker {venue_net} vs model {model_net}"
-                    ));
-                }
+                reconcile(&trading, &mut book, &symbol, &bot_id, &rec).await?;
             }
         }
 

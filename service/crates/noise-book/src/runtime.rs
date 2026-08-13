@@ -98,6 +98,61 @@ impl Book {
         }
     }
 
+    /// Take the broker's word that we hold NOTHING, and make the model agree.
+    ///
+    /// `closed_at` is the price the BROKER actually closed at, from its own
+    /// executions. Given one, each open sleeve books a real exit at that price
+    /// and the P&L is the money that really moved. Given `None` — no execution
+    /// exists, so the entry never filled and there was never a position — the
+    /// sleeve is dropped with no fill at all, because inventing an exit price
+    /// would put a number in the P&L that nothing traded at, and it would be
+    /// indistinguishable from a real one forever.
+    ///
+    /// Only ever called for broker-flat. The opposite direction — the broker
+    /// holding something the model does not — is not adoptable: it is either
+    /// somebody else trading the account or a lost ledger, and both want a
+    /// human. This one is safe because it can only ever REDUCE what we believe
+    /// we are carrying.
+    pub fn adopt_broker_flat(
+        &mut self,
+        closed_at: Option<f64>,
+        reason: &str,
+    ) -> (Vec<&'static str>, Vec<Fill>) {
+        let (mut cleared, mut booked) = (Vec::new(), Vec::new());
+        let (instrument, costs) = (self.instrument.clone(), self.costs);
+        for st in &mut self.sleeves {
+            if let Some(pos) = st.position.take() {
+                cleared.push(st.cfg.key);
+                // A fill needs the bar it happened on; without one there is no
+                // session to book it against either.
+                if let (Some(price), Some(bar), Some(session)) =
+                    (closed_at, st.last_bar.as_ref(), st.session)
+                {
+                    booked.push(exit_all(
+                        st.cfg.key,
+                        &instrument,
+                        session,
+                        &pos,
+                        bar,
+                        price,
+                        reason,
+                        &costs,
+                    ));
+                }
+            }
+            // Resting orders belong to a position that does not exist.
+            st.resting.clear();
+        }
+        // Through `book_fill`, not straight onto `fills`: reconciled money is
+        // money, so it has to reach the session's daily net and be counted by
+        // the kill criterion like any other loss. Appending to the ledger alone
+        // would leave the rail blind to it.
+        for f in booked.iter().cloned() {
+            self.book_fill(f);
+        }
+        (cleared, booked)
+    }
+
     pub fn apply_control(&mut self, c: &Control) {
         if c.halt {
             if self.halted.is_none() && c.flatten {
@@ -665,6 +720,102 @@ mod halt_semantics_tests {
                 .filter(|s| s.position.is_some())
                 .count()
         }
+    }
+
+    /// The broker is the truth about what we hold, and adopting FLAT is the
+    /// safe direction — it can only reduce believed exposure. But it must book
+    /// the money that actually moved: dropping a position silently loses real
+    /// P&L, and inventing an exit price puts a number in the ledger that
+    /// nothing traded at.
+    #[test]
+    fn adopting_broker_flat_books_the_brokers_own_price() {
+        let all = bars();
+        let mut d = Driver::new();
+        let mut i = 0;
+        while i < all.len() && d.open_positions() == 0 {
+            d.feed(&all[i]);
+            i += 1;
+        }
+        assert!(
+            d.open_positions() > 0,
+            "never opened a position — test is vacuous"
+        );
+
+        let open = d.open_positions();
+        let before = d.book.fills.len();
+        let daily_before: f64 = d.book.daily_net.values().sum();
+        let entry = d
+            .book
+            .sleeves
+            .iter()
+            .find_map(|s| s.position.as_ref().map(|p| (p.entry_price, p.sign())))
+            .expect("a position");
+
+        // The broker says it closed 25 points in our favour.
+        let exit_px = entry.0 + 25.0 * entry.1;
+        let (cleared, booked) = d
+            .book
+            .adopt_broker_flat(Some(exit_px), "reconciled-broker-flat");
+
+        assert_eq!(cleared.len(), open, "every open sleeve is cleared");
+        assert_eq!(
+            d.open_positions(),
+            0,
+            "the model still believes it holds something"
+        );
+        assert_eq!(booked.len(), open, "one fill per position that existed");
+        assert_eq!(
+            d.book.fills.len(),
+            before + open,
+            "fills must reach the book's ledger"
+        );
+        for f in &booked {
+            assert_eq!(f.exit, exit_px, "booked at a price the broker did not give");
+            assert_eq!(f.reason, "reconciled-broker-flat");
+            assert!(
+                f.dollars > 0.0,
+                "25 points our way should book a gain, got {}",
+                f.dollars
+            );
+        }
+        // Reconciled money is money: the session's net and therefore the kill
+        // rail must see it, or the rail is blind to losses taken this way.
+        let booked_net: f64 = booked.iter().map(|f| f.dollars).sum();
+        let daily: f64 = d.book.daily_net.values().sum();
+        assert!(
+            (daily - (daily_before + booked_net)).abs() < 1e-6,
+            "daily net missed the reconciled fills: {daily} vs {}",
+            daily_before + booked_net
+        );
+    }
+
+    /// The other half: no execution means the entry never filled, so there was
+    /// never a position and there is no money to book. A fill here would be
+    /// indistinguishable from a real trade forever.
+    #[test]
+    fn no_broker_execution_books_no_fill() {
+        let all = bars();
+        let mut d = Driver::new();
+        let mut i = 0;
+        while i < all.len() && d.open_positions() == 0 {
+            d.feed(&all[i]);
+            i += 1;
+        }
+        assert!(
+            d.open_positions() > 0,
+            "never opened a position — test is vacuous"
+        );
+        let before = d.book.fills.len();
+
+        let (cleared, booked) = d.book.adopt_broker_flat(None, "reconciled-broker-flat");
+
+        assert!(!cleared.is_empty(), "the position is still dropped");
+        assert_eq!(d.open_positions(), 0);
+        assert!(
+            booked.is_empty(),
+            "booked a fill with no price to book it at"
+        );
+        assert_eq!(d.book.fills.len(), before, "the ledger must not grow");
     }
 
     /// Halt is a GRACEFUL stop: it stops the book taking anything new on,
