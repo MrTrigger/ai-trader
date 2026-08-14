@@ -1027,6 +1027,18 @@ fn reason(current: Decimal, target: Decimal) -> OrderReason {
     }
 }
 
+/// What a rebalance moved, split by whether the cap had a say in it.
+///
+/// `spent` is the allowance consumed by additions, which is what
+/// `turnover_budget` governs. `turned_over` is everything the book actually
+/// traded, reductions included. They diverge on the days that matter most, and
+/// reporting only the first would understate the churn on exactly those days.
+#[derive(Debug, Clone, Copy)]
+struct Turnover {
+    spent: Decimal,
+    turned_over: Decimal,
+}
+
 /// Everything `diff` needs to know about the market, as opposed to the book.
 struct Market<'a> {
     prices: &'a BTreeMap<String, Decimal>,
@@ -1041,7 +1053,7 @@ fn diff(
     market: &Market<'_>,
     nav: Decimal,
     cfg: &Config,
-) -> (Vec<Order>, Vec<Estimate>, Vec<String>, Decimal, Decimal) {
+) -> (Vec<Order>, Vec<Estimate>, Vec<String>, Turnover, Decimal) {
     let Market {
         prices,
         adv,
@@ -1088,28 +1100,51 @@ fn diff(
         }
         candidates.push((asset, drift, notional, *price, why, estimate));
     }
-    // Match the retired planner's turnover policy exactly: exits are exempt,
-    // then the remaining budget is spent on the largest absolute drift,
-    // regardless of whether that drift is a reduction or an increase.  The
-    // execution-safe reason ordering is applied only after budget selection.
-    candidates.sort_by(
-        |a, b| match (a.4 == OrderReason::Exit, b.4 == OrderReason::Exit) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (true, true) => a.0.cmp(&b.0),
-            (false, false) => b.1.abs().cmp(&a.1.abs()).then_with(|| a.0.cmp(&b.0)),
-        },
-    );
-    let mut used = Decimal::ZERO;
+    // Spending the budget to ADD risk is discretionary; spending it to SHED
+    // risk is not. The retired planner exempted exits on exactly that
+    // reasoning — "a position we no longer want is risk we are still carrying,
+    // and pacing out of it is not a saving" — and then budgeted every Reduce,
+    // which is the same sentence with a different quantity.
+    //
+    // The cost of the inconsistency was not theoretical. The budget came out
+    // fully spent every single day, deferring ~0.36 of intended weight, so a
+    // book could not follow the model when it reversed. KAITO went from the
+    // highest-conviction long in the book to rank 19 of 22 overnight; the
+    // planner asked for 4.54% -> 0.22% and the cap refused, leaving $869 of
+    // loss in a position nobody wanted to hold.
+    //
+    // So risk reduction is free and only entries and increases compete. The
+    // book converges on the target from BELOW on a reversal day, which is the
+    // safe direction to be wrong in: gross drifts down until the budget can
+    // rebuild it, rather than staying long what the model has abandoned.
+    let free = |why: OrderReason| matches!(why, OrderReason::Exit | OrderReason::Reduce);
+    candidates.sort_by(|a, b| match (free(a.4), free(b.4)) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (true, true) => a.0.cmp(&b.0),
+        (false, false) => b.1.abs().cmp(&a.1.abs()).then_with(|| a.0.cmp(&b.0)),
+    });
+    // What the cap governs, and what the book actually did. They are no longer
+    // the same number, and reporting only the first would understate turnover
+    // on exactly the days it matters.
+    let mut spent = Decimal::ZERO;
+    let mut turned_over = Decimal::ZERO;
     let mut dropped = Decimal::ZERO;
     let mut selected = Vec::new();
     for (asset, drift, notional, price, why, est) in candidates {
-        if why != OrderReason::Exit && used + drift.abs() > cfg.turnover_budget {
+        if !free(why) && spent + drift.abs() > cfg.turnover_budget {
             dropped += drift.abs();
             skipped.push(format!("{asset}: trade deferred by turnover budget"));
             continue;
         }
-        used += drift.abs();
+            // Only additions consume the allowance. Letting reductions eat it
+        // would trade one hostage for another: a heavy de-risking day would
+        // leave nothing to buy with, so the book would shed what the model
+        // abandoned and never establish what it now wants.
+        if !free(why) {
+            spent += drift.abs();
+        }
+        turned_over += drift.abs();
         selected.push((asset, drift, notional, price, why, est));
     }
     let reason_rank = |reason: OrderReason| match reason {
@@ -1142,7 +1177,7 @@ fn diff(
         });
         estimates.push(est);
     }
-    (orders, estimates, skipped, used, dropped)
+    (orders, estimates, skipped, Turnover { spent, turned_over }, dropped)
 }
 
 pub struct DecisionInput<'a> {
@@ -1325,7 +1360,10 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
             Vec::new(),
             Vec::new(),
             vec!["plan rejected: no orders computed".into()],
-            Decimal::ZERO,
+            Turnover {
+                spent: Decimal::ZERO,
+                turned_over: Decimal::ZERO,
+            },
             Decimal::ZERO,
         )
     };
@@ -1377,8 +1415,11 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         warnings.push(warning(
             WarningKind::TurnoverCapped,
             format!(
-                "turnover budget {} spent ({used} used); deferred {dropped} weight",
-                cfg.turnover_budget
+                "turnover budget {}: {} spent adding, {} more turned over reducing \
+                 risk (exempt from the cap); deferred {dropped} weight",
+                cfg.turnover_budget,
+                used.spent,
+                used.turned_over - used.spent
             ),
         ));
     }
@@ -1939,13 +1980,109 @@ mod tests {
             &cfg,
         );
 
-        assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].asset, "B");
-        assert_eq!(orders[0].reason, OrderReason::Increase);
-        assert_eq!(used, Decimal::new(35, 2));
-        assert_eq!(dropped, Decimal::new(3, 1));
-        assert!(skipped.iter().any(|message| message.starts_with("A:")));
-        assert!(skipped.iter().any(|message| message.starts_with("C:")));
+        // A: 0.30 -> 0.20 and C: 0.30 -> 0.10 are reductions, so the cap has
+        // no say in them however tight it is. B: 0.10 -> 0.45 is an addition
+        // and gets the whole 0.40 allowance to itself — the reductions do not
+        // eat into it, or a heavy de-risking day would leave nothing to buy
+        // with and the book would shed what the model dropped without ever
+        // establishing what it now wants.
+        let by: BTreeMap<_, _> = orders.iter().map(|o| (o.asset.as_str(), o)).collect();
+        assert_eq!(orders.len(), 3, "got {:?}", orders.iter().map(|o| &o.asset).collect::<Vec<_>>());
+        assert_eq!(by["A"].reason, OrderReason::Reduce);
+        assert_eq!(by["C"].reason, OrderReason::Reduce);
+        assert_eq!(by["B"].reason, OrderReason::Increase);
+        assert_eq!(used.spent, Decimal::new(35, 2), "only B consumes the allowance");
+        assert_eq!(
+            used.turned_over,
+            Decimal::new(65, 2),
+            "but the book really moved 0.65, and the disclosure must say so"
+        );
+        assert_eq!(dropped, Decimal::ZERO);
+        assert!(skipped.iter().all(|m| !m.contains("turnover")), "{skipped:?}");
+    }
+
+    /// The cap still binds on additions, which is the whole point of keeping it.
+    #[test]
+    fn additions_still_compete_for_the_allowance() {
+        let mut cfg = config();
+        cfg.turnover_budget = Decimal::new(4, 1);
+        cfg.limits.min_position_notional = Decimal::ZERO;
+        // Three names the book does not hold, wanting 0.3 each: 0.9 of
+        // additions against an allowance of 0.4.
+        let weights = BTreeMap::from([
+            ("A".into(), Decimal::new(3, 1)),
+            ("B".into(), Decimal::new(3, 1)),
+            ("C".into(), Decimal::new(3, 1)),
+        ]);
+        let current = BTreeMap::new();
+        let three = |v: Decimal| {
+            BTreeMap::from([("A".to_string(), v), ("B".to_string(), v), ("C".to_string(), v)])
+        };
+        let three_opt = |v: Decimal| {
+            BTreeMap::from([
+                ("A".to_string(), Some(v)),
+                ("B".to_string(), Some(v)),
+                ("C".to_string(), Some(v)),
+            ])
+        };
+        let prices = three(Decimal::from(100));
+        let adv = three_opt(Decimal::from(100_000_000));
+        let vol = three_opt(Decimal::new(5, 1));
+
+        let (orders, _, skipped, used, dropped) = diff(
+            &weights,
+            &current,
+            &Market {
+                prices: &prices,
+                adv: &adv,
+                vol: &vol,
+                profile: None,
+            },
+            Decimal::from(100_000),
+            &cfg,
+        );
+        assert_eq!(orders.len(), 1, "0.4 buys one 0.3 entry and no more");
+        assert_eq!(used.spent, Decimal::new(3, 1));
+        assert_eq!(used.turned_over, Decimal::new(3, 1), "no reductions here");
+        assert_eq!(dropped, Decimal::new(6, 1));
+        assert_eq!(
+            skipped.iter().filter(|m| m.contains("turnover")).count(),
+            2
+        );
+    }
+
+    /// The case that cost real money: the model abandons a name overnight and
+    /// the book cannot follow because the day's allowance is already gone.
+    #[test]
+    fn a_name_the_model_abandoned_is_sold_even_with_the_allowance_exhausted() {
+        let mut cfg = config();
+        // No allowance at all: the harshest possible cap.
+        cfg.turnover_budget = Decimal::ZERO;
+        cfg.limits.min_position_notional = Decimal::ZERO;
+        // KAITO's actual shape on 2026-08-14: held 4.54%, wanted 0.22%.
+        let weights = BTreeMap::from([("KAITO".to_string(), Decimal::new(22, 4))]);
+        let current = BTreeMap::from([("KAITO".to_string(), Decimal::new(454, 4))]);
+        let prices = BTreeMap::from([("KAITO".to_string(), Decimal::new(41, 2))]);
+        let adv = BTreeMap::from([("KAITO".to_string(), Some(Decimal::from(50_000_000)))]);
+        let vol = BTreeMap::from([("KAITO".to_string(), Some(Decimal::from(1)))]);
+
+        let (orders, _, _, used, dropped) = diff(
+            &weights,
+            &current,
+            &Market {
+                prices: &prices,
+                adv: &adv,
+                vol: &vol,
+                profile: None,
+            },
+            Decimal::from(100_000),
+            &cfg,
+        );
+        assert_eq!(orders.len(), 1, "shedding risk is never deferred");
+        assert_eq!(orders[0].reason, OrderReason::Reduce);
+        assert_eq!(orders[0].side, Side::Sell);
+        assert_eq!(used.spent, Decimal::ZERO, "it cost no allowance");
+        assert_eq!(dropped, Decimal::ZERO);
     }
 
     #[test]
