@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::binance_micro::{self, BookMinute, FlowMinute};
 use crate::costs::percentile;
 use crate::universe::Candidate;
-use crate::{get, need};
+use crate::{get, need, tmp_sibling};
 
 /// Same default dollar clip size as the plan-2 cost summary's `--notional`.
 pub const DEFAULT_NOTIONAL: f64 = 5000.0;
@@ -186,7 +186,9 @@ pub fn cmd_binance_costs(args: &[String]) -> Result<(), String> {
         }
     }
     let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
-    std::fs::write(&out_path, json).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let tmp_path = tmp_sibling(&out_path);
+    std::fs::write(&tmp_path, json).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
     println!(
         "wrote costs for {} asset(s) to {}",
         out.len(),

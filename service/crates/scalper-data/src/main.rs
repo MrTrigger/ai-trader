@@ -340,20 +340,41 @@ fn parse_micro_sources(args: &[String]) -> Result<Vec<String>, String> {
 /// directories as needed. Used for the daily book/flow/metrics files, which
 /// are wholly regenerated from that day's archive each pull (no merge
 /// needed - the source day is immutable once published).
+///
+/// Writes go to a `.tmp` sibling first and `rename` into place at the end,
+/// so a process killed mid-write leaves either the old complete file or no
+/// file at all - never a truncated one. That matters here specifically
+/// because the backfill's skip rule trusts any file that parses, so a
+/// partial file from a killed write would be silently treated as complete
+/// forever.
 fn write_jsonl<T: serde::Serialize>(path: &std::path::Path, rows: &[T]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    for row in rows {
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(row).map_err(|e| e.to_string())?
-        )
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let tmp_path = tmp_sibling(path);
+    {
+        let mut file =
+            std::fs::File::create(&tmp_path).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        for row in rows {
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(row).map_err(|e| e.to_string())?
+            )
+            .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        }
     }
+    std::fs::rename(&tmp_path, path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(())
+}
+
+/// `{path}.tmp` in the same directory as `path`, so the tmp-then-rename in
+/// `write_jsonl` and the other whole-file writers below stays on the same
+/// filesystem (a cross-filesystem rename is not atomic).
+pub(crate) fn tmp_sibling(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 /// Read a symbol's existing funding file (if any) so a fresh pull can merge
@@ -710,7 +731,9 @@ fn cmd_summarize_costs(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&costs_dir).map_err(|e| e.to_string())?;
     let out_path = costs_dir.join(format!("summary-{start_str}-{end_str}.json"));
     let json = serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?;
-    std::fs::write(&out_path, &json).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let tmp_path = tmp_sibling(&out_path);
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
 
     print_cost_table(&summary);
     println!("wrote {}", out_path.display());
@@ -772,7 +795,9 @@ async fn cmd_universe(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&universe_dir).map_err(|e| e.to_string())?;
     let out_path = universe_dir.join("scalper-universe.json");
     let json = serde_json::to_string_pretty(&candidates).map_err(|e| e.to_string())?;
-    std::fs::write(&out_path, &json).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let tmp_path = tmp_sibling(&out_path);
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
 
     // Print table
     println!("{:<12} {:>15}  {}", "coin", "day_volume_usd", "binance_um");
@@ -962,33 +987,41 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
-    let mut file =
-        std::fs::File::create(&out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    let manifest = Manifest {
-        kind: "manifest",
-        feature_set_version: features_scalper::FEATURE_SET_VERSION,
-        features: &features_scalper::FEATURE_NAMES,
-        horizons_min: &horizons,
-        stride_min: stride,
-        assets: &assets,
-    };
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&manifest).map_err(|e| e.to_string())?
-    )
-    .map_err(|e| format!("{}: {e}", out_path.display()))?;
-    // Rows are written one asset block at a time (the order `all_rows` was
-    // built in above), ts ascending within each block. That order carries
-    // no meaning for training: the trainer shuffles/splits by time itself.
-    for row in &all_rows {
+    // tmp-then-rename: this matrix is a gate input, so a process killed
+    // mid-write must not leave a partial-but-parseable file behind (see
+    // write_jsonl's doc comment for the failure mode this avoids).
+    let tmp_path = tmp_sibling(&out_path);
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        let manifest = Manifest {
+            kind: "manifest",
+            feature_set_version: features_scalper::FEATURE_SET_VERSION,
+            features: &features_scalper::FEATURE_NAMES,
+            horizons_min: &horizons,
+            stride_min: stride,
+            assets: &assets,
+        };
         writeln!(
             file,
             "{}",
-            serde_json::to_string(row).map_err(|e| e.to_string())?
+            serde_json::to_string(&manifest).map_err(|e| e.to_string())?
         )
-        .map_err(|e| format!("{}: {e}", out_path.display()))?;
+        .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        // Rows are written one asset block at a time (the order `all_rows`
+        // was built in above), ts ascending within each block. That order
+        // carries no meaning for training: the trainer shuffles/splits by
+        // time itself.
+        for row in &all_rows {
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(row).map_err(|e| e.to_string())?
+            )
+            .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        }
     }
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
 
     println!(
         "wrote {} rows for {} asset(s) to {}",
@@ -1097,6 +1130,67 @@ mod tests {
             ),
             std::time::Duration::from_secs(0)
         );
+    }
+
+    #[test]
+    fn write_jsonl_leaves_no_tmp_behind_and_the_target_parses() {
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-write-jsonl-{}-{}",
+            std::process::id(),
+            "clean"
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("2026-08-13.jsonl");
+
+        write_jsonl(&path, &[1u32, 2, 3]).unwrap();
+
+        assert!(path.exists(), "target file must exist after a clean write");
+        assert!(
+            !tmp_sibling(&path).exists(),
+            "the .tmp sibling must not survive a successful write"
+        );
+        let rows: Vec<u32> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Simulates a kill mid-write: a `.tmp` file is already sitting next to
+    /// the target (as if a previous process died after `File::create` but
+    /// before `rename`). A fresh `write_jsonl` call must still land a
+    /// correct target and replace that stale `.tmp` - the tmp-then-rename
+    /// shape, not the OS's atomicity guarantee itself, is what's under test.
+    #[test]
+    fn write_jsonl_replaces_a_stale_tmp_left_by_an_interrupted_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-write-jsonl-{}-{}",
+            std::process::id(),
+            "interrupted"
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-08-13.jsonl");
+        std::fs::write(&path, "{\"stale\":true}\n").unwrap();
+        std::fs::write(tmp_sibling(&path), "garbage from a killed write").unwrap();
+
+        write_jsonl(&path, &[42u32]).unwrap();
+
+        assert!(
+            !tmp_sibling(&path).exists(),
+            "a fresh write must consume/replace any leftover .tmp"
+        );
+        let rows: Vec<u32> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows, vec![42], "the target must hold the new write, not the stale content");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

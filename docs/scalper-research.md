@@ -376,15 +376,20 @@ no discretion once a run starts:
   §5's universe-selection rule.
 
 **Funding cost is not charged, pre-registered as negligible.** The
-arithmetic: strategy holds are ≤60 minutes; funding settles every 8 hours,
-so the probability a given trade's hold crosses a funding timestamp is
-roughly `hold_minutes / (8×60) ≤ 60/480 ≈ 12.5%` at the 60-minute horizon,
-proportionally less at 15/30; typical Binance UM funding rates run around
-1bp per 8h period; so expected funding cost per trade is bounded by
-roughly `0.125 × 1bp ≈ 0.125bp`, comfortably under the stated **< 0.2
-bps/trade** bound this amendment pre-registers. This is deliberately not
-folded into `round_trip_bps` — it's a documented, bounded omission, not a
-silent gap.
+arithmetic: strategy holds are ≤60 minutes; crossing probability is bounded
+by `hold_minutes / interval_minutes`, and the interval is not uniformly 8
+hours — Binance UM lists some contracts on a 4-hour funding cycle (our own
+`FundingRow` records this per-symbol as `funding_interval_hours`), so the
+bound must use the shortest interval observed in the universe, not the
+common case. At the 60-minute horizon with a 4-hour (240-minute) interval:
+`60/240 = 25%` crossing probability; typical Binance UM funding rates run
+around 1bp per period; so expected funding cost per trade is bounded by
+roughly `0.25 × 1bp = 0.25bp`, comfortably under the stated **< 0.3
+bps/trade** bound this amendment pre-registers. (For an 8-hour-interval
+contract the same arithmetic gives `60/480 ≈ 12.5%`, i.e. `≈0.125bp` —
+the 4-hour case is the binding one and the one the bound is set against.)
+This is deliberately not folded into `round_trip_bps` — it's a documented,
+bounded omission, not a silent gap.
 
 **HL recording continues accruing.** §2's hourly `bin/scalper-record.sh` job
 is not being turned off by this amendment. It's superseded only as the
