@@ -112,7 +112,10 @@ pub fn open_month_days(year: i32, month: u32, today_utc: NaiveDate) -> Vec<Naive
 }
 
 /// Epochs arrive in ms (pre-2025 files) or µs (2025+). Values, not flags.
-fn epoch_utc(raw: i64) -> Result<DateTime<Utc>, String> {
+///
+/// `pub(crate)`: `binance_micro` reuses this exact autodetect for
+/// aggTrades/fundingRate epochs rather than re-deriving the threshold.
+pub(crate) fn epoch_utc(raw: i64) -> Result<DateTime<Utc>, String> {
     let micros = if raw > 100_000_000_000_000 {
         raw
     } else {
@@ -181,10 +184,12 @@ pub fn parse_um_klines_zip(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use chrono::{TimeZone, Utc};
 
-    fn zip_with_one_file(name: &str, content: &[u8]) -> Vec<u8> {
+    /// `pub(crate)`: `binance_micro`'s tests reuse this fixture builder
+    /// rather than duplicating it.
+    pub(crate) fn zip_with_one_file(name: &str, content: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut z = zip::ZipWriter::new(&mut buf);

@@ -65,6 +65,11 @@ training.
 
 ## 2. Hourly: record book costs
 
+*(Superseded by Amendment 1 as the gate's cost source — Binance UM
+`binance-costs` is what a gate-eligible run charges now. This section still
+runs unchanged: HL recording continues accruing as the future HL-port
+option. See Amendment 1.)*
+
 ```bash
 bin/scalper-record.sh [top] [seconds] [interval]   # default 25 3600 10
 ```
@@ -183,10 +188,13 @@ been produced, specifically so no future number gets to argue with it.
 
 **A run is gate-eligible only if all of the following hold:**
 
-1. **At least 4 weeks of recorded book data.** `data/books/` must cover at
-   least 28 distinct UTC days feeding the cost summary passed to `gate`.
-   Anything less (the smoke run's 10 minutes included) produces a number,
-   but not a gate-eligible one.
+1. **At least 4 weeks of recorded book data.** *(Superseded by Amendment 1's
+   condition 1 — an 18-month matrix span on Binance archives, not this HL
+   book-recording bar, gates a Binance run. Original text below, unchanged,
+   for the HL-costed path.)* `data/books/` must cover at least 28 distinct
+   UTC days feeding the cost summary passed to `gate`. Anything less (the
+   smoke run's 10 minutes included) produces a number, but not a
+   gate-eligible one.
 2. **Every mapped, 90-day-eligible candidate is in the matrix.** No
    pre-filtering the universe down to "the ones that look promising" before
    the first run — that's the failure mode this protocol exists to prevent.
@@ -244,7 +252,11 @@ read the same way a FAIL is: stop, or go back to feature research.
 
 ## 6. Known gaps that matter here
 
-**Funding-rate feature is deferred, not implemented.** The spec's feature
+**Funding-rate feature is deferred, not implemented.** *(Superseded by
+Amendment 1 / Plan 3c Task 2 — `fs-rust-scalper-2` implements
+`funding_rate_bps` and `funding_x_mom` from Binance's funding archive.
+Original text below describes fs-1, which is no longer what a gate-eligible
+run uses.)* The spec's feature
 catalog lists funding rate as a candidate; `features-scalper`'s 26-feature
 v1 (`FEATURE_SET_VERSION = "fs-rust-scalper-1"`) does not include it — it
 needs a Binance UM funding-archive ingestion job that doesn't exist yet.
@@ -256,7 +268,12 @@ funding source that's only available live (not in backtest) to close the
 gap early — that would silently break train/live parity.
 
 **kPEPE-tier coins need their own book recording, or they gate at the
-20bps default.** `gate`'s cost lookup (`compute_round_trip_bps`) charges
+20bps default.** *(Superseded by Amendment 1 for the Binance gate path —
+`binance-costs`/`gate --binance-costs` has its own untradeable-day
+mechanism, "day found within the 14-day lookback or not," reported as
+`days_without_costs`; there is no 20bps default on that path. This
+paragraph still describes the HL-costed `gate --costs` path unchanged.)*
+`gate`'s cost lookup (`compute_round_trip_bps`) charges
 `DEFAULT_ROUND_TRIP_BPS = 20.0` for any symbol entirely absent from the cost
 summary — confirmed correct, not-optimistic behavior in the smoke run's
 kPEPE trace, and not a case-mismatch bug (coin identity is case-consistent
@@ -274,3 +291,121 @@ the matrix actually has an entry in the cost summary used — a candidate
 gating on the 20bps default hasn't had its real cost measured, and its
 `total_net_bps` (which feeds §5's one allowed drop rule) is only as good as
 that default.
+
+---
+
+## Amendment 1 (2026-08-14): Binance venue
+
+*(This section amends, and does not delete, the protocol above. Where it
+conflicts with §1-§6, this section governs. Paragraphs superseded by this
+amendment are marked in place, above, with a one-line note — the original
+text stays, unedited, immediately below each note.)*
+
+User decision (2026-08-13): prove profitability on Binance UM first. HL
+becomes a later port, justified by buying vendor data only after a Binance
+PASS — see "Funding" and "HL recording continues" below.
+
+**Venue: Binance USDT-M futures (UM).** The gate simulates execution on
+Binance UM, not Hyperliquid: Binance klines (§1) for bars, Binance
+microstructure archives (`binance-costs`, Plan 3c Task 3) for time-varying
+costs, and Binance's own published fee schedule (below) for fees. HL book
+recording (§2) is no longer the cost source for the gate — see below for
+what it's still for.
+
+**Gate eligibility, amended.** A run is gate-eligible only if, in addition
+to the existing §5 conditions that still apply unchanged (the one-drop-one-
+rerun universe rule, the Sharpe > 2.0 bar on out-of-sample daily returns):
+
+1. **≥18 months of matrix span** (`training-matrix --start`/`--end`), not
+   the 4-weeks-of-book-recording bar §5.1 set for the HL protocol — Binance's
+   archives go back years, so there's no reason to gate on a thin window.
+   Supersedes §5, condition 1 (the "≥28 distinct UTC days" book-recording
+   rule) — HL's cost source no longer determines eligibility.
+2. **Every mapped, 90-day-eligible candidate is in the matrix** — unchanged
+   from §5.2.
+3. **fs-2 features** (`FEATURE_SET_VERSION = "fs-rust-scalper-2"`,
+   `features-scalper`) — fs-1 matrices are refused by the gate against fs-2
+   fold artifacts and vice versa; a gate-eligible run must be fs-2 end to
+   end.
+4. **Time-varying costs via `binance-costs` + `gate --binance-costs`** — not
+   the flat `--costs` summary. The concrete commands:
+
+   ```bash
+   service/target/release/scalper-data binance-costs \
+     --data-root data --universe data/scalper-universe.json \
+     --start <matrix-start> --end <matrix-end> \
+     --out data/binance-micro/costs-daily.json --notional <live notional>
+
+   service/target/release/scalper-data gate \
+     --matrix data/matrices/gate-run.jsonl \
+     --folds data/models/gate-run-h<horizon>/folds.json \
+     --binance-costs data/binance-micro/costs-daily.json \
+     --fee-taker-bps <F> --fee-maker-bps <F> \
+     --notional <live notional> \
+     --out data/reports/gate-run-h<horizon>.json
+   ```
+
+   (Note for anyone reading Task 4's plan bullet literally: `binance-costs`
+   takes `--universe`, not `--assets` — the plan doc's own bullet is stale
+   on this point; the flags above are what `scalper-data`'s USAGE block
+   actually defines.)
+5. **All three horizons — 15, 30, 60 — every run, all three reported.**
+   Unchanged from §5.3.
+
+**Fee fixed-point rule (pre-registered).** Fees are charged as follows, with
+no discretion once a run starts:
+
+- **Run 1** charges **VIP0 + BNB-discount taker: 4.50 bps**
+  (`--fee-taker-bps 4.5 --fee-maker-bps 1.8`), the verified rate in
+  `docs/binance-um-fee-table-2026-08.md`.
+- After run 1, read `overall.projected_30d_volume_usd` from its gate
+  report. Map that figure to a tier in the fee-table snapshot **by the
+  volume criterion only** — assume the BNB-balance requirement for that
+  tier is met, since the fee-table snapshot doesn't resolve every tier's
+  BNB threshold (see its "Gap" section) and the strategy's account is
+  assumed to hold whatever BNB the tier needs.
+- **If the mapped tier differs from VIP0, run exactly ONE re-run** at that
+  tier's fees. Report both runs' full output.
+- **The second run's verdict is the gate verdict.** Not the first, not
+  whichever is more favorable. If the fee-table snapshot doesn't cover the
+  mapped tier (today it only resolves VIP0 and VIP9 — see the snapshot's
+  "Gap" section), re-fetch Binance's authenticated fee schedule before
+  doing the one allowed re-run; don't substitute an unverified number.
+- **No further iteration.** One run at VIP0+BNB, at most one re-run at the
+  volume-mapped tier, then the number is the number — same discipline as
+  §5's universe-selection rule.
+
+**Funding cost is not charged, pre-registered as negligible.** The
+arithmetic: strategy holds are ≤60 minutes; crossing probability is bounded
+by `hold_minutes / interval_minutes`, and the interval is not uniformly 8
+hours — Binance UM lists some contracts on a 4-hour funding cycle (our own
+`FundingRow` records this per-symbol as `funding_interval_hours`), so the
+bound must use the shortest interval observed in the universe, not the
+common case. At the 60-minute horizon with a 4-hour (240-minute) interval:
+`60/240 = 25%` crossing probability; typical Binance UM funding rates run
+around 1bp per period; so expected funding cost per trade is bounded by
+roughly `0.25 × 1bp = 0.25bp`, comfortably under the stated **< 0.3
+bps/trade** bound this amendment pre-registers. (For an 8-hour-interval
+contract the same arithmetic gives `60/480 ≈ 12.5%`, i.e. `≈0.125bp` —
+the 4-hour case is the binding one and the one the bound is set against.)
+This is deliberately not folded into `round_trip_bps` — it's a documented,
+bounded omission, not a silent gap.
+
+**HL recording continues accruing.** §2's hourly `bin/scalper-record.sh` job
+is not being turned off by this amendment. It's superseded only as the
+gate's cost *source*: the paragraph in §2 describing `summarize-costs`'s
+output as "the per-coin cost summary the gate consumes" now describes the
+flat-cost, HL-execution path (`gate --costs`), which remains available but
+is no longer what a Binance gate-eligible run uses (see condition 4 above).
+The HL book history keeps accruing in parallel as a live option on a future
+HL port.
+
+**"Buy HL vendor data (e.g. Tardis)" is the PASS-branch action, named
+explicitly.** If a Binance gate run under this amendment's rules produces a
+PASS, the next step — and only then — is to buy Tardis (or equivalent) HL
+historical book/trade data to build an HL-costed gate run for a possible
+port, rather than waiting on HL's own book recording to accumulate 18
+months organically. A FAIL on Binance is not grounds to buy HL data hoping
+the other venue does better — §5's FAIL handling (stop, or return to
+feature research under a new `FEATURE_SET_VERSION`) applies exactly as
+written, venue included.
