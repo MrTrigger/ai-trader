@@ -87,8 +87,8 @@ pub fn snap_micro(
                 ask_02: book_row.and_then(|r| r.bands.get("0.2").copied()),
                 bid_10: book_row.and_then(|r| r.bands.get("-1.0").copied()),
                 ask_10: book_row.and_then(|r| r.bands.get("1.0").copied()),
-                oi_value: metrics_row.map(|r| r.sum_open_interest_value),
-                taker_ls_ratio: metrics_row.map(|r| r.sum_taker_long_short_vol_ratio),
+                oi_value: metrics_row.and_then(|r| r.sum_open_interest_value),
+                taker_ls_ratio: metrics_row.and_then(|r| r.sum_taker_long_short_vol_ratio),
                 funding_rate: funding_row.map(|r| r.funding_rate),
             })
         })
@@ -204,12 +204,12 @@ mod tests {
     fn metrics_row(ts_s: i64, oi_value: f64, ls_ratio: f64) -> MetricsRow {
         MetricsRow {
             ts_s,
-            sum_open_interest: 1.0,
-            sum_open_interest_value: oi_value,
-            count_toptrader_long_short_ratio: 1.0,
-            sum_toptrader_long_short_ratio: 1.0,
-            count_long_short_ratio: 1.0,
-            sum_taker_long_short_vol_ratio: ls_ratio,
+            sum_open_interest: Some(1.0),
+            sum_open_interest_value: Some(oi_value),
+            count_toptrader_long_short_ratio: Some(1.0),
+            sum_toptrader_long_short_ratio: Some(1.0),
+            count_long_short_ratio: Some(1.0),
+            sum_taker_long_short_vol_ratio: Some(ls_ratio),
         }
     }
 
@@ -268,6 +268,28 @@ mod tests {
         let out_fresh = snap_micro(&bars, &fresh_book, &[], &fresh_metrics, &[]);
         assert_eq!(out_fresh[0].as_ref().unwrap().bid_02, Some(10.0));
         assert_eq!(out_fresh[0].as_ref().unwrap().oi_value, Some(5_000.0));
+    }
+
+    #[test]
+    fn a_present_but_uncomputed_metrics_field_stays_none_not_missing_row() {
+        // Distinct from the staleness case above: the metrics row IS found
+        // within tolerance, but Binance itself left sum_open_interest_value
+        // and sum_taker_long_short_vol_ratio empty for this row (the
+        // 2024-08-12 BTCUSDT shape) - that must flow through as `None` on
+        // the bar, not silently become 0.0 or panic on a double-Option.
+        let bars = vec![bar(1_000_000)];
+        let metrics = vec![MetricsRow {
+            ts_s: 999_990,
+            sum_open_interest: Some(70_705.68),
+            sum_open_interest_value: None,
+            count_toptrader_long_short_ratio: None,
+            sum_toptrader_long_short_ratio: None,
+            count_long_short_ratio: None,
+            sum_taker_long_short_vol_ratio: None,
+        }];
+        let out = snap_micro(&bars, &[], &[], &metrics, &[]);
+        assert_eq!(out[0].as_ref().unwrap().oi_value, None);
+        assert_eq!(out[0].as_ref().unwrap().taker_ls_ratio, None);
     }
 
     #[test]

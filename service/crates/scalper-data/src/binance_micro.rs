@@ -541,12 +541,15 @@ pub fn merge_funding_rows(existing: Vec<FundingRow>, fresh: Vec<FundingRow>) -> 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MetricsRow {
     pub ts_s: i64,
-    pub sum_open_interest: f64,
-    pub sum_open_interest_value: f64,
-    pub count_toptrader_long_short_ratio: f64,
-    pub sum_toptrader_long_short_ratio: f64,
-    pub count_long_short_ratio: f64,
-    pub sum_taker_long_short_vol_ratio: f64,
+    /// `None` when the source column was an empty string - Binance's
+    /// metrics archive has empty OI/ratio cells on early dates (observed
+    /// live on 2024-08-12 BTCUSDT), not just on thin/new symbols.
+    pub sum_open_interest: Option<f64>,
+    pub sum_open_interest_value: Option<f64>,
+    pub count_toptrader_long_short_ratio: Option<f64>,
+    pub sum_toptrader_long_short_ratio: Option<f64>,
+    pub count_long_short_ratio: Option<f64>,
+    pub sum_taker_long_short_vol_ratio: Option<f64>,
 }
 
 /// Parse one metrics daily zip. Columns verified against a live download
@@ -557,6 +560,15 @@ pub struct MetricsRow {
 /// space-separated UTC (`2026-08-12 00:00:00`), the same format as
 /// bookDepth's `timestamp` column, NOT an epoch. `symbol` is dropped: the
 /// output file is already keyed by symbol via its path.
+///
+/// The OI and ratio columns are EMPTY on early dates (a real 2024-08-12
+/// BTCUSDT row: `...,4129590903.88...,,,,1.76193600` - the toptrader
+/// count/sum and long_short count columns are blank while taker_ls is
+/// populated), which is Binance's own "not computed yet for this symbol at
+/// this time" signal, not corrupt data - an empty cell parses to `None`
+/// for that field. A non-empty cell that still fails to parse is a
+/// genuinely bad row and stays a hard error: junk is not the same fact as
+/// missing.
 pub fn parse_metrics_zip(bytes: &[u8], asset: &str) -> Result<Vec<MetricsRow>, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("{asset}: bad zip: {e}"))?;
@@ -582,9 +594,15 @@ pub fn parse_metrics_zip(bytes: &[u8], asset: &str) -> Result<Vec<MetricsRow>, S
         let ts = NaiveDateTime::parse_from_str(cols[0].trim(), "%Y-%m-%d %H:%M:%S")
             .map_err(|e| format!("{asset}: bad create_time {:?}: {e}", cols[0]))?
             .and_utc();
-        let f = |i: usize| -> Result<f64, String> {
-            cols[i]
-                .parse()
+        // Empty cell -> None (Binance's own "not computed" marker); a
+        // non-empty cell that fails to parse is still a hard error.
+        let f = |i: usize| -> Result<Option<f64>, String> {
+            let raw = cols[i].trim();
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            raw.parse::<f64>()
+                .map(Some)
                 .map_err(|e| format!("{asset}: col {i}: {e}: {line}"))
         };
         out.push(MetricsRow {
@@ -933,12 +951,46 @@ mod tests {
         let rows = parse_metrics_zip(&bytes, "BTCUSDT").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].ts_s, 1_786_492_800);
-        assert_eq!(rows[0].sum_open_interest, 109311.972);
-        assert_eq!(rows[0].sum_open_interest_value, 6946232440.128);
-        assert_eq!(rows[0].count_toptrader_long_short_ratio, 1.90829977);
-        assert_eq!(rows[0].sum_toptrader_long_short_ratio, 1.66235);
-        assert_eq!(rows[0].count_long_short_ratio, 1.80442398);
-        assert_eq!(rows[0].sum_taker_long_short_vol_ratio, 0.839761);
+        assert_eq!(rows[0].sum_open_interest, Some(109311.972));
+        assert_eq!(rows[0].sum_open_interest_value, Some(6946232440.128));
+        assert_eq!(rows[0].count_toptrader_long_short_ratio, Some(1.90829977));
+        assert_eq!(rows[0].sum_toptrader_long_short_ratio, Some(1.66235));
+        assert_eq!(rows[0].count_long_short_ratio, Some(1.80442398));
+        assert_eq!(rows[0].sum_taker_long_short_vol_ratio, Some(0.839761));
         assert_eq!(rows[1].ts_s, 1_786_493_100);
+    }
+
+    #[test]
+    fn metrics_rows_treat_empty_ratio_and_oi_cells_as_none() {
+        // Real row shape from a live BTCUSDT backfill, 2024-08-12: the
+        // toptrader count/sum and long_short count columns are empty while
+        // OI and taker_ls are populated - Binance hadn't computed those
+        // ratios yet at that date. Empty must parse to None, not error.
+        let csv = "create_time,symbol,sum_open_interest,sum_open_interest_value,\
+            count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,\
+            count_long_short_ratio,sum_taker_long_short_vol_ratio\n\
+            2024-08-12 09:00:00,BTCUSDT,70705.68,4129590903.88,,,,1.76193600\n";
+        let bytes = zip_with_one_file("BTCUSDT-metrics-2024-08-12.csv", csv.as_bytes());
+        let rows = parse_metrics_zip(&bytes, "BTCUSDT").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sum_open_interest, Some(70705.68));
+        assert_eq!(rows[0].sum_open_interest_value, Some(4129590903.88));
+        assert_eq!(rows[0].count_toptrader_long_short_ratio, None);
+        assert_eq!(rows[0].sum_toptrader_long_short_ratio, None);
+        assert_eq!(rows[0].count_long_short_ratio, None);
+        assert_eq!(rows[0].sum_taker_long_short_vol_ratio, Some(1.761936));
+    }
+
+    #[test]
+    fn metrics_rows_still_error_on_a_genuinely_unparseable_value() {
+        // Junk in a ratio column (not merely empty) must stay a hard error
+        // - "missing" and "corrupt" are different facts.
+        let csv = "2026-08-12 00:00:00,BTCUSDT,109311.972,6946232440.128,not-a-number,1.66235,1.80442398,0.839761\n";
+        let bytes = zip_with_one_file("BTCUSDT-metrics-2026-08-12.csv", csv.as_bytes());
+        let err = parse_metrics_zip(&bytes, "BTCUSDT").unwrap_err();
+        assert!(
+            err.contains("col 4"),
+            "expected the error to name the bad column, got: {err}"
+        );
     }
 }

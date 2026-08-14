@@ -1292,12 +1292,12 @@ mod tests {
 
             let metrics = binance_micro::MetricsRow {
                 ts_s: ts,
-                sum_open_interest: 1.0,
-                sum_open_interest_value: 5_000.0 + i as f64,
-                count_toptrader_long_short_ratio: 1.0,
-                sum_toptrader_long_short_ratio: 1.0,
-                count_long_short_ratio: 1.0,
-                sum_taker_long_short_vol_ratio: 1.2,
+                sum_open_interest: Some(1.0),
+                sum_open_interest_value: Some(5_000.0 + i as f64),
+                count_toptrader_long_short_ratio: Some(1.0),
+                sum_toptrader_long_short_ratio: Some(1.0),
+                count_long_short_ratio: Some(1.0),
+                sum_taker_long_short_vol_ratio: Some(1.2),
             };
             metrics_lines.push_str(&serde_json::to_string(&metrics).unwrap());
             metrics_lines.push('\n');
