@@ -30,6 +30,11 @@ usage: crypto-portfolio <command>
                 [--tradeable <json>] [--overwrite]
       Record a point-in-time liquidity-ranked universe using Rust store logic.
 
+  compare --baseline DIR --variant DIR [--block 20] [--iterations 2000]
+      Block-bootstrap the Sharpe difference between two walk-forward runs over
+      the same folds. Nine folds give nine observations; this gives an interval
+      that does not depend on treating them as nine independent ones.
+
   liquidity-profile --config F --data-root D --out F [--hours 1,2] [--days 180]
                     [--spreads F]
       Median quote volume per name in the hours the bot trades, from the bar
@@ -1286,6 +1291,97 @@ fn cmd_liquidity_profile(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// What a change was actually worth, with an interval around it.
+///
+/// Two walk-forward runs over the same folds, paired by date and
+/// block-bootstrapped. The pairing matters: the question is what the CHANGE
+/// did, not what two periods happened to return. The blocks matter too —
+/// daily returns are autocorrelated and drawdowns are runs, so resampling days
+/// independently would report a tighter interval than the evidence supports.
+fn cmd_compare(args: &[String]) -> Result<(), String> {
+    let base_dir = PathBuf::from(need(args, "--baseline")?);
+    let var_dir = PathBuf::from(need(args, "--variant")?);
+    let block: usize = get(args, "--block")
+        .map(|v| v.parse().map_err(|e| format!("--block: {e}")))
+        .transpose()?
+        .unwrap_or(20);
+    let iterations: usize = get(args, "--iterations")
+        .map(|v| v.parse().map_err(|e| format!("--iterations: {e}")))
+        .transpose()?
+        .unwrap_or(2000);
+
+    // Concatenate the folds' step returns in order. Each fold is its own
+    // window, so a block never spans the seam between two of them.
+    let load = |dir: &PathBuf| -> Result<Vec<(chrono::DateTime<chrono::Utc>, f64)>, String> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("fold-") && n.ends_with(".json"))
+            })
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(format!("{}: no fold-*.json", dir.display()));
+        }
+        let mut out = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            // Only the NAV path, so a fold file can gain fields without
+            // breaking the one tool that has to read every past run.
+            let v: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", f.display()))?;
+            let mut path: Vec<(chrono::DateTime<chrono::Utc>, f64)> = v["steps"]
+                .as_array()
+                .ok_or_else(|| format!("{}: no steps", f.display()))?
+                .iter()
+                .filter_map(|s| {
+                    let t = s["as_of"].as_str()?.parse().ok()?;
+                    let nav: f64 = s["nav"].as_str()?.parse().ok()?;
+                    (nav > 0.0).then_some((t, nav))
+                })
+                .collect();
+            path.sort_by_key(|(t, _)| *t);
+            for pair in path.windows(2) {
+                out.push((pair[1].0, pair[1].1 / pair[0].1 - 1.0));
+            }
+        }
+        out.sort_by_key(|(t, _)| *t);
+        Ok(out)
+    };
+
+    let baseline = load(&base_dir)?;
+    let variant = load(&var_dir)?;
+    let r = crypto_portfolio::validate::bootstrap_delta(
+        &baseline, &variant, block, iterations, 365.0, 0x5EED,
+    )?;
+    println!("{} -> {}", base_dir.display(), var_dir.display());
+    println!(
+        "  {} steps, block {}, {} resamples",
+        r.steps, r.block, r.iterations
+    );
+    println!("  observed Sharpe delta {:+.3}", r.observed);
+    println!(
+        "  90% interval [{:+.3}, {:+.3}]   median {:+.3}",
+        r.p05, r.p95, r.p50
+    );
+    println!(
+        "  variant ahead in {:.0}% of resamples",
+        r.share_positive * 100.0
+    );
+    println!(
+        "\n  {}",
+        if r.conclusive() {
+            "the interval excludes zero"
+        } else {
+            "the interval includes zero: this evidence does not separate them"
+        }
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -1294,6 +1390,7 @@ fn main() -> ExitCode {
         Some("features") => cmd_features(&args[1..]),
         Some("universe-rank") => cmd_universe_rank(&args[1..]),
         Some("liquidity-profile") => cmd_liquidity_profile(&args[1..]),
+        Some("compare") => cmd_compare(&args[1..]),
         Some("universe-record") => cmd_universe_record(&args[1..]),
         Some("universe-list") => cmd_universe_list(&args[1..]),
         Some("data-pull") => cmd_data_pull(&args[1..]),
