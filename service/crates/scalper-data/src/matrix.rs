@@ -56,8 +56,17 @@ pub fn forward_returns_bps(bars: &[Bar], horizons_min: &[i64]) -> Vec<BTreeMap<S
 /// Join `rows` (from `features_scalper::compute`) with `fwd` (from
 /// `forward_returns_bps`, same length and index alignment as `rows`) and
 /// keep every `stride_min`-th row by index, dropping any row where a
-/// feature is still cold (`None`) or a horizon present anywhere in `fwd` is
-/// missing for that row. Pure.
+/// feature is still cold (`None`), a horizon present anywhere in `fwd` is
+/// missing for that row, or a feature is non-finite. Pure.
+///
+/// `features_scalper::compute` upholds "a feature is `Some` only if it is
+/// finite" as an invariant, but this function does not trust that from the
+/// caller's side either: any row carrying a `Some(NaN)`/`Some(inf)` feature
+/// is dropped here (and counted as dropped, same as a cold row), and a
+/// `debug_assert!` on every row this function actually emits re-checks
+/// that postcondition in dev/test builds - so a gate's strict f64 JSONL
+/// reader can never be handed a `null`, whether or not the upstream
+/// invariant held.
 ///
 /// Rows are returned in the order they were given - one asset's block at a
 /// time, ts ascending within the block, when the CLI calls this once per
@@ -88,6 +97,15 @@ pub fn matrix_rows(
             if row.values.iter().any(Option::is_none) {
                 return None;
             }
+            // A `Some` feature must be finite - `features_scalper::compute`
+            // guarantees this, but a matrix that reaches the gate's strict
+            // f64 JSONL reader is exactly the artifact a violation here
+            // would corrupt (NaN serializes as `null`), so this function
+            // enforces the postcondition itself rather than trusting the
+            // caller.
+            if row.values.iter().any(|v| v.is_some_and(|x| !x.is_finite())) {
+                return None;
+            }
             if !all_horizons.iter().all(|h| fwd_row.contains_key(*h)) {
                 return None;
             }
@@ -96,6 +114,10 @@ pub fn matrix_rows(
                 .zip(row.values.iter())
                 .map(|(name, v)| ((*name).to_string(), v.expect("checked Some above")))
                 .collect();
+            debug_assert!(
+                features.values().all(|v| v.is_finite()),
+                "matrix_rows emitted a non-finite feature value - the finite filter above has a gap"
+            );
             Some(MatrixRow {
                 ts: row.ts_utc.timestamp(),
                 asset: coin.to_string(),
@@ -188,6 +210,51 @@ mod tests {
         assert!(
             ts.windows(2).all(|w| w[1] - w[0] >= 300),
             "stride 5 = >=300s apart"
+        );
+    }
+
+    /// `features_scalper::compute` upholds "Some only if finite" as an
+    /// invariant, but `matrix_rows` must not simply trust that from its
+    /// caller - a hand-built `FeatureRow` carrying `Some(NaN)` (the exact
+    /// shape that would otherwise serialize as JSON `null` and be refused
+    /// by the gate's strict f64 reader) must be dropped, and only that
+    /// row, not the whole batch.
+    #[test]
+    fn a_non_finite_feature_value_is_dropped_and_counted_as_dropped() {
+        let bars = ramp(200);
+        let rows = compute(&bars, &bars, &full_micro(&bars)).unwrap();
+        let fwd = forward_returns_bps(&bars, &[1]);
+
+        let mut hostile_rows = rows.clone();
+        // Rows 100/101 are otherwise fully warm; corrupt one feature each
+        // to NaN/infinity, as if an upstream formula's own guard had a gap.
+        hostile_rows[100].values[0] = Some(f64::NAN);
+        hostile_rows[101].values[1] = Some(f64::INFINITY);
+
+        let clean = matrix_rows(&rows, &fwd, 1, "kTEST");
+        let with_hostile = matrix_rows(&hostile_rows, &fwd, 1, "kTEST");
+        assert!(
+            clean
+                .iter()
+                .any(|r| r.ts == bars[100].ts_utc.timestamp())
+                && clean.iter().any(|r| r.ts == bars[101].ts_utc.timestamp()),
+            "rows 100/101 must be warm and kept without corruption, or this test proves nothing"
+        );
+
+        assert_eq!(
+            with_hostile.len(),
+            clean.len() - 2,
+            "the NaN and inf rows must be dropped, and only those two"
+        );
+        let kept_ts: std::collections::HashSet<i64> = with_hostile.iter().map(|r| r.ts).collect();
+        assert!(!kept_ts.contains(&rows[100].ts_utc.timestamp()));
+        assert!(!kept_ts.contains(&rows[101].ts_utc.timestamp()));
+        assert!(
+            with_hostile
+                .iter()
+                .flat_map(|r| r.features.values())
+                .all(|v| v.is_finite()),
+            "no surviving row may carry a non-finite feature"
         );
     }
 

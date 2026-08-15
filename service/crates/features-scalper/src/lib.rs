@@ -46,6 +46,16 @@
 //! itself be missing. `depth_imb_10_m15` is a fifth rolling feature with
 //! the same full-and-clean discipline, mirroring `taker_buy_ratio_m15`'s
 //! 15-minute window instead of the 60-minute one.
+//!
+//! Validity invariant: a feature is `Some` only if it is finite. Every
+//! formula above is expected to guard its own known non-finite cases
+//! (e.g. `oi_change_60` requires both OI endpoints to be strictly
+//! positive before taking a log-ratio, since Binance metrics has zero-OI
+//! minutes early in some series), but `compute()` also sweeps every
+//! `values[i]` immediately before pushing each `FeatureRow` and turns any
+//! `Some(NaN)`/`Some(inf)` into `None` - a NaN or infinity was never a
+//! valid output of any of these 38 definitions, so this is a bug-proofing
+//! net, not a feature-definition change.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -380,7 +390,20 @@ pub fn compute(
         };
         values[32] = if oi_window.len() == CLOSE_WINDOW {
             match (oi_window.front().copied().flatten(), oi_value) {
-                (Some(old), Some(cur)) => Some((cur / old).ln()),
+                // Binance metrics has zero-OI minutes early in some series,
+                // and a non-positive `old`/`cur` would make `ln` produce
+                // NaN or -inf rather than a real ratio - never a valid
+                // feature value, so both endpoints must be strictly
+                // positive and the result finite (belt: this specific
+                // guard; braces: the compute()-wide finite sweep below).
+                (Some(old), Some(cur)) if old > 0.0 && cur > 0.0 => {
+                    let v = (cur / old).ln();
+                    if v.is_finite() {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             }
         } else {
@@ -402,6 +425,20 @@ pub fn compute(
         } else {
             None
         };
+
+        // Validity invariant, enforced once for every feature regardless
+        // of how it was derived above: a feature is `Some` only if it is
+        // finite. NaN/inf is never a valid feature value - it means an
+        // input combination that individual formulas didn't (or couldn't
+        // anticipate) guard against, not a value a model should train or
+        // score on. This is the belt to each formula's own brace.
+        for v in values.iter_mut() {
+            if let Some(x) = *v {
+                if !x.is_finite() {
+                    *v = None;
+                }
+            }
+        }
 
         rows.push(FeatureRow {
             ts_utc: b.ts_utc,
@@ -855,6 +892,100 @@ mod tests {
         micro2[0] = None;
         let rows2 = compute(&bars, &bars, &micro2).unwrap();
         assert!(rows2[60].values[i("oi_change_60")].is_none());
+    }
+
+    /// A zero (or negative) OI endpoint 60 minutes back must never produce
+    /// `oi_change_60` at all - `ln(cur/0.0)` and `ln(cur/negative)` are
+    /// exactly the non-finite cases the gate's Rust reader refuses (a
+    /// bug found via gate-run-2: Binance metrics has zero-OI minutes
+    /// early in some series, and `Some(NaN)`/`Some(inf)` serializes as
+    /// JSON `null`, which the strict f64 reader rejects).
+    #[test]
+    fn oi_change_60_is_none_when_the_old_endpoint_is_zero_or_negative() {
+        let bars = ramp(65);
+        let zero_old_at_60: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                let oi = if idx == 0 { 0.0 } else { 1000.0 + idx as f64 * 10.0 };
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    oi_value: Some(oi),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rows = compute(&bars, &bars, &zero_old_at_60).unwrap();
+        assert!(
+            rows[60].values[i("oi_change_60")].is_none(),
+            "old OI of 0.0 must not produce a value (ln(x/0) is inf)"
+        );
+
+        let negative_old_at_60: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                let oi = if idx == 0 {
+                    -50.0
+                } else {
+                    1000.0 + idx as f64 * 10.0
+                };
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    oi_value: Some(oi),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rows2 = compute(&bars, &bars, &negative_old_at_60).unwrap();
+        assert!(
+            rows2[60].values[i("oi_change_60")].is_none(),
+            "negative old OI must not produce a value (ln of a negative ratio is NaN)"
+        );
+    }
+
+    /// Hostile synthetic input designed to try to coax a non-finite value
+    /// out of every rolling/ratio feature at once (zero and negative OI
+    /// endpoints, zero depth on both sides, degenerate spread/taker
+    /// inputs). No matter what upstream data throws at `compute()`, no
+    /// row may contain `Some(NaN)`/`Some(inf)` - the compute()-wide
+    /// finite sweep is the last line of defense even if a future formula
+    /// forgets its own guard.
+    #[test]
+    fn no_non_finite_value_survives_compute_over_a_hostile_synthetic_input() {
+        let bars = ramp(70);
+        let micro: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    spread_bps: Some(0.0),
+                    taker_buy_ratio: Some(0.5),
+                    bid_02: Some(0.0),
+                    ask_02: Some(0.0),
+                    bid_10: Some(0.0),
+                    ask_10: Some(0.0),
+                    // OI oscillates through zero and negative so every
+                    // 60-back pairing includes a degenerate `old`.
+                    oi_value: Some(if idx % 2 == 0 { 0.0 } else { -1.0 }),
+                    taker_ls_ratio: Some(1.0),
+                    funding_rate: Some(0.0),
+                })
+            })
+            .collect();
+        let rows = compute(&bars, &bars, &micro).unwrap();
+        for (idx, row) in rows.iter().enumerate() {
+            for (fi, v) in row.values.iter().enumerate() {
+                if let Some(x) = v {
+                    assert!(
+                        x.is_finite(),
+                        "row {idx} feature {} ({fi}) is non-finite: {x}",
+                        FEATURE_NAMES[fi]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
