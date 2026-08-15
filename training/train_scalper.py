@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import operator
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,36 +37,149 @@ N_ESTIMATORS = 400
 EARLY_STOPPING_ROUNDS = 50
 MIN_ROWS = 50_000
 
+# x stays float64 (NOT float32): verified empirically that LightGBM produces
+# non-bit-identical split thresholds when fit on a float32-cast copy of the
+# same data vs the original float64 (see training/README or git history for
+# the check) - feature_infos min/max and tree thresholds diverge at the 7th
+# significant digit. That would silently change every model's numbers, so
+# we keep the extra memory and stay float64.
+X_DTYPE = np.float64
+
+
+@dataclass(slots=True)
+class Matrix:
+    """Columnar in-memory form of a `features-scalper` training matrix.
+
+    Built by one streaming pass over the JSONL file - no per-row dict is
+    retained once its fields have been copied into the arrays below, so
+    peak memory is a small multiple of the arrays themselves rather than a
+    materialized list of nested Python dicts.
+    """
+
+    feature_names: list[str]
+    ts: np.ndarray  # int64, shape (n,)
+    asset_codes: np.ndarray  # int32, shape (n,) - index into asset_vocab
+    asset_vocab: list[str]
+    x: np.ndarray  # float64, shape (n, len(feature_names)), feature_names order
+    fwd: dict[str, np.ndarray]  # horizon (str) -> float64 array, shape (n,)
+
+    def __len__(self) -> int:
+        return len(self.ts)
+
 
 def load_matrix(path: Path):
-    """Stream the matrix manifest and rows. No computation, no filtering."""
+    """Stream the matrix manifest and rows into a columnar `Matrix`.
+
+    No computation, no filtering. Two passes over the file: a cheap first
+    pass just counts data rows (and peeks at the first row to learn which
+    forward-return horizons are present) so the arrays can be preallocated
+    exactly once; the second pass fills them line by line. No list of
+    per-row dicts is ever held in full.
+    """
     path = Path(path)
     with path.open(encoding="utf-8") as source:
         manifest = json.loads(next(source))
         if manifest.get("kind") != "manifest":
             raise ValueError("first matrix row is not the Rust feature manifest")
-        rows = [json.loads(line) for line in source if line.strip()]
-    return manifest, rows
+        feature_names = list(manifest["features"])
+        n = 0
+        first_line = None
+        for line in source:
+            if not line.strip():
+                continue
+            n += 1
+            if first_line is None:
+                first_line = line
+
+    n_features = len(feature_names)
+
+    if "horizons_min" in manifest:
+        horizons = [str(h) for h in manifest["horizons_min"]]
+    elif first_line is not None:
+        horizons = list(json.loads(first_line).get("fwd_bps", {}).keys())
+    else:
+        horizons = []
+
+    ts = np.empty(n, dtype=np.int64)
+    x = np.empty((n, n_features), dtype=X_DTYPE)
+    fwd = {h: np.empty(n, dtype=np.float64) for h in horizons}
+    asset_codes = np.empty(n, dtype=np.int32)
+    asset_vocab: list[str] = []
+    vocab_index: dict[str, int] = {}
+
+    single_feature = feature_names[0] if n_features == 1 else None
+    feature_getter = operator.itemgetter(*feature_names) if n_features > 1 else None
+
+    if n:
+        with path.open(encoding="utf-8") as source:
+            next(source)  # manifest line, already parsed above
+            i = 0
+            for line in source:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                ts[i] = row["ts"]
+
+                asset = row.get("asset")
+                code = vocab_index.get(asset)
+                if code is None:
+                    code = len(asset_vocab)
+                    vocab_index[asset] = code
+                    asset_vocab.append(asset)
+                asset_codes[i] = code
+
+                if n_features == 1:
+                    x[i, 0] = row["features"][single_feature]
+                elif n_features > 1:
+                    x[i] = feature_getter(row["features"])
+
+                fwd_row = row["fwd_bps"]
+                for h in horizons:
+                    fwd[h][i] = fwd_row[h]
+
+                i += 1
+        assert i == n, "matrix row count changed between the counting and parsing pass"
+
+    matrix = Matrix(
+        feature_names=feature_names,
+        ts=ts,
+        asset_codes=asset_codes,
+        asset_vocab=asset_vocab,
+        x=x,
+        fwd=fwd,
+    )
+    return manifest, matrix
 
 
-def prepare(rows, feature_names, horizon, through_ts):
+def prepare(matrix: Matrix, feature_names, horizon, through_ts):
     """Assemble ordered X/y through a cutoff timestamp (inclusive).
 
     Label is fwd_bps[horizon] winsorized at the 0.5/99.5 percentiles of the
     kept (training) rows themselves - no lookahead into excluded rows.
     """
-    if len(rows) < MIN_ROWS:
+    feature_names = list(feature_names)
+    if feature_names != matrix.feature_names:
         raise ValueError(
-            f"only {len(rows)} rows in matrix; scalping matrices are big, "
+            "feature_names must match the matrix's stored feature order "
+            f"(matrix has {matrix.feature_names}, got {feature_names})"
+        )
+    n_total = len(matrix)
+    if n_total < MIN_ROWS:
+        raise ValueError(
+            f"only {n_total} rows in matrix; scalping matrices are big, "
             f"refusing a fit under {MIN_ROWS:,} rows"
         )
-    kept = [row for row in rows if row["ts"] <= through_ts]
     # The matrix producer writes rows one asset block at a time (ts-ascending
     # only within each block), so a global chronological order is Python's
-    # obligation here - fit()'s early-stopping tail-split depends on it.
-    kept.sort(key=lambda row: row["ts"])
-    x = np.asarray([[row["features"][name] for name in feature_names] for row in kept])
-    y = np.asarray([row["fwd_bps"][str(horizon)] for row in kept], dtype=float)
+    # obligation here - fit()'s early-stopping tail-split depends on it. A
+    # stable sort of the kept rows' positions preserves the same tie order
+    # that Python's stable list.sort() gave the old dict-of-rows code.
+    kept_idx = np.flatnonzero(matrix.ts <= through_ts)
+    order = np.argsort(matrix.ts[kept_idx], kind="stable")
+    idx = kept_idx[order]
+
+    x = matrix.x[idx]
+    y = matrix.fwd[str(horizon)][idx]
     lo, hi = np.percentile(y, [0.5, 99.5])
     y = np.clip(y, lo, hi)
     return x, y
@@ -114,10 +229,10 @@ def main(argv=None) -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    manifest, rows = load_matrix(args.matrix)
+    manifest, matrix = load_matrix(args.matrix)
     features = manifest["features"]
     through_ts = _through_ts(args.through)
-    x, y = prepare(rows, features, args.horizon, through_ts)
+    x, y = prepare(matrix, features, args.horizon, through_ts)
     booster = fit(x, y, features)
 
     document = {

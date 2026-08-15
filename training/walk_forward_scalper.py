@@ -21,11 +21,12 @@ DEFAULT_STEP_DAYS = 30
 SECONDS_PER_DAY = 86400
 
 
-def training_slice(rows, train_start_ts, train_end_ts, horizon_min):
-    """Rows in [train_start_ts, train_end_ts], purged of the horizon window
-    that would otherwise let a label peek across the train/test boundary."""
+def training_slice(matrix, train_start_ts, train_end_ts, horizon_min):
+    """Boolean mask (over `matrix`) of rows in [train_start_ts, train_end_ts],
+    purged of the horizon window that would otherwise let a label peek across
+    the train/test boundary."""
     cutoff = train_end_ts - horizon_min * 60
-    return [row for row in rows if train_start_ts <= row["ts"] <= cutoff]
+    return (matrix.ts >= train_start_ts) & (matrix.ts <= cutoff)
 
 
 def _build_fold_document(booster, features, manifest, horizon, train_end_ts, n_rows):
@@ -54,12 +55,12 @@ def main(argv=None) -> None:
     parser.add_argument("--step-days", type=int, default=DEFAULT_STEP_DAYS)
     args = parser.parse_args(argv)
 
-    manifest, rows = train_scalper.load_matrix(args.matrix)
-    if not rows:
+    manifest, matrix = train_scalper.load_matrix(args.matrix)
+    if len(matrix) == 0:
         raise SystemExit(f"{args.matrix} has no rows; nothing to fold")
     features = manifest["features"]
-    matrix_start_ts = min(row["ts"] for row in rows)
-    matrix_end_ts = max(row["ts"] for row in rows)
+    matrix_start_ts = int(matrix.ts.min())
+    matrix_end_ts = int(matrix.ts.max())
 
     train_seconds = args.train_days * SECONDS_PER_DAY
     test_seconds = args.test_days * SECONDS_PER_DAY
@@ -82,10 +83,11 @@ def main(argv=None) -> None:
 
     kept = []
     for train_end_ts, test_start_ts, test_end_ts in candidates:
-        train_rows = training_slice(rows, matrix_start_ts, train_end_ts, args.horizon)
-        if len(train_rows) < train_scalper.MIN_ROWS:
+        mask = training_slice(matrix, matrix_start_ts, train_end_ts, args.horizon)
+        n_train = int(mask.sum())
+        if n_train < train_scalper.MIN_ROWS:
             continue
-        kept.append((train_end_ts, test_start_ts, test_end_ts, train_rows))
+        kept.append((train_end_ts, test_start_ts, test_end_ts))
 
     if not kept:
         raise SystemExit(
@@ -96,8 +98,15 @@ def main(argv=None) -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     fold_specs = []
-    for idx, (train_end_ts, test_start_ts, test_end_ts, train_rows) in enumerate(kept):
-        x, y = train_scalper.prepare(train_rows, features, args.horizon, train_end_ts)
+    for idx, (train_end_ts, test_start_ts, test_end_ts) in enumerate(kept):
+        # matrix_start_ts is the matrix's own global minimum ts, so the
+        # training_slice lower bound never excludes anything here - this
+        # cutoff is exactly the upper edge training_slice already embargoed
+        # to, so preparing straight from the matrix reproduces the same
+        # purged, sorted, winsorized set the old rows-list slice-then-prepare
+        # pipeline produced.
+        cutoff = train_end_ts - args.horizon * 60
+        x, y = train_scalper.prepare(matrix, features, args.horizon, cutoff)
         booster = train_scalper.fit(x, y, features)
         document = _build_fold_document(
             booster, features, manifest, args.horizon, train_end_ts, len(x)

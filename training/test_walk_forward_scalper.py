@@ -27,10 +27,13 @@ def test_folds_are_chronological_purged_and_dumped(tmp_path):
 def test_embargo_drops_training_rows_inside_the_horizon(tmp_path):
     # prepare() must never see a training row whose label window crosses train_end.
     path, names = synthetic_matrix(tmp_path, n=60_000)
-    _, rows = train_scalper.load_matrix(path)
-    kept = walk_forward_scalper.training_slice(rows, train_start_ts=rows[0]["ts"],
-                                               train_end_ts=rows[-1]["ts"], horizon_min=30)
-    assert max(r["ts"] for r in kept) <= rows[-1]["ts"] - 30 * 60
+    _, matrix = train_scalper.load_matrix(path)
+    mask = walk_forward_scalper.training_slice(
+        matrix, train_start_ts=int(matrix.ts[0]), train_end_ts=int(matrix.ts[-1]),
+        horizon_min=30,
+    )
+    kept_ts = matrix.ts[mask]
+    assert kept_ts.max() <= matrix.ts[-1] - 30 * 60
 
 
 def test_all_folds_skipped_is_a_loud_failure(tmp_path):
