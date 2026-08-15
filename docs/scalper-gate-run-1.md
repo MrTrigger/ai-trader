@@ -22,17 +22,18 @@ its re-run.
 
 | # | Condition | Met? | Evidence |
 |---|---|---|---|
-| 1 | ≥18 months of matrix span | **NOT MET (in substance)** | The `training-matrix` command was run with `--start 2024-08-01 --end 2026-08-15` (24.5 months requested — the literal command flags clear 18 months). But every one of the 24 assets' **kept** rows (the rows that actually survive fs-2's all-features-Some requirement) start on **2026-01-15**, not 2024-08-01 — see "Matrix" below. Actual per-asset matrix span is **~210 days (~6.9 months)**, not ≥18 months. Root cause: Binance's own `bookDepth` archive (`data.binance.vision`) did not publish the ±0.2% percentage band before 2026-01-16 — files before that date carry only the `-1.0`/`1.0` bands (confirmed by inspecting `data/binance-micro/book/BTCUSDT/2024-08-01.jsonl` through `2026-01-14.jsonl`: two keys only; `2026-01-16.jsonl` onward: four keys). fs-2's `depth_imb_02` needs `bid_02`/`ask_02`, so every row before that date is dropped by `training-matrix`'s all-Some requirement. This is an external data-source limitation on Binance's side, not a pipeline bug — flow/metrics/funding coverage for the same assets does reach back to 2024-08-01 (or each asset's own listing date), confirming the book-band gap is the sole bottleneck. |
+| 1 | ≥18 months of matrix span | **NOT MET (in substance)** | The `training-matrix` command was run with `--start 2024-08-01 --end 2026-08-15` (24.5 months requested — the literal command flags clear 18 months). But every one of the 24 assets' **kept** rows (the rows that actually survive fs-2's all-features-Some requirement) start on **2026-01-15**, not 2024-08-01 — see "Matrix" below. Actual per-asset matrix span is **~210 days (~6.9 months)**, not ≥18 months. Root cause: the ±0.2% percentage band first appears in the ingested `bookDepth` data at `data/binance-micro/book/BTCUSDT/2026-01-15.jsonl`, ts `1768460460` (2026-01-15 07:01 UTC) — the snapshot immediately before it (ts `1768460400`, 07:00 UTC, same file) still carries only the `-1.0`/`1.0` bands; every day before 2026-01-15 has only those two keys (confirmed by inspecting `data/binance-micro/book/BTCUSDT/2024-08-01.jsonl` through `2026-01-14.jsonl`). The ±0.2% level is simply not present in the ingested band set before that point — this may reflect a change in what Binance's archive publishes, or a level that only becomes representable once book depth data is dense enough; the snapshot doesn't establish which. Either way, fs-2's `depth_imb_02` needs `bid_02`/`ask_02`, so every row before 2026-01-15 07:01 UTC is dropped by `training-matrix`'s all-Some requirement (matrix rows in practice start 2026-01-15 08:00 UTC, the first full bar-close after that). This is a data-availability limitation in the ingested archive, not a bug in this codebase's matrix logic — flow/metrics/funding coverage for the same assets does reach back to 2024-08-01 (or each asset's own listing date), confirming the band gap is the sole bottleneck. |
 | 2 | Every mapped, 90-day-eligible candidate is in the matrix | Met | 24 of 25 universe candidates are Binance-mapped (`HYPE` has `binance_um: null`, correctly excluded). All 24 appear in the matrix manifest's `assets` list and all 24 produced rows (see per-asset table below) — no candidate skipped with a "no bars" warning. |
 | 3 | fs-2 features (`fs-rust-scalper-2`) | Met | Manifest line: `"feature_set_version":"fs-rust-scalper-2"`, 38 features listed (26 fs-1 + 12 fs-2), matching the spec. |
-| 4 | Time-varying costs via `binance-costs` + `gate --binance-costs` | Met (mechanically) | `binance-costs` ran successfully for all 24 mapped assets; `gate` was invoked with `--binance-costs` (not `--costs`) for all three horizons. `days_without_costs` totals only 3 (all on `KAITO`) per horizon — the book-band gap does not leave the matrix-covered window (2026-01-15 onward) short of cost data, since flow-derived spread data was available throughout. |
+| 4 | Time-varying costs via `binance-costs` + `gate --binance-costs` | Met (mechanically) | `binance-costs` ran successfully for all 24 mapped assets; `gate` was invoked with `--binance-costs` (not `--costs`) for all three horizons. `days_without_costs` totals only 3 (all on `KAITO`) per horizon, so cost lookups never hard-fail inside the matrix-covered window — but that field undercounts thin-book days that still resolve via the 14-day fallback; see "Step 2 — Binance costs" below for the 78 genuinely thin in-window days this masks. |
 | 5 | All three horizons (15/30/60) run, every run, all reported | Met | See per-horizon table below. |
 
 **Conclusion: this run does not clear Amendment 1's eligibility bar.**
 Condition 1 fails because the requested 24.5-month window is not the
 window the data actually supports — real per-asset coverage is bounded to
-~7 months by a gap in Binance's own bookDepth archive, discovered during
-this run, not anticipated by the runbook or the plan. The pipeline itself
+~7 months by the ±0.2% band being absent from the ingested `bookDepth`
+data before 2026-01-15, discovered during this run, not anticipated by
+the runbook or the plan. The pipeline itself
 worked correctly end to end (conditions 2-5 all met); the failure is a
 data-availability ceiling, external to this codebase. **No PASS/FAIL
 result below should be read as evidence for or against the strategy at
@@ -106,6 +107,11 @@ from **2026-01-15 to between 2026-07-15 and 2026-08-13** (asset-dependent
 on how current its Binance listing/backfill is) — **~205–210 days
 (~6.7–6.9 months)** per asset. This is the number that matters for
 eligibility condition 1, not the 24.5-month `--start`/`--end` window.
+This uniform ~7-month *date* span hides very uneven *row density*: kept
+rows range from CRV's 536 and ETHFI's 1,197 up to BTC's 53,619 (a 100x
+spread) — the low-count assets have long stretches of the ~7-month window
+missing intermediate warm rows (thin trading, gaps in one of the four
+joined sources, etc.), not just a shorter calendar span.
 
 ### Step 2 — Binance costs
 
@@ -128,7 +134,7 @@ days (`impact_bps: null`) over the full requested 744-745-day window:
 | DOGE | 744 | 532 |
 | kPEPE | 744 | 532 |
 | ZEC | 744 | 532 |
-| CRV | 744 | 532 |
+| CRV | 744 | 601 |
 | ETHFI | 744 | 532 |
 | WLD | 744 | 532 |
 | XMR | 744 | 532 |
@@ -146,14 +152,28 @@ days (`impact_bps: null`) over the full requested 744-745-day window:
 | XPL | 358 | 146 |
 | VIRTUAL | 613 | 401 |
 
-**532 of 744 days (~71%) are "thin" for every asset with a full-span
-listing** — this is the same book-band gap as condition 1: `impact_bps`
-needs the ±0.2% band, which the archive doesn't publish before
-2026-01-16, so every pre-2026-01-16 day is marked thin regardless of the
-book's actual real-world depth. This does not corrupt the gate's cost
-lookups for the window that matters (the matrix only has rows from
-2026-01-15 onward), which is why `days_without_costs` in every gate report
-below is a tiny number (3, all on KAITO) rather than in the hundreds.
+**~532 of 744 days (~71%) are "thin" for every asset with a full-span
+listing** — most of this is the same band gap as condition 1: `impact_bps`
+needs the ±0.2% band, which isn't in the ingested set before 2026-01-15,
+so every earlier day is marked thin regardless of the book's actual
+real-world depth. **But that pre-band majority is not the whole thin-day
+story, and the claim that it "does not corrupt the gate's cost lookups for
+the window that matters" is overstated.** Restricting the thin-day count
+to each asset's own matrix-covered window (i.e. counting only days on or
+after that asset's first kept row) still leaves **78 genuinely thin $5k
+days inside the window that actually trains and gates**: CRV has 69 thin
+days between 2026-02-06 and 2026-04-28, and KAITO — the single largest
+contributor to both h15's and h30's net P&L (see per-asset breakdown
+below) — has 9: 2026-06-01, 06-05, 06-06, 06-10, 06-24, 06-25, 06-26,
+07-02, 07-03. On each of those days, the recorded ±0.2% book genuinely
+could not absorb a $5,000 clip, per the pre-registered impact model.
+`days_without_costs` (3, all on KAITO, in every gate report below) does
+**not** capture this — it only counts days where the *entry-day-or-prior-
+14-days* lookup fails entirely and a prediction never gets costed at all;
+a thin day whose cost lookup falls back to a nearby priced day is silently
+absorbed into the round-trip cost and never counted as "without costs."
+So the true rate of within-window thin-book days is undercounted by that
+field, not zero.
 
 ### Step 3 — per-horizon fold fit + gate
 
@@ -221,44 +241,55 @@ structurally excluded.
 | 30 | 1,500,000.00 |
 | 60 | 421,487.60 |
 
-Maximum: **$1,500,000** (h30). Mapping this to a tier using
-`docs/binance-um-fee-table-2026-08.md` **by the volume criterion only**:
+Maximum: **$1,500,000** (h30), computed as `n_trades × 2 × notional ÷
+(121 OOS days) × 30` — i.e. the total round-trip notional over the whole
+121-day out-of-sample record, annualized down to a 30-day rate. That
+smooths over the trade concentration documented below: since every h15
+trade and every h30 trade came from a single active ~30-day fold (fold 3,
+2026-07-14..08-13 — see "What the diagnostics say"), the volume that
+month *actually* traded was **$4,680,000** for h15 (468 × 2 × $5,000) and
+**$6,050,000** for h30 (605 × 2 × $5,000) — 3-4x the smoothed
+`projected_30d_volume_usd` figure. Whichever figure the fixed-point rule
+is meant to use, an authenticated fee fetch needs to resolve tier
+thresholds up to at least **~$6M**, not just ~$1.5M.
 
-- The snapshot fully verifies exactly two tiers: **VIP0** (no stated
-  volume floor — "regular user," the default tier) and **VIP9** (cited,
-  not independently verified, floor ≥$30,000,000,000 30-day volume). $1.5M
-  is nowhere near VIP9's floor, so this run is not VIP9.
-- The snapshot's own "Gap" section explicitly declines to give a reliable
-  VIP1 threshold: candidate figures cited from secondary (non-Binance)
-  sources range from **$250k to $15M**, and the sources actively disagree
-  with each other (one even attaches a fee rate to the $250k citation that
-  the snapshot itself flags as "almost certainly contamination," since it
-  is *higher* than VIP0's rate).
-- **$1,500,000 falls inside that disputed range** — above the lowest cited
-  VIP1 threshold ($250k) and below the higher ones ($5M, $15M). There is
-  no verified number in the snapshot to resolve this either way.
+Mapping to a tier using `docs/binance-um-fee-table-2026-08.md` **by the
+volume criterion only**:
+
+- The snapshot **verifies exactly one tier**: **VIP0** (no stated volume
+  floor — "regular user," the default tier), fetched directly from a live
+  Binance FAQ page. **VIP9** (floor ≥$30,000,000,000 30-day volume) is
+  **cited from four secondary aggregator sites, not independently
+  verified** — the snapshot is explicit that this row is "directional
+  only." Even on that unverified figure, $1.5M–$6M is nowhere near VIP9's
+  floor, so this run is confidently not VIP9 regardless.
+- The snapshot's "Gap" section explicitly declines to give a reliable
+  VIP1 threshold: it cites **four** disagreeing candidate figures from
+  secondary (non-Binance) sources — **$250k**, **$1M**, **$5M**, and
+  **$15M** — plus a fee rate attached to the $250k citation that the
+  snapshot itself flags as "almost certainly contamination" (it's *higher*
+  than VIP0's rate, which a real volume-discount tier cannot be).
+- **$1,500,000–$6,050,000 straddles that disputed range**: it exceeds two
+  of the four cited candidates ($250k, $1M) and falls short of the other
+  two ($5M, $15M). There is no verified number in the snapshot to resolve
+  this either way, and the *actually-traded* $6.05M figure exceeds three
+  of the four candidates.
 
 Per the pre-registered rule: *"If the fee-table snapshot doesn't cover the
 mapped tier... re-fetch Binance's authenticated fee schedule before doing
 the one allowed re-run; don't substitute an unverified number."* Since the
-snapshot cannot verify whether $1.16M–$1.5M in 30-day volume stays under
-VIP1's real threshold or clears it, and this run does not invent VIP1-8
-fees or thresholds:
+snapshot cannot verify whether this run's 30-day volume (on any
+computation, smoothed or actually-traded) stays under VIP1's real
+threshold or clears it, and this run does not invent VIP1-8 fees or
+thresholds:
 
 **Outcome: STOPPED. Verdict marked PROVISIONAL pending an authenticated
 fee fetch.** What's needed to resolve it: Binance's authenticated VIP1
-maker/taker fee schedule and its exact 30-day-volume (and BNB-balance)
-threshold, fetched from a logged-in account session — the two data points
+(and possibly higher) maker/taker fee schedule and its exact
+30-day-volume (and BNB-balance) threshold, fetched from a logged-in
+account session, covering figures up to at least ~$6M — the data points
 the public snapshot could not obtain. **No second gate run was performed**
 (no VIP1-8 fees were invented to run at).
-
-One directionally-useful fact, not used to adjust any number above: VIP
-fee tiers are structured so higher-volume tiers never charge *more* than
-VIP0 — fees are flat or lower at every tier above the base rate. So
-whichever tier $1.16M–$1.5M actually falls in, run-1's 4.5bps taker /
-1.8bps maker figures are the *highest* plausible fee for this account,
-never the lowest. This is noted for completeness; it does not resolve the
-open question and is not treated as license to call run-1 final.
 
 ---
 
@@ -358,15 +389,16 @@ h15 trades. `days_without_costs`: `{"KAITO": 3}`.
 
 **Overall gate outcome: NOT GATE-ELIGIBLE.** Amendment 1's condition 1
 (≥18 months of matrix span) is not met — actual per-asset matrix span is
-~7 months, bounded by a gap in Binance's own bookDepth archive (no ±0.2%
-band before 2026-01-16), not by anything this pipeline did wrong. Per the
-protocol, a run that fails an eligibility condition cannot produce a
+~7 months, bounded by the ±0.2% band not being present in the ingested
+`bookDepth` data before 2026-01-15, not by anything this pipeline did
+wrong. Per the protocol, a run that fails an eligibility condition cannot produce a
 capital-allocation gate verdict; the per-horizon PASS/PASS/FAIL results
 above are the gate tool's mechanical output, not a decision. The fee
 fixed-point step's outcome is also **PROVISIONAL**, independently of the
 eligibility finding (see above) — the fee-table snapshot cannot resolve
-whether run-1's $1.16M–$1.5M projected 30-day volume clears VIP1, and no
-VIP1-8 fee was invented to test at.
+whether run-1's $1.16M–$6.05M range of 30-day volume figures (smoothed
+`projected_30d_volume_usd` vs. the actually-traded single month) clears
+VIP1, and no VIP1-8 fee was invented to test at.
 
 ---
 
@@ -378,35 +410,64 @@ not a walk-forward record.** At h15 and h30, folds 0-2 (test windows
 (h15) and 605 (h30) trades came from fold 3 alone (test window
 2026-07-14..08-13). At h60, the pattern inverts: fold 1 (2026-05-15..06-14)
 produced all 170 trades and a −5.99 fold Sharpe; folds 0, 2, and 3 produced
-zero trades. In every horizon, 3 of the 4 folds are silent. The
-`pred_abs_p90`/`p99` columns show why: at h15, folds 0-2 top out around
-0.6-2.3bps predicted move, while fold 3 jumps to 7.7bps (p90) / 21.3bps
-(p99) — comfortably past assets' `threshold_bps_by_asset` (13.6-38.8bps
-range) only in that one window. The h30/h60 folds show the same pattern
-of predicted-magnitude quiet periods punctuated by one active window. This
-means each horizon's headline Sharpe (whether PASS or FAIL) is really one
-30-day period's trading record, not four independent out-of-sample
-periods averaged together — precisely the "one period, not an out-of-sample
-record" caveat the smoke run raised, still true here despite four nominal
-folds.
+zero trades. In every horizon, 3 of the 4 folds are silent (n_preds per
+fold: 65,268 / 91,250 / 87,690 / 72,571 — 316,779 predictions total across
+all folds, of which only the active fold's ever cross a trade threshold).
+The `pred_abs_p90`/`p99` columns show that even in the one active window,
+trading is a thin tail: at h15 fold 3, `pred_abs_p90` is **7.703bps**,
+which is *below* the lowest per-asset threshold in the run (BTC,
+13.577bps) — only `pred_abs_p99` (21.336bps) clears that low end. Of
+72,571 predictions in fold 3, only 468 traded (**0.64%**) — so "only the
+top ~1% of predictions cleared thresholds," not "comfortably past" them
+as a bulk statement about the fold. The h30/h60 folds show the same
+pattern of predicted-magnitude quiet periods punctuated by one active,
+thin-tail window.
 
-**h60's FAIL is a genuine negative signal, not a no-trades artifact.**
-Its pooled `ic` (−0.0097) and `rank_ic` (−0.0039) are both negative — the
-model's h60 predictions are anti-correlated with realized 60-minute
-returns across the walk-forward record, and the one fold that did trade
-(fold 1) lost badly (−5.99 Sharpe, 170 trades). This is a different
-failure mode from the smoke run's h30/h60 NO-TRADES (predictions too
-small to clear the cost threshold) — here there was enough signal
-magnitude to trade, and it traded against the model's own realized skill.
+This concentration also explains why the headline annualized Sharpes look
+more dramatic than the underlying trading record: `sharpe_annualized` is
+computed over all **121** days in the pooled out-of-sample window, of
+which **90 (h15), 91 (h30), and 103 (h60) are exact zero-return days**
+(no trade, no P&L) — only 31, 30, and 18 days respectively have any
+nonzero daily return. The *traded-fold-only* Sharpes (each horizon's one
+active fold) are **14.9122 (h15 fold 3), 4.0947 (h30 fold 3), and −5.9857
+(h60 fold 1)** — each horizon's 121-day headline number is that one
+month's record diluted by three flat months of zeros, not four
+independently-earned months averaged together. Precisely the "one period,
+not an out-of-sample record" caveat the smoke run raised, still true here
+despite four nominal folds.
 
-**h15 and h30's PASS results both rest on wide dispersion across assets.**
-KAITO alone contributed 4,876 of the net bps behind h15's result (166 of
-468 trades) and 1,700 of the net bps behind h30's (195 of 605 trades) —
-by far the largest single-asset contributor at both horizons, and also the
-only asset with any `days_without_costs` (3 days). Excluding KAITO's
-contribution, the remaining 22-23 traded assets are a mix of positive and
-negative `total_net_bps` at both horizons, with no consistent unanimous
-direction. Three assets — XMR, DOGE, XRP — show negative `total_net_bps`
-at all three horizons; this is reported as a fact about the per-asset
-tables above, not as a recommendation (the one-allowed-drop-and-rerun step
-in §5 was not exercised in this task).
+**h60's FAIL is not a clean "anti-correlated across the walk-forward
+record" story — it's two assets losing badly in one fold.** The pooled
+`ic` (−0.0097) and `rank_ic` (−0.0039) are both small and only slightly
+negative — essentially indistinguishable from zero rather than a strong
+anti-signal — and fold 2's own `ic` (0.0266) is actually **positive**.
+The FAIL is concentrated: `ZEC` (47 trades, −2,916.62bps) and `WLD` (57
+trades, −1,931.50bps) together account for **−4,848.12bps of h60's
+−5,056.09bps total net** (≈96%), and per-asset data (not shown per-day in
+the gate report, but consistent with both assets' trades landing inside
+fold 1's 2026-05-15..06-14 window) point to early June as the loss
+window. This is still a real loss — the one fold that traded lost badly
+enough to fail the gate on its own — but it is concentrated in two assets
+within one month, not a signal that is anti-correlated with returns
+throughout the walk-forward record.
+
+**h15 and h30's PASS results both rest on one dominant asset.** KAITO
+alone contributed 4,876.44 of h15's **+9,515.90bps** total net (166 of 468
+trades, **51%** of the total) and 1,700.36 of h30's **+3,219.11bps**
+(195 of 605 trades, **53%**) — by far the largest single-asset contributor
+at both horizons, and also the only asset with any `days_without_costs`
+(3 days) or any of the 9 within-window thin-book days noted above.
+**Excluding KAITO, the remaining assets are still net positive**: h15 ex-
+KAITO is +4,639.46bps on 302 trades; h30 ex-KAITO is +1,518.75bps on 410
+trades — so the PASS is not solely a KAITO artifact, but KAITO is
+responsible for roughly half of each horizon's net edge, on a book that
+itself couldn't absorb a $5,000 clip on 9 of the days inside the traded
+window. Three assets — XMR, DOGE, XRP — show negative `total_net_bps` at
+all three horizons; this is reported as a fact about the per-asset tables
+above, not as a recommendation (the one-allowed-drop-and-rerun step in §5
+was not exercised in this task).
+
+**Out-of-sample window recap:** 121 days total in the pooled OOS record
+for every horizon; days with any nonzero daily P&L: **31 (h15), 30 (h30),
+18 (h60)**. The remaining 90/91/103 days are exact-zero no-trade days
+(see above).
