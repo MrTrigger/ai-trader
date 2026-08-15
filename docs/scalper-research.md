@@ -409,3 +409,113 @@ months organically. A FAIL on Binance is not grounds to buy HL data hoping
 the other venue does better — §5's FAIL handling (stop, or return to
 feature research under a new `FEATURE_SET_VERSION`) applies exactly as
 written, venue included.
+
+---
+
+## Amendment 2 (2026-08-15): fs-3 for eligibility
+
+*(This section amends, and does not delete, Amendment 1 and the protocol
+above. Where it conflicts with either, this section governs. This
+amendment is committed before any code change it describes — the fs-3
+substitution below does not exist in `features-scalper` yet at the moment
+this text is written.)*
+
+**Why: band availability, not model results.** Gate run 1
+(`docs/scalper-gate-run-1.md`) came back not gate-eligible on Amendment
+1's condition 1 (≥18 months of matrix span) for a reason discovered
+during that run, not anticipated by the runbook or the plan that preceded
+it: fs-2's `depth_imb_02` needs the ±0.2% book-depth band, and that band
+is simply absent from the ingested `bookDepth` archive before a fixed
+date. The verified evidence, from gate run 1's own inspection plus the
+follow-up check this amendment relies on:
+
+- The ±0.2% band **first appears** in `data/binance-micro/book/BTCUSDT/2026-01-15.jsonl`
+  at ts `1768460460` (2026-01-15 07:01 UTC). The snapshot immediately
+  before it, ts `1768460400` (07:00 UTC, same file), still carries only
+  the `-1.0`/`1.0` band keys; every day file before 2026-01-15 has only
+  those two keys (gate run 1 confirmed this by inspecting BTCUSDT's day
+  files from 2024-08-01 through 2026-01-14).
+- The ±1.0% band, by contrast, **exists for the full ingested history**.
+  Re-verified today (2026-08-15) by spot-checking day files across three
+  assets spanning the universe's coverage tiers — BTC, ZEC, and KAITO —
+  back to each asset's earliest 2024-08 day file: the `-1.0`/`1.0` keys
+  are present in every file checked, with no gap corresponding to the
+  ±0.2% one.
+- fs-2's `depth_imb_02` (index 27), `depth_02_z_60` (index 29), and
+  `depth_slope` (index 37) each read `bid_02`/`ask_02`, so `training-
+  matrix`'s all-Some requirement drops every row before 2026-01-15 07:01
+  UTC — the ~6.9-month actual span gate run 1 measured, against the
+  ≥18-month bar. fs-1's 26 features and fs-2's `depth_imb_10` (index 28)
+  read only the ±1.0% band and are unaffected.
+
+This is a data-availability ceiling in what Binance's archive publishes
+before 2026-01-15, external to this codebase — not a bug in `training-
+matrix`'s row logic, and not evidence about the strategy either way.
+
+**What changes: fs-3, three features substituted, everything else held
+fixed.** `features-scalper` gains `FEATURE_SET_VERSION =
+"fs-rust-scalper-3"`. Feature count stays 38. Only indices 27, 29, and 37
+change name/definition; index 28 (`depth_imb_10`) and all other 34
+indices are byte-for-byte the same as fs-2 (and, for the 26 fs-1
+features, the same as fs-1). `MicroMinute` keeps its `bid_02`/`ask_02`
+fields exactly as they are (they may be `None`) — fs-3 simply never reads
+them:
+
+| # | fs-2 | fs-3 | Rationale |
+|---|------|------|-----------|
+| 27 | `depth_imb_02` = (bid_02−ask_02)/(bid_02+ask_02+eps) | **`depth_10_z_60`** = z-score of (bid_10+ask_10) over a trailing 60-minute, gap-reset, full window | Keeps a depth-*dynamics* signal, moved to the band that exists. |
+| 29 | `depth_02_z_60` | **`depth_10_log`** = ln(bid_10+ask_10+eps) | Keeps a depth-*level* signal (a liquidity-regime feature, distinct from 27's z-score) at the surviving band. |
+| 37 | `depth_slope` = ln((bid_10+ask_10+eps)/(bid_02+ask_02+eps)) | **`depth_imb_10_m15`** = trailing 15-minute mean of `depth_imb_10`, all-Some window, gap-reset | Keeps an imbalance-*persistence* signal instead of a two-band slope that can no longer be computed pre-2026-01-15. |
+
+Everything else in Amendment 1 is unchanged by this amendment: the venue
+(Binance UM), the fee schedule and the fee fixed-point rule (VIP0 +
+BNB-discount taker 4.50bps / maker 1.8bps on run 2, with the one allowed
+re-run at the volume-mapped tier per that rule), the `binance-costs` +
+`gate --binance-costs` cost path, all three horizons (15/30/60) every
+run, the §5 eligibility conditions 2–5, the anchored-expanding fold
+schedule (90-day train floor / 30-day test / 30-day step, `MIN_ROWS =
+50,000`), the `--threshold-mult`/`--notional` no-retuning rule, and the
+one-drop-one-rerun universe-selection rule (unanimous negative
+`total_net_bps` across all three horizons, one exclude list, one rebuild,
+one rerun, then the number is the number). None of that is touched by
+substituting three feature definitions.
+
+**No run-1 result beyond the eligibility failure informed this
+substitution.** The fs-3 changes above are forced by data availability —
+which three fs-2 features read the ±0.2% band — not by any P&L, Sharpe,
+IC, or per-asset number gate run 1 produced. Gate run 1's per-horizon
+PASS/FAIL/NO-TRADES results, its KAITO-concentration finding, and every
+other diagnostic in `docs/scalper-gate-run-1.md` played no role in
+choosing `depth_10_z_60` / `depth_10_log` / `depth_imb_10_m15` or their
+definitions; those were chosen solely to preserve a dynamics, a level,
+and a persistence signal at the band the archive actually has. This
+statement is made explicitly, before code exists, so it can be checked
+against the diff when fs-3 lands.
+
+**Run 2 supersedes run 1 as the gate record.** Once a gate run is
+completed under fs-3, its report (`docs/scalper-gate-run-2.md`) is the
+gate record this protocol's PASS/FAIL determination is read from. Gate
+run 1 stays on file exactly as written, unedited, and is not the gate
+record — it was never eligible (Amendment 1 condition 1, and by
+extension condition 3, since it ran fs-2) — but its diagnostics remain
+available for comparison, same as any superseded document under this
+protocol's amendment discipline.
+
+**Frozen-data rule still applies.** No pull or backfill of any kind
+between now and the fs-3 gate run — run 2 rebuilds its matrix from the
+data already on disk under `data/`, exactly as the runbook's frozen-data
+rule (§4, restated by plan 3d's global constraints) requires. Deepening
+`data/perp` or `data/binance-micro` between this amendment and the run
+would change the matrix's stride phase and warmup window and defeat the
+comparison run 2 is meant to make against run 1.
+
+**Fee fixed-point rule applies to run 2 unchanged.** Run 2 charges VIP0 +
+BNB-discount taker (4.50bps) / maker (1.8bps) exactly as Amendment 1
+specifies, then maps `overall.projected_30d_volume_usd` to a tier and, if
+that tier differs from VIP0, runs exactly one re-run at that tier's fees
+— the second run's verdict is the gate verdict. VIP1–8 remain unresolved
+in `docs/binance-um-fee-table-2026-08.md` pending the user's
+authenticated fetch of Binance's fee schedule; if the volume-mapped tier
+falls in that unresolved range, the re-fetch happens before the one
+allowed re-run, per Amendment 1's rule — no unverified number is
+substituted.
