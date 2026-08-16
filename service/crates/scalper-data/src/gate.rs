@@ -598,21 +598,75 @@ fn merge_daily(stitched: &mut BTreeMap<NaiveDate, f64>, fold_daily: &BTreeMap<Na
 }
 
 /// The training matrix: manifest feature order, the feature-set version it
-/// was built against, plus every row. Reuses `matrix::MatrixRow` (Task 2's
-/// row type) rather than redefining it.
+/// was built against, and every row's fields split into parallel columns
+/// instead of a `Vec<MatrixRow>` of heap-allocated per-row maps - a
+/// 2.4M-row x 38-feature matrix as `Vec<MatrixRow>` was observed to SIGKILL
+/// (OOM) at 7GB; this columnar form holds the same data in a handful of
+/// flat `Vec`s (`x` alone is `n * features.len()` `f64`s, no per-row
+/// allocation at all).
+///
+/// `ts[i]`/`asset_idx[i]`/`x[i*F..(i+1)*F]` are row `i`'s fields, `F =
+/// features.len()`, in manifest feature order. `asset_idx[i]` indexes
+/// `assets`, an interned vocabulary of asset names in first-seen (file)
+/// order - a row's asset is looked up once per distinct string instead of
+/// cloned into every row.
+///
+/// A feature absent from a row's `features` map (deferred to prediction
+/// time, exactly like the old `Vec<MatrixRow>` reader: `load_matrix` itself
+/// never errors on it) is stored as `f64::NAN` - safe as a "missing"
+/// sentinel because the matrix writer (`matrix::matrix_rows`) guarantees
+/// every feature it writes is finite, and JSON itself cannot express a
+/// literal NaN, so a NAN in `x` can only mean "this row's JSON had no entry
+/// for this feature name", never a real value.
+///
+/// `fwd[horizon][i]` is row `i`'s forward return at that horizon, or
+/// `f64::NAN` if that row's `fwd_bps` had no entry for it - same missing
+/// sentinel, same justification (`matrix::forward_returns_bps` never writes
+/// a fabricated/NaN label; a horizon is a fully absent key or a real
+/// number). The horizon key set is discovered from the rows themselves (a
+/// key seen on any row gets a column; rows seen before that key first
+/// appeared are backfilled with NAN for it), not assumed from the
+/// manifest - the manifest's own `horizons_min` doesn't gate which keys a
+/// row's `fwd_bps` may carry, so trusting it here could disagree with what
+/// `MatrixRow.fwd_bps.get(...)` would have found.
 struct Matrix {
     features: Vec<String>,
     feature_set_version: String,
-    rows: Vec<MatrixRow>,
+    ts: Vec<i64>,
+    asset_idx: Vec<u32>,
+    assets: Vec<String>,
+    x: Vec<f64>,
+    fwd: BTreeMap<String, Vec<f64>>,
+}
+
+impl Matrix {
+    fn n(&self) -> usize {
+        self.ts.len()
+    }
+
+    /// Row `i`'s feature values, in `features` (manifest) order - a `NAN`
+    /// entry means that feature was absent from the row's JSON.
+    fn row_features(&self, i: usize) -> &[f64] {
+        let f = self.features.len();
+        &self.x[i * f..(i + 1) * f]
+    }
+
+    fn asset(&self, i: usize) -> &str {
+        &self.assets[self.asset_idx[i] as usize]
+    }
 }
 
 fn load_matrix(path: &Path) -> Result<Matrix, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut lines = text.lines();
-    let manifest_line = lines
-        .next()
-        .ok_or_else(|| format!("{}: empty matrix", path.display()))?;
-    let manifest: serde_json::Value = serde_json::from_str(manifest_line)
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    let mut manifest_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut manifest_line)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if manifest_line.trim().is_empty() {
+        return Err(format!("{}: empty matrix", path.display()));
+    }
+    let manifest: serde_json::Value = serde_json::from_str(manifest_line.trim_end())
         .map_err(|e| format!("{}: manifest line: {e}", path.display()))?;
     if manifest.get("kind").and_then(|v| v.as_str()) != Some("manifest") {
         return Err(format!(
@@ -636,16 +690,63 @@ fn load_matrix(path: &Path) -> Result<Matrix, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("{}: manifest has no feature_set_version", path.display()))?
         .to_string();
+    let n_features = features.len();
 
-    let rows: Vec<MatrixRow> = lines
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).map_err(|e| format!("{}: row: {e}", path.display())))
-        .collect::<Result<_, _>>()?;
+    let mut ts: Vec<i64> = Vec::new();
+    let mut asset_idx: Vec<u32> = Vec::new();
+    let mut assets: Vec<String> = Vec::new();
+    let mut asset_lookup: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut x: Vec<f64> = Vec::new();
+    let mut fwd: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut n: usize = 0;
+
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.map_err(|e| format!("{}: {e}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A transient per-line parse: `MatrixRow`'s `BTreeMap`s are
+        // allocated and dropped once per iteration, never retained past the
+        // column-unpacking below - the whole point of streaming instead of
+        // `Vec<MatrixRow>`.
+        let row: MatrixRow = serde_json::from_str(&line)
+            .map_err(|e| format!("{}: row: {e}", path.display()))?;
+
+        ts.push(row.ts);
+        let idx = *asset_lookup.entry(row.asset.clone()).or_insert_with(|| {
+            let idx = assets.len() as u32;
+            assets.push(row.asset.clone());
+            idx
+        });
+        asset_idx.push(idx);
+
+        for name in &features {
+            x.push(row.features.get(name).copied().unwrap_or(f64::NAN));
+        }
+
+        for (h, v) in &row.fwd_bps {
+            fwd.entry(h.clone())
+                .or_insert_with(|| vec![f64::NAN; n])
+                .push(*v);
+        }
+        for col in fwd.values_mut() {
+            if col.len() == n {
+                col.push(f64::NAN);
+            }
+        }
+
+        n += 1;
+    }
+    debug_assert_eq!(x.len(), n * n_features);
 
     Ok(Matrix {
         features,
         feature_set_version,
-        rows,
+        ts,
+        asset_idx,
+        assets,
+        x,
+        fwd,
     })
 }
 
@@ -838,9 +939,9 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
 
     let horizon_key = folds_doc.horizon_min.to_string();
     let assets: Vec<String> = matrix
-        .rows
+        .assets
         .iter()
-        .map(|r| r.asset.clone())
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -981,35 +1082,47 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         let trees = load_model(&model_path, &matrix.features, &matrix.feature_set_version)?;
 
         let mut preds: Vec<Pred> = Vec::new();
-        for row in matrix
-            .rows
-            .iter()
-            .filter(|r| r.ts >= fold.test_start_ts && r.ts < fold.test_end_ts)
-        {
-            let Some(&fwd_bps) = row.fwd_bps.get(&horizon_key) else {
-                continue; // no label at this horizon for this row
-            };
-            let values: Vec<f64> = matrix
-                .features
-                .iter()
-                .map(|name| {
-                    row.features.get(name).copied().ok_or_else(|| {
-                        format!(
-                            "{}: row ts={} asset={} missing feature {name:?}",
-                            matrix_path.display(),
-                            row.ts,
-                            row.asset
-                        )
+        // `None` (no row in the whole matrix ever carried this horizon key)
+        // means every row's lookup would have missed too - skip the fold's
+        // test window entirely rather than indexing a column that isn't
+        // there.
+        let fwd_col = matrix.fwd.get(&horizon_key);
+        if let Some(fwd_col) = fwd_col {
+            for i in 0..matrix.n() {
+                let ts = matrix.ts[i];
+                if !(ts >= fold.test_start_ts && ts < fold.test_end_ts) {
+                    continue;
+                }
+                let fwd_bps = fwd_col[i];
+                if fwd_bps.is_nan() {
+                    continue; // no label at this horizon for this row
+                }
+                let row_feats = matrix.row_features(i);
+                let values: Vec<f64> = matrix
+                    .features
+                    .iter()
+                    .zip(row_feats)
+                    .map(|(name, &v)| {
+                        if v.is_nan() {
+                            Err(format!(
+                                "{}: row ts={} asset={} missing feature {name:?}",
+                                matrix_path.display(),
+                                ts,
+                                matrix.asset(i)
+                            ))
+                        } else {
+                            Ok(v)
+                        }
                     })
-                })
-                .collect::<Result<_, _>>()?;
-            let pred_bps = lightgbm_json::predict(&trees, &values)?;
-            preds.push(Pred {
-                ts: row.ts,
-                asset: row.asset.clone(),
-                pred_bps,
-                fwd_bps,
-            });
+                    .collect::<Result<_, _>>()?;
+                let pred_bps = lightgbm_json::predict(&trees, &values)?;
+                preds.push(Pred {
+                    ts,
+                    asset: matrix.asset(i).to_string(),
+                    pred_bps,
+                    fwd_bps,
+                });
+            }
         }
 
         let (trades, next_state) = simulate_with_state_by_day(
