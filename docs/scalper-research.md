@@ -594,3 +594,36 @@ band exists. One m is run; no scan.
 is the first run whose costed trading window can match the matrix span. Its
 eligibility statement must report both spans (matrix; costed/tradeable OOS)
 explicitly. Run 2 stays on file with its ~6-month costed window stated.
+
+## Amendment 4 (2026-08-16): a look-ahead in the metrics join — fs-4
+
+**What was found.** Gate run 3 (Amendment 3 exits + 3b costs) reported
+Sharpe 15–18 at every horizon with fold Sharpes of 25–42 in 2024–25 and IC
+≈ 0.30 at h15. That is not a trading result. Investigation: the fold models'
+gain is dominated by `taker_ls_ratio` (~42%) and `oi_change_60` (~11%), both
+from Binance's `metrics` archive (5-minute rows). Direct measurement on BTC
+2025-03..05 (26,496 rows): the taker ratio stamped `create_time = T`
+correlates **+0.365** with the return over **[T, T+5m)** and −0.013 with
+[T+5m, T+10m). Binance's `create_time` marks the START of the 5-minute
+aggregation window; the row at T summarizes flow through T+5m. `micro_join`
+snapped metrics with `ts_s ≤ bar_ts`, handing the bar at T a row that
+contains five minutes of its own future. Every fs-2/fs-3 model (gate runs
+1–3) is contaminated by this; the run-2 audit's "IC implausibly high" flag was
+this. Runs 1–3 stay on file as INVALID for signal purposes (their cost, exit
+and eligibility machinery is unaffected and stands).
+
+**Fix (fs-rust-scalper-4).** Feature definitions unchanged (all 38); the
+metrics join becomes `ts_s + 300 ≤ bar_ts` (a 5-minute row is available only
+after its window closes) with the same 600s staleness tolerance measured
+from window close. bookDepth snapshots are point-in-time (a snapshot at T is
+the book at T) and aggTrades minute-buckets at T summarize [T, T+60) — a bar
+at open-time T whose features are computed at its close T+60 may use bucket
+T; those joins are unchanged. Every micro source's timestamp semantics are
+now recorded in `micro_join.rs`'s module doc with the measurement that
+established them, and a regression test asserts the metrics offset.
+
+**Consequence.** Full re-run: matrix rebuilt on the same frozen data, folds
+re-fit, gates at all three horizons under Amendments 1–3b as amended here.
+That run (gate run 4) is the first uncontaminated record. Fees, costs (3b),
+exits (3), fold schedule, horizons, drop rule, fixed-point: unchanged.
+Pre-registered before any fs-4 code exists.
