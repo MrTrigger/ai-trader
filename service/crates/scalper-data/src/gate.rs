@@ -11,9 +11,12 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+use features_crypto::Bar;
+
 use crate::binance_costs::DayCost;
 use crate::binance_micro;
 use crate::costs::{percentile, CostSummary};
+use crate::exits::{self, ExitKind};
 use crate::matrix::MatrixRow;
 use crate::{get, need};
 
@@ -297,6 +300,160 @@ where
         flat_after.insert(p.asset.clone(), p.ts + hold_secs);
     }
     (trades, flat_after)
+}
+
+/// One asset's 1m bar path plus its Wilder ATR(14) (`exits::atr14`,
+/// index-aligned to `bars`) and a `ts -> index` lookup - everything
+/// `simulate_with_state_atr` needs to resolve an accepted entry's Amendment
+/// 3 stop/target exit against that asset's actual path. Built once per
+/// `cmd_gate` invocation under `--exit atr`, not per fold.
+struct AssetPath {
+    bars: Vec<Bar>,
+    atr: Vec<Option<f64>>,
+    index_by_ts: BTreeMap<i64, usize>,
+}
+
+impl AssetPath {
+    fn new(bars: Vec<Bar>) -> Self {
+        let atr = exits::atr14(&bars);
+        let index_by_ts = bars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.ts_utc.timestamp(), i))
+            .collect();
+        AssetPath {
+            bars,
+            atr,
+            index_by_ts,
+        }
+    }
+}
+
+/// Tallies of how `simulate_with_state_atr`'s accepted entries resolved,
+/// summed across folds by `cmd_gate` into `Report::exit_stats`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExitStatsAccum {
+    stops: usize,
+    targets: usize,
+    time_exits: usize,
+    bars_held_sum: u64,
+    /// An accepted entry (same threshold rule as `--exit time`) whose asset
+    /// had no ATR value yet at the entry bar - cold warm-up, or the entry
+    /// bar landed right after a >120s gap - so no stop/target could be
+    /// computed. Skipped rather than priced with a fabricated stop/target,
+    /// same discipline as every other "can't resolve, don't fabricate"
+    /// skip in this module (a missing round-trip cost, a thin book).
+    skipped_no_atr: usize,
+}
+
+/// `simulate_with_state_by_day`'s Amendment 3 sibling: the entry rule
+/// (signal via `pred_bps` vs `threshold_mult * round_trip`, hold-window
+/// blocking via `flat_after`, per-(asset, entry day) round-trip cost
+/// lookup) is IDENTICAL - only what happens after an entry is accepted
+/// differs. Under `--exit time`, the trade's outcome is the matrix's own
+/// `fwd_bps` at the fold's fixed horizon; here, it is
+/// `exits::resolve_exit` walking the asset's real 1m bar path forward from
+/// the entry bar against a `k=4` ATR(14) stop and a `1.2x` target
+/// (`exits::stop_target`), stop-wins-ties, with the Amendment-1 fixed-time
+/// exit surviving only as a fallback when neither level is touched by
+/// `horizon_min` bars later.
+///
+/// Because of that, `flat_after` is set to the EXIT bar's own ts, not
+/// `entry_ts + horizon_min*60s` - a stop or target can free the position
+/// before the full horizon elapses, and (matching the live bot's one
+/// continuous position per asset) the very next signal after that earlier
+/// exit is eligible to enter, not blocked until the original horizon would
+/// have expired.
+///
+/// The only future data this reads beyond what `--exit time` already reads
+/// (via `fwd_bps`, itself already a forward-looking label) is `path[1..]` -
+/// bars strictly AFTER the entry bar - inside `resolve_exit`, which is
+/// exactly the trade's own realized outcome, not information used to
+/// accept or size the entry itself. ATR at the entry bar (`path.atr[idx]`)
+/// is computed only from bars up to and including the entry bar.
+fn simulate_with_state_atr(
+    preds: &[Pred],
+    round_trip_by_asset_day: &BTreeMap<String, BTreeMap<NaiveDate, f64>>,
+    paths: &BTreeMap<String, AssetPath>,
+    horizon_min: i64,
+    threshold_mult: f64,
+    carry: &BTreeMap<String, i64>,
+) -> (Vec<Trade>, BTreeMap<String, i64>, ExitStatsAccum) {
+    let mut sorted: Vec<&Pred> = preds.iter().collect();
+    sorted.sort_by(|a, b| (a.asset.as_str(), a.ts).cmp(&(b.asset.as_str(), b.ts)));
+
+    let horizon_bars = horizon_min.max(0) as usize;
+    let mut flat_after: BTreeMap<String, i64> = carry.clone();
+    let mut trades = Vec::new();
+    let mut stats = ExitStatsAccum::default();
+
+    for p in sorted {
+        let Some(round_trip) = round_trip_by_asset_day
+            .get(p.asset.as_str())
+            .and_then(|by_day| by_day.get(&date_of(p.ts)))
+            .copied()
+        else {
+            continue;
+        };
+        let next_free = *flat_after.get(p.asset.as_str()).unwrap_or(&i64::MIN);
+        if p.ts < next_free {
+            continue; // still held
+        }
+        let threshold = threshold_mult * round_trip;
+        let side: i8 = if p.pred_bps > threshold {
+            1
+        } else if p.pred_bps < -threshold {
+            -1
+        } else {
+            continue; // no signal
+        };
+
+        // An asset with a resolvable round-trip cost but no bar path at all
+        // (shouldn't happen when --data-root matches the matrix's source,
+        // but not assumed) is untradeable in atr mode - skip exactly like a
+        // missing cost lookup, not a fabricated exit.
+        let Some(path) = paths.get(p.asset.as_str()) else {
+            continue;
+        };
+        let Some(&idx) = path.index_by_ts.get(&p.ts) else {
+            continue; // matrix row's ts has no matching bar - can't resolve
+        };
+        let Some(atr) = path.atr[idx] else {
+            stats.skipped_no_atr += 1;
+            continue;
+        };
+
+        let entry_px = path.bars[idx].close;
+        let (stop_px, target_px) = exits::stop_target(entry_px, side, atr);
+        let exit = exits::resolve_exit(
+            entry_px,
+            side,
+            stop_px,
+            target_px,
+            &path.bars[idx..],
+            horizon_bars,
+        );
+
+        let gross_bps = side as f64 * (exit.exit_px / entry_px - 1.0) * 1e4;
+        let net_bps = gross_bps - round_trip;
+        trades.push(Trade {
+            asset: p.asset.clone(),
+            entry_ts: p.ts,
+            side,
+            net_bps,
+        });
+
+        match exit.exit_kind {
+            ExitKind::Stop => stats.stops += 1,
+            ExitKind::Target => stats.targets += 1,
+            ExitKind::Time => stats.time_exits += 1,
+        }
+        stats.bars_held_sum += exit.bars_held as u64;
+
+        let exit_ts = path.bars[idx + exit.bars_held].ts_utc.timestamp();
+        flat_after.insert(p.asset.clone(), exit_ts);
+    }
+    (trades, flat_after, stats)
 }
 
 /// UTC calendar date a unix timestamp falls on.
@@ -840,6 +997,12 @@ struct OverallReport {
     /// fixed `TAKER_FEE_BPS` constant. `None` only if a future cost source
     /// adds a mode that doesn't fit either shape.
     fee_bps_used: Option<f64>,
+    /// `"atr"` under `--exit atr` (Amendment 3); omitted entirely under
+    /// `--exit time` (the default) - that omission is deliberate and load
+    /// bearing: `--exit time`'s report must stay byte-identical to every
+    /// gate run before Amendment 3, which never had this field at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -876,7 +1039,26 @@ struct Report {
     /// silently priced at a default.
     days_without_costs: BTreeMap<String, usize>,
     daily_returns_bps: BTreeMap<String, f64>,
+    /// Populated only under `--exit atr` (Amendment 3): summed across every
+    /// fold. Omitted entirely under `--exit time` - same byte-identity
+    /// reasoning as `OverallReport::exit_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_stats: Option<ExitStatsReport>,
     overall: OverallReport,
+}
+
+#[derive(Serialize)]
+struct ExitStatsReport {
+    stops: usize,
+    targets: usize,
+    time_exits: usize,
+    /// Mean `bars_held` over `stops + targets + time_exits` trades; `0.0`
+    /// when that count is `0` (nothing traded, not a divide-by-zero NaN).
+    mean_bars_held: f64,
+    /// Accepted entries skipped because the asset had no ATR value yet at
+    /// the entry bar (cold warm-up or right after a >120s gap) - see
+    /// `ExitStatsAccum::skipped_no_atr`.
+    skipped_no_atr: usize,
 }
 
 pub fn cmd_gate(args: &[String]) -> Result<(), String> {
@@ -893,6 +1075,25 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     let notional_usd: f64 = notional
         .parse()
         .map_err(|e| format!("bad --notional {notional:?}: {e}"))?;
+
+    // `--exit time` (default) is Amendment 1's unchanged fixed-horizon
+    // exit, byte-identical to every gate run before Amendment 3. `--exit
+    // atr` is Amendment 3's pre-registered ATR stop/target, which needs
+    // `--data-root` to read each asset's 1m bars for exit resolution -
+    // `--matrix`/`--folds`/costs alone aren't enough, those never carried
+    // OHLC.
+    let exit_mode = get(args, "--exit").unwrap_or_else(|| "time".to_string());
+    if exit_mode != "time" && exit_mode != "atr" {
+        return Err(format!(
+            "--exit must be \"time\" or \"atr\", got {exit_mode:?}"
+        ));
+    }
+    let data_root: Option<PathBuf> = get(args, "--data-root").map(PathBuf::from);
+    if exit_mode == "atr" && data_root.is_none() {
+        return Err("--data-root is required with --exit atr (to read 1m bars for stop/target \
+                     resolution)"
+            .into());
+    }
 
     let costs_path = get(args, "--costs").map(PathBuf::from);
     let binance_costs_path = get(args, "--binance-costs").map(PathBuf::from);
@@ -949,6 +1150,22 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     // Chronological order (not file order) is what makes the hold-state
     // carry below correct, and doubles as the real-overlap check.
     let ordered_folds = validate_no_ts_overlap(&folds_doc.folds)?;
+
+    // `--exit atr` only: one asset's 1m bars + ATR(14) + ts index, read
+    // once up front (not per fold) - same store key rule `training-matrix`
+    // uses (`coin.to_uppercase()`), since the matrix's `asset` column is
+    // the universe coin name, not the store key.
+    let mut asset_paths: BTreeMap<String, AssetPath> = BTreeMap::new();
+    if exit_mode == "atr" {
+        let perp_root = data_root.as_ref().expect("checked above").join("perp");
+        for asset in &assets {
+            let store_key = asset.to_uppercase();
+            let bars = crypto_portfolio::store::read_asset(&perp_root, 60, &store_key)?;
+            if !bars.is_empty() {
+                asset_paths.insert(asset.clone(), AssetPath::new(bars));
+            }
+        }
+    }
 
     // Every calendar day any fold's test window could produce an entry on -
     // the full domain the per-(asset, day) round-trip cost lookup below
@@ -1076,6 +1293,8 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     // one continuous position per asset, not one that forgets on every
     // fold's first row.
     let mut hold_state: BTreeMap<String, i64> = BTreeMap::new();
+    // `--exit atr` only: summed across every fold into `Report::exit_stats`.
+    let mut exit_stats_total = ExitStatsAccum::default();
 
     for fold in &ordered_folds {
         let model_path = folds_dir.join(&fold.model);
@@ -1125,13 +1344,30 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             }
         }
 
-        let (trades, next_state) = simulate_with_state_by_day(
-            &preds,
-            &round_trip_by_asset_day,
-            folds_doc.horizon_min,
-            threshold_mult,
-            &hold_state,
-        );
+        let (trades, next_state) = if exit_mode == "atr" {
+            let (trades, next_state, stats) = simulate_with_state_atr(
+                &preds,
+                &round_trip_by_asset_day,
+                &asset_paths,
+                folds_doc.horizon_min,
+                threshold_mult,
+                &hold_state,
+            );
+            exit_stats_total.stops += stats.stops;
+            exit_stats_total.targets += stats.targets;
+            exit_stats_total.time_exits += stats.time_exits;
+            exit_stats_total.bars_held_sum += stats.bars_held_sum;
+            exit_stats_total.skipped_no_atr += stats.skipped_no_atr;
+            (trades, next_state)
+        } else {
+            simulate_with_state_by_day(
+                &preds,
+                &round_trip_by_asset_day,
+                folds_doc.horizon_min,
+                threshold_mult,
+                &hold_state,
+            )
+        };
         hold_state = next_state;
         let daily = daily_returns_bps(&trades, n_assets, (fold.test_start_ts, fold.test_end_ts));
         let sharpe = annualized_sharpe(&daily);
@@ -1229,6 +1465,28 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
 
     let test_span_days = stitched_daily.len();
 
+    let exit_stats_report = if exit_mode == "atr" {
+        let n = exit_stats_total.stops + exit_stats_total.targets + exit_stats_total.time_exits;
+        Some(ExitStatsReport {
+            stops: exit_stats_total.stops,
+            targets: exit_stats_total.targets,
+            time_exits: exit_stats_total.time_exits,
+            mean_bars_held: if n > 0 {
+                exit_stats_total.bars_held_sum as f64 / n as f64
+            } else {
+                0.0
+            },
+            skipped_no_atr: exit_stats_total.skipped_no_atr,
+        })
+    } else {
+        None
+    };
+    let exit_mode_field = if exit_mode == "atr" {
+        Some(exit_mode.clone())
+    } else {
+        None
+    };
+
     let report = Report {
         generated_utc: Utc::now().to_rfc3339(),
         matrix: matrix_path.display().to_string(),
@@ -1247,6 +1505,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             .into_iter()
             .map(|(day, bps)| (day.to_string(), bps))
             .collect(),
+        exit_stats: exit_stats_report,
         overall: OverallReport {
             n_trades: n_trades_total,
             sharpe_annualized: overall_sharpe,
@@ -1261,6 +1520,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
                 test_span_days,
             ),
             fee_bps_used,
+            exit_mode: exit_mode_field,
         },
     };
 
@@ -2278,6 +2538,230 @@ mod tests {
         assert_eq!(
             count, 1,
             "must count the one day BTC actually had a dropped prediction on, not the span"
+        );
+    }
+
+    /// `--exit time` (the default, unspecified here) must never emit
+    /// `exit_stats` or `overall.exit_mode` at all - not `null`, ABSENT -
+    /// since the byte-identity guard for Amendment 3 (`--exit time` must
+    /// diff empty against every gate report written before it) depends on
+    /// these keys not existing in that mode's JSON.
+    #[test]
+    fn exit_time_mode_omits_the_new_report_fields_entirely() {
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-gate-e2e-exit-time-omits-fields-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest",
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "horizons_min": [15],
+            "stride_min": 1,
+            "assets": ["BTC"],
+        });
+        let row = serde_json::json!({
+            "ts": 600, "asset": "BTC", "features": features, "fwd_bps": {"15": 20.0},
+        });
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row}\n")).unwrap();
+
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0, "train_start_ts": 0, "train_end_ts": 0,
+                    "test_start_ts": 0, "test_end_ts": 3_600,
+                    "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let model = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION,
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "model": { "tree_info": [{
+                "tree_index": 0, "num_leaves": 1,
+                "tree_structure": { "leaf_value": 100.0 },
+            }] },
+        });
+        std::fs::write(dir.join("fold-0.json"), serde_json::to_string(&model).unwrap()).unwrap();
+
+        let costs_path = dir.join("costs.json");
+        std::fs::write(&costs_path, "{}").unwrap();
+
+        let out_path = dir.join("report.json");
+        let args = vec![
+            "--matrix".to_string(),
+            matrix_path.to_string_lossy().to_string(),
+            "--folds".to_string(),
+            folds_path.to_string_lossy().to_string(),
+            "--costs".to_string(),
+            costs_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+        ];
+        cmd_gate(&args).unwrap(); // no --exit at all - the default
+
+        let raw = std::fs::read_to_string(&out_path).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !raw.contains("exit_stats") && !raw.contains("exit_mode"),
+            "the raw JSON text must not contain either key at all under --exit time"
+        );
+        assert!(report.get("exit_stats").is_none());
+        assert!(report["overall"].get("exit_mode").is_none());
+    }
+
+    /// Full wiring, end to end, for `--exit atr` (Amendment 3): a flat 1m
+    /// bar series (constant OHLC -> constant ATR = 0.1 at every warm index)
+    /// written to a real perp store, one matrix row at bar index 20 (well
+    /// past the 14-bar ATR warm-up), a single-leaf model predicting a
+    /// constant 100.0 (well past the DEFAULT_ROUND_TRIP_BPS-derived
+    /// threshold), and a 15-bar horizon. Neither the stop
+    /// (entry - 4*0.1 = 99.6) nor the target (entry + 4.8*0.1 = 100.48) is
+    /// ever touched by the flat path (low=99.95, high=100.05 throughout),
+    /// so the trade must resolve as a Time exit at bar 35's close (100.0),
+    /// giving net_bps = 0 gross minus the DEFAULT_ROUND_TRIP_BPS round trip
+    /// (20.0), hand-computed and checked exactly.
+    #[test]
+    fn cmd_gate_runs_end_to_end_in_atr_mode_and_resolves_a_time_exit() {
+        use chrono::{Duration, TimeZone};
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir = std::env::temp_dir().join(format!(
+            "scalper-gate-e2e-atr-exit-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let bars: Vec<Bar> = (0..50)
+            .map(|i| Bar {
+                ts_utc: base + Duration::minutes(i),
+                asset: "TEST".to_string(),
+                interval_s: 60,
+                open: 100.0,
+                high: 100.05,
+                low: 99.95,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: Some(100.0),
+                trades: Some(5),
+            })
+            .collect();
+        let entry_idx = 20usize;
+        let entry_ts = bars[entry_idx].ts_utc.timestamp();
+
+        let perp_root = dir.join("perp");
+        crypto_portfolio::store::write(&perp_root, &bars).unwrap();
+
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest",
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "horizons_min": [15],
+            "stride_min": 1,
+            "assets": ["TEST"],
+        });
+        let row = serde_json::json!({
+            "ts": entry_ts, "asset": "TEST", "features": features, "fwd_bps": {"15": 999.0},
+        });
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row}\n")).unwrap();
+
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0, "train_start_ts": 0, "train_end_ts": entry_ts,
+                    "test_start_ts": entry_ts - 60, "test_end_ts": entry_ts + 60,
+                    "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Single-leaf model: predicts a constant 100.0 bps regardless of
+        // features - well past 1.5 * DEFAULT_ROUND_TRIP_BPS (30.0).
+        let model = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION,
+            "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "model": { "tree_info": [{
+                "tree_index": 0, "num_leaves": 1,
+                "tree_structure": { "leaf_value": 100.0 },
+            }] },
+        });
+        std::fs::write(dir.join("fold-0.json"), serde_json::to_string(&model).unwrap()).unwrap();
+
+        // Empty costs -> "TEST" falls back to DEFAULT_ROUND_TRIP_BPS (20.0).
+        let costs_path = dir.join("costs.json");
+        std::fs::write(&costs_path, "{}").unwrap();
+
+        let out_path = dir.join("report.json");
+        let args = vec![
+            "--matrix".to_string(),
+            matrix_path.to_string_lossy().to_string(),
+            "--folds".to_string(),
+            folds_path.to_string_lossy().to_string(),
+            "--costs".to_string(),
+            costs_path.to_string_lossy().to_string(),
+            "--exit".to_string(),
+            "atr".to_string(),
+            "--data-root".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_path.to_string_lossy().to_string(),
+        ];
+        cmd_gate(&args).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(report["overall"]["exit_mode"], "atr");
+        assert_eq!(report["overall"]["n_trades"], 1);
+        assert_eq!(report["exit_stats"]["stops"], 0);
+        assert_eq!(report["exit_stats"]["targets"], 0);
+        assert_eq!(report["exit_stats"]["time_exits"], 1);
+        assert_eq!(report["exit_stats"]["mean_bars_held"], 15.0);
+        assert_eq!(report["exit_stats"]["skipped_no_atr"], 0);
+
+        // Hand-computed: gross = 1 * (100.0/100.0 - 1) * 1e4 = 0.0;
+        // net = 0.0 - 20.0 = -20.0.
+        let net_bps = report["per_asset"]["TEST"]["total_net_bps"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (net_bps - (-20.0)).abs() < 1e-9,
+            "flat path -> 0 gross, net = -DEFAULT_ROUND_TRIP_BPS, got {net_bps}"
         );
     }
 }

@@ -3,6 +3,7 @@ mod binance_micro;
 mod binance_um;
 mod books;
 mod costs;
+mod exits;
 mod gate;
 mod matrix;
 mod micro_join;
@@ -102,7 +103,7 @@ usage: scalper-data <command>
       output keyed by coin: {asset: {day: {spread_bps_p75, impact_bps,
       samples}}}. A candidate with no Binance UM listing is skipped.
 
-  gate --matrix <path> --folds <path/folds.json> (--costs <path> | --binance-costs <path> --fee-taker-bps F --fee-maker-bps F) [--threshold-mult 1.5] [--notional 5000] --out <path>
+  gate --matrix <path> --folds <path/folds.json> (--costs <path> | --binance-costs <path> --fee-taker-bps F --fee-maker-bps F) [--threshold-mult 1.5] [--notional 5000] [--exit time|atr] [--data-root <dir>] --out <path>
       Walk-forward gate: for each fold in folds.json, load fold-N.json (a
       LightGBM JSON dump), predict every matrix row in that fold's test
       window via lightgbm-json, and simulate a threshold-gated long/short
@@ -121,6 +122,19 @@ usage: scalper-data <command>
       daily P&L into one series and reports the annualized Sharpe gate
       (> 2.0 to PASS), plus overall.projected_30d_volume_usd and
       overall.fee_bps_used, to --out.
+
+      --exit time (default) is Amendment 1's unchanged fixed-horizon exit -
+      byte-identical to every gate run before Amendment 3. --exit atr
+      applies Amendment 3's pre-registered ATR(14) Wilder stop/target
+      instead (stop = 4*ATR, target = 1.2*stop, stop-wins-ties, time exit
+      as fallback at the horizon) and requires --data-root <dir> to read
+      each asset's 1m bars from {data-root}/perp (store key =
+      coin.to_uppercase(), same rule as training-matrix) to resolve each
+      accepted entry's realized exit. Adds overall.exit_mode and
+      exit_stats (stops/targets/time_exits/mean_bars_held/skipped_no_atr)
+      to the report; both are omitted entirely under --exit time; the
+      knobs (k=4, R:R=1.2, ATR period 14) are fixed by
+      docs/scalper-research.md Amendment 3 and are not CLI flags.
 ";
 
 pub(crate) fn get(args: &[String], name: &str) -> Option<String> {
