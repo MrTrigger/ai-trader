@@ -2004,6 +2004,7 @@ mod tests {
             spread_bps_p75: spread_p75,
             impact_bps: impact,
             samples: 100,
+            impact_model: "b10".to_string(),
         }
     }
 
