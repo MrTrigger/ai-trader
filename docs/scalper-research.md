@@ -559,3 +559,38 @@ applies — no re-tuning of k or R:R.
 **Provenance.** Run 3 supersedes run 2 as the gate record only if it is
 eligible under the same conditions; run 2 stays on file as the fixed-exit
 result. Data stays frozen (no pull between run 2 and run 3). fs-3 unchanged.
+
+## Amendment 3b (2026-08-16): the cost model must not depend on the ±0.2% band either
+
+**Why.** The audit of gate run 2 found that the pre-registered impact model
+(`binance_costs.rs`, Amendment 1) prices a $5k clip against the day's median
+**±0.2%** band depth — the same band Amendment 2 documents as absent from the
+bookDepth archive before 2026-01-15. Every OOS day before that date is
+therefore "thin → untradeable" by rule at every horizon: run 2's costed
+trading window was 2026-01-15..2026-07-22 (~6 months, 4-5 folds), not the
+24-month matrix span. Removing the band dependency from features (Amendment 2)
+without removing it from costs left the eligibility problem in place on the
+cost side. This amendment fixes that, pre-registered before run 3.
+
+**Impact model (replaces Amendment 1's).** For a notional N against the day's
+median ±1.0% band depth d10 = min(median bid_10, median ask_10):
+`impact_bps = m · (N / d10) · 50`, i.e. a uniform-density walk within a
+100-bps band, halved for average depth, times a multiplier **m = 2.3**;
+`None` (thin, untradeable that day) if N > d10 or the band is absent. **Floor:**
+on days where the ±0.2% band also exists, `impact_bps = max(new model,
+Amendment-1 model)` — post-2026-01-15 costs are never lower than run 2
+charged. Spread (p75 of minute estimates), fees, the 14-day absent-day
+fallback, thin-day rule: unchanged.
+
+**Why m = 2.3 (measured, not tuned).** On the 5,010 asset-days from
+2026-01-15 where both bands exist, the ratio of the ±1%-band model at m = 1 to
+the pre-registered ±0.2%-band model has p10/p25/p50/p75/p90 = 0.36 / 0.44 /
+0.56 / 0.68 / 0.76 (per-asset medians 0.37 AAVE, KAITO … 0.74 BTC). m = 2.3 is
+the smallest value at which the new model is at least as conservative as the
+old on ≥ 75% of asset-days; the max-floor covers the remainder where the old
+band exists. One m is run; no scan.
+
+**Consequence for the record.** Run 3 (Amendment 3 exits + this cost model)
+is the first run whose costed trading window can match the matrix span. Its
+eligibility statement must report both spans (matrix; costed/tradeable OOS)
+explicitly. Run 2 stays on file with its ~6-month costed window stated.
