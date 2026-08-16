@@ -519,3 +519,43 @@ authenticated fetch of Binance's fee schedule; if the volume-mapped tier
 falls in that unresolved range, the re-fetch happens before the one
 allowed re-run, per Amendment 1's rule — no unverified number is
 substituted.
+
+## Amendment 3 (2026-08-16): ATR stop/target exits, pre-registered
+
+**Why.** Gate run 2 (`docs/scalper-gate-run-2.md`) FAILED at all three horizons
+under the fixed-time exit, while pooled rank IC was 0.26 / 0.18 / 0.11 —
+ranking skill without profitable trades. Under a fixed-time exit the trade
+collects the full noisy H-minute path; a stop/target pair pays for being right
+about direction. User decision 2026-08-16: test an ATR-based stop/target with
+1.2:1 reward:risk. This amendment fixes every parameter BEFORE run 3 exists.
+
+**Exit rule (the only change vs Amendment 1/2).**
+- ATR(14) on 1-minute bars, Wilder smoothing, true range against the prior
+  close, computed in Rust from the same bars the features use. Value at the
+  entry bar's close, in price units.
+- Stop distance = **k · ATR(14)** with **k = 4**. Target distance = **1.2 ×
+  stop** (R:R 1.2:1). Long: stop = entry − 4·ATR, target = entry + 4.8·ATR;
+  short mirrored. Entry price = the signal bar's close (unchanged).
+- Resolution on 1m bars, per bar after entry, in order: if the bar's low ≤ stop
+  (long) / high ≥ stop (short) → exit at the stop price; else if the bar's high
+  ≥ target (long) / low ≤ target (short) → exit at the target price. **A bar
+  that touches both counts as a stop** (conservative; intrabar order is
+  unknowable from bars). If neither is hit by the bar H minutes after entry →
+  exit at that bar's close (the Amendment-1 time exit as fallback).
+- Costs, entry rule (|pred| > 1.5 × round trip), fees, fold schedule, horizons,
+  universe, drop rule and fee fixed-point: unchanged.
+
+**Why k = 4 (measured, not tuned).** ATR(14) at 1m, last six months, median
+across the 24 mapped assets ≈ 5–22 bps of price; the round-trip cost the gate
+charges is 9–25 bps — i.e. cost ≈ 0.6–1.7 × ATR (BTC 1.73, ETH 1.27, SOL 1.17,
+ZEC 0.57; table in the run-3 record). Net of a cost c ≈ 1.1 ATR: at k = 1 the
+after-cost R:R is (1.2−1.1):(1+1.1) ≈ 0.05:1; k = 3 → 0.6:1; **k = 4 → 0.72:1
+(break-even hit rate ≈ 58%)**; k = 5 → 0.8:1. k = 4 is the smallest value at
+which the nominal 1.2:1 survives costs meaningfully while the stop stays inside
+the H-minute window for typical volatility. Exactly one k and one R:R are
+run; no scan. If run 3 FAILs at these values, the FAIL branch of Amendment 1
+applies — no re-tuning of k or R:R.
+
+**Provenance.** Run 3 supersedes run 2 as the gate record only if it is
+eligible under the same conditions; run 2 stays on file as the fixed-exit
+result. Data stays frozen (no pull between run 2 and run 3). fs-3 unchanged.
