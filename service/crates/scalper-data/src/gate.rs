@@ -344,6 +344,16 @@ struct ExitStatsAccum {
     /// same discipline as every other "can't resolve, don't fabricate"
     /// skip in this module (a missing round-trip cost, a thin book).
     skipped_no_atr: usize,
+    /// An accepted entry whose asset's bar path has no bar at EXACTLY
+    /// `entry_ts + horizon_min*60` - the same exact-ts lookup
+    /// `matrix::forward_returns_bps` uses for `fwd_bps`, so this should
+    /// only ever fire if `--data-root`'s store disagrees with whatever
+    /// built the matrix (a shorter/older pull, say). Skipped and counted
+    /// rather than walked with a bar-count guess, which is exactly the bug
+    /// this field exists to make visible if it ever fires: a raw
+    /// `horizon_min`-as-bar-count walk can silently run past the labeled
+    /// horizon when the asset's bar series has a hole in it.
+    skipped_no_end_bar: usize,
 }
 
 /// `simulate_with_state_by_day`'s Amendment 3 sibling: the entry rule
@@ -366,11 +376,26 @@ struct ExitStatsAccum {
 /// have expired.
 ///
 /// The only future data this reads beyond what `--exit time` already reads
-/// (via `fwd_bps`, itself already a forward-looking label) is `path[1..]` -
-/// bars strictly AFTER the entry bar - inside `resolve_exit`, which is
-/// exactly the trade's own realized outcome, not information used to
-/// accept or size the entry itself. ATR at the entry bar (`path.atr[idx]`)
-/// is computed only from bars up to and including the entry bar.
+/// (via `fwd_bps`, itself already a forward-looking label) is bars strictly
+/// AFTER the entry bar, up to and including the bar at exactly `entry_ts +
+/// horizon_min*60` - inside `resolve_exit`, which is exactly the trade's
+/// own realized outcome, not information used to accept or size the entry
+/// itself. ATR at the entry bar (`path.atr[idx]`) is computed only from
+/// bars up to and including the entry bar.
+///
+/// The walk is bounded by TIME, not by a raw bar count: the end bar is
+/// looked up as `path.index_by_ts[entry_ts + horizon_min*60]` - the exact
+/// same timestamp `matrix::forward_returns_bps` labels `fwd_bps` from -
+/// and `resolve_exit` is handed the slice up to exactly that bar, with
+/// `horizon_bars` set to the ACTUAL number of array steps between them.
+/// That distinction only matters when the asset's bar series has a hole
+/// inside the window: sizing the walk as a raw `horizon_min`-bars count
+/// would walk past the intended horizon (and past whatever the missing
+/// span may have gapped through) whenever bars are missing, since bar
+/// count and elapsed minutes stop agreeing the moment a bar goes missing.
+/// Bounding by the exact end-bar index keeps `--exit atr` resolving
+/// against the identical [entry, entry+H] window `--exit time`'s
+/// `fwd_bps` label was computed over, missing bars and all - never longer.
 fn simulate_with_state_atr(
     preds: &[Pred],
     round_trip_by_asset_day: &BTreeMap<String, BTreeMap<NaiveDate, f64>>,
@@ -382,7 +407,7 @@ fn simulate_with_state_atr(
     let mut sorted: Vec<&Pred> = preds.iter().collect();
     sorted.sort_by(|a, b| (a.asset.as_str(), a.ts).cmp(&(b.asset.as_str(), b.ts)));
 
-    let horizon_bars = horizon_min.max(0) as usize;
+    let horizon_secs = horizon_min.max(0) * 60;
     let mut flat_after: BTreeMap<String, i64> = carry.clone();
     let mut trades = Vec::new();
     let mut stats = ExitStatsAccum::default();
@@ -423,6 +448,18 @@ fn simulate_with_state_atr(
             continue;
         };
 
+        // The exact same ts `matrix::forward_returns_bps` labels `fwd_bps`
+        // from - guaranteed to exist for any accepted pred whose row
+        // carries a label at `horizon_min` (which it must, or `preds`
+        // wouldn't have this row at all - see the `fwd_bps.is_nan()` skip
+        // in `cmd_gate`'s fold loop), UNLESS `--data-root`'s store simply
+        // doesn't cover as much history as whatever built the matrix.
+        let Some(&end_idx) = path.index_by_ts.get(&(p.ts + horizon_secs)) else {
+            stats.skipped_no_end_bar += 1;
+            continue;
+        };
+        let horizon_bars = end_idx - idx;
+
         let entry_px = path.bars[idx].close;
         let (stop_px, target_px) = exits::stop_target(entry_px, side, atr);
         let exit = exits::resolve_exit(
@@ -430,7 +467,7 @@ fn simulate_with_state_atr(
             side,
             stop_px,
             target_px,
-            &path.bars[idx..],
+            &path.bars[idx..=end_idx],
             horizon_bars,
         );
 
@@ -1059,6 +1096,12 @@ struct ExitStatsReport {
     /// the entry bar (cold warm-up or right after a >120s gap) - see
     /// `ExitStatsAccum::skipped_no_atr`.
     skipped_no_atr: usize,
+    /// Accepted entries skipped because the asset's bar path had no bar at
+    /// exactly `entry_ts + horizon_min*60` - see
+    /// `ExitStatsAccum::skipped_no_end_bar`. Should stay `0` in practice;
+    /// a nonzero count means `--data-root`'s store doesn't cover the same
+    /// history the matrix was built from.
+    skipped_no_end_bar: usize,
 }
 
 pub fn cmd_gate(args: &[String]) -> Result<(), String> {
@@ -1358,6 +1401,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             exit_stats_total.time_exits += stats.time_exits;
             exit_stats_total.bars_held_sum += stats.bars_held_sum;
             exit_stats_total.skipped_no_atr += stats.skipped_no_atr;
+            exit_stats_total.skipped_no_end_bar += stats.skipped_no_end_bar;
             (trades, next_state)
         } else {
             simulate_with_state_by_day(
@@ -1477,6 +1521,7 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
                 0.0
             },
             skipped_no_atr: exit_stats_total.skipped_no_atr,
+            skipped_no_end_bar: exit_stats_total.skipped_no_end_bar,
         })
     } else {
         None
@@ -2753,6 +2798,7 @@ mod tests {
         assert_eq!(report["exit_stats"]["time_exits"], 1);
         assert_eq!(report["exit_stats"]["mean_bars_held"], 15.0);
         assert_eq!(report["exit_stats"]["skipped_no_atr"], 0);
+        assert_eq!(report["exit_stats"]["skipped_no_end_bar"], 0);
 
         // Hand-computed: gross = 1 * (100.0/100.0 - 1) * 1e4 = 0.0;
         // net = 0.0 - 20.0 = -20.0.
@@ -2762,6 +2808,116 @@ mod tests {
         assert!(
             (net_bps - (-20.0)).abs() < 1e-9,
             "flat path -> 0 gross, net = -DEFAULT_ROUND_TRIP_BPS, got {net_bps}"
+        );
+    }
+
+    /// A 3-minute hole INSIDE the horizon window (bars `entry+11..=
+    /// entry+13` simply missing from the store) must not extend the walk
+    /// past the labeled end bar `entry+15` - the exact bug the coordinator
+    /// flagged in the pre-registration review of the first `--exit atr`
+    /// cut: sizing the walk by a raw `horizon_min`-as-bar-count (15) would
+    /// have walked 15 array steps from the entry index, landing on
+    /// `entry+16` instead (since 3 bars are missing, 15 array steps covers
+    /// 3 more minutes of real time than intended). Bounding by the exact
+    /// `entry_ts + horizon_min*60` timestamp lookup fixes this: only 12
+    /// bars actually exist between entry and the labeled end bar, so the
+    /// walk must stop there.
+    #[test]
+    fn a_gap_inside_the_horizon_still_stops_the_walk_at_the_labeled_end_bar() {
+        use chrono::{Duration, TimeZone};
+
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let entry_min = 20i64;
+        let horizon_min = 15i64;
+
+        // Minutes present: 0..=entry_min+10 (a normal gap-free run, past
+        // the 14-bar ATR warm-up), then entry_min+14, entry_min+15 (the
+        // labeled end bar), entry_min+16 - a 3-minute hole at
+        // entry_min+11..=entry_min+13.
+        let mut minutes: Vec<i64> = (0..=entry_min + 10).collect();
+        minutes.extend([entry_min + 14, entry_min + 15, entry_min + 16]);
+
+        let bars: Vec<Bar> = minutes
+            .iter()
+            .map(|&m| {
+                // Flat OHLC everywhere (well inside the ATR=0.1-derived
+                // stop 99.6 / target 100.48 band, so neither is ever
+                // touched); the labeled end bar and the bar right after it
+                // get distinguishable closes, still safely inside that
+                // band, so the test can tell exactly which bar the walk
+                // landed on.
+                let (o, h, l, c) = if m == entry_min + 15 {
+                    (100.2, 100.25, 100.15, 100.2)
+                } else if m == entry_min + 16 {
+                    (100.3, 100.35, 100.25, 100.3)
+                } else {
+                    (100.0, 100.05, 99.95, 100.0)
+                };
+                Bar {
+                    ts_utc: base + Duration::minutes(m),
+                    asset: "TEST".to_string(),
+                    interval_s: 60,
+                    open: o,
+                    high: h,
+                    low: l,
+                    close: c,
+                    volume: 1.0,
+                    quote_volume: Some(100.0),
+                    trades: Some(5),
+                }
+            })
+            .collect();
+
+        let entry_ts = (base + Duration::minutes(entry_min)).timestamp();
+        let path = AssetPath::new(bars);
+        // Sanity: the hole is real.
+        for hole_m in entry_min + 11..=entry_min + 13 {
+            assert!(!path
+                .index_by_ts
+                .contains_key(&(base + Duration::minutes(hole_m)).timestamp()));
+        }
+
+        let preds = vec![Pred {
+            ts: entry_ts,
+            asset: "TEST".to_string(),
+            pred_bps: 100.0, // well past any plausible threshold
+            fwd_bps: 999.0,  // unused by the atr path
+        }];
+        let round_trip_by_asset_day: BTreeMap<String, BTreeMap<NaiveDate, f64>> =
+            BTreeMap::from([(
+                "TEST".to_string(),
+                BTreeMap::from([(date_of(entry_ts), 20.0)]),
+            )]);
+        let paths = BTreeMap::from([("TEST".to_string(), path)]);
+
+        let (trades, _next_state, stats) = simulate_with_state_atr(
+            &preds,
+            &round_trip_by_asset_day,
+            &paths,
+            horizon_min,
+            1.5,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(stats.stops, 0);
+        assert_eq!(stats.targets, 0);
+        assert_eq!(stats.time_exits, 1);
+        assert_eq!(stats.skipped_no_end_bar, 0);
+        // 12 array steps actually walked (10 normal + the 2 across the
+        // hole), not the nominal horizon_min=15 - bars_held must count
+        // only bars actually walked.
+        assert_eq!(stats.bars_held_sum, 12);
+
+        // The exit must land on the LABELED end bar's close (100.2, at
+        // entry_min+15), not the bar 15 raw array-steps away (which, with
+        // the 3-bar hole, would have been entry_min+16's close, 100.3).
+        let net_bps = trades[0].net_bps;
+        let expected_net = (100.2_f64 / 100.0 - 1.0) * 1e4 - 20.0;
+        let buggy_net = (100.3_f64 / 100.0 - 1.0) * 1e4 - 20.0;
+        assert!(
+            (net_bps - expected_net).abs() < 1e-9,
+            "exit must land on close[entry+15] (net_bps={expected_net}), got {net_bps}              (would be {buggy_net} if the walk wrongly reached entry+16 instead)"
         );
     }
 }

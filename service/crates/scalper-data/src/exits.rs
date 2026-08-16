@@ -9,6 +9,19 @@
 //! Pure functions only, same discipline as `gate.rs`'s simulation core - the
 //! CLI wiring that reads bars from the store and threads them into the
 //! simulation lives in `gate.rs::cmd_gate`.
+//!
+//! PnL convention: `gate.rs::simulate_with_state_atr` prices a resolved
+//! `Exit` as a SIMPLE (linear) return, `side * (exit_px / entry_px - 1) *
+//! 1e4` bps, not the log return `matrix.rs::forward_returns_bps` uses for
+//! `fwd_bps` (`1e4 * ln(close_t+H / close_t)`). That's intentional, not an
+//! inconsistency to reconcile: a stop/target fill is a real linear-perp
+//! fill price, and linear PnL is exactly `exit/entry - 1` on a perpetual
+//! (no compounding within the trade to justify a log return). The two
+//! conventions diverge by `~r^2/2` bps for a move of `r` (since `ln(1+r) ≈
+//! r - r^2/2`) - negligible at the sub-1%-per-trade moves this strategy
+//! trades, so the `--exit time` path's `fwd_bps`-based net_bps and the
+//! `--exit atr` path's `exit_px`-based net_bps stay numerically
+//! comparable despite the different formulas.
 
 use chrono::{DateTime, Utc};
 use features_crypto::Bar;
@@ -136,16 +149,43 @@ pub fn stop_target(entry_px: f64, side: i8, atr: f64) -> (f64, f64) {
 /// allowed: bars strictly after the entry bar, resolving the trade's own
 /// realized outcome, never used to inform the entry decision itself.
 ///
+/// `horizon_bars` MUST be sized by the caller as the exact array-index
+/// distance to the bar at entry_ts + H*60 (the same bar Amendment 1's
+/// fixed-time exit reads its `fwd_bps` label from), not a raw
+/// minutes-equals-bars assumption - `gate.rs::simulate_with_state_atr`
+/// does this via an exact ts lookup (`AssetPath::index_by_ts`). Sizing it
+/// that way is what keeps a data hole INSIDE the window from extending the
+/// walk past the labeled horizon: a gap just shortens `path` (fewer array
+/// elements between the entry and end bars), it never changes which bar
+/// the walk is required to stop at. This function itself stays ignorant of
+/// wall-clock time - it just walks the bars it's given - so getting this
+/// right is entirely on the caller.
+///
 /// Walks at most `horizon_bars` bars after entry (or however many `path`
-/// actually has beyond the entry bar, if fewer). Per bar, in this order:
-/// stop first (long: `low <= stop_px`; short: `high >= stop_px`) - so a bar
-/// that touches both stop and target in the same bar counts as a stop,
-/// conservative and automatic purely from checking stop before target, per
-/// Amendment 3 ("intrabar order is unknowable from bars") - then target
-/// (long: `high >= target_px`; short: `low <= target_px`). If neither hits
-/// within the walked bars, exits at the last bar actually walked's close -
-/// the Amendment-1 time exit, as fallback (this also covers the asset's
-/// series simply ending before `horizon_bars` bars have elapsed).
+/// actually has beyond the entry bar, if fewer - a defensive fallback, not
+/// the normal path once callers size `horizon_bars` as above). Per bar, in
+/// this order: stop first (long: `low <= stop_px`; short: `high >=
+/// stop_px`) - so a bar that touches both stop and target in the same bar
+/// counts as a stop, conservative and automatic purely from checking stop
+/// before target, per Amendment 3 ("intrabar order is unknowable from
+/// bars") - then target (long: `high >= target_px`; short: `low <=
+/// target_px`). If neither hits within the walked bars, exits at the last
+/// bar actually walked's close - the Amendment-1 time exit, as fallback
+/// (this also covers `path` simply running short of `horizon_bars`, the
+/// defensive case above).
+///
+/// Gapped-through-stop conservatism: if the bar that triggers the stop is
+/// itself the first bar after a >120s gap (the same `GAP_LIMIT_S` ATR's
+/// warm-up resets on) AND its OPEN has already breached the stop level
+/// (long: `open <= stop_px`; short: `open >= stop_px`), the fill is at
+/// that bar's OPEN, not the nominal `stop_px` - the missing span could
+/// have crossed the stop well before the bar even opened, and pricing the
+/// fill at the nicer `stop_px` would be optimistic about a level the book
+/// may never have traded at post-gap. This is deliberately NOT symmetric:
+/// a gapped-through TARGET still fills at `target_px`, never the more
+/// favorable open - Amendment 3 registers one conservative adjustment
+/// (worse fills get worse, better fills don't get better), not a general
+/// "use whichever price is realistic" rule.
 pub fn resolve_exit(
     entry_px: f64,
     side: i8,
@@ -160,6 +200,7 @@ pub fn resolve_exit(
     for (i, bar) in path.iter().enumerate().take(available + 1).skip(1) {
         bars_held = i;
         last_close = bar.close;
+        let gapped_here = (bar.ts_utc - path[i - 1].ts_utc).num_seconds() > GAP_LIMIT_S;
 
         let stop_hit = if side >= 0 {
             bar.low <= stop_px
@@ -167,8 +208,14 @@ pub fn resolve_exit(
             bar.high >= stop_px
         };
         if stop_hit {
+            let gapped_through = gapped_here
+                && if side >= 0 {
+                    bar.open <= stop_px
+                } else {
+                    bar.open >= stop_px
+                };
             return Exit {
-                exit_px: stop_px,
+                exit_px: if gapped_through { bar.open } else { stop_px },
                 exit_kind: ExitKind::Stop,
                 bars_held,
             };
@@ -414,5 +461,69 @@ mod tests {
         assert_eq!(exit.exit_kind, ExitKind::Time);
         assert_eq!(exit.bars_held, 2);
         assert_eq!(exit.exit_px, path[2].close);
+    }
+
+    // -- gapped-through fills --------------------------------------------
+
+    #[test]
+    fn a_gapped_through_stop_fills_at_the_bars_open_not_stop_px() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let entry = bar_at(start, 100.0, 100.05, 99.95, 100.0);
+        // A >120s (5 minute) gap; this bar's own OPEN already breached the
+        // stop (95.0), well before it printed a low - the missing span
+        // could have crossed 95.0 at any point, so the fill must not be
+        // priced at the nicer stop_px.
+        let gapped = bar_at(start + Duration::minutes(5), 93.0, 94.0, 90.0, 91.0);
+        let path = vec![entry, gapped];
+
+        let exit = resolve_exit(100.0, 1, 95.0, 110.0, &path, 5);
+        assert_eq!(exit.exit_kind, ExitKind::Stop);
+        assert_eq!(
+            exit.exit_px, 93.0,
+            "a gapped-through stop must fill at the bar's open, not stop_px"
+        );
+        assert_eq!(exit.bars_held, 1);
+    }
+
+    #[test]
+    fn a_gapped_through_target_still_fills_at_target_px() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let entry = bar_at(start, 100.0, 100.05, 99.95, 100.0);
+        // Same shape as the stop case, mirrored: a >120s gap bar whose
+        // OPEN already blew through the target (105.0). Unlike a stop, a
+        // gapped-through TARGET gets no favorable treatment - Amendment 3
+        // registers one conservative adjustment (worse fills get worse),
+        // not a symmetric "best available price" rule.
+        let gapped = bar_at(start + Duration::minutes(5), 110.0, 115.0, 108.0, 112.0);
+        let path = vec![entry, gapped];
+
+        let exit = resolve_exit(100.0, 1, 90.0, 105.0, &path, 5);
+        assert_eq!(exit.exit_kind, ExitKind::Target);
+        assert_eq!(
+            exit.exit_px, 105.0,
+            "a gapped-through target must still fill at target_px, not the more favorable open"
+        );
+        assert_eq!(exit.bars_held, 1);
+    }
+
+    #[test]
+    fn a_stop_touched_without_a_gap_fills_at_stop_px_even_if_open_looks_breached() {
+        // No gap here (1-minute spacing) - the open-fill rule must only
+        // ever trigger on a bar immediately after a >120s gap, never on an
+        // ordinary consecutive bar, regardless of what its open looks like
+        // relative to the stop.
+        let mut path = flat_path(3, 100.0);
+        path[1] = {
+            let mut b = path[1].clone();
+            b.open = 90.0; // "beyond" the stop, but this bar is NOT gapped
+            b.low = 90.0;
+            b
+        };
+        let exit = resolve_exit(100.0, 1, 95.0, 110.0, &path, 3);
+        assert_eq!(exit.exit_kind, ExitKind::Stop);
+        assert_eq!(
+            exit.exit_px, 95.0,
+            "without a preceding gap, a stop hit must still fill at stop_px"
+        );
     }
 }
