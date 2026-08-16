@@ -1870,13 +1870,13 @@ mod tests {
     /// The version cross-check proven end-to-end through `cmd_gate` itself
     /// (not just `load_model` in isolation): a REAL fs-1-versioned model
     /// artifact - fs-1's historical `feature_set_version` and its actual
-    /// 26-feature order, exactly as they were before fs-2 (later fs-3)
-    /// bumped `features_scalper::FEATURE_SET_VERSION` past
+    /// 26-feature order, exactly as they were before fs-2 (later fs-3,
+    /// fs-4) bumped `features_scalper::FEATURE_SET_VERSION` past
     /// `fs-rust-scalper-1` - scored against a matrix built from the current
-    /// (fs-3) feature catalog must be refused, not silently scored against
+    /// (fs-4) feature catalog must be refused, not silently scored against
     /// the wrong 26 columns of a 38-column row.
     #[test]
-    fn a_stale_fs1_artifact_is_refused_end_to_end_against_an_fs3_matrix() {
+    fn a_stale_fs1_artifact_is_refused_end_to_end_against_an_fs4_matrix() {
         use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
 
         let dir = std::env::temp_dir().join(format!(
@@ -1992,7 +1992,7 @@ mod tests {
 
         assert!(
             err.contains("fs-rust-scalper-1") && err.contains(FEATURE_SET_VERSION),
-            "expected the gate to refuse the stale fs-1 artifact against the fs-3 matrix, \
+            "expected the gate to refuse the stale fs-1 artifact against the fs-4 matrix, \
              got: {err}"
         );
     }

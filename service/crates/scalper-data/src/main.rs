@@ -1568,7 +1568,7 @@ mod tests {
         let content = std::fs::read_to_string(&out_path).unwrap();
         let mut lines = content.lines();
         let manifest: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-3");
+        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-4");
         let rows: Vec<matrix::MatrixRow> =
             lines.map(|l| serde_json::from_str(l).unwrap()).collect();
         assert!(

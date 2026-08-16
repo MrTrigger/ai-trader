@@ -38,6 +38,25 @@
 //! for parity with fs-2 but are unused. The other 9 fs-2 features, and all
 //! 26 fs-1 features, are unchanged.
 //!
+//! fs-4 (`fs-rust-scalper-4`) changes no feature DEFINITION at all - all 38
+//! names, formulas and indices are identical to fs-3. The version still
+//! bumps because the fix is in the join that produces this module's
+//! `micro: &[Option<MicroMinute>]` input, not in this module: fs-1/2/3 all
+//! joined the Binance `metrics` source (`oi_value`, `taker_ls_ratio`) with
+//! `row.ts_s <= bar_ts`, which handed a bar a metrics row whose 5-minute
+//! window had not yet closed - up to 5 minutes of that row's own future
+//! leaking into the bar (`docs/scalper-research.md` Amendment 4; measured
+//! directly: `taker_ls_ratio` correlates +0.365 with the return over the
+//! row's own window and −0.013 with the window after it). fs-4's caller
+//! (`scalper_data::micro_join`) now joins metrics on window-close, not
+//! row-start. Since the fix lives entirely in the caller, this module
+//! cannot enforce it by itself - the version bump exists so that a model
+//! artifact trained against a contaminated fs-1/2/3 matrix is refused by
+//! the version cross-check (`scalper-data::gate`) rather than silently
+//! scored against fs-4 rows, even though the two catalogs are otherwise
+//! identical. Every fs-2/fs-3 model (gate runs 1-3) is contaminated by
+//! this and is not a valid signal result.
+//!
 //! The four rolling micro features (`depth_10_z_60`, `taker_buy_ratio_m15`,
 //! `oi_change_60`, `spread_z_60`) use trailing windows reset by the same
 //! 120s bar-gap rule as fs-1's windows, and only ever contribute a value
@@ -62,7 +81,7 @@ use std::collections::{BTreeMap, VecDeque};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use features_crypto::Bar;
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-3";
+pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-4";
 
 pub const FEATURE_NAMES: [&str; 38] = [
     "ret_1",
@@ -693,7 +712,7 @@ mod tests {
     #[test]
     fn the_catalog_is_the_contract() {
         assert_eq!(FEATURE_NAMES.len(), 38);
-        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-3");
+        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-4");
         assert_eq!(FEATURE_NAMES[27], "depth_10_z_60");
         assert_eq!(FEATURE_NAMES[28], "depth_imb_10");
         assert_eq!(FEATURE_NAMES[29], "depth_10_log");
