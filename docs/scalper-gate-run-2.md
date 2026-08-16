@@ -1,17 +1,23 @@
 # Crypto scalper — gate run 2 (Binance venue, Amendment 1 + Amendment 2 / fs-3)
 
 > **Bottom line up front: this run IS gate-eligible, and the gate result is
-> FAIL at all three horizons.** Amendment 2's fs-3 substitution fixed gate
-> run 1's eligibility failure (the ±0.2%-band truncation): read literally,
-> Amendment 1's condition 1 ("≥18 months of matrix span
-> (`training-matrix --start`/`--end`)") is a run-level bar on the matrix's
-> requested window, not a per-asset one, and this run's window is
-> 2024-08-01..2026-08-15 (24.5 months). All five eligibility conditions are
-> met — see "Eligibility checklist" below, including the one place the
-> wording could be read the other way. **Overall gate outcome: GATE
+> FAIL at all three horizons.** The matrix's actual (measured) span, not
+> merely its requested `--start`/`--end` flags, reaches 2024-08-01 to
+> 2026-08-13 (24.4 months) for the great majority of assets — a genuine,
+> measured improvement over run 1, whose matrix was requested at the same
+> 24.5-month window but whose *actual* kept rows were uniformly truncated
+> to ~7 months by the ±0.2%-band gap. That measured difference is what
+> grounds eligibility here, not the command flags alone (which were
+> identical between the two runs and cannot by themselves distinguish
+> them). See "Eligibility checklist" below. **A second fact matters just as
+> much and is not part of the eligibility test: the cost model's own data
+> is bound to that same ±0.2% band, so only 2026-01-15..2026-07-22 (189
+> days, 6.2 months) of this 24.4-month matrix is actually costed and
+> tradeable** — see "Step 2 — Binance costs". **Overall gate outcome: GATE
 > FAILED.** Every horizon's out-of-sample annualized Sharpe is negative
-> (h15 −1.78, h30 −1.09, h60 −1.00), against the 2.0 bar, on a real,
-> eligible, full-span run — not a diagnostic-only number like run 1's.
+> (h15 −1.78, h30 −1.09, h60 −1.00), 3.0-3.8 points below the 2.0 bar, on
+> an eligible run — not a diagnostic-only number like run 1's, but one
+> whose tradeable record is far shorter than its matrix span.
 
 **Run date:** 2026-08-16
 **Repo:** `/home/magnus/dev/magnus/ai-trader`, branch `scalper-plan3d` (not a
@@ -27,40 +33,42 @@ and this run.
 
 | # | Condition | Met? | Evidence |
 |---|---|---|---|
-| 1 | ≥18 months of matrix span (`training-matrix --start`/`--end`) | **MET** | See "Condition 1, read literally" below — the run-level window is 24.5 months; three of 24 assets individually fall short of 18 months of *kept-row* history for listing-date reasons, which is a fact about those assets, not a violation of this condition as worded. |
+| 1 | ≥18 months of matrix span (`training-matrix --start`/`--end`) | **MET** | See "Condition 1, grounded on the measured span" below — the matrix's *actual, measured* kept-row span (not just its requested flags) reaches 24.4 months for 21 of 24 assets; three fall short of 18 months of kept-row history for listing-date reasons, which is a fact about those assets, not a violation of this condition as worded. |
 | 2 | Every mapped, 90-day-eligible candidate is in the matrix | Met | 24 of 25 universe candidates are Binance-mapped (`HYPE` has `binance_um: null`, correctly excluded — unchanged from run 1, universe frozen). All 24 appear in the fs-3 matrix manifest's `assets` list and all 24 produced kept rows (see "Matrix" below). |
 | 3 | fs-3 features (`fs-rust-scalper-3`) | Met | Manifest line: `"feature_set_version":"fs-rust-scalper-3"`, 38 features listed, matching Amendment 2's spec (indices 27/29/37 are `depth_10_z_60`/`depth_10_log`/`depth_imb_10_m15`; index 28 `depth_imb_10` and all other 34 indices unchanged from fs-1/fs-2). |
-| 4 | Time-varying costs via `binance-costs` + `gate --binance-costs` | Met (mechanically) | Every gate report's `binance_costs` field is `data/binance-micro/costs-daily.json`; all three horizons were gated with `--binance-costs`, not `--costs`. Reused, not regenerated (see "Step 2" below) — same caveat as run 1 about `days_without_costs` undercounting thin-book days that resolve via the 14-day fallback, now at much larger scale (see "Cost stats"). |
+| 4 | Time-varying costs via `binance-costs` + `gate --binance-costs` | Met (mechanically) | Every gate report's `binance_costs` field is `data/binance-micro/costs-daily.json`; all three horizons were gated with `--binance-costs`, not `--costs`. Reused, not regenerated (see "Step 2 — Binance costs" below) — that section documents a real, separate limitation: the cost model's own ±0.2%-band dependency confines *tradeable* days to 2026-01-15 onward, well inside this matrix's 24.4-month span. |
 | 5 | All three horizons (15/30/60) run, every run, all reported | Met | See per-horizon table below. |
 
-**Conclusion: this run clears Amendment 1 + 2's eligibility bar.** All five
-conditions are met. The gate's per-horizon FAIL/FAIL/FAIL result below is
-therefore a real capital-allocation verdict, not a diagnostic-only number —
-unlike run 1, which never reached this state.
+**Conclusion: this run clears Amendment 1 + 2's eligibility bar on the
+matrix-span test.** All five conditions are met. The gate's per-horizon
+FAIL/FAIL/FAIL result below is therefore a real capital-allocation
+verdict, not a diagnostic-only number — unlike run 1, which never reached
+this state. This is a narrower claim than "the whole 24.4-month record was
+traded on": see "Step 2 — Binance costs" for the separate fact that only
+~6.2 months of that span was ever costed and tradeable.
 
-### Condition 1, read literally
+### Condition 1, grounded on the measured span
 
 Amendment 1's exact text: *"1. **≥18 months of matrix span**
 (`training-matrix --start`/`--end`), not the 4-weeks-of-book-recording bar
 §5.1 set for the HL protocol — Binance's archives go back years, so there's
 no reason to gate on a thin window."*
 
-The parenthetical defines what "matrix span" means for this condition: the
-`training-matrix` command's own `--start`/`--end` flags — a single,
-run-level property of the command that was run, not a per-asset property
-of which rows survived into the matrix. That is a different condition from
-#2 above ("every mapped... candidate is in the matrix"), which is the
-condition that speaks to individual candidates; condition 1's text never
-says "every asset" or "each candidate." This run's `training-matrix`
-command (below) was invoked with `--start 2024-08-01 --end 2026-08-15` —
-**24.5 months**, clearing 18 by a wide margin. Under this literal reading,
-condition 1 is **MET**.
+Reading the parenthetical as "the command's `--start`/`--end` flags decide
+this condition" does not work: **run 1 was invoked with the identical
+`--start 2024-08-01 --end 2026-08-15` flags** and was correctly ruled NOT
+MET on this same condition, because its *actual* kept rows were truncated
+to ~7 months by the missing ±0.2% band regardless of what the flags
+requested. Flag-literalism cannot distinguish run 1 from run 2 — both used
+the same flags — so it is not what condition 1 is actually testing. What
+changed between the two runs, and what this condition has to be read as
+testing, is the matrix's **measured, actual span**: does the data that
+`training-matrix` produced reach 18 months, not just the command asked for
+it to.
 
-For completeness, and because gate run 1's own eligibility failure turned
-on exactly this kind of gap between the requested window and the *actual*
-per-asset row span, the per-asset span was independently verified by
-streaming `data/matrices/gate-run-2.jsonl` once (`asset`/`ts` fields only,
-not loaded as row dicts) and measuring each asset's first and last kept-row
+That measured span was independently verified by streaming
+`data/matrices/gate-run-2.jsonl` once (`asset`/`ts` fields only, not
+loaded as row dicts) and measuring each asset's first and last kept-row
 timestamp against 2026-08-15:
 
 | asset | months | asset | months | asset | months |
@@ -69,22 +77,37 @@ timestamp against 2026-08-15:
 | FARTCOIN | 19.8 | KAITO | 17.8 | PUMP | 16.1 |
 | | | | | XPL | 11.7 |
 
-21 of 24 assets independently clear 18 months of kept-row history — direct
-confirmation that Amendment 2's fs-3 substitution fixed the ±0.2%-band
-truncation gate run 1 hit (which had flattened *every* asset to the same
-~7-month window regardless of listing date). The three that don't — PUMP
-(16.1mo), KAITO (17.8mo), XPL (11.7mo) — are short for an external reason
-(their own Binance UM listing date, same fact pattern condition 2 already
-accepts for these same assets), not a recurrence of run 1's data-coverage
-bug. **If condition 1 is instead read as a per-asset bar** — i.e., as if it
-said "every mapped candidate's own matrix span," which its text does not —
-**this run is NOT eligible on PUMP, KAITO, and XPL**, and, per Amendment
-1's FAIL-branch discipline, that would make every horizon's result below
-non-eligible diagnostics, the same status run 1 had. This document applies
-the wording as written (the parenthetical's `--start`/`--end` definition)
-and reports the run as eligible; the alternative reading and its
-consequence are stated here for the record, not resolved by softening
-either reading.
+21 of 24 assets independently clear 18 months of kept-row history, with
+the representative/majority-asset span running 2024-08-01 to 2026-08-13
+(24.4 months) — a *measured* fact, not a restatement of the command flags,
+and the fact that actually distinguishes this run from run 1 (whose
+measured span, on the identical flags, was ~7 months for every asset).
+This condition is read at the run/majority level, consistent with
+condition 2 being the separate condition that speaks to individual
+candidates (its text never says "every asset" or "each candidate," and
+condition 2 already tolerates late-listed assets having a shorter history
+for an external reason). The three that fall short of 18 months — PUMP
+(16.1mo), KAITO (17.8mo), XPL (11.7mo) — are short for that same external
+reason (their own Binance UM listing date), not a recurrence of run 1's
+systemic data-coverage bug.
+
+**If condition 1 is instead read as a strict per-asset bar** — i.e., as if
+it said "every mapped candidate's own matrix span," which its text does
+not — **this run is NOT eligible on PUMP, KAITO, and XPL**, and, per
+Amendment 1's FAIL-branch discipline, that would make every horizon's
+result below non-eligible diagnostics, the same status run 1 had. This
+document reads the condition as testing the matrix's measured span at the
+run/majority level (the reading that is actually consistent with how run
+1 was adjudicated) and reports the run as eligible; the stricter
+per-asset reading and its consequence are stated here for the record, not
+resolved by softening either reading.
+
+**Separately from the eligibility test — matrix span is not the same
+question as tradeable span.** Matrix span: 24.4 months (2024-08-01 to
+2026-08-13, measured, above). Costed/tradeable OOS span: 6.2 months
+(2026-01-15 to 2026-07-22, 189 days — see "Step 2 — Binance costs"). The
+gap between these two numbers is the single most important fact about
+this run's diagnostics below.
 
 ---
 
@@ -201,13 +224,49 @@ correct outcome of "no pull between runs," not an oversight.
 cost lookup fails entirely, per the gate report — identical across all
 three horizon reports, since it's a matrix/cost-file property, not a
 horizon-dependent one) totals **8,280** asset-days across the 24 assets,
-ranging from LIT's 30 up to 442 apiece for eleven assets (BTC, DOGE, ETH,
-SOL, SUI, XRP, kPEPE among them) — far larger than run 1's total of 9
-(3 per horizon, all KAITO). This is the same undercount caveat run 1's
-doc raised (a thin day that resolves via the 14-day fallback isn't
-counted here), reported at the scale this run's ~21-month window actually
-produces; it is not evidence of a new bug, since the per-asset day/thin
-totals above are unchanged from run 1's already-accepted numbers.
+ranging from LIT's 30 up to 442 apiece for **seven** assets with
+uninterrupted 2024-08-01 history (BTC, DOGE, ETH, SOL, SUI, XRP, kPEPE);
+just below that, LINK 438, ENA 436, AAVE 426, WLD 424, TAO 423 — far
+larger than run 1's **3 per horizon** (also identical across horizons,
+all on KAITO).
+
+**This is not an undercount — it is the same ±0.2%-band gap that drove
+run 1's eligibility failure, now surfacing on the cost side instead of the
+feature side.** `binance_costs.rs`'s `impact_bps` is a pre-registered
+walk-cost model priced off the day's **median ±0.2% band depth**
+(`bid_02`/`ask_02`) — the identical band fs-2's `depth_imb_02` needed and
+fs-3 was built to stop needing for its *features*. The band is absent
+before 2026-01-15 (per Amendment 2), so every day before that has a
+measured `impact_bps: None` entry. And `gate.rs::resolve_round_trip`'s own
+rule (its doc comment, verbatim: *"if `day` itself has a `DayCost` entry,
+that entry decides the outcome outright, with no fallback... A
+measured-and-thin entry day is untradeable on ITS OWN evidence"*) means
+the 14-day lookback **never rescues a measured-thin day** — it only
+activates when a day has no cost entry at all. Since nearly every
+pre-2026-01-15 day *does* have a measured (thin) entry, not a missing one,
+the lookback cannot reach past 2026-01-15 either. The result: **every OOS
+day before 2026-01-15 is untradeable by rule, regardless of signal**, and
+442 = 631 − 189 exactly for the seven assets with full 2024-08-01 history
+— 442 is every day of the pooled OOS window *before* the 189-day costed
+window that begins 2026-01-15, not a sample of miscellaneous gaps within
+it. Assets slightly below 442 (LINK 438, ENA 436, AAVE 426, WLD 424, TAO
+423, ...) have a handful of additional thin days *inside* the 189-day
+costed window on top of that baseline.
+
+**Costed/tradeable window: 2026-01-15 to 2026-07-22 — 189 days (6.2
+months) — essentially the same window run 1 was ruled non-eligible on**
+(run 1's actual matrix span measured 2026-01-15 to between 2026-07-15 and
+2026-08-13, ~205-210 days). fs-3 fixed which *features* the ±0.2% band
+gates; it did not, and could not, change which days the *cost model* can
+price, because `binance_costs.rs` was not part of Amendment 2's
+substitution. This is the direct explanation for why only 4-5 of 21 folds
+trade at any horizon (see "Per-horizon results" below): folds 0-13 (test
+windows entirely before 2025-12-24) and most of fold 14 (test window
+2025-12-24..2026-01-23, only its last ~9 days inside the costed window)
+cover dates where trading is impossible by construction, independent of
+model quality.
+
+---
 
 ### Step 3 — per-horizon fold fit + gate
 
@@ -361,10 +420,13 @@ pre-registered. `overall.projected_30d_volume_usd` from the three reports:
 whole 631-day pooled OOS window and annualizes to a 30-day rate — the same
 formula run 1 used. It understates the concentration documented above (4-5
 of 21 folds trade): fold 15 alone (2026-01-23..2026-02-22, the single
-busiest ~30-day window at every horizon) realizes **8-13x** the smoothed
-figure — $151.94M vs. $11.19M at h15, down to $54.45M vs. $4.86M at h60.
-The full-record realized total ($102.2M-$235.4M) is 21-24x the smoothed
-30-day figure.
+busiest ~30-day window at every horizon) realizes **13.6x (h15), 13.1x
+(h30), and 11.2x (h60)** the smoothed figure — $151.94M vs. $11.19M at
+h15, down to $54.45M vs. $4.86M at h60. The full-record realized total is
+**exactly 21.0x** the smoothed 30-day figure at every horizon (631 OOS
+days ÷ 30 — a ratio of the window lengths, not asset- or horizon-specific,
+so it comes out identical across all three: $235.44M/$11.19M,
+$150.74M/$7.17M, $102.2M/$4.86M all reduce to 21.0).
 
 Mapping to a tier using `docs/binance-um-fee-table-2026-08.md` **by the
 volume criterion only**, per the pre-registered rule:
@@ -382,33 +444,51 @@ volume criterion only**, per the pre-registered rule:
 - **Every horizon's smoothed figure clears the two lowest disputed
   candidates ($250k, $1M) by 5x-45x**, and the realized busiest-month and
   full-record figures clear **all four** disputed candidates, including
-  the highest ($15M), by 3.6x-15.7x. There is no reading of this run's
-  volume — smoothed or realized — under which VIP0 (the no-floor default)
-  remains a defensible mapped tier: run 1's $1.16M-$6.05M range at least
-  straddled the disputed band; run 2's $4.86M-$235.4M range sits above or
-  deep inside it on every measure.
+  the highest ($15M), by 3.6x-15.7x. **This is an argument that VIP0 is an
+  implausible mapped tier, built on secondary-sourced, unverified
+  candidate thresholds — not a computation that resolves the tier**, since
+  the snapshot itself states none of the four VIP1 candidates is
+  Binance-authored and one is internally impossible. Run 1's $1.16M-$6.05M
+  range at least straddled the disputed band on a similar, weaker
+  argument; run 2's $4.86M-$235.4M range sits above or deep inside it on
+  every measure, which strengthens the argument without turning it into a
+  verified fact.
 
 Per the pre-registered rule: *"If the mapped tier differs from VIP0, run
-exactly ONE re-run at that tier's fees... If the fee-table snapshot
-doesn't cover the mapped tier... re-fetch Binance's authenticated fee
-schedule before doing the one allowed re-run; don't substitute an
-unverified number."* Since this run's volume — on every computation —
-maps to a tier the snapshot cannot resolve (VIP1 or higher, exact tier
-unknown), and no VIP1-8 fee is invented to test at:
+exactly ONE re-run at that tier's fees... **The second run's verdict is
+the gate verdict.** Not the first, not whichever is more favorable. If the
+fee-table snapshot doesn't cover the mapped tier... re-fetch Binance's
+authenticated fee schedule before doing the one allowed re-run; don't
+substitute an unverified number."* This rule is unconditional: it is not
+"re-run if the argument above is persuasive enough" — it requires a real
+re-run at a real, resolved tier before any second-run verdict exists.
+Since this run's volume maps (per the argument above, not a verified
+computation) to a tier the snapshot cannot resolve, and no VIP1-8 fee is
+invented to test at:
 
 **Outcome: STOPPED. Verdict marked PROVISIONAL pending an authenticated
-fee fetch**, same disposition as run 1, on a stronger case (run 2's volume
-figures exceed run 1's by 3x-100x and clear disputed thresholds run 1's
-figures only straddled). What the authenticated fetch must resolve:
-Binance's real VIP1 (and, given the realized-total figures reach
-$102M-$235M over the full record, very possibly higher) maker/taker fee
-schedule and BNB-balance thresholds, covering volume figures up to at
-least **~$235M**, not just the ~$4.9M-$11.2M smoothed range. **No second
-gate run was performed.** Independent of this open question: since VIP1+
-fees can only be lower than VIP0's, and all three horizons already FAIL
-by 55-115% of the 2.0 threshold at VIP0's (higher) fee rate, a cheaper
-fee schedule changes the exact Sharpe figures but does not change the
-FAIL/FAIL/FAIL disposition below.
+fee fetch.** This PROVISIONAL status is the headline of this section, not
+a footnote to it: by Amendment 1's rule, the run-2 number this document
+reports (VIP0 + BNB rates) is *not* the tier the fixed-point rule would
+ultimately settle on if the tier were resolved — only the second run, at
+the real mapped tier, produces the rule's actual verdict, and that run has
+not happened. What the authenticated fetch must resolve: Binance's real
+VIP1 (and, given the realized-total figures reach $102M-$235M over the
+full record, very possibly higher) maker/taker fee schedule and
+BNB-balance thresholds, covering volume figures up to at least **~$235M**,
+not just the ~$4.9M-$11.2M smoothed range — smoothed volume here is
+**4.8x-11.5x** run 1's smoothed figures per matching horizon (h15
+9.6x, h30 4.8x, h60 11.5x) and realized busiest-month volume is
+**15x-32x** run 1's realized busiest-month figures (h15 32.5x, h30
+15.5x, h60 32.0x). **No second gate run was performed.**
+
+Independent of this open question, and stated only as a numeric fact, not
+a substitute for the required re-run: since VIP1+ fees can only be lower
+than VIP0's, and every horizon's Sharpe already sits 3.0-3.8 points below
+the 2.0 threshold at VIP0's (higher) fee rate, a cheaper fee schedule
+would move the exact Sharpe figures but is very unlikely to flip the
+FAIL/FAIL/FAIL disposition below — that is an observation about magnitude,
+not a reason to skip the one allowed re-run the rule requires.
 
 ---
 
@@ -416,7 +496,7 @@ FAIL/FAIL/FAIL disposition below.
 
 All 24 mapped assets traded at all three horizons (unlike run 1, where
 FARTCOIN produced zero h15 trades). `days_without_costs` per-asset totals
-are in "Cost stats" above (identical across horizons).
+are in "Step 2 — Binance costs" above (identical across horizons).
 
 ### h15 (24 of 24 assets traded; sorted by total_net_bps)
 
@@ -556,46 +636,93 @@ exercised, given the VERDICT below.
 
 ## VERDICT
 
-**h15: FAIL** (sharpe_annualized −1.783482 < 2.0 gate threshold).
-**h30: FAIL** (sharpe_annualized −1.092699 < 2.0 gate threshold).
-**h60: FAIL** (sharpe_annualized −0.995603 < 2.0 gate threshold).
+**h15: FAIL** (sharpe_annualized −1.783482, 3.8 points below the 2.0 gate
+threshold).
+**h30: FAIL** (sharpe_annualized −1.092699, 3.1 points below the 2.0 gate
+threshold).
+**h60: FAIL** (sharpe_annualized −0.995603, 3.0 points below the 2.0 gate
+threshold).
 
 **Overall gate outcome: GATE FAILED.** This run is eligible under the
-literal reading of Amendment 1's condition 1 (see "Eligibility checklist"
-above) — the requested matrix span is 24.5 months, clearing 18, and
-conditions 2-5 are independently met. Unlike run 1, whose PASS/PASS/FAIL
-numbers were explicitly non-authoritative diagnostics, **this run's
-FAIL/FAIL/FAIL result is the gate verdict the protocol's §5/Amendment 1
-capital-allocation rule is read from.** The fee fixed-point step is
-separately PROVISIONAL (see above) but does not change this: VIP1+ fees
-can only be lower than the VIP0 rate charged here, and every horizon
-already fails by a wide margin at the higher VIP0 rate. If condition 1 is
-instead read as a per-asset bar (see "Condition 1, read literally"), this
-run is **not** eligible on PUMP/KAITO/XPL, and every number above is a
-diagnostic, not a verdict — but the per-horizon FAIL/FAIL/FAIL mechanical
-result is unchanged either way.
+measured-span reading of Amendment 1's condition 1 (see "Eligibility
+checklist" above) — the matrix's actual kept-row span reaches 24.4 months
+for 21 of 24 assets, and conditions 2-5 are independently met. Unlike run
+1, whose PASS/PASS/FAIL numbers were explicitly non-authoritative
+diagnostics, **this run's FAIL/FAIL/FAIL result is the gate verdict the
+protocol's §5/Amendment 1 capital-allocation rule is read from — for the
+6.2-month window (2026-01-15..2026-07-22) that was actually costed and
+tradeable, not the full 24.4-month matrix span** (see "Step 2 — Binance
+costs" and "What the diagnostics say"). The fee fixed-point step is
+separately **PROVISIONAL, not final** (see above): Amendment 1's rule
+makes the second, tier-resolved run's verdict the actual verdict, and that
+run has not happened. As a numeric observation only, not a substitute for
+that required re-run: VIP1+ fees can only be lower than the VIP0 rate
+charged here, and every horizon already fails by 3.0-3.8 points at the
+higher VIP0 rate. If condition 1 is instead read as a strict per-asset bar
+(see "Condition 1, grounded on the measured span"), this run is **not**
+eligible on PUMP/KAITO/XPL, and every number above is a diagnostic, not a
+verdict — but the per-horizon FAIL/FAIL/FAIL mechanical result is
+unchanged either way.
 
 ---
 
 ## What the diagnostics say
 
-**Pooled IC is far above zero at every horizon while P&L is negative at
-every horizon.** `overall.ic`/`overall.rank_ic`: h15 0.241242/0.257331,
-h30 0.171904/0.175808, h60 0.111679/0.114397. Per-fold `ic` across the 21
-folds: h15 ranges −0.0158 to 0.3305 (mean 0.2273, median 0.2906, 3 of 21
-folds negative); h30 ranges −0.0055 to 0.2259 (mean 0.1573, median 0.1995,
-2 of 21 negative); h60 ranges −0.0116 to 0.1586 (mean 0.1022, median
-0.1238, 2 of 21 negative). Per-fold `rank_ic` shows the same pattern (3 of
-21 negative at every horizon). The overwhelming majority of folds — 18-19
-of 21 at every horizon — have positive `ic` and `rank_ic`, and the pooled
-figures sit well inside that positive range, not near zero. At the same
-time, `overall.sharpe_annualized` is negative at every horizon (−1.78,
-−1.09, −1.00) and per-asset `total_net_bps` is negative for 19 of 24
-assets at h15, 16 of 24 at h30, and 16 of 24 at h60. Ranking skill —
-positive, consistent-sign correlation between predicted and realized
-returns across nearly every walk-forward fold — coexists with a
-cost-thresholded trading record that loses money at every horizon this
-run tested.
+**Per-fold IC is bimodal, and the two modes line up with the tradeable
+window, not with chance.** For h15: folds 0-14 and fold 20 (the folds
+whose test windows sit outside the 2026-01-15..2026-07-22 costed window,
+plus fold 14 which straddles its start, plus fold 20 which is fully
+inside it but sits after the loss run) run ≈0.27-0.33; folds 15-19 (which
+carry 85% of h15's 23,544 trades — 20,067 of them — and every trading
+fold's net loss) run **0.0557, −0.0057, −0.0158, −0.0032, 0.0416** — near
+zero, three of the five negative. The same pattern holds at h30/h60 (see
+the per-horizon fold tables above). **Where money was lost, there was no
+ranking skill left to lose it profitably with; where ranking skill was
+strongest (folds 0-13), the cost model could not price a single trade, so
+none was taken.** `overall.ic`/`overall.rank_ic` — h15 0.241242/0.257331,
+h30 0.171904/0.175808, h60 0.111679/0.114397 — pool predictions from both
+regimes into one number; reading it as "the strategy's skill" conflates a
+high-IC, untradeable regime with a near-zero-IC, actually-traded one.
+
+**Gross P&L (before fees/impact) is positive on average; costs, not
+signal, drive the net loss — except that even gross P&L only clears costs
+in one 8-day window.** Per-trade arithmetic, from `overall.n_trades` and
+per-asset `total_net_bps` (already-net figures) plus the trade-weighted
+round-trip cost implied by `threshold_bps_by_asset` (`= threshold / 1.5`,
+weighted by each asset's `n_trades`):
+
+| horizon | mean net/trade (bps) | trade-weighted round trip (bps) | of which fees | implied mean gross/trade (bps) | hit rate |
+|---:|---:|---:|---:|---:|---:|
+| 15 | −4.67 | 11.43 | 9.0 (2×4.5 taker) | ≈+6.8 | 45.5% |
+| 30 | −3.34 | 11.40 | 9.0 | ≈+8.1 | 46.4% |
+| 60 | −3.79 | 11.38 | 9.0 | ≈+7.6 | 46.8% |
+
+A positive implied mean gross/trade with a sub-50% hit rate is a
+right-skewed distribution (a minority of large winners funding a majority
+of small losers), not a broad edge. It is also **not evenly spread across
+the traded folds**: fold 14's own test window (2025-12-24..2026-01-23,
+sharpe +8.5155 at h15) is gross-profitable at roughly **+27bps/trade**,
+concentrated in the ~8 days (2026-01-15..2026-01-22) that fall inside the
+costed window before fold 15 begins. Excluding fold 14, the remaining
+traded folds (15-17, and 20 at h30/h60) run roughly **+3.3bps/trade
+gross — below the 9.0bps fee floor alone**, before any spread/impact is
+added. Daily net P&L (`daily_returns_bps`) is uniformly small and positive
+from 2026-01-15 through 2026-01-31, then **flips sharply negative starting
+2026-02-01** (h15: −334, −704, +30, −653, −926 bps on 02-01..02-05) and
+stays predominantly negative through the rest of the costed window.
+
+**One number here does not look like a real 15-minute signal and is
+flagged, not adjusted.** The pooled `ic` for the 2024-25 folds (0-13,
+before any trading is even possible) runs **≈0.27-0.33 at every horizon
+sampled at h15** — an implausibly high correlation for a 15-minute
+crypto-perp return prediction by the standards of published intraday
+crypto/equity microstructure literature, where single-digit-percent IC is
+already considered strong. This is reported as a fact worth an alignment
+check (are `folds[].ic` and the forward-return target actually
+non-overlapping and free of any train/test leakage in this range,
+independent of the ±0.2%-band question) — not investigated or adjusted
+here, and not treated as informing the FAIL verdict either way, since the
+verdict rests on the traded folds' net P&L, not on this pooled figure.
 
 Per Amendment 1's protocol: *"A FAIL — on either the first run or the one
 allowed re-run — means the project stops or returns to feature research.
@@ -616,13 +743,17 @@ second attempt at massaging the same features past the same gate."*
   columnar Python loader (`ts`/`asset`/`x`/`fwd` arrays, commit `55dcc76`,
   "Load the matrix columnar so a 2.4M-row fit fits in memory").
 - **NaN/null `oi_change_60` rows** — the Rust gate refused the matrix with
-  `invalid type: null, expected f64` on 1,114 rows where `oi_change_60`'s
+  `invalid type: null, expected f64` on rows where `oi_change_60`'s
   `ln(cur/old)` went non-finite (zero/negative OI 60 minutes earlier) →
   fixed by a finiteness invariant (`features-scalper`, a feature is
   `Some` only if finite; `matrix.rs` drops and counts non-finite rows;
-  commit `5f8e77a`, "A feature is Some only if it is finite"). The matrix
-  was rebuilt from the same frozen data under this fix: 2,447,682 →
-  2,446,569 total lines (manifest + kept rows).
+  commit `5f8e77a`, "A feature is Some only if it is finite"). The
+  matrix was rebuilt from the same frozen data under this fix: 2,447,682
+  → 2,446,569 total lines (manifest + kept rows) — a drop of **1,113**
+  lines. The commit message accompanying `5f8e77a` states "1,114 rows"
+  from its own count at commit time; the line-count difference measured
+  directly from both matrix files (2,447,682 − 2,446,569) is authoritative
+  here and is 1,113, one fewer than the commit message's figure.
 - **Rust gate loader SIGKILL at the 7GB memory guard** —
   `gate.rs::load_matrix` read the whole 3.3GB file into a `String`, then
   parsed every row into an owned, non-interned `BTreeMap<String, f64>`
