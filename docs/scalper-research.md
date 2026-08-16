@@ -627,3 +627,42 @@ re-fit, gates at all three horizons under Amendments 1–3b as amended here.
 That run (gate run 4) is the first uncontaminated record. Fees, costs (3b),
 exits (3), fold schedule, horizons, drop rule, fixed-point: unchanged.
 Pre-registered before any fs-4 code exists.
+
+## Research phase closed (2026-08-16)
+
+Gate run 4 (`docs/scalper-gate-run-4.md`) is the record. It is the first
+gate run built on an uncontaminated feature set (fs-4, Amendment 4's causal
+metrics join), eligible under every condition in Amendments 1–4 without
+qualification, and it **FAILS the gate at all three horizons** — h15
+Sharpe 0.7567, h30 0.6869, h60 0.5127, all below the 2.0 bar. Per §5's
+FAIL-branch text (restated, unedited, by every amendment through this one):
+*"A FAIL — on either the first run or the one allowed re-run — means the
+project stops or returns to feature research. Not: lower the 2.0 threshold.
+Not: keep adding horizons until one clears. Not: shrink the notional until
+costs look better. Not: re-run with a different fold schedule until a
+favorable window turns up."* That branch is invoked here. This closes the
+research phase under this feature set.
+
+**Any continuation is a new pre-registered signal program, not a parameter
+change.** Re-tuning `k`, R:R, the threshold-mult, the notional, the fold
+schedule, or the gate threshold against gate run 4's numbers is exactly what
+§5 and Amendment 1 rule out. A continuation means: a new
+`FEATURE_SET_VERSION`, its features and any other changed definition
+pre-registered as a dated amendment before a single number exists, then this
+exact protocol run again from a fresh first run.
+
+Three directions have been flagged by the engineer as candidates for such a
+program. None is endorsed here, none has been tested, and this section
+recommends none of them over the others or over stopping entirely:
+
+- Tick-level order-flow features built from the raw aggTrades tape (the
+  archives are already ingested per-minute; the raw trade tape itself is
+  not currently stored).
+- Maker-side execution economics — post-only entries, which would need a
+  fill model that is not optimistic (queue-position aware), since the
+  current simulator has none.
+- An alternative label/target in place of fixed-horizon forward return.
+
+Any of these would require its own amendment, its own feature-set version,
+its own matrix rebuild, and its own fresh gate run — the protocol does not
+distinguish a "small" continuation from a full new run.
