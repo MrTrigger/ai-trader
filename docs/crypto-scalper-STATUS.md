@@ -181,3 +181,20 @@ closure, tick order flow and maker economics have now been tried and
 failed; a different label/target has not. Fee tiers VIP1–8 remain
 unverified (immaterial to any verdict so far). No live bot; nothing
 deployed.
+
+
+## 10. Addendum 2026-08-18 (later) — Program 3 run and closed
+
+Amendment 6 (`242b3b0`): fs-6 = fs-5 + six BTC tick-context features
+(`btc_tk_ret_10s/30s`, `btc_tk_imb_30s/5m`, `btc_tk_intensity_10s`,
+`rel_tk_ret_30s`), computed once over BTC's tape (`features-scalper::
+btc_tick_context`, `a933a71`), taker execution = run 4's exact setup.
+**Gate run 6 (`docs/scalper-gate-run-6.md`) FAILS at all three horizons**:
+first run 0.601 / 0.727 / 0.672; §5 drop re-run (CRV, LIT, WLD out; the
+verdict) 0.667 / 0.437 / 0.559. The BTC features took 16–31% of model gain
+and added no OOS IC (0.026/0.020/0.021 vs run 4's 0.037/0.022/0.015).
+Program 3 closed. Six gate runs, four clean, three programs: every clean
+run at IC 0.02–0.04, Sharpe 0.1–0.8. Nothing tuned, nothing deployed.
+New gitignored artifacts: `data/matrices/gate-run-6{,b}.jsonl`,
+`data/models/gate-run-6{,b}-h*`, `data/reports/gate-run-6{,b}-h*.json`,
+`data/scalper-universe-run6b.json`.

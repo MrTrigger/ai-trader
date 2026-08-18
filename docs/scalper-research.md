@@ -1003,3 +1003,29 @@ numbers.**
 3. Only then: `training-matrix` (fs-6) → `walk_forward_scalper.py` × 3 →
    `gate --exit atr` × 3 (taker) → `docs/scalper-gate-run-6.md`, all three
    horizons reported, drop rule applied afresh if any symbol qualifies.
+
+## Program 3 closed (2026-08-18)
+
+Gate run 6 (`docs/scalper-gate-run-6.md`) is the record for Program 3. It
+is eligible under every condition in Amendments 1–6 and it **FAILS the gate
+at all three horizons** — first run (24 assets, taker, fs-6) h15 0.6007,
+h30 0.7272, h60 0.6718; the §5 one-allowed-drop re-run (CRV, LIT, WLD
+excluded; 21 assets) h15 0.6671, h30 0.4368, h60 0.5586, and the second
+run's verdict is the verdict. Fee tier provisional as in runs 2, 4 and 5.
+
+What the program established: the six BTC tick-context features are used
+heavily by the models (31% / 24% / 16% of gain, four of the top six
+features at h15) and add no out-of-sample ranking skill — pooled IC
+0.026 / 0.020 / 0.021 against run 4's 0.037 / 0.022 / 0.015, Sharpe at the
+same level as run 4 on the same folds and execution.
+
+Per Amendment 6 §6.2 the FAIL branch is invoked; nothing is revisited.
+Program 3 is closed. Three programs — six gate runs, four clean — have now
+been run under pre-registration on the same 24-month Binance UM record:
+minute-bar features (fs-1..4), own-asset tick order flow, maker execution,
+cross-asset tick context. Every clean run lands at pooled IC 0.02–0.04 and
+Sharpe 0.1–0.8; nothing clears 2.0. This section recommends nothing; the
+one closure-named direction never run (a different label/target) remains
+untested, and the honest prior from the record is that it addresses the
+wrong constraint (at h15 ~80% of exits are time exits, so the label already
+is the outcome).
