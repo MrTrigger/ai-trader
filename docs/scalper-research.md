@@ -851,7 +851,9 @@ terms, exactly as this one is.
 
 1. `pull-binance-tape` + parquet tape store + manifest (with a test that a
    stored day round-trips the archive rows losslessly and that a 404 day is
-   recorded, not fabricated).
+   recorded, not fabricated). The pull itself for the §5.1 span may run as
+   soon as this lands — it fetches a public archive and produces no
+   feature, fill or gate number — and must be complete before step 4.
 2. `TapeWindow` assembly in `scalper-data` (window bounds strictly `< C`,
    tested with a trade at exactly `C` being excluded) and the twelve fs-5
    features in `features-scalper` with golden values on a hand-built tape
@@ -860,7 +862,7 @@ terms, exactly as this one is.
    not fill; a print strictly through `P` fills at `P` at that trade's
    `ts_ms`; a print at `C + 999 ms` does not fill; no print → miss), the
    fill-bar exit walk, the §5.4 round trip, the new report fields.
-4. Only then: `pull-binance-tape` for the span, `training-matrix` (fs-5),
+4. Only then: `training-matrix` (fs-5),
    `walk_forward_scalper.py` × 3 horizons, `gate --entry maker --exit atr`
    × 3, and `docs/scalper-gate-run-5.md` written from the reports.
 
