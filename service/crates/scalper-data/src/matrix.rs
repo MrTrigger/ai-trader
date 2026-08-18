@@ -196,7 +196,13 @@ mod tests {
     #[test]
     fn matrix_rows_drop_cold_rows_and_stride_samples() {
         let bars = ramp(200);
-        let rows = compute(&bars, &bars, &full_micro(&bars)).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &full_micro(&bars),
+            &mut features_scalper::SyntheticTape,
+        )
+        .unwrap();
         let fwd = forward_returns_bps(&bars, &[15]);
         let m = matrix_rows(&rows, &fwd, 5, "kTEST");
         assert!(!m.is_empty());
@@ -222,7 +228,13 @@ mod tests {
     #[test]
     fn a_non_finite_feature_value_is_dropped_and_counted_as_dropped() {
         let bars = ramp(200);
-        let rows = compute(&bars, &bars, &full_micro(&bars)).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &full_micro(&bars),
+            &mut features_scalper::SyntheticTape,
+        )
+        .unwrap();
         let fwd = forward_returns_bps(&bars, &[1]);
 
         let mut hostile_rows = rows.clone();
@@ -259,7 +271,13 @@ mod tests {
     #[test]
     fn no_micro_coverage_at_all_drops_every_row_under_fs2() {
         let bars = ramp(200);
-        let rows = compute(&bars, &bars, &vec![None; bars.len()]).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &vec![None; bars.len()],
+            &mut features_scalper::NoTape,
+        )
+        .unwrap();
         let fwd = forward_returns_bps(&bars, &[15]);
         let m = matrix_rows(&rows, &fwd, 5, "kTEST");
         assert!(

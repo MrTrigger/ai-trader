@@ -66,6 +66,17 @@
 //! the same full-and-clean discipline, mirroring `taker_buy_ratio_m15`'s
 //! 15-minute window instead of the 60-minute one.
 //!
+//! fs-5 (`fs-rust-scalper-5`, `docs/scalper-research.md` Amendment 5)
+//! appends twelve tick order-flow features (indices 38-49, `tick.rs`) built
+//! from the raw aggTrades tape the CALLER serves through a `TapeSource`
+//! (one `TapeMinute` per bar minute, or `None` when no tape day covers it -
+//! the same "the crate reads what it is handed" pattern as `MicroMinute`).
+//! Indices 0-37 are byte-for-byte fs-4: same names, formulas, joins and
+//! code path; a `NoTape` source reproduces fs-4's 38 values exactly with
+//! twelve `None`s appended (asserted below). Windows are `[C − W, C)` in
+//! ms, strictly before the bar's close; a `None` minute or a skipped minute
+//! breaks tape coverage and the tick windows restart from empty.
+//!
 //! Validity invariant: a feature is `Some` only if it is finite. Every
 //! formula above is expected to guard its own known non-finite cases
 //! (e.g. `oi_change_60` requires both OI endpoints to be strictly
@@ -81,9 +92,14 @@ use std::collections::{BTreeMap, VecDeque};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use features_crypto::Bar;
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-4";
+pub mod tick;
+pub use tick::{
+    NoTape, SyntheticTape, TapeMinute, TapeSource, TapeTrade, TickState, TICK_FEATURE_NAMES,
+};
 
-pub const FEATURE_NAMES: [&str; 38] = [
+pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-5";
+
+pub const FEATURE_NAMES: [&str; 50] = [
     "ret_1",
     "ret_3",
     "ret_5",
@@ -122,6 +138,20 @@ pub const FEATURE_NAMES: [&str; 38] = [
     "funding_x_mom",
     "spread_z_60",
     "depth_imb_10_m15",
+    // fs-5 (Amendment 5): tick order flow, indices 38-49 - kept in lockstep
+    // with `tick::TICK_FEATURE_NAMES` (asserted in tests).
+    "tk_imb_10s",
+    "tk_imb_30s",
+    "tk_imb_5m",
+    "tk_large_imb_5m",
+    "tk_run",
+    "tk_ret_10s",
+    "tk_ret_30s",
+    "tk_vwap_dev_30s",
+    "tk_intensity_10s",
+    "tk_notional_ratio_30s",
+    "tk_impact_5m",
+    "tk_size_med_5m_log",
 ];
 
 const EPS: f64 = 1e-12;
@@ -157,7 +187,7 @@ pub struct FeatureRow {
     pub values: Vec<Option<f64>>,
 }
 
-/// Compute the 38-feature row set for `bars` (one asset's ascending 1m
+/// Compute the 50-feature row set for `bars` (one asset's ascending 1m
 /// bars), using `btc_bars` (BTC's ascending 1m bars, ascending) as context
 /// for `btc_ret_5` / `rel_ret_5`, and `micro` (one slot per bar, same
 /// length as `bars`) for the 12 fs-3 microstructure features. Pass the
@@ -168,6 +198,7 @@ pub fn compute(
     bars: &[Bar],
     btc_bars: &[Bar],
     micro: &[Option<MicroMinute>],
+    tape: &mut dyn TapeSource,
 ) -> Result<Vec<FeatureRow>, String> {
     validate_ascending(bars)?;
     validate_ascending(btc_bars)?;
@@ -202,6 +233,9 @@ pub fn compute(
     let mut oi_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 61
     let mut depth_imb_10_window: VecDeque<Option<f64>> = VecDeque::new(); // up to 15
     let mut prev_ts: Option<DateTime<Utc>> = None;
+    // fs-5 tape state: keeps its own coverage discipline (consecutive
+    // covered minutes), so a bar gap that skips a minute breaks it too.
+    let mut tick_state = TickState::new();
 
     for (idx, b) in bars.iter().enumerate() {
         let gapped = match prev_ts {
@@ -445,6 +479,12 @@ pub fn compute(
             None
         };
 
+        // fs-5 (Amendment 5): the twelve tick features at this bar's close.
+        let minute_ts_s = b.ts_utc.timestamp();
+        let tape_minute = tape.minute(minute_ts_s)?;
+        let tk = tick_state.push(minute_ts_s, tape_minute);
+        values[38..50].copy_from_slice(&tk);
+
         // Validity invariant, enforced once for every feature regardless
         // of how it was derived above: a feature is `Some` only if it is
         // finite. NaN/inf is never a valid feature value - it means an
@@ -621,7 +661,7 @@ mod tests {
     #[test]
     fn one_row_per_bar_and_cold_windows_are_none_not_zero() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
         assert_eq!(rows.len(), 70);
         assert!(rows[0].values[i("ret_1")].is_none(), "no history yet");
         assert!(
@@ -638,8 +678,8 @@ mod tests {
     fn appending_bars_never_changes_emitted_rows() {
         let long = ramp(200);
         let short: Vec<Bar> = long[..150].to_vec();
-        let a = compute(&short, &short, &no_micro(150)).unwrap();
-        let b = compute(&long, &long, &no_micro(200)).unwrap();
+        let a = compute(&short, &short, &no_micro(150), &mut NoTape).unwrap();
+        let b = compute(&long, &long, &no_micro(200), &mut NoTape).unwrap();
         for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.ts_utc, y.ts_utc);
             assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
@@ -671,8 +711,8 @@ mod tests {
             .collect();
         let short: Vec<Bar> = long[..150].to_vec();
         let short_micro: Vec<Option<MicroMinute>> = long_micro[..150].to_vec();
-        let a = compute(&short, &short, &short_micro).unwrap();
-        let b = compute(&long, &long, &long_micro).unwrap();
+        let a = compute(&short, &short, &short_micro, &mut NoTape).unwrap();
+        let b = compute(&long, &long, &long_micro, &mut NoTape).unwrap();
         for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
         }
@@ -685,7 +725,7 @@ mod tests {
         for b in bars.iter_mut().skip(65) {
             b.ts_utc += Duration::minutes(10);
         }
-        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
         assert!(rows[64].values[i("ret_1")].is_some(), "warm before the gap");
         assert!(
             rows[65].values[i("ret_1")].is_none(),
@@ -697,34 +737,72 @@ mod tests {
     #[test]
     fn btc_context_aligns_by_timestamp_and_rel_ret_is_zero_for_btc_itself() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
         let last = &rows[69];
         assert_eq!(last.values[i("btc_ret_5")], last.values[i("ret_5")]);
         assert_eq!(last.values[i("rel_ret_5")], Some(0.0));
         // Missing BTC ts -> None
         let mut btc = ramp(70);
         btc.retain(|b| b.ts_utc != bars[69].ts_utc);
-        let rows2 = compute(&bars, &btc, &no_micro(70)).unwrap();
+        let rows2 = compute(&bars, &btc, &no_micro(70), &mut NoTape).unwrap();
         assert!(rows2[69].values[i("btc_ret_5")].is_none());
         assert!(rows2[69].values[i("rel_ret_5")].is_none());
     }
 
     #[test]
     fn the_catalog_is_the_contract() {
-        assert_eq!(FEATURE_NAMES.len(), 38);
-        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-4");
+        assert_eq!(FEATURE_NAMES.len(), 50);
+        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-5");
+        assert_eq!(&FEATURE_NAMES[38..], &TICK_FEATURE_NAMES[..]);
         assert_eq!(FEATURE_NAMES[27], "depth_10_z_60");
         assert_eq!(FEATURE_NAMES[28], "depth_imb_10");
         assert_eq!(FEATURE_NAMES[29], "depth_10_log");
         assert_eq!(FEATURE_NAMES[37], "depth_imb_10_m15");
-        let rows = compute(&ramp(70), &ramp(70), &no_micro(70)).unwrap();
+        let rows = compute(&ramp(70), &ramp(70), &no_micro(70), &mut NoTape).unwrap();
         assert_eq!(rows[0].values.len(), FEATURE_NAMES.len());
+    }
+
+    /// fs-4 parity: the tape can only ever add indices 38-49. Whatever the
+    /// tape says, indices 0-37 are the fs-4 values (same code path), and a
+    /// `NoTape` source leaves 38-49 all `None`.
+    #[test]
+    fn the_tape_never_touches_the_38_fs4_features() {
+        let bars = ramp(150);
+        let micro: Vec<Option<MicroMinute>> = bars
+            .iter()
+            .map(|b| {
+                Some(MicroMinute {
+                    ts_s: b.ts_utc.timestamp(),
+                    spread_bps: Some(3.0),
+                    taker_buy_ratio: Some(0.5),
+                    bid_02: Some(1.0),
+                    ask_02: Some(1.0),
+                    bid_10: Some(10.0),
+                    ask_10: Some(9.0),
+                    oi_value: Some(1000.0),
+                    taker_ls_ratio: Some(1.1),
+                    funding_rate: Some(0.0001),
+                })
+            })
+            .collect();
+        let without = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let with = compute(&bars, &bars, &micro, &mut SyntheticTape).unwrap();
+        for (a, b) in without.iter().zip(with.iter()) {
+            assert_eq!(&a.values[..38], &b.values[..38]);
+            assert!(a.values[38..].iter().all(Option::is_none));
+        }
+        // With sixty covered minutes behind it, every tick feature is Some.
+        assert!(
+            with[149].values[38..].iter().all(Option::is_some),
+            "{:?}",
+            &with[149].values[38..]
+        );
     }
 
     #[test]
     fn micro_length_mismatch_is_rejected() {
         let bars = ramp(10);
-        let err = compute(&bars, &bars, &no_micro(9)).unwrap_err();
+        let err = compute(&bars, &bars, &no_micro(9), &mut NoTape).unwrap_err();
         assert!(err.contains("micro.len()"), "got: {err}");
     }
 
@@ -735,7 +813,7 @@ mod tests {
     #[test]
     fn micro_all_none_reproduces_fs1_and_nones_the_rest() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70)).unwrap();
+        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
 
         // Golden values for row 65 of `ramp(70)`, pinned bit-for-bit. These
         // literals ARE fs-1's outputs on this input: `is_some()` alone lets
@@ -777,7 +855,7 @@ mod tests {
             ask_10: Some(300.0),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         let expect_imb10 = (500.0 - 300.0) / (500.0 + 300.0 + EPS);
         assert!((rows[4].values[i("depth_imb_10")].unwrap() - expect_imb10).abs() < 1e-12);
         // No micro data at all that minute -> None, not a fabricated ratio.
@@ -796,7 +874,7 @@ mod tests {
             ask_10: Some(300.0),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         let expect = (500.0_f64 + 300.0 + EPS).ln();
         assert!((rows[4].values[i("depth_10_log")].unwrap() - expect).abs() < 1e-12);
 
@@ -806,7 +884,7 @@ mod tests {
             ask_10: None,
             ..Default::default()
         });
-        let rows2 = compute(&bars, &bars, &micro).unwrap();
+        let rows2 = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert!(rows2[4].values[i("depth_10_log")].is_none());
     }
 
@@ -832,7 +910,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert!(
             rows[13].values[i("depth_imb_10_m15")].is_none(),
             "only 14 minutes of history"
@@ -857,7 +935,7 @@ mod tests {
         // requirement rather than averaging over a gap.
         let mut micro2 = micro.clone();
         micro2[10] = None;
-        let rows2 = compute(&bars, &bars, &micro2).unwrap();
+        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape).unwrap();
         assert!(rows2[19].values[i("depth_imb_10_m15")].is_none());
     }
 
@@ -872,7 +950,7 @@ mod tests {
             taker_ls_ratio: Some(1.4),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert_eq!(rows[19].values[i("funding_rate_bps")], Some(0.0001 * 1e4));
         assert_eq!(rows[19].values[i("taker_buy_ratio")], Some(0.62));
         assert_eq!(rows[19].values[i("taker_ls_ratio")], Some(1.4));
@@ -896,7 +974,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert!(
             rows[58].values[i("oi_change_60")].is_none(),
             "not yet 61 minutes of history since the last reset"
@@ -909,7 +987,7 @@ mod tests {
         // ratio against a stale substitute.
         let mut micro2 = micro.clone();
         micro2[0] = None;
-        let rows2 = compute(&bars, &bars, &micro2).unwrap();
+        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape).unwrap();
         assert!(rows2[60].values[i("oi_change_60")].is_none());
     }
 
@@ -926,7 +1004,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, b)| {
-                let oi = if idx == 0 { 0.0 } else { 1000.0 + idx as f64 * 10.0 };
+                let oi = if idx == 0 {
+                    0.0
+                } else {
+                    1000.0 + idx as f64 * 10.0
+                };
                 Some(MicroMinute {
                     ts_s: b.ts_utc.timestamp(),
                     oi_value: Some(oi),
@@ -934,7 +1016,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &zero_old_at_60).unwrap();
+        let rows = compute(&bars, &bars, &zero_old_at_60, &mut NoTape).unwrap();
         assert!(
             rows[60].values[i("oi_change_60")].is_none(),
             "old OI of 0.0 must not produce a value (ln(x/0) is inf)"
@@ -956,7 +1038,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows2 = compute(&bars, &bars, &negative_old_at_60).unwrap();
+        let rows2 = compute(&bars, &bars, &negative_old_at_60, &mut NoTape).unwrap();
         assert!(
             rows2[60].values[i("oi_change_60")].is_none(),
             "negative old OI must not produce a value (ln of a negative ratio is NaN)"
@@ -966,8 +1048,8 @@ mod tests {
     /// Hostile synthetic input designed to try to coax a non-finite value
     /// out of every rolling/ratio feature at once (zero and negative OI
     /// endpoints, zero depth on both sides, degenerate spread/taker
-    /// inputs). No matter what upstream data throws at `compute()`, no
-    /// row may contain `Some(NaN)`/`Some(inf)` - the compute()-wide
+    /// inputs). No matter what upstream data throws at `compute(, &mut NoTape)`, no
+    /// row may contain `Some(NaN)`/`Some(inf)` - the compute(, &mut NoTape)-wide
     /// finite sweep is the last line of defense even if a future formula
     /// forgets its own guard.
     #[test]
@@ -993,7 +1075,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         for (idx, row) in rows.iter().enumerate() {
             for (fi, v) in row.values.iter().enumerate() {
                 if let Some(x) = v {
@@ -1021,7 +1103,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert!(
             rows[13].values[i("taker_buy_ratio_m15")].is_none(),
             "only 14 minutes of history"
@@ -1056,7 +1138,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
         assert!(
             rows[64].values[i("depth_10_z_60")].is_some(),
             "60-wide clean window before the gap"

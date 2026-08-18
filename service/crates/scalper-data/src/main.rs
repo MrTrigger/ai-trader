@@ -86,7 +86,7 @@ usage: scalper-data <command>
       in --exclude. Writes {data-root}/scalper-universe.json and prints a table
       with a NO-BINANCE marker on unmapped coins.
 
-  training-matrix --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--stride 5] [--horizons 15,30,60] [--micro-root <dir>]
+  training-matrix --data-root <dir> --universe <path> --start YYYY-MM-DD --end YYYY-MM-DD --out <path> [--stride 5] [--horizons 15,30,60] [--micro-root <dir>] [--tape-root <dir>]
       Build the trainer's JSONL matrix: for each universe candidate with a
       Binance UM listing, read 1m bars from {data-root}/perp (store key =
       coin.to_uppercase()), compute features-scalper's fs-2 feature set (BTC
@@ -101,7 +101,7 @@ usage: scalper-data <command>
       omit it to run fs-2 with those 12 features all None (still a valid,
       just uninformative, matrix). Prints per-asset 'kept N of M (book from
       DATE|none, flow from DATE|none, metrics from DATE|none, funding from
-      DATE|none)' - one first-coverage date per source, since funding's
+      DATE|none, tape from DATE|none)' - one first-coverage date per source, since funding's
       unlimited lookback covers from day one while book/flow/metrics (the
       sources that actually gate row survival) typically start later.
 
@@ -1095,6 +1095,11 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         return Err("--horizons produced no values".into());
     }
     let micro_root: Option<PathBuf> = get(args, "--micro-root").map(PathBuf::from);
+    // Amendment 5: {tape-root}/binance-micro/tape/{SYMBOL}/{day}.parquet
+    // (pull-binance-tape's layout) feeds the twelve fs-5 tick features;
+    // omit it and they are all None (fs-4 parity, still a valid matrix).
+    let tape_root: Option<PathBuf> =
+        get(args, "--tape-root").map(|p| tape::tape_root(&PathBuf::from(p)));
 
     let text = std::fs::read_to_string(&universe_path)
         .map_err(|e| format!("{}: {e}", universe_path.display()))?;
@@ -1147,7 +1152,19 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         };
         let cov = coverage_starts(&bars, &micro);
 
-        let feature_rows = features_scalper::compute(&bars, &btc_bars, &micro)?;
+        let feature_rows = match (&tape_root, candidate.binance_um.as_ref()) {
+            (Some(root), Some(symbol)) => {
+                let mut cursor = tape::TapeCursor::new(root, symbol);
+                features_scalper::compute(&bars, &btc_bars, &micro, &mut cursor)?
+            }
+            _ => {
+                features_scalper::compute(&bars, &btc_bars, &micro, &mut features_scalper::NoTape)?
+            }
+        };
+        let tape_from = feature_rows
+            .iter()
+            .find(|r| r.values[38..].iter().all(Option::is_some))
+            .map(|r| r.ts_utc.date_naive());
         let fwd = matrix::forward_returns_bps(&bars, &horizons);
         let mut rows = matrix::matrix_rows(&feature_rows, &fwd, stride, &candidate.coin);
         rows.retain(|r| r.ts >= start_ts && r.ts < end_ts);
@@ -1165,8 +1182,41 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
                     && b.ts_utc.timestamp() < end_ts
             })
             .count();
+        // Which features cost rows: for every stride-sampled in-window bar,
+        // count the None features by name and print the worst offenders -
+        // the run record needs to say WHY rows were dropped, not just how
+        // many (Amendment 5's tick features add a coverage/activity
+        // dimension the fs-4 features did not have).
+        let mut none_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for (idx, (b, r)) in bars.iter().zip(feature_rows.iter()).enumerate() {
+            if idx % stride.max(1) != 0
+                || b.ts_utc.timestamp() < start_ts
+                || b.ts_utc.timestamp() >= end_ts
+            {
+                continue;
+            }
+            for (name, v) in features_scalper::FEATURE_NAMES.iter().zip(r.values.iter()) {
+                if v.is_none() {
+                    *none_counts.entry(name).or_default() += 1;
+                }
+            }
+        }
+        let mut offenders: Vec<(&str, usize)> = none_counts.into_iter().collect();
+        offenders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let offenders_text = offenders
+            .iter()
+            .take(6)
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !offenders.is_empty() {
+            println!(
+                "{}: None counts among {} sampled rows: {}",
+                candidate.coin, m, offenders_text
+            );
+        }
         println!(
-            "{}: kept {} of {} (book from {}, flow from {}, metrics from {}, funding from {})",
+            "{}: kept {} of {} (book from {}, flow from {}, metrics from {}, funding from {}, tape from {})",
             candidate.coin,
             rows.len(),
             m,
@@ -1174,6 +1224,7 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             coverage_date_or_none(cov.flow),
             coverage_date_or_none(cov.metrics),
             coverage_date_or_none(cov.funding),
+            coverage_date_or_none(tape_from),
         );
         assets.push(candidate.coin.clone());
         all_rows.extend(rows);
@@ -1623,6 +1674,26 @@ mod tests {
         std::fs::create_dir_all(&metrics_dir).unwrap();
         std::fs::write(metrics_dir.join(format!("{day}.jsonl")), metrics_lines).unwrap();
 
+        // Amendment 5: the tape day file, from the same synthetic tape the
+        // feature crate's own tests use, so all twelve tick features warm.
+        let mut tape_trades = Vec::new();
+        for i in 0..n {
+            let ts = (base + chrono::Duration::minutes(i)).timestamp();
+            for t in features_scalper::SyntheticTape::minute_trades(ts) {
+                tape_trades.push(tape::TapeTrade {
+                    ts_ms: t.ts_ms,
+                    price: t.price,
+                    qty: t.qty,
+                    is_buyer_maker: !t.is_buy,
+                });
+            }
+        }
+        tape::write_day(
+            &tape::day_path(&tape::tape_root(data_root), symbol, day),
+            &tape_trades,
+        )
+        .unwrap();
+
         let funding_dir = micro_root.join("funding");
         std::fs::create_dir_all(&funding_dir).unwrap();
         let funding = binance_micro::FundingRow {
@@ -1689,6 +1760,8 @@ mod tests {
             "15".to_string(),
             "--micro-root".to_string(),
             root.to_string_lossy().to_string(),
+            "--tape-root".to_string(),
+            root.to_string_lossy().to_string(),
         ];
         cmd_training_matrix(&args).expect("a missing store dir must be a warning, not a failure");
 
@@ -1707,8 +1780,8 @@ mod tests {
         assert!(rows.iter().any(|r| r.asset == "kTEST"));
         assert!(rows.iter().all(|r| r.asset == "BTC" || r.asset == "kTEST"));
         assert!(
-            rows.iter().all(|r| r.features.len() == 38),
-            "fs-2 rows carry all 38 features, not fs-1's 26"
+            rows.iter().all(|r| r.features.len() == 50),
+            "fs-5 rows carry all 50 features"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -1768,7 +1841,7 @@ mod tests {
         let content = std::fs::read_to_string(&out_path).unwrap();
         let mut lines = content.lines();
         let manifest: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-4");
+        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-5");
         let rows: Vec<matrix::MatrixRow> =
             lines.map(|l| serde_json::from_str(l).unwrap()).collect();
         assert!(

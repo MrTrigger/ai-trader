@@ -48,10 +48,6 @@ pub struct TapeTrade {
 }
 
 impl TapeTrade {
-    /// `price × qty` in quote (USDT) units.
-    pub fn notional(&self) -> f64 {
-        self.price * self.qty
-    }
     /// A taker buy (aggressor lifted the ask).
     pub fn is_buy(&self) -> bool {
         !self.is_buyer_maker
@@ -346,5 +342,124 @@ mod tests {
         write_manifest(&path, &all).unwrap();
         assert_eq!(read_manifest(&path).unwrap(), all);
         assert!(read_manifest(&dir.join("nope.json")).unwrap().is_empty());
+    }
+}
+
+/// Serves one symbol's tape to `features_scalper::compute` a minute at a
+/// time, loading one day file at a time (bars are consumed in ascending
+/// order, so at most the current day is resident - ~1M trades for the
+/// busiest symbol). A minute on a day with no file answers `None` (no
+/// coverage); a minute on a present day with no prints answers
+/// `Some(empty)`.
+pub struct TapeCursor {
+    tape_root: PathBuf,
+    symbol: String,
+    loaded_day: Option<NaiveDate>,
+    day_present: bool,
+    minutes: BTreeMap<i64, Vec<features_scalper::TapeTrade>>,
+}
+
+impl TapeCursor {
+    pub fn new(tape_root: &Path, symbol: &str) -> Self {
+        Self {
+            tape_root: tape_root.to_path_buf(),
+            symbol: symbol.to_string(),
+            loaded_day: None,
+            day_present: false,
+            minutes: BTreeMap::new(),
+        }
+    }
+
+    fn load(&mut self, day: NaiveDate) -> Result<(), String> {
+        self.minutes.clear();
+        self.loaded_day = Some(day);
+        let path = day_path(&self.tape_root, &self.symbol, day);
+        if !path.exists() {
+            self.day_present = false;
+            return Ok(());
+        }
+        self.day_present = true;
+        for t in read_day(&path)? {
+            let minute = t.ts_ms.div_euclid(60_000) * 60;
+            self.minutes
+                .entry(minute)
+                .or_default()
+                .push(features_scalper::TapeTrade {
+                    ts_ms: t.ts_ms,
+                    price: t.price,
+                    qty: t.qty,
+                    is_buy: !t.is_buyer_maker,
+                });
+        }
+        Ok(())
+    }
+}
+
+impl features_scalper::TapeSource for TapeCursor {
+    fn minute(&mut self, minute_ts_s: i64) -> Result<Option<features_scalper::TapeMinute>, String> {
+        let day = chrono::DateTime::<chrono::Utc>::from_timestamp(minute_ts_s, 0)
+            .ok_or_else(|| format!("{}: bad minute ts {minute_ts_s}", self.symbol))?
+            .date_naive();
+        if self.loaded_day != Some(day) {
+            self.load(day)?;
+        }
+        if !self.day_present {
+            return Ok(None);
+        }
+        Ok(Some(features_scalper::TapeMinute {
+            trades: self.minutes.get(&minute_ts_s).cloned().unwrap_or_default(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use features_scalper::TapeSource;
+
+    #[test]
+    fn cursor_serves_minutes_from_day_files_and_none_for_absent_days() {
+        let dir = std::env::temp_dir().join(format!("scalper-tape-cursor-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let day = NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+        let day_start_ms = day
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let trades = vec![
+            TapeTrade {
+                ts_ms: day_start_ms + 61_000,
+                price: 1.0,
+                qty: 1.0,
+                is_buyer_maker: true,
+            },
+            TapeTrade {
+                ts_ms: day_start_ms + 119_999,
+                price: 2.0,
+                qty: 1.0,
+                is_buyer_maker: false,
+            },
+            TapeTrade {
+                ts_ms: day_start_ms + 120_000,
+                price: 3.0,
+                qty: 1.0,
+                is_buyer_maker: false,
+            },
+        ];
+        write_day(&day_path(&dir, "T", day), &trades).unwrap();
+        let mut cur = TapeCursor::new(&dir, "T");
+        let m1 = cur.minute(day_start_ms / 1000 + 60).unwrap().unwrap();
+        assert_eq!(m1.trades.len(), 2, "[60s, 120s) holds the first two");
+        assert!(!m1.trades[0].is_buy && m1.trades[1].is_buy);
+        let m2 = cur.minute(day_start_ms / 1000 + 120).unwrap().unwrap();
+        assert_eq!(m2.trades.len(), 1);
+        let m0 = cur.minute(day_start_ms / 1000).unwrap().unwrap();
+        assert!(
+            m0.trades.is_empty(),
+            "a covered minute with no prints is Some(empty)"
+        );
+        // Next day has no file -> None.
+        assert!(cur.minute(day_start_ms / 1000 + 86_400).unwrap().is_none());
     }
 }
