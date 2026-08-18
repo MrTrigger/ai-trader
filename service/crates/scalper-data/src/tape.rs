@@ -47,13 +47,6 @@ pub struct TapeTrade {
     pub is_buyer_maker: bool,
 }
 
-impl TapeTrade {
-    /// A taker buy (aggressor lifted the ask).
-    pub fn is_buy(&self) -> bool {
-        !self.is_buyer_maker
-    }
-}
-
 pub fn tape_root(data_root: &Path) -> PathBuf {
     data_root.join("binance-micro").join("tape")
 }
@@ -285,7 +278,7 @@ mod tests {
                 is_buyer_maker: true
             }
         );
-        assert!(!trades[1].is_buyer_maker && trades[1].is_buy());
+        assert!(!trades[1].is_buyer_maker);
         assert_eq!(trades[2], trades[3]);
 
         let dir = scratch("roundtrip");

@@ -307,10 +307,10 @@ where
 /// `simulate_with_state_atr` needs to resolve an accepted entry's Amendment
 /// 3 stop/target exit against that asset's actual path. Built once per
 /// `cmd_gate` invocation under `--exit atr`, not per fold.
-struct AssetPath {
-    bars: Vec<Bar>,
-    atr: Vec<Option<f64>>,
-    index_by_ts: BTreeMap<i64, usize>,
+pub(crate) struct AssetPath {
+    pub(crate) bars: Vec<Bar>,
+    pub(crate) atr: Vec<Option<f64>>,
+    pub(crate) index_by_ts: BTreeMap<i64, usize>,
 }
 
 impl AssetPath {
@@ -494,7 +494,7 @@ fn simulate_with_state_atr(
 }
 
 /// UTC calendar date a unix timestamp falls on.
-fn date_of(ts: i64) -> NaiveDate {
+pub(crate) fn date_of(ts: i64) -> NaiveDate {
     DateTime::<Utc>::from_timestamp(ts, 0)
         .expect("timestamp in range")
         .date_naive()
@@ -504,10 +504,34 @@ fn date_of(ts: i64) -> NaiveDate {
 /// giving up - the pre-registered "nearest PRIOR day within 14 days" rule.
 const COST_LOOKBACK_DAYS: i64 = 14;
 
-/// `2*fee_taker_bps + spread_bps_p75 + 2*impact_bps` for one already-known
-/// `DayCost`.
-fn round_trip_formula(fee_taker_bps: f64, dc: &DayCost, impact_bps: f64) -> f64 {
-    2.0 * fee_taker_bps + dc.spread_bps_p75 + 2.0 * impact_bps
+/// Which execution the round trip is priced for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CostMode {
+    /// Amendments 1-4: taker in, taker out - `2·fee_taker + spread_p75 +
+    /// 2·impact`.
+    Taker { fee_taker_bps: f64 },
+    /// Amendment 5 §5.4: maker in, taker out - `fee_maker + fee_taker +
+    /// spread_p75/2 + impact`. The maker leg pays no spread and no impact
+    /// by construction; its cost is the adverse selection the fill rule
+    /// imposes.
+    MakerEntry {
+        fee_maker_bps: f64,
+        fee_taker_bps: f64,
+    },
+}
+
+impl CostMode {
+    fn round_trip(&self, dc: &DayCost, impact_bps: f64) -> f64 {
+        match *self {
+            CostMode::Taker { fee_taker_bps } => {
+                2.0 * fee_taker_bps + dc.spread_bps_p75 + 2.0 * impact_bps
+            }
+            CostMode::MakerEntry {
+                fee_maker_bps,
+                fee_taker_bps,
+            } => fee_maker_bps + fee_taker_bps + dc.spread_bps_p75 / 2.0 + impact_bps,
+        }
+    }
 }
 
 /// Resolve `asset`'s round-trip cost for entry `day` from its time-varying
@@ -536,21 +560,19 @@ fn round_trip_formula(fee_taker_bps: f64, dc: &DayCost, impact_bps: f64) -> f64 
 pub(crate) fn resolve_round_trip(
     day_costs: Option<&BTreeMap<NaiveDate, DayCost>>,
     day: NaiveDate,
-    fee_taker_bps: f64,
+    mode: CostMode,
 ) -> Option<f64> {
     let day_costs = day_costs?;
 
     if let Some(dc) = day_costs.get(&day) {
-        return dc
-            .impact_bps
-            .map(|impact| round_trip_formula(fee_taker_bps, dc, impact));
+        return dc.impact_bps.map(|impact| mode.round_trip(dc, impact));
     }
 
     for offset in 1..=COST_LOOKBACK_DAYS {
         let d = day - chrono::Duration::days(offset);
         if let Some(dc) = day_costs.get(&d) {
             if let Some(impact) = dc.impact_bps {
-                return Some(round_trip_formula(fee_taker_bps, dc, impact));
+                return Some(mode.round_trip(dc, impact));
             }
         }
     }
@@ -986,6 +1008,12 @@ struct FoldReport {
     pred_abs_p90: Option<f64>,
     pred_abs_p99: Option<f64>,
     n_preds: usize,
+    /// `--entry maker` only (Amendment 5): orders placed / filled in this
+    /// fold. Omitted otherwise so every earlier report stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_signals: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_fills: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -993,6 +1021,11 @@ struct AssetReport {
     n_trades: usize,
     total_net_bps: f64,
     hit_rate: f64,
+    /// `--entry maker` only: orders placed / filled for this asset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_signals: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_fills: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -1040,6 +1073,10 @@ struct OverallReport {
     /// gate run before Amendment 3, which never had this field at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_mode: Option<String>,
+    /// `"maker"` under `--entry maker` (Amendment 5); omitted otherwise,
+    /// same byte-identity reasoning as `exit_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1081,7 +1118,33 @@ struct Report {
     /// reasoning as `OverallReport::exit_mode`.
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_stats: Option<ExitStatsReport>,
+    /// Populated only under `--entry maker` (Amendment 5): fill-model
+    /// tallies summed across every fold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fill_stats: Option<FillStatsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tape_root: Option<String>,
     overall: OverallReport,
+}
+
+#[derive(Serialize)]
+struct FillStatsReport {
+    /// Orders placed (accepted signals with a free slot, a cost, an ATR, the
+    /// fill and end bars, and tape coverage for the fill minute).
+    n_signals: usize,
+    n_fills: usize,
+    n_misses: usize,
+    /// `n_fills / n_signals`; `0.0` when nothing was placed.
+    fill_rate: f64,
+    /// Mean `fill_ts − C` over fills, ms; `0.0` when nothing filled.
+    mean_fill_delay_ms: f64,
+    /// Accepted signals whose fill minute had no tape day - no order can be
+    /// said to have filled; not placed, not fabricated.
+    skipped_no_tape: usize,
+    /// Of `exit_stats.stops` / `.targets`, how many resolved inside the fill
+    /// minute on the tape (the rest resolved on later OHLC bars).
+    fill_minute_stops: usize,
+    fill_minute_targets: usize,
 }
 
 #[derive(Serialize)]
@@ -1131,6 +1194,39 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             "--exit must be \"time\" or \"atr\", got {exit_mode:?}"
         ));
     }
+    // `--entry taker` (default) is every run before Amendment 5. `--entry
+    // maker` is Amendment 5's pre-registered maker entry: needs `--exit atr`
+    // (the only exit it is registered with), `--tape-root` (the fill model
+    // reads the raw tape), `--universe` (matrix asset name -> Binance
+    // symbol, the tape's key - the universe file is the sole identity
+    // source) and `--binance-costs` (§5.4's cost formula is defined on the
+    // day-cost fields).
+    let entry_mode = get(args, "--entry").unwrap_or_else(|| "taker".to_string());
+    if entry_mode != "taker" && entry_mode != "maker" {
+        return Err(format!(
+            "--entry must be \"taker\" or \"maker\", got {entry_mode:?}"
+        ));
+    }
+    let is_maker = entry_mode == "maker";
+    if is_maker && exit_mode != "atr" {
+        return Err(
+            "--entry maker requires --exit atr (Amendment 5 registers no other exit)".into(),
+        );
+    }
+    let tape_root: Option<PathBuf> =
+        get(args, "--tape-root").map(|p| crate::tape::tape_root(&PathBuf::from(p)));
+    let universe_path: Option<PathBuf> = get(args, "--universe").map(PathBuf::from);
+    if is_maker && tape_root.is_none() {
+        return Err(
+            "--tape-root is required with --entry maker (the fill model reads the tape)".into(),
+        );
+    }
+    if is_maker && universe_path.is_none() {
+        return Err(
+            "--universe is required with --entry maker (asset -> Binance symbol for the tape)"
+                .into(),
+        );
+    }
     let data_root: Option<PathBuf> = get(args, "--data-root").map(PathBuf::from);
     if exit_mode == "atr" && data_root.is_none() {
         return Err(
@@ -1169,6 +1265,9 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
         if fee_maker_bps.is_none() {
             return Err("--fee-maker-bps is required with --binance-costs".into());
         }
+    }
+    if is_maker && binance_costs_path.is_none() {
+        return Err("--entry maker requires --binance-costs (Amendment 5 §5.4 prices the maker round trip on day costs)".into());
     }
 
     let matrix = load_matrix(&matrix_path)?;
@@ -1209,6 +1308,34 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             if !bars.is_empty() {
                 asset_paths.insert(asset.clone(), AssetPath::new(bars));
             }
+        }
+    }
+
+    // `--entry maker` only: one tape cursor per matrix asset, keyed by the
+    // asset name, opened on the universe file's Binance symbol.
+    let mut tape_cursors: BTreeMap<String, crate::tape::TapeCursor> = BTreeMap::new();
+    if is_maker {
+        let universe_path = universe_path.as_ref().expect("checked above");
+        let tape_root = tape_root.as_ref().expect("checked above");
+        let text = std::fs::read_to_string(universe_path)
+            .map_err(|e| format!("{}: {e}", universe_path.display()))?;
+        let candidates: Vec<crate::universe::Candidate> =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", universe_path.display()))?;
+        for asset in &assets {
+            let symbol = candidates
+                .iter()
+                .find(|c| &c.coin == asset)
+                .and_then(|c| c.binance_um.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: matrix asset {asset:?} has no Binance UM symbol in the universe file",
+                        universe_path.display()
+                    )
+                })?;
+            tape_cursors.insert(
+                asset.clone(),
+                crate::tape::TapeCursor::new(tape_root, &symbol),
+            );
         }
     }
 
@@ -1295,11 +1422,21 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
                 .collect::<Result<_, _>>()?
         };
         let fee_taker = fee_taker_bps.expect("checked above");
+        let cost_mode = if is_maker {
+            CostMode::MakerEntry {
+                fee_maker_bps: fee_maker_bps.expect("checked above"),
+                fee_taker_bps: fee_taker,
+            }
+        } else {
+            CostMode::Taker {
+                fee_taker_bps: fee_taker,
+            }
+        };
         for asset in &assets {
             let day_costs = binance_costs.get(asset);
             let mut by_day = BTreeMap::new();
             for &day in &days_span {
-                if let Some(rt) = resolve_round_trip(day_costs, day, fee_taker) {
+                if let Some(rt) = resolve_round_trip(day_costs, day, cost_mode) {
                     by_day.insert(day, rt);
                 }
             }
@@ -1340,8 +1477,11 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     let mut hold_state: BTreeMap<String, i64> = BTreeMap::new();
     // `--exit atr` only: summed across every fold into `Report::exit_stats`.
     let mut exit_stats_total = ExitStatsAccum::default();
+    // `--entry maker` only: summed across every fold into `Report::fill_stats`.
+    let mut maker_stats_total = crate::maker::MakerStatsAccum::default();
 
     for fold in &ordered_folds {
+        let mut fold_fill_counts: Option<(usize, usize)> = None;
         let model_path = folds_dir.join(&fold.model);
         let trees = load_model(&model_path, &matrix.features, &matrix.feature_set_version)?;
 
@@ -1389,7 +1529,37 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             }
         }
 
-        let (trades, next_state) = if exit_mode == "atr" {
+        let (trades, next_state) = if is_maker {
+            let (trades, next_state, stats) = crate::maker::simulate_maker(
+                &preds,
+                &round_trip_by_asset_day,
+                &asset_paths,
+                &mut tape_cursors,
+                folds_doc.horizon_min,
+                threshold_mult,
+                &hold_state,
+            )?;
+            exit_stats_total.stops += stats.stops;
+            exit_stats_total.targets += stats.targets;
+            exit_stats_total.time_exits += stats.time_exits;
+            exit_stats_total.bars_held_sum += stats.bars_held_sum;
+            exit_stats_total.skipped_no_atr += stats.skipped_no_atr;
+            exit_stats_total.skipped_no_end_bar += stats.skipped_no_bar;
+            maker_stats_total.signals += stats.signals;
+            maker_stats_total.fills += stats.fills;
+            maker_stats_total.misses += stats.misses;
+            maker_stats_total.fill_delay_ms_sum += stats.fill_delay_ms_sum;
+            maker_stats_total.skipped_no_tape += stats.skipped_no_tape;
+            maker_stats_total.fill_minute_stops += stats.fill_minute_stops;
+            maker_stats_total.fill_minute_targets += stats.fill_minute_targets;
+            for (asset, (sig, fills)) in stats.per_asset {
+                let e = maker_stats_total.per_asset.entry(asset).or_default();
+                e.0 += sig;
+                e.1 += fills;
+            }
+            fold_fill_counts = Some((stats.signals, stats.fills));
+            (trades, next_state)
+        } else if exit_mode == "atr" {
             let (trades, next_state, stats) = simulate_with_state_atr(
                 &preds,
                 &round_trip_by_asset_day,
@@ -1435,6 +1605,8 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             pred_abs_p90,
             pred_abs_p99,
             n_preds: preds.len(),
+            n_signals: fold_fill_counts.map(|c| c.0),
+            n_fills: fold_fill_counts.map(|c| c.1),
         });
 
         merge_daily(&mut stitched_daily, &daily);
@@ -1487,12 +1659,23 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     let per_asset: BTreeMap<String, AssetReport> = per_asset_acc
         .into_iter()
         .map(|(asset, (n_trades, total_net_bps, wins))| {
+            let counts = maker_stats_total.per_asset.get(&asset).copied();
             (
                 asset,
                 AssetReport {
                     n_trades,
                     total_net_bps,
                     hit_rate: wins as f64 / n_trades as f64,
+                    n_signals: if is_maker {
+                        Some(counts.map(|c| c.0).unwrap_or(0))
+                    } else {
+                        None
+                    },
+                    n_fills: if is_maker {
+                        Some(counts.map(|c| c.1).unwrap_or(0))
+                    } else {
+                        None
+                    },
                 },
             )
         })
@@ -1533,6 +1716,29 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
+    let fill_stats_report = if is_maker {
+        let m = &maker_stats_total;
+        Some(FillStatsReport {
+            n_signals: m.signals,
+            n_fills: m.fills,
+            n_misses: m.misses,
+            fill_rate: if m.signals > 0 {
+                m.fills as f64 / m.signals as f64
+            } else {
+                0.0
+            },
+            mean_fill_delay_ms: if m.fills > 0 {
+                m.fill_delay_ms_sum as f64 / m.fills as f64
+            } else {
+                0.0
+            },
+            skipped_no_tape: m.skipped_no_tape,
+            fill_minute_stops: m.fill_minute_stops,
+            fill_minute_targets: m.fill_minute_targets,
+        })
+    } else {
+        None
+    };
 
     let report = Report {
         generated_utc: Utc::now().to_rfc3339(),
@@ -1553,6 +1759,12 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             .map(|(day, bps)| (day.to_string(), bps))
             .collect(),
         exit_stats: exit_stats_report,
+        fill_stats: fill_stats_report,
+        tape_root: if is_maker {
+            tape_root.as_ref().map(|p| p.display().to_string())
+        } else {
+            None
+        },
         overall: OverallReport {
             n_trades: n_trades_total,
             sharpe_annualized: overall_sharpe,
@@ -1568,6 +1780,11 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
             ),
             fee_bps_used,
             exit_mode: exit_mode_field,
+            entry_mode: if is_maker {
+                Some(entry_mode.clone())
+            } else {
+                None
+            },
         },
     };
 
@@ -2018,7 +2235,8 @@ mod tests {
     fn resolve_round_trip_uses_the_exact_day_and_the_pre_registered_formula() {
         let costs = BTreeMap::from([(d(0), day_cost(5.0, Some(2.0)))]);
         // 2*fee_taker + spread_p75 + 2*impact = 2*3.0 + 5.0 + 2*2.0 = 15.0.
-        let got = resolve_round_trip(Some(&costs), d(0), 3.0).unwrap();
+        let got =
+            resolve_round_trip(Some(&costs), d(0), CostMode::Taker { fee_taker_bps: 3.0 }).unwrap();
         assert!((got - 15.0).abs() < 1e-9, "got {got}");
     }
 
@@ -2029,7 +2247,8 @@ mod tests {
             (d(3), day_cost(4.0, Some(1.0))),
             (d(1), day_cost(999.0, Some(999.0))), // further back - must not win
         ]);
-        let got = resolve_round_trip(Some(&costs), d(5), 3.0).unwrap();
+        let got =
+            resolve_round_trip(Some(&costs), d(5), CostMode::Taker { fee_taker_bps: 3.0 }).unwrap();
         // 2*3.0 + 4.0 + 2*1.0 = 12.0, from d(3), not d(1).
         assert!((got - 12.0).abs() < 1e-9, "got {got}");
     }
@@ -2046,7 +2265,8 @@ mod tests {
             (d(4), day_cost(6.0, Some(1.0))),
         ]);
         assert!(
-            resolve_round_trip(Some(&costs), d(5), 3.0).is_none(),
+            resolve_round_trip(Some(&costs), d(5), CostMode::Taker { fee_taker_bps: 3.0 })
+                .is_none(),
             "a thin entry day must not fall back to a calmer prior day"
         );
     }
@@ -2056,7 +2276,8 @@ mod tests {
         // d(5) has no entry at all (as opposed to a present-but-thin one) -
         // this IS the case the prior-day fallback exists for.
         let costs = BTreeMap::from([(d(3), day_cost(4.0, Some(1.0)))]);
-        let got = resolve_round_trip(Some(&costs), d(5), 3.0).unwrap();
+        let got =
+            resolve_round_trip(Some(&costs), d(5), CostMode::Taker { fee_taker_bps: 3.0 }).unwrap();
         assert!((got - 12.0).abs() < 1e-9, "got {got}"); // 2*3 + 4 + 2*1
     }
 
@@ -2069,7 +2290,8 @@ mod tests {
             (d(4), day_cost(5.0, None)),
             (d(3), day_cost(6.0, Some(1.0))),
         ]);
-        let got = resolve_round_trip(Some(&costs), d(5), 3.0).unwrap();
+        let got =
+            resolve_round_trip(Some(&costs), d(5), CostMode::Taker { fee_taker_bps: 3.0 }).unwrap();
         assert!((got - 14.0).abs() < 1e-9, "got {got}"); // 2*3 + 6 + 2*1
     }
 
@@ -2077,18 +2299,20 @@ mod tests {
     fn resolve_round_trip_gives_up_beyond_14_days_back() {
         let costs = BTreeMap::from([(d(0), day_cost(5.0, Some(2.0)))]);
         assert!(
-            resolve_round_trip(Some(&costs), d(14), 3.0).is_some(),
+            resolve_round_trip(Some(&costs), d(14), CostMode::Taker { fee_taker_bps: 3.0 })
+                .is_some(),
             "exactly 14 days back is still within the window"
         );
         assert!(
-            resolve_round_trip(Some(&costs), d(15), 3.0).is_none(),
+            resolve_round_trip(Some(&costs), d(15), CostMode::Taker { fee_taker_bps: 3.0 })
+                .is_none(),
             "15 days back is outside the window"
         );
     }
 
     #[test]
     fn resolve_round_trip_is_none_when_the_asset_has_no_cost_data_at_all() {
-        assert!(resolve_round_trip(None, d(0), 3.0).is_none());
+        assert!(resolve_round_trip(None, d(0), CostMode::Taker { fee_taker_bps: 3.0 }).is_none());
     }
 
     // -- projected_30d_volume_usd -------------------------------------------
@@ -2818,6 +3042,246 @@ mod tests {
             (net_bps - (-20.0)).abs() < 1e-9,
             "flat path -> 0 gross, net = -DEFAULT_ROUND_TRIP_BPS, got {net_bps}"
         );
+    }
+
+    /// Amendment 5 end to end: `--entry maker --exit atr --binance-costs`
+    /// on a hand-built path, tape, cost file and universe. Two signal rows:
+    /// the first's fill minute never prints through the price (a MISS, no
+    /// trade), the second fills at C+2s and is stopped inside the fill
+    /// minute on the tape. Round trip is §5.4's maker formula, hand-computed.
+    #[test]
+    fn cmd_gate_runs_end_to_end_in_maker_mode_with_a_miss_and_a_fill_minute_stop() {
+        use chrono::{Duration, TimeZone};
+        use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
+
+        let dir =
+            std::env::temp_dir().join(format!("scalper-gate-e2e-maker-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Flat 100.0 bars with a 0.10 range -> ATR(14) = 0.10, stop = 0.40,
+        // target = 0.48 away from the fill price.
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let bars: Vec<Bar> = (0..80)
+            .map(|i| Bar {
+                ts_utc: base + Duration::minutes(i),
+                asset: "TEST".to_string(),
+                interval_s: 60,
+                open: 100.0,
+                high: 100.05,
+                low: 99.95,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: Some(100.0),
+                trades: Some(5),
+            })
+            .collect();
+        let sig1 = 20usize; // miss
+        let sig2 = 40usize; // fill + fill-minute stop
+        let ts1 = bars[sig1].ts_utc.timestamp();
+        let ts2 = bars[sig2].ts_utc.timestamp();
+        crypto_portfolio::store::write(&dir.join("perp"), &bars).unwrap();
+
+        // Tape for the day: fill minute of sig1 prints only AT 100.0 (no
+        // fill for a long); fill minute of sig2 prints 99.9 at C+2s (fill at
+        // 100.0), then 99.5 at C+10s (<= stop 99.6 -> stop inside the minute).
+        let c1_ms = (ts1 + 60) * 1000;
+        let c2_ms = (ts2 + 60) * 1000;
+        let tape_trades = vec![
+            crate::tape::TapeTrade {
+                ts_ms: c1_ms + 5_000,
+                price: 100.0,
+                qty: 1.0,
+                is_buyer_maker: true,
+            },
+            crate::tape::TapeTrade {
+                ts_ms: c1_ms + 30_000,
+                price: 100.0,
+                qty: 1.0,
+                is_buyer_maker: false,
+            },
+            crate::tape::TapeTrade {
+                ts_ms: c2_ms + 500,
+                price: 99.0,
+                qty: 1.0,
+                is_buyer_maker: true,
+            }, // before latency
+            crate::tape::TapeTrade {
+                ts_ms: c2_ms + 2_000,
+                price: 99.9,
+                qty: 1.0,
+                is_buyer_maker: true,
+            },
+            crate::tape::TapeTrade {
+                ts_ms: c2_ms + 10_000,
+                price: 99.5,
+                qty: 1.0,
+                is_buyer_maker: true,
+            },
+        ];
+        let tape_root = crate::tape::tape_root(&dir);
+        crate::tape::write_day(
+            &crate::tape::day_path(&tape_root, "TESTUSDT", base.date_naive()),
+            &tape_trades,
+        )
+        .unwrap();
+        let universe_path = dir.join("universe.json");
+        std::fs::write(
+            &universe_path,
+            r#"[{"coin":"TEST","day_volume_usd":1.0,"binance_um":"TESTUSDT"}]"#,
+        )
+        .unwrap();
+
+        let mut features = serde_json::Map::new();
+        for name in FEATURE_NAMES {
+            features.insert(name.to_string(), serde_json::json!(1.0));
+        }
+        let feature_names: Vec<&str> = FEATURE_NAMES.to_vec();
+        let manifest = serde_json::json!({
+            "kind": "manifest", "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names, "horizons_min": [15], "stride_min": 1, "assets": ["TEST"],
+        });
+        let row1 = serde_json::json!({"ts": ts1, "asset": "TEST", "features": features, "fwd_bps": {"15": 0.0}});
+        let row2 = serde_json::json!({"ts": ts2, "asset": "TEST", "features": features, "fwd_bps": {"15": 0.0}});
+        let matrix_path = dir.join("matrix.jsonl");
+        std::fs::write(&matrix_path, format!("{manifest}\n{row1}\n{row2}\n")).unwrap();
+
+        let folds_path = dir.join("folds.json");
+        std::fs::write(
+            &folds_path,
+            serde_json::to_string(&serde_json::json!({
+                "horizon_min": 15,
+                "folds": [{
+                    "i": 0, "train_start_ts": 0, "train_end_ts": ts1,
+                    "test_start_ts": ts1 - 60, "test_end_ts": ts2 + 60, "model": "fold-0.json",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let model = serde_json::json!({
+            "format_version": MODEL_FORMAT_VERSION, "feature_set_version": FEATURE_SET_VERSION,
+            "features": feature_names,
+            "model": { "tree_info": [{ "tree_index": 0, "num_leaves": 1, "tree_structure": { "leaf_value": 100.0 } }] },
+        });
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
+
+        // Day cost: spread p75 = 4.0, impact = 2.0. Maker round trip =
+        // 1.8 + 4.5 + 4.0/2 + 2.0 = 10.3 bps (taker would be 9 + 4 + 4 = 17).
+        let costs_path = dir.join("costs.json");
+        std::fs::write(
+            &costs_path,
+            format!(
+                r#"{{"TEST": {{"{}": {{"spread_bps_p75": 4.0, "impact_bps": 2.0, "samples": 50}}}}}}"#,
+                base.date_naive()
+            ),
+        )
+        .unwrap();
+
+        let out_path = dir.join("report.json");
+        let args: Vec<String> = [
+            "--matrix",
+            matrix_path.to_str().unwrap(),
+            "--folds",
+            folds_path.to_str().unwrap(),
+            "--binance-costs",
+            costs_path.to_str().unwrap(),
+            "--fee-taker-bps",
+            "4.5",
+            "--fee-maker-bps",
+            "1.8",
+            "--exit",
+            "atr",
+            "--entry",
+            "maker",
+            "--data-root",
+            dir.to_str().unwrap(),
+            "--tape-root",
+            dir.to_str().unwrap(),
+            "--universe",
+            universe_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        cmd_gate(&args).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(report["overall"]["entry_mode"], "maker");
+        assert_eq!(report["overall"]["exit_mode"], "atr");
+        assert_eq!(report["fill_stats"]["n_signals"], 2);
+        assert_eq!(report["fill_stats"]["n_fills"], 1);
+        assert_eq!(report["fill_stats"]["n_misses"], 1);
+        assert_eq!(report["fill_stats"]["fill_rate"], 0.5);
+        assert_eq!(report["fill_stats"]["mean_fill_delay_ms"], 2000.0);
+        assert_eq!(report["fill_stats"]["fill_minute_stops"], 1);
+        assert_eq!(report["exit_stats"]["stops"], 1);
+        assert_eq!(report["overall"]["n_trades"], 1);
+        assert_eq!(report["per_asset"]["TEST"]["n_signals"], 2);
+        assert_eq!(report["per_asset"]["TEST"]["n_fills"], 1);
+        assert_eq!(report["folds"][0]["n_signals"], 2);
+        assert_eq!(report["folds"][0]["n_fills"], 1);
+        // Threshold = 1.5 * 10.3 = 15.45.
+        let thr = report["overall"]["threshold_bps_by_asset"]["TEST"]
+            .as_f64()
+            .unwrap();
+        assert!((thr - 15.45).abs() < 1e-9, "maker threshold {thr}");
+        // Stop at 100 - 0.4 = 99.6 -> gross = (99.6/100 - 1)*1e4 = -40 bps;
+        // net = -40 - 10.3 = -50.3.
+        let net = report["per_asset"]["TEST"]["total_net_bps"]
+            .as_f64()
+            .unwrap();
+        assert!((net - (-50.3)).abs() < 1e-9, "net {net}");
+    }
+
+    #[test]
+    fn maker_entry_refuses_a_time_exit_and_needs_tape_universe_and_binance_costs() {
+        let base: Vec<String> = [
+            "--matrix", "m", "--folds", "f", "--out", "o", "--entry", "maker",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = cmd_gate(&base).unwrap_err();
+        assert!(err.contains("--exit atr"), "{err}");
+        let mut a = base.clone();
+        a.extend(["--exit", "atr"].iter().map(|s| s.to_string()));
+        assert!(cmd_gate(&a).unwrap_err().contains("--tape-root"));
+        a.extend(["--tape-root", "t"].iter().map(|s| s.to_string()));
+        assert!(cmd_gate(&a).unwrap_err().contains("--universe"));
+        a.extend(
+            ["--universe", "u", "--data-root", "d", "--costs", "c"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert!(cmd_gate(&a).unwrap_err().contains("--binance-costs"));
+    }
+
+    #[test]
+    fn maker_cost_mode_is_one_maker_fee_one_taker_fee_half_spread_one_impact() {
+        let dc = DayCost {
+            spread_bps_p75: 4.0,
+            impact_bps: Some(2.0),
+            samples: 1,
+            impact_model: "b10".into(),
+        };
+        let taker = CostMode::Taker { fee_taker_bps: 4.5 }.round_trip(&dc, 2.0);
+        let maker = CostMode::MakerEntry {
+            fee_maker_bps: 1.8,
+            fee_taker_bps: 4.5,
+        }
+        .round_trip(&dc, 2.0);
+        assert!((taker - 17.0).abs() < 1e-12);
+        assert!((maker - 10.3).abs() < 1e-12);
     }
 
     /// A 3-minute hole INSIDE the horizon window (bars `entry+11..=

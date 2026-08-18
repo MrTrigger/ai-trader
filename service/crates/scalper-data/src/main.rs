@@ -5,6 +5,7 @@ mod books;
 mod costs;
 mod exits;
 mod gate;
+mod maker;
 mod matrix;
 mod micro_join;
 mod tape;
@@ -115,7 +116,7 @@ usage: scalper-data <command>
       output keyed by coin: {asset: {day: {spread_bps_p75, impact_bps,
       samples}}}. A candidate with no Binance UM listing is skipped.
 
-  gate --matrix <path> --folds <path/folds.json> (--costs <path> | --binance-costs <path> --fee-taker-bps F --fee-maker-bps F) [--threshold-mult 1.5] [--notional 5000] [--exit time|atr] [--data-root <dir>] --out <path>
+  gate --matrix <path> --folds <path/folds.json> (--costs <path> | --binance-costs <path> --fee-taker-bps F --fee-maker-bps F) [--threshold-mult 1.5] [--notional 5000] [--exit time|atr] [--data-root <dir>] [--entry taker|maker --tape-root <dir> --universe <path>] --out <path>
       Walk-forward gate: for each fold in folds.json, load fold-N.json (a
       LightGBM JSON dump), predict every matrix row in that fold's test
       window via lightgbm-json, and simulate a threshold-gated long/short
@@ -134,6 +135,14 @@ usage: scalper-data <command>
       daily P&L into one series and reports the annualized Sharpe gate
       (> 2.0 to PASS), plus overall.projected_30d_volume_usd and
       overall.fee_bps_used, to --out.
+      --entry maker (Amendment 5, requires --exit atr, --binance-costs,
+      --tape-root and --universe): a post-only limit at the signal bar's
+      close rests [C+1s, C+60s); filled only if the tape prints STRICTLY
+      through it (a print at our price never fills), fill minute resolved on
+      the tape from the fill onward, later bars on OHLC as Amendment 3; all
+      exits taker; round trip = fee_maker + fee_taker + spread_p75/2 +
+      impact. Report gains fill_stats and per-fold/per-asset
+      n_signals/n_fills; the taker path's report is byte-identical to before.
 
       --exit time (default) is Amendment 1's unchanged fixed-horizon exit -
       byte-identical to every gate run before Amendment 3. --exit atr
