@@ -903,8 +903,8 @@ fn load_matrix(path: &Path) -> Result<Matrix, String> {
         // allocated and dropped once per iteration, never retained past the
         // column-unpacking below - the whole point of streaming instead of
         // `Vec<MatrixRow>`.
-        let row: MatrixRow = serde_json::from_str(&line)
-            .map_err(|e| format!("{}: row: {e}", path.display()))?;
+        let row: MatrixRow =
+            serde_json::from_str(&line).map_err(|e| format!("{}: row: {e}", path.display()))?;
 
         ts.push(row.ts);
         let idx = *asset_lookup.entry(row.asset.clone()).or_insert_with(|| {
@@ -1133,9 +1133,11 @@ pub fn cmd_gate(args: &[String]) -> Result<(), String> {
     }
     let data_root: Option<PathBuf> = get(args, "--data-root").map(PathBuf::from);
     if exit_mode == "atr" && data_root.is_none() {
-        return Err("--data-root is required with --exit atr (to read 1m bars for stop/target \
+        return Err(
+            "--data-root is required with --exit atr (to read 1m bars for stop/target \
                      resolution)"
-            .into());
+                .into(),
+        );
     }
 
     let costs_path = get(args, "--costs").map(PathBuf::from);
@@ -2646,7 +2648,11 @@ mod tests {
                 "tree_structure": { "leaf_value": 100.0 },
             }] },
         });
-        std::fs::write(dir.join("fold-0.json"), serde_json::to_string(&model).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
 
         let costs_path = dir.join("costs.json");
         std::fs::write(&costs_path, "{}").unwrap();
@@ -2692,10 +2698,8 @@ mod tests {
         use chrono::{Duration, TimeZone};
         use features_scalper::{FEATURE_NAMES, FEATURE_SET_VERSION};
 
-        let dir = std::env::temp_dir().join(format!(
-            "scalper-gate-e2e-atr-exit-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("scalper-gate-e2e-atr-exit-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2765,7 +2769,11 @@ mod tests {
                 "tree_structure": { "leaf_value": 100.0 },
             }] },
         });
-        std::fs::write(dir.join("fold-0.json"), serde_json::to_string(&model).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("fold-0.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
 
         // Empty costs -> "TEST" falls back to DEFAULT_ROUND_TRIP_BPS (20.0).
         let costs_path = dir.join("costs.json");

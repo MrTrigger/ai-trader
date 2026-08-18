@@ -227,19 +227,24 @@ mod tests {
         let mid = 64000.5;
         let cost = walk_cost_bps(&asks, 128_002.0, mid, true).unwrap();
         assert!(cost > 0.0 && cost < 2.0, "got {cost} bps");
-        assert!(walk_cost_bps(&asks, 500_000.0, mid, true).is_none(), "book too thin");
+        assert!(
+            walk_cost_bps(&asks, 500_000.0, mid, true).is_none(),
+            "book too thin"
+        );
     }
 
     #[test]
     fn summaries_carry_medians_and_thin_books_stay_visible() {
-        let snaps: Vec<BookSnapshot> =
-            (0..5).map(|_| snap("BTC", 64000.0, 64001.0, 2.0)).collect();
+        let snaps: Vec<BookSnapshot> = (0..5).map(|_| snap("BTC", 64000.0, 64001.0, 2.0)).collect();
         let out = summarize(&snaps, &[5_000.0, 50_000_000.0]);
         let btc = &out["BTC"];
         assert_eq!(btc.samples, 5);
         assert!(btc.spread_bps_median > 0.0);
         assert!(btc.cross_bps["5000"].is_some());
-        assert!(btc.cross_bps["50000000"].is_none(), "an unabsorbable notional reads None, not 0");
+        assert!(
+            btc.cross_bps["50000000"].is_none(),
+            "an unabsorbable notional reads None, not 0"
+        );
     }
 
     #[test]

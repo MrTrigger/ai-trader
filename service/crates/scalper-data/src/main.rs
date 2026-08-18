@@ -7,6 +7,7 @@ mod exits;
 mod gate;
 mod matrix;
 mod micro_join;
+mod tape;
 mod universe;
 
 use std::collections::BTreeMap;
@@ -50,6 +51,17 @@ usage: scalper-data <command>
       pull-binance-perp. Assets with no UM listing are skipped with a
       warning. --sources restricts which of the four archives to pull
       (default: all).
+
+  pull-binance-tape --data-root <dir> --universe <file> --start YYYY-MM-DD --end YYYY-MM-DD [--concurrency N]
+      Amendment 5 (Program 2): store the RAW Binance UM aggTrades tape,
+      losslessly, one zstd Parquet file per mapped universe symbol per UTC
+      day under {data-root}/binance-micro/tape/{SYMBOL}/{YYYY-MM-DD}.parquet
+      (columns ts_ms, price, qty, is_buyer_maker; archive row order), plus
+      {data-root}/binance-micro/tape/manifest.json recording per symbol
+      every stored day's row count and every day the archive 404'd. Rows
+      are parsed by the same code path pull-binance-micro's flow reduction
+      uses. Resume-safe: a (symbol, day) already in the manifest is not
+      re-fetched. --concurrency symbols are pulled in parallel (default 8).
 
   record-books --data-root <dir> --seconds N --interval N [--assets A,B | --top N]
       Poll Hyperliquid L2 books at --interval seconds and append one JSON
@@ -404,6 +416,177 @@ fn read_funding_jsonl(path: &std::path::Path) -> Result<Vec<binance_micro::Fundi
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+async fn cmd_pull_binance_tape(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(need(args, "--data-root")?);
+    let universe_path = PathBuf::from(need(args, "--universe")?);
+    let start = parse_date(&need(args, "--start")?)?;
+    let end = parse_date(&need(args, "--end")?)?;
+    if start >= end {
+        return Err("--start must precede --end".into());
+    }
+    let concurrency: usize = match get(args, "--concurrency") {
+        Some(v) => v.parse().map_err(|e| format!("bad --concurrency: {e}"))?,
+        None => 8,
+    };
+    if concurrency == 0 {
+        return Err("--concurrency must be >= 1".into());
+    }
+
+    let text = std::fs::read_to_string(&universe_path)
+        .map_err(|e| format!("{}: {e}", universe_path.display()))?;
+    let candidates: Vec<universe::Candidate> =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", universe_path.display()))?;
+    let symbols: Vec<String> = candidates
+        .iter()
+        .filter_map(|c| c.binance_um.clone())
+        .collect();
+    if symbols.is_empty() {
+        return Err(format!(
+            "{}: no mapped Binance UM symbols",
+            universe_path.display()
+        ));
+    }
+
+    let tape_root = tape::tape_root(&root);
+    let manifest_path = tape::manifest_path(&tape_root);
+    let manifest = std::sync::Arc::new(std::sync::Mutex::new(tape::read_manifest(&manifest_path)?));
+    let days = binance_micro::days(start, end);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent("ai-trader-rust/0.1 (public archive)")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // One task per symbol, at most `concurrency` alive at once; each task
+    // walks its days sequentially. Parsing a busy day is CPU-heavy, so the
+    // parse runs on the blocking pool rather than the async threads.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+    for symbol in symbols.clone() {
+        let client = client.clone();
+        let tape_root = tape_root.clone();
+        let manifest = manifest.clone();
+        let manifest_path = manifest_path.clone();
+        let days = days.clone();
+        let semaphore = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.map_err(|e| e.to_string())?;
+            let mut fetched = 0usize;
+            let mut skipped = 0usize;
+            let mut missing = 0usize;
+            for day in days {
+                let already = manifest
+                    .lock()
+                    .expect("manifest mutex")
+                    .get(&symbol)
+                    .map(|m| m.has(day))
+                    .unwrap_or(false);
+                let path = tape::day_path(&tape_root, &symbol, day);
+                let present_on_disk = path.exists();
+                if already && (present_on_disk || manifest_says_missing(&manifest, &symbol, day)) {
+                    skipped += 1;
+                    continue;
+                }
+                let bytes = binance_micro::fetch_daily(
+                    &client,
+                    binance_micro::KIND_AGG_TRADES,
+                    &symbol,
+                    day,
+                )
+                .await?;
+                match bytes {
+                    None => {
+                        println!("{symbol} tape {day}: 404 (recorded as missing)");
+                        manifest
+                            .lock()
+                            .expect("manifest mutex")
+                            .entry(symbol.clone())
+                            .or_default()
+                            .record_missing(day);
+                        missing += 1;
+                    }
+                    Some(bytes) => {
+                        let sym = symbol.clone();
+                        let trades = tokio::task::spawn_blocking(move || {
+                            tape::parse_agg_trades_zip_raw(&bytes, &sym)
+                        })
+                        .await
+                        .map_err(|e| format!("{symbol}: parse task: {e}"))??;
+                        let n = trades.len();
+                        let path2 = path.clone();
+                        tokio::task::spawn_blocking(move || tape::write_day(&path2, &trades))
+                            .await
+                            .map_err(|e| format!("{symbol}: write task: {e}"))??;
+                        println!("{symbol} tape {day}: {n} trade(s)");
+                        manifest
+                            .lock()
+                            .expect("manifest mutex")
+                            .entry(symbol.clone())
+                            .or_default()
+                            .record_present(day, n as u64);
+                        fetched += 1;
+                    }
+                }
+                // Persist progress as we go so an interrupted pull resumes
+                // without re-fetching what it already has.
+                if (fetched + missing) % 10 == 0 {
+                    let snapshot = manifest.lock().expect("manifest mutex").clone();
+                    tape::write_manifest(&manifest_path, &snapshot)?;
+                }
+            }
+            let snapshot = manifest.lock().expect("manifest mutex").clone();
+            tape::write_manifest(&manifest_path, &snapshot)?;
+            println!("{symbol}: {fetched} fetched, {missing} 404, {skipped} already stored");
+            Ok::<(), String>(())
+        }));
+    }
+    let mut errors = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+    let snapshot = manifest.lock().expect("manifest mutex").clone();
+    tape::write_manifest(&manifest_path, &snapshot)?;
+
+    let mut total_rows = 0u64;
+    let mut total_days = 0usize;
+    let mut total_missing = 0usize;
+    for symbol in &symbols {
+        if let Some(m) = snapshot.get(symbol) {
+            total_days += m.present.len();
+            total_missing += m.missing.len();
+            total_rows += m.present.values().sum::<u64>();
+        }
+    }
+    println!(
+        "tape: {} symbol(s), {total_days} day(s) stored, {total_missing} day(s) 404, {total_rows} trade(s); manifest {}",
+        symbols.len(),
+        manifest_path.display()
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn manifest_says_missing(
+    manifest: &std::sync::Arc<std::sync::Mutex<tape::Manifest>>,
+    symbol: &str,
+    day: chrono::NaiveDate,
+) -> bool {
+    manifest
+        .lock()
+        .expect("manifest mutex")
+        .get(symbol)
+        .map(|m| m.missing.contains(&day))
+        .unwrap_or(false)
 }
 
 async fn cmd_pull_binance_micro(args: &[String]) -> Result<(), String> {
@@ -1006,8 +1189,8 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     // write_jsonl's doc comment for the failure mode this avoids).
     let tmp_path = tmp_sibling(&out_path);
     {
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp_path).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
         let manifest = Manifest {
             kind: "manifest",
             feature_set_version: features_scalper::FEATURE_SET_VERSION,
@@ -1061,6 +1244,19 @@ fn main() -> ExitCode {
                 }
             };
             runtime.block_on(cmd_pull_binance_perp(&args[1..]))
+        }
+        Some("pull-binance-tape") => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(cmd_pull_binance_tape(&args[1..]))
         }
         Some("pull-binance-micro") => {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1202,7 +1398,11 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(rows, vec![42], "the target must hold the new write, not the stale content");
+        assert_eq!(
+            rows,
+            vec![42],
+            "the target must hold the new write, not the stale content"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

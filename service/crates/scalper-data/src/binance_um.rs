@@ -154,7 +154,11 @@ pub fn parse_um_klines_zip(
                 cols.len()
             ));
         }
-        let ts = epoch_utc(cols[0].parse().map_err(|e| format!("{asset}: {e}: {line}"))?)?;
+        let ts = epoch_utc(
+            cols[0]
+                .parse()
+                .map_err(|e| format!("{asset}: {e}: {line}"))?,
+        )?;
         if ts < start || ts >= end {
             continue;
         }
@@ -173,7 +177,11 @@ pub fn parse_um_klines_zip(
             close: f(4)?,
             volume: f(5)?,
             quote_volume: Some(f(7)?),
-            trades: Some(cols[8].parse().map_err(|e| format!("{asset}: col 8: {e}"))?),
+            trades: Some(
+                cols[8]
+                    .parse()
+                    .map_err(|e| format!("{asset}: col 8: {e}"))?,
+            ),
         };
         bar.validate()?;
         bars.push(bar);
@@ -202,10 +210,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hl_coins_map_to_um_symbols() {
-        assert_eq!(
-            super::binance_um_symbol("BTC").as_deref(),
-            Some("BTCUSDT")
-        );
+        assert_eq!(super::binance_um_symbol("BTC").as_deref(), Some("BTCUSDT"));
         assert_eq!(
             super::binance_um_symbol("kPEPE").as_deref(),
             Some("1000PEPEUSDT")

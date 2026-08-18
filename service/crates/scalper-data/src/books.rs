@@ -95,8 +95,12 @@ mod tests {
     fn depth_caps_the_levels_kept() {
         let book = L2Book {
             levels: vec![
-                (0..30).map(|i| lvl(&format!("{}", 64000 - i), "1")).collect(),
-                (0..30).map(|i| lvl(&format!("{}", 64001 + i), "1")).collect(),
+                (0..30)
+                    .map(|i| lvl(&format!("{}", 64000 - i), "1"))
+                    .collect(),
+                (0..30)
+                    .map(|i| lvl(&format!("{}", 64001 + i), "1"))
+                    .collect(),
             ],
         };
         let s = snapshot_from_book("BTC", 0, &book, 10).unwrap();

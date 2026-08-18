@@ -397,6 +397,40 @@ fn parse_bool_ci(raw: &str) -> Option<bool> {
 /// `agg`) is skipped. `transact_time` uses the same ms/µs autodetect as
 /// klines' `open_time` (`binance_um::epoch_utc`); `is_buyer_maker` is
 /// parsed case-insensitively (`parse_bool_ci`).
+/// One parsed aggTrades CSV row - the raw tuple both consumers of the
+/// tape (this module's per-minute `FlowMinute` reduction and `tape.rs`'s
+/// lossless store, Amendment 5) are built from, so the two can never
+/// disagree on how a row is read. `None` for the header row some files
+/// carry (starts with `agg`) or an empty line.
+pub(crate) fn parse_agg_trade_row(
+    line: &str,
+    asset: &str,
+) -> Result<Option<(i64, f64, f64, bool)>, String> {
+    if line.is_empty() || line.starts_with("agg") {
+        return Ok(None);
+    }
+    let cols: Vec<&str> = line.split(',').collect();
+    if cols.len() < 7 {
+        return Err(format!(
+            "{asset}: aggTrades row has {} columns: {line}",
+            cols.len()
+        ));
+    }
+    let price: f64 = cols[1]
+        .parse()
+        .map_err(|e| format!("{asset}: price: {e}: {line}"))?;
+    let qty: f64 = cols[2]
+        .parse()
+        .map_err(|e| format!("{asset}: quantity: {e}: {line}"))?;
+    let raw_ts: i64 = cols[5]
+        .parse()
+        .map_err(|e| format!("{asset}: transact_time: {e}: {line}"))?;
+    let ts_ms = epoch_utc(raw_ts)?.timestamp_millis();
+    let is_buyer_maker = parse_bool_ci(cols[6].trim())
+        .ok_or_else(|| format!("{asset}: is_buyer_maker: bad value {:?}: {line}", cols[6]))?;
+    Ok(Some((ts_ms, price, qty, is_buyer_maker)))
+}
+
 fn parse_agg_trades_lines<I>(lines: I, asset: &str) -> Result<Vec<FlowMinute>, String>
 where
     I: Iterator<Item = std::io::Result<String>>,
@@ -405,33 +439,10 @@ where
     let mut cur: Option<MinuteAcc> = None;
     for line in lines {
         let line = line.map_err(|e| format!("{asset}: {e}"))?;
-        if line.is_empty() || line.starts_with("agg") {
+        let Some((ts_ms, price, qty, is_buyer_maker)) = parse_agg_trade_row(&line, asset)? else {
             continue; // header row some files carry
-        }
-        let cols: Vec<&str> = line.split(',').collect();
-        if cols.len() < 7 {
-            return Err(format!(
-                "{asset}: aggTrades row has {} columns: {line}",
-                cols.len()
-            ));
-        }
-        let price: f64 = cols[1]
-            .parse()
-            .map_err(|e| format!("{asset}: price: {e}: {line}"))?;
-        let qty: f64 = cols[2]
-            .parse()
-            .map_err(|e| format!("{asset}: quantity: {e}: {line}"))?;
-        let raw_ts: i64 = cols[5]
-            .parse()
-            .map_err(|e| format!("{asset}: transact_time: {e}: {line}"))?;
-        let ts = epoch_utc(raw_ts)?;
-        let is_buyer_maker = parse_bool_ci(cols[6].trim()).ok_or_else(|| {
-            format!("{asset}: is_buyer_maker: bad value {:?}: {line}", cols[6])
-        })?;
-
-        let ts_epoch = ts.timestamp();
-        let ts_ms = ts.timestamp_millis();
-        let minute = ts_epoch.div_euclid(60) * 60;
+        };
+        let minute = ts_ms.div_euclid(60_000) * 60;
 
         if cur.as_ref().map(|a| a.minute) != Some(minute) {
             if let Some(acc) = cur.take() {
@@ -676,11 +687,15 @@ mod tests {
             2026-08-12 00:00:31,1.00,60,660\n";
         let bytes = zip_with_one_file("BTCUSDT-bookDepth-2026-08-12.csv", csv.as_bytes());
         let rows = parse_book_depth_zip(&bytes, "BTCUSDT").unwrap();
-        assert_eq!(rows.len(), 1, "both snapshots fall in the same minute bucket");
+        assert_eq!(
+            rows.len(),
+            1,
+            "both snapshots fall in the same minute bucket"
+        );
         let row = &rows[0];
         assert_eq!(row.ts_s, 1_786_492_800); // 2026-08-12T00:00:00Z
-        // Only the LAST snapshot's (00:00:31) values survive, and only the
-        // ±0.2/±1.0 bands - the ±5% row never had a matching key at all.
+                                             // Only the LAST snapshot's (00:00:31) values survive, and only the
+                                             // ±0.2/±1.0 bands - the ±5% row never had a matching key at all.
         assert_eq!(row.bands.len(), 4);
         assert_eq!(row.bands["-1.0"], 600.0);
         assert_eq!(row.bands["-0.2"], 120.0);
@@ -759,7 +774,10 @@ mod tests {
         let asks = vec![(1_000, 99.90)];
         let bids = vec![(1_050, 100.00)];
         let (median, n, distinct_bids) = spread_estimate_bps(&asks, &bids);
-        assert_eq!(n, 0, "the only candidate sample was negative and got discarded");
+        assert_eq!(
+            n, 0,
+            "the only candidate sample was negative and got discarded"
+        );
         assert_eq!(distinct_bids, 0);
         assert!(median.is_none());
     }
@@ -832,8 +850,7 @@ mod tests {
         assert_eq!(m0.ts_s, 1_754_956_800);
         assert_eq!(m0.n_trades, 6);
         // notional = 100.10+100.00+100.20+100.00+100.30*2+100.10*2
-        let expected_notional =
-            100.10 + 100.00 + 100.20 + 100.00 + 100.30 * 2.0 + 100.10 * 2.0;
+        let expected_notional = 100.10 + 100.00 + 100.20 + 100.00 + 100.30 * 2.0 + 100.10 * 2.0;
         assert!((m0.notional - expected_notional).abs() < 1e-6);
         // buy (ask-side) notional = 100.10 + 100.20 + 100.30*2
         let expected_buy = 100.10 + 100.20 + 100.30 * 2.0;
@@ -934,7 +951,10 @@ mod tests {
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].ts_s, 100);
         assert_eq!(merged[1].ts_s, 200);
-        assert_eq!(merged[1].funding_rate, 0.00025, "fresh row wins on collision");
+        assert_eq!(
+            merged[1].funding_rate, 0.00025,
+            "fresh row wins on collision"
+        );
         assert_eq!(merged[2].ts_s, 300);
     }
 

@@ -234,9 +234,7 @@ mod tests {
         let clean = matrix_rows(&rows, &fwd, 1, "kTEST");
         let with_hostile = matrix_rows(&hostile_rows, &fwd, 1, "kTEST");
         assert!(
-            clean
-                .iter()
-                .any(|r| r.ts == bars[100].ts_utc.timestamp())
+            clean.iter().any(|r| r.ts == bars[100].ts_utc.timestamp())
                 && clean.iter().any(|r| r.ts == bars[101].ts_utc.timestamp()),
             "rows 100/101 must be warm and kept without corruption, or this test proves nothing"
         );

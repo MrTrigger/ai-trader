@@ -286,7 +286,10 @@ mod tests {
         let bars = minute_bars(&ohlc);
         let atr = atr14(&bars);
         assert_eq!(atr.len(), 16);
-        assert!(atr[..14].iter().all(Option::is_none), "indices 0..=13 must be None: {atr:?}");
+        assert!(
+            atr[..14].iter().all(Option::is_none),
+            "indices 0..=13 must be None: {atr:?}"
+        );
         assert!(atr[14].is_some(), "index 14 must be the seeded ATR");
 
         // Hand-compute the seed: TR_t for t=1..=14 uses close_{t-1} =

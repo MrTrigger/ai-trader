@@ -3177,12 +3177,15 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 name = "scalper-data"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "chrono",
  "crypto-portfolio",
  "features-crypto",
  "features-scalper",
  "hyperliquid",
  "lightgbm-json",
+ "parquet",
  "reqwest",
  "serde",
  "serde_json",

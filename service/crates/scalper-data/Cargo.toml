@@ -15,9 +15,12 @@ venue.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
+arrow-array = "56"
+arrow-schema = "56"
+parquet = { version = "56", features = ["arrow"] }
 
 [[bin]]
 name = "scalper-data"
