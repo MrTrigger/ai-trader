@@ -201,6 +201,8 @@ mod tests {
             &bars,
             &full_micro(&bars),
             &mut features_scalper::SyntheticTape,
+            &features_scalper::btc_tick_context(&bars, &mut features_scalper::SyntheticTape)
+                .unwrap(),
         )
         .unwrap();
         let fwd = forward_returns_bps(&bars, &[15]);
@@ -233,6 +235,8 @@ mod tests {
             &bars,
             &full_micro(&bars),
             &mut features_scalper::SyntheticTape,
+            &features_scalper::btc_tick_context(&bars, &mut features_scalper::SyntheticTape)
+                .unwrap(),
         )
         .unwrap();
         let fwd = forward_returns_bps(&bars, &[1]);
@@ -276,6 +280,7 @@ mod tests {
             &bars,
             &vec![None; bars.len()],
             &mut features_scalper::NoTape,
+            &features_scalper::BtcTickContext::new(),
         )
         .unwrap();
         let fwd = forward_returns_bps(&bars, &[15]);

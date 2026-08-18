@@ -1121,6 +1121,38 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     // feature row, including BTC's own - so this is a hard failure, not a
     // skip-with-warning like a missing per-asset store dir below.
     let btc_bars = store::read_asset(&perp_root, 60, "BTC")?;
+    // BTC's Binance symbol for the fs-6 BTC tape cursor - from the universe
+    // file, the sole identity source. Required only when a tape root is
+    // given; "BTCUSDT" is not assumed.
+    // Computed once over BTC's own bars and tape (Amendment 6 §6.1: BTC's
+    // coverage discipline, not the asset's) and shared by every asset.
+    let btc_context: features_scalper::BtcTickContext = match &tape_root {
+        Some(root) => {
+            let btc_symbol = candidates
+                .iter()
+                .find(|c| c.coin.eq_ignore_ascii_case("BTC"))
+                .and_then(|c| c.binance_um.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: --tape-root given but the universe has no mapped BTC entry (fs-6 needs BTC's tape)",
+                        universe_path.display()
+                    )
+                })?;
+            let mut btc_cursor = tape::TapeCursor::new(root, &btc_symbol);
+            let ctx = features_scalper::btc_tick_context(&btc_bars, &mut btc_cursor)?;
+            let covered = ctx
+                .values()
+                .filter(|v| v.iter().all(Option::is_some))
+                .count();
+            println!(
+                "BTC tick context: {} minute(s), {} fully covered",
+                ctx.len(),
+                covered
+            );
+            ctx
+        }
+        None => features_scalper::BtcTickContext::new(),
+    };
     if btc_bars.is_empty() {
         return Err(format!(
             "no BTC bars in {} - BTC context (btc_ret_5, rel_ret_5) is required for every \
@@ -1161,14 +1193,22 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         };
         let cov = coverage_starts(&bars, &micro);
 
+        // Amendment 6 (fs-6): BTC's tape is served alongside the asset's,
+        // keyed on the universe file's BTC symbol - the same identity rule
+        // as everything else. For BTC itself the two cursors read the same
+        // symbol (rel_tk_ret_30s = 0 by construction).
         let feature_rows = match (&tape_root, candidate.binance_um.as_ref()) {
             (Some(root), Some(symbol)) => {
                 let mut cursor = tape::TapeCursor::new(root, symbol);
-                features_scalper::compute(&bars, &btc_bars, &micro, &mut cursor)?
+                features_scalper::compute(&bars, &btc_bars, &micro, &mut cursor, &btc_context)?
             }
-            _ => {
-                features_scalper::compute(&bars, &btc_bars, &micro, &mut features_scalper::NoTape)?
-            }
+            _ => features_scalper::compute(
+                &bars,
+                &btc_bars,
+                &micro,
+                &mut features_scalper::NoTape,
+                &btc_context,
+            )?,
         };
         let tape_from = feature_rows
             .iter()
@@ -1789,8 +1829,8 @@ mod tests {
         assert!(rows.iter().any(|r| r.asset == "kTEST"));
         assert!(rows.iter().all(|r| r.asset == "BTC" || r.asset == "kTEST"));
         assert!(
-            rows.iter().all(|r| r.features.len() == 50),
-            "fs-5 rows carry all 50 features"
+            rows.iter().all(|r| r.features.len() == 56),
+            "fs-6 rows carry all 56 features"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -1850,7 +1890,7 @@ mod tests {
         let content = std::fs::read_to_string(&out_path).unwrap();
         let mut lines = content.lines();
         let manifest: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-5");
+        assert_eq!(manifest["feature_set_version"], "fs-rust-scalper-6");
         let rows: Vec<matrix::MatrixRow> =
             lines.map(|l| serde_json::from_str(l).unwrap()).collect();
         assert!(

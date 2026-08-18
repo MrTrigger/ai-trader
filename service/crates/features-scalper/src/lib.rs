@@ -77,6 +77,17 @@
 //! ms, strictly before the bar's close; a `None` minute or a skipped minute
 //! breaks tape coverage and the tick windows restart from empty.
 //!
+//! fs-6 (`fs-rust-scalper-6`, Amendment 6) appends six BTC-context tick
+//! features (indices 50-55): Amendment 5's rows 43/44/39/40/46 evaluated on
+//! BTC's tape at the SAME close as the asset's bar - computed ONCE over
+//! BTC's own bar sequence by `btc_tick_context` (its own `TickState`, the
+//! same window/coverage rules; coverage breaks on a None or skipped BTC
+//! minute, never on the asset's gaps) and joined by exact timestamp - plus
+//! `rel_tk_ret_30s` = own minus BTC. For BTC itself the caller passes BTC's tape for both sources, so
+//! 50-54 equal 43/44/39/40/46 and 55 is 0.0 - the `btc_ret_5`/`rel_ret_5`
+//! convention. Indices 0-49 are byte-for-byte fs-5; a `NoTape` BTC source
+//! reproduces fs-5's 50 values with six `None`s appended (asserted below).
+//!
 //! Validity invariant: a feature is `Some` only if it is finite. Every
 //! formula above is expected to guard its own known non-finite cases
 //! (e.g. `oi_change_60` requires both OI endpoints to be strictly
@@ -97,9 +108,9 @@ pub use tick::{
     NoTape, SyntheticTape, TapeMinute, TapeSource, TapeTrade, TickState, TICK_FEATURE_NAMES,
 };
 
-pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-5";
+pub const FEATURE_SET_VERSION: &str = "fs-rust-scalper-6";
 
-pub const FEATURE_NAMES: [&str; 50] = [
+pub const FEATURE_NAMES: [&str; 56] = [
     "ret_1",
     "ret_3",
     "ret_5",
@@ -152,6 +163,13 @@ pub const FEATURE_NAMES: [&str; 50] = [
     "tk_notional_ratio_30s",
     "tk_impact_5m",
     "tk_size_med_5m_log",
+    // fs-6 (Amendment 6): BTC tick context, indices 50-55.
+    "btc_tk_ret_10s",
+    "btc_tk_ret_30s",
+    "btc_tk_imb_30s",
+    "btc_tk_imb_5m",
+    "btc_tk_intensity_10s",
+    "rel_tk_ret_30s",
 ];
 
 const EPS: f64 = 1e-12;
@@ -187,18 +205,43 @@ pub struct FeatureRow {
     pub values: Vec<Option<f64>>,
 }
 
-/// Compute the 50-feature row set for `bars` (one asset's ascending 1m
+/// Compute the 56-feature row set for `bars` (one asset's ascending 1m
 /// bars), using `btc_bars` (BTC's ascending 1m bars, ascending) as context
 /// for `btc_ret_5` / `rel_ret_5`, and `micro` (one slot per bar, same
 /// length as `bars`) for the 12 fs-3 microstructure features. Pass the
 /// same slice for `bars`/`btc_bars` to compute BTC's own rows. `micro[i]
 /// == None` means no micro data was available that minute, so all 12 new
 /// features are `None` at that row; the 26 fs-1 features are unaffected.
+/// fs-6 BTC context: Amendment 5's twelve tick features evaluated over
+/// BTC's OWN ascending 1m bars and tape, keyed by bar timestamp. Computed
+/// once by the caller and shared across every asset's `compute` call; an
+/// asset bar whose timestamp is absent here gets `None` for indices 50-55.
+pub type BtcTickContext = BTreeMap<i64, [Option<f64>; 12]>;
+
+/// Run `TickState` over `btc_bars`'s minutes against `btc_tape`. Coverage
+/// discipline is BTC's alone (a None or skipped BTC minute breaks it), so
+/// an asset's own gaps never blank its BTC context.
+pub fn btc_tick_context(
+    btc_bars: &[Bar],
+    btc_tape: &mut dyn TapeSource,
+) -> Result<BtcTickContext, String> {
+    validate_ascending(btc_bars)?;
+    let mut state = TickState::new();
+    let mut out = BTreeMap::new();
+    for b in btc_bars {
+        let ts = b.ts_utc.timestamp();
+        let minute = btc_tape.minute(ts)?;
+        out.insert(ts, state.push(ts, minute));
+    }
+    Ok(out)
+}
+
 pub fn compute(
     bars: &[Bar],
     btc_bars: &[Bar],
     micro: &[Option<MicroMinute>],
     tape: &mut dyn TapeSource,
+    btc_context: &BtcTickContext,
 ) -> Result<Vec<FeatureRow>, String> {
     validate_ascending(bars)?;
     validate_ascending(btc_bars)?;
@@ -485,6 +528,20 @@ pub fn compute(
         let tk = tick_state.push(minute_ts_s, tape_minute);
         values[38..50].copy_from_slice(&tk);
 
+        // fs-6 (Amendment 6): BTC tick context at the same close - rows
+        // 43/44/39/40/46 of Amendment 5's table on BTC's tape, and own
+        // minus BTC 30 s return.
+        let btk = btc_context.get(&minute_ts_s).copied().unwrap_or([None; 12]);
+        values[50] = btk[5]; // tk_ret_10s on BTC
+        values[51] = btk[6]; // tk_ret_30s on BTC
+        values[52] = btk[1]; // tk_imb_30s on BTC
+        values[53] = btk[2]; // tk_imb_5m on BTC
+        values[54] = btk[8]; // tk_intensity_10s on BTC
+        values[55] = match (tk[6], btk[6]) {
+            (Some(own), Some(btc)) => Some(own - btc),
+            _ => None,
+        };
+
         // Validity invariant, enforced once for every feature regardless
         // of how it was derived above: a feature is `Some` only if it is
         // finite. NaN/inf is never a valid feature value - it means an
@@ -661,7 +718,14 @@ mod tests {
     #[test]
     fn one_row_per_bar_and_cold_windows_are_none_not_zero() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 70);
         assert!(rows[0].values[i("ret_1")].is_none(), "no history yet");
         assert!(
@@ -678,8 +742,22 @@ mod tests {
     fn appending_bars_never_changes_emitted_rows() {
         let long = ramp(200);
         let short: Vec<Bar> = long[..150].to_vec();
-        let a = compute(&short, &short, &no_micro(150), &mut NoTape).unwrap();
-        let b = compute(&long, &long, &no_micro(200), &mut NoTape).unwrap();
+        let a = compute(
+            &short,
+            &short,
+            &no_micro(150),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
+        let b = compute(
+            &long,
+            &long,
+            &no_micro(200),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.ts_utc, y.ts_utc);
             assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
@@ -711,8 +789,22 @@ mod tests {
             .collect();
         let short: Vec<Bar> = long[..150].to_vec();
         let short_micro: Vec<Option<MicroMinute>> = long_micro[..150].to_vec();
-        let a = compute(&short, &short, &short_micro, &mut NoTape).unwrap();
-        let b = compute(&long, &long, &long_micro, &mut NoTape).unwrap();
+        let a = compute(
+            &short,
+            &short,
+            &short_micro,
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
+        let b = compute(
+            &long,
+            &long,
+            &long_micro,
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         for (x, y) in a.iter().zip(b.iter().take(150)) {
             assert_eq!(x.values, y.values, "append changed history at {}", x.ts_utc);
         }
@@ -725,7 +817,14 @@ mod tests {
         for b in bars.iter_mut().skip(65) {
             b.ts_utc += Duration::minutes(10);
         }
-        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert!(rows[64].values[i("ret_1")].is_some(), "warm before the gap");
         assert!(
             rows[65].values[i("ret_1")].is_none(),
@@ -737,28 +836,49 @@ mod tests {
     #[test]
     fn btc_context_aligns_by_timestamp_and_rel_ret_is_zero_for_btc_itself() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         let last = &rows[69];
         assert_eq!(last.values[i("btc_ret_5")], last.values[i("ret_5")]);
         assert_eq!(last.values[i("rel_ret_5")], Some(0.0));
         // Missing BTC ts -> None
         let mut btc = ramp(70);
         btc.retain(|b| b.ts_utc != bars[69].ts_utc);
-        let rows2 = compute(&bars, &btc, &no_micro(70), &mut NoTape).unwrap();
+        let rows2 = compute(
+            &bars,
+            &btc,
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert!(rows2[69].values[i("btc_ret_5")].is_none());
         assert!(rows2[69].values[i("rel_ret_5")].is_none());
     }
 
     #[test]
     fn the_catalog_is_the_contract() {
-        assert_eq!(FEATURE_NAMES.len(), 50);
-        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-5");
-        assert_eq!(&FEATURE_NAMES[38..], &TICK_FEATURE_NAMES[..]);
+        assert_eq!(FEATURE_NAMES.len(), 56);
+        assert_eq!(FEATURE_SET_VERSION, "fs-rust-scalper-6");
+        assert_eq!(&FEATURE_NAMES[38..50], &TICK_FEATURE_NAMES[..]);
         assert_eq!(FEATURE_NAMES[27], "depth_10_z_60");
         assert_eq!(FEATURE_NAMES[28], "depth_imb_10");
         assert_eq!(FEATURE_NAMES[29], "depth_10_log");
         assert_eq!(FEATURE_NAMES[37], "depth_imb_10_m15");
-        let rows = compute(&ramp(70), &ramp(70), &no_micro(70), &mut NoTape).unwrap();
+        let rows = compute(
+            &ramp(70),
+            &ramp(70),
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert_eq!(rows[0].values.len(), FEATURE_NAMES.len());
     }
 
@@ -785,24 +905,115 @@ mod tests {
                 })
             })
             .collect();
-        let without = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
-        let with = compute(&bars, &bars, &micro, &mut SyntheticTape).unwrap();
+        let without = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
+        let with = compute(
+            &bars,
+            &bars,
+            &micro,
+            &mut SyntheticTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         for (a, b) in without.iter().zip(with.iter()) {
             assert_eq!(&a.values[..38], &b.values[..38]);
             assert!(a.values[38..].iter().all(Option::is_none));
         }
-        // With sixty covered minutes behind it, every tick feature is Some.
+        // With sixty covered minutes behind it, every own tick feature is
+        // Some; with NoTape for BTC, 50-55 are None (fs-5 parity).
         assert!(
-            with[149].values[38..].iter().all(Option::is_some),
+            with[149].values[38..50].iter().all(Option::is_some),
             "{:?}",
-            &with[149].values[38..]
+            &with[149].values[38..50]
         );
+        assert!(with[149].values[50..56].iter().all(Option::is_none));
+    }
+
+    /// fs-6: BTC context = Amendment 5 rows 43/44/39/40/46 on BTC's tape;
+    /// BTC-as-own makes 50-54 equal the own features and 55 exactly 0.0; a
+    /// BTC minute that is None blanks 50-55 while 38-49 stand.
+    #[test]
+    fn btc_tick_context_is_the_own_features_on_btcs_tape_and_rel_is_own_minus_btc() {
+        let bars = ramp(150);
+        let ctx_same = btc_tick_context(&bars, &mut SyntheticTape).unwrap();
+        let a = compute(&bars, &bars, &no_micro(150), &mut SyntheticTape, &ctx_same).unwrap();
+        let r = &a[149].values;
+        assert_eq!(r[50], r[i("tk_ret_10s")]);
+        assert_eq!(r[51], r[i("tk_ret_30s")]);
+        assert_eq!(r[52], r[i("tk_imb_30s")]);
+        assert_eq!(r[53], r[i("tk_imb_5m")]);
+        assert_eq!(r[54], r[i("tk_intensity_10s")]);
+        assert_eq!(r[55], Some(0.0));
+        struct Shifted;
+        impl TapeSource for Shifted {
+            fn minute(&mut self, m: i64) -> Result<Option<TapeMinute>, String> {
+                let mut t = SyntheticTape::minute_trades(m);
+                for x in t.iter_mut() {
+                    x.price *= 1.0 + 0.0001 * ((m / 60) % 7) as f64;
+                }
+                Ok(Some(TapeMinute { trades: t }))
+            }
+        }
+        let ctx_shift = btc_tick_context(&bars, &mut Shifted).unwrap();
+        let b = compute(&bars, &bars, &no_micro(150), &mut SyntheticTape, &ctx_shift).unwrap();
+        let rb = &b[149].values;
+        assert_eq!(
+            &rb[38..50],
+            &r[38..50],
+            "own features are unaffected by the BTC source"
+        );
+        let own = rb[i("tk_ret_30s")].unwrap();
+        let btc = rb[51].unwrap();
+        assert!((rb[55].unwrap() - (own - btc)).abs() < 1e-12);
+        assert!(rb[55] != Some(0.0));
+        struct Gappy(i64);
+        impl TapeSource for Gappy {
+            fn minute(&mut self, m: i64) -> Result<Option<TapeMinute>, String> {
+                if m == self.0 {
+                    return Ok(None);
+                }
+                Ok(Some(TapeMinute {
+                    trades: SyntheticTape::minute_trades(m),
+                }))
+            }
+        }
+        let gap_idx = 120usize; // well past the 60-minute warm-up
+        let ctx_gap =
+            btc_tick_context(&bars, &mut Gappy(bars[gap_idx].ts_utc.timestamp())).unwrap();
+        let c = compute(&bars, &bars, &no_micro(150), &mut SyntheticTape, &ctx_gap).unwrap();
+        assert!(c[gap_idx].values[50..56].iter().all(Option::is_none));
+        assert!(c[gap_idx].values[38..50].iter().all(Option::is_some));
+        assert_eq!(&c[gap_idx].values[..50], &a[gap_idx].values[..50]);
+        // An asset gap does NOT blank BTC context: drop the asset's bar at
+        // gap_idx+1 (BTC keeps it) - at the asset's next bar 50-55 are the
+        // BTC values for that timestamp, unaffected.
+        let mut gapped_bars = bars.clone();
+        gapped_bars.remove(gap_idx + 1);
+        let g = compute(
+            &gapped_bars,
+            &bars,
+            &no_micro(149),
+            &mut SyntheticTape,
+            &ctx_same,
+        )
+        .unwrap();
+        let next = &g[gap_idx + 1]; // the bar after the removed one
+        let full = &a[gap_idx + 2];
+        assert_eq!(next.ts_utc, full.ts_utc);
+        assert_eq!(&next.values[50..55], &full.values[50..55]);
+        assert!(next.values[50].is_some());
     }
 
     #[test]
     fn micro_length_mismatch_is_rejected() {
         let bars = ramp(10);
-        let err = compute(&bars, &bars, &no_micro(9), &mut NoTape).unwrap_err();
+        let err = compute(
+            &bars,
+            &bars,
+            &no_micro(9),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("micro.len()"), "got: {err}");
     }
 
@@ -813,7 +1024,14 @@ mod tests {
     #[test]
     fn micro_all_none_reproduces_fs1_and_nones_the_rest() {
         let bars = ramp(70);
-        let rows = compute(&bars, &bars, &no_micro(70), &mut NoTape).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &no_micro(70),
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
 
         // Golden values for row 65 of `ramp(70)`, pinned bit-for-bit. These
         // literals ARE fs-1's outputs on this input: `is_some()` alone lets
@@ -855,7 +1073,7 @@ mod tests {
             ask_10: Some(300.0),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         let expect_imb10 = (500.0 - 300.0) / (500.0 + 300.0 + EPS);
         assert!((rows[4].values[i("depth_imb_10")].unwrap() - expect_imb10).abs() < 1e-12);
         // No micro data at all that minute -> None, not a fabricated ratio.
@@ -874,7 +1092,7 @@ mod tests {
             ask_10: Some(300.0),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         let expect = (500.0_f64 + 300.0 + EPS).ln();
         assert!((rows[4].values[i("depth_10_log")].unwrap() - expect).abs() < 1e-12);
 
@@ -884,7 +1102,7 @@ mod tests {
             ask_10: None,
             ..Default::default()
         });
-        let rows2 = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows2 = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(rows2[4].values[i("depth_10_log")].is_none());
     }
 
@@ -910,7 +1128,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(
             rows[13].values[i("depth_imb_10_m15")].is_none(),
             "only 14 minutes of history"
@@ -935,7 +1153,7 @@ mod tests {
         // requirement rather than averaging over a gap.
         let mut micro2 = micro.clone();
         micro2[10] = None;
-        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape).unwrap();
+        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(rows2[19].values[i("depth_imb_10_m15")].is_none());
     }
 
@@ -950,7 +1168,7 @@ mod tests {
             taker_ls_ratio: Some(1.4),
             ..Default::default()
         });
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert_eq!(rows[19].values[i("funding_rate_bps")], Some(0.0001 * 1e4));
         assert_eq!(rows[19].values[i("taker_buy_ratio")], Some(0.62));
         assert_eq!(rows[19].values[i("taker_ls_ratio")], Some(1.4));
@@ -974,7 +1192,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(
             rows[58].values[i("oi_change_60")].is_none(),
             "not yet 61 minutes of history since the last reset"
@@ -987,7 +1205,7 @@ mod tests {
         // ratio against a stale substitute.
         let mut micro2 = micro.clone();
         micro2[0] = None;
-        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape).unwrap();
+        let rows2 = compute(&bars, &bars, &micro2, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(rows2[60].values[i("oi_change_60")].is_none());
     }
 
@@ -1016,7 +1234,14 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &zero_old_at_60, &mut NoTape).unwrap();
+        let rows = compute(
+            &bars,
+            &bars,
+            &zero_old_at_60,
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert!(
             rows[60].values[i("oi_change_60")].is_none(),
             "old OI of 0.0 must not produce a value (ln(x/0) is inf)"
@@ -1038,7 +1263,14 @@ mod tests {
                 })
             })
             .collect();
-        let rows2 = compute(&bars, &bars, &negative_old_at_60, &mut NoTape).unwrap();
+        let rows2 = compute(
+            &bars,
+            &bars,
+            &negative_old_at_60,
+            &mut NoTape,
+            &BtcTickContext::new(),
+        )
+        .unwrap();
         assert!(
             rows2[60].values[i("oi_change_60")].is_none(),
             "negative old OI must not produce a value (ln of a negative ratio is NaN)"
@@ -1048,8 +1280,8 @@ mod tests {
     /// Hostile synthetic input designed to try to coax a non-finite value
     /// out of every rolling/ratio feature at once (zero and negative OI
     /// endpoints, zero depth on both sides, degenerate spread/taker
-    /// inputs). No matter what upstream data throws at `compute(, &mut NoTape)`, no
-    /// row may contain `Some(NaN)`/`Some(inf)` - the compute(, &mut NoTape)-wide
+    /// inputs). No matter what upstream data throws at `compute(, &mut NoTape, &BtcTickContext::new())`, no
+    /// row may contain `Some(NaN)`/`Some(inf)` - the compute(, &mut NoTape, &BtcTickContext::new())-wide
     /// finite sweep is the last line of defense even if a future formula
     /// forgets its own guard.
     #[test]
@@ -1075,7 +1307,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         for (idx, row) in rows.iter().enumerate() {
             for (fi, v) in row.values.iter().enumerate() {
                 if let Some(x) = v {
@@ -1103,7 +1335,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(
             rows[13].values[i("taker_buy_ratio_m15")].is_none(),
             "only 14 minutes of history"
@@ -1138,7 +1370,7 @@ mod tests {
                 })
             })
             .collect();
-        let rows = compute(&bars, &bars, &micro, &mut NoTape).unwrap();
+        let rows = compute(&bars, &bars, &micro, &mut NoTape, &BtcTickContext::new()).unwrap();
         assert!(
             rows[64].values[i("depth_10_z_60")].is_some(),
             "60-wide clean window before the gap"
