@@ -666,3 +666,203 @@ recommends none of them over the others or over stopping entirely:
 Any of these would require its own amendment, its own feature-set version,
 its own matrix rebuild, and its own fresh gate run — the protocol does not
 distinguish a "small" continuation from a full new run.
+
+## Amendment 5 (2026-08-18): Program 2 — tick order flow (fs-5) and maker entry, pre-registered
+
+*(This section opens a NEW signal program under the terms the closure
+section above sets: a new `FEATURE_SET_VERSION`, every changed definition
+written here before a single number exists, then the protocol run again from
+a fresh first run. It amends, and does not delete, §1–6 and Amendments 1–4.
+Where it conflicts with them it governs; everything it does not name is
+unchanged. At the moment this text is written no fs-5 code, no tape store,
+no maker fill path and no gate-run-5 number exists.)*
+
+**Why this program, and what did and did not inform it.** Gate run 4 is the
+record and it FAILED. Its diagnostics are on file and two of them are the
+reason this program exists — read as *where* the edge is lost, not as
+numbers to tune against: (i) with minute-aggregated inputs the honest pooled
+IC is ≈0.04 at h15 and ≈0 by h60, and (ii) 99.7% of predictions never
+clear a taker round trip of ~11–46 bps, so the strategy hardly trades even
+though it is cost-positive when it does. Both point at the same object the
+current pipeline throws away: the raw Binance aggTrades tape.
+`binance_micro.rs` downloads it daily and reduces it to one `FlowMinute` per
+minute; the trades themselves are never stored. Program 2 keeps the tape and
+uses it for two things at once — sub-minute order-flow features (signal
+side) and a pessimistic maker fill model (cost side). No parameter below is
+derived from any run-4 P&L, Sharpe, IC, per-asset or per-fold figure; each is
+either an a-priori microstructure convention or a definitional consequence,
+and this statement is made so it can be checked against the diff.
+
+**Data availability, verified 2026-08-18.** `data.binance.vision/data/
+futures/um/daily/aggTrades/<SYMBOL>/<SYMBOL>-aggTrades-<date>.zip` and
+`.../trades/...` return HTTP 200 (BTCUSDT 2026-07-15: 13.6 MB and 22.0 MB
+compressed); `.../bookTicker/...` returns 404 for UM futures. So this
+program has the trade tape (price, quantity, `transact_time` in ms,
+`is_buyer_maker`) and does NOT have a tick-level best bid/ask. Every
+definition below is written against the trade tape only; nothing here
+assumes book state between bookDepth snapshots.
+
+### 5.1 The tape store (new; the only addition to the frozen data)
+
+- New `scalper-data` subcommand `pull-binance-tape`: fetch the daily
+  aggTrades archive for every mapped universe symbol and store it losslessly
+  as `data/binance-micro/tape/<SYMBOL>/<YYYY-MM-DD>.parquet` with columns
+  `ts_ms: i64` (`transact_time`), `price: f64`, `qty: f64`,
+  `is_buyer_maker: bool`, in archive row order. Same k-prefix identity rule
+  as every other puller (the universe file is the sole identity source).
+- **Span: 2024-08-01 through 2026-08-15 inclusive** — the exact archive
+  window run 4's `binance-costs` and `training-matrix` were built on. Not
+  one day more: run 5's matrix span must equal run 4's so the two records
+  differ only in what this amendment changes.
+- **Every other store is frozen byte-for-byte as run 4 left it**: `data/perp`,
+  `data/binance-micro/{book,flow,metrics,funding}`, `data/scalper-universe.
+  json`, `data/binance-micro/costs-daily-3b.json`. No pull, backfill or
+  universe refresh of any kind. The universe is run 4's 24 mapped assets.
+- The pull must COMPLETE before the matrix is built. A per-symbol manifest
+  (`data/binance-micro/tape/manifest.json`: days present, days the archive
+  404'd, row counts) is written by the puller and reported in the run-5
+  record. A missing tape day makes every fs-5 tick feature `None` for that
+  asset-day, so `training-matrix`'s all-Some rule drops those rows — the
+  same way a missing bookDepth day already drops rows; no imputation.
+
+### 5.2 fs-5: twelve tick features appended, the 38 fs-4 features untouched
+
+`FEATURE_SET_VERSION = "fs-rust-scalper-5"`, 50 features. Indices 0–37 are
+byte-for-byte fs-4 (same names, formulas, joins — Amendment 4's causal
+metrics join included). Indices 38–49 are new and are computed by
+`features-scalper` from a per-bar `TapeWindow` the CALLER assembles from
+the tape store, in the same pattern as `MicroMinute`: the feature crate
+never opens a tape file.
+
+Conventions, binding for all twelve: a bar with open time `T` is evaluated at
+its close `C = T + 60 s`. A window of length `W` is the half-open interval
+`[C − W, C)` in `ts_ms`, i.e. **strictly before the close** — no trade at or
+after `C` is visible. `buy` = taker buy = `is_buyer_maker == false`; `sell`
+mirrored. Notional = `price × qty`. `eps = 1e-12`. Bar-gap reset (>120 s
+between consecutive bars) resets the 60-minute baselines exactly as every
+other rolling window in the crate. As everywhere in the crate: `Some` only if
+finite; any `None` input → `None` output.
+
+| # | name | definition |
+|---|------|------------|
+| 38 | `tk_imb_10s` | `(buy_notional − sell_notional) / (buy_notional + sell_notional)` over W = 10 s; `None` if no trades in the window |
+| 39 | `tk_imb_30s` | same, W = 30 s |
+| 40 | `tk_imb_5m` | same, W = 300 s |
+| 41 | `tk_large_imb_5m` | same imbalance over W = 300 s restricted to trades whose notional is in the top decile of that window's own trades (≥ the window's p90 notional, `costs::percentile`); `None` if the window has < 10 trades |
+| 42 | `tk_run` | signed length of the run of consecutive same-side trades ending at the last trade before `C` (positive = buys), clipped to ±50, counted within W = 300 s; `None` if no trades in the window |
+| 43 | `tk_ret_10s` | `1e4 · ln(p_last / p_ref)`, `p_last` = price of the last trade before `C`, `p_ref` = price of the last trade before `C − 10 s`; `None` if either is missing within W = 300 s |
+| 44 | `tk_ret_30s` | same with `C − 30 s` |
+| 45 | `tk_vwap_dev_30s` | `1e4 · (p_last − vwap_30s) / vwap_30s`, notional-weighted vwap over W = 30 s; `None` if no trades |
+| 46 | `tk_intensity_10s` | `ln((n_10s + 1) / (n_60m / 360 + 1))`: trade count in the last 10 s against the trailing-60-minute count scaled to 10 s; `None` unless the 60-minute baseline window is full (60 minutes of tape coverage without a bar gap) |
+| 47 | `tk_notional_ratio_30s` | `ln((notional_30s + 1) / (notional_60m / 120 + 1))`, same baseline discipline as 46 |
+| 48 | `tk_impact_5m` | Kyle-λ proxy: over the 30 consecutive 10-second buckets in `[C − 300, C)`, `x_i` = signed notional (buy − sell) of bucket `i`, `y_i` = `1e4 · ln(last_i / last_{i−1})` (last trade price of the bucket; a bucket with no trades inherits the prior last, giving `y_i = 0`, `x_i = 0`); feature = `cov(x, y) / var(x)` × 1e6 (bps per $1M signed); `None` if fewer than 10 of the 30 buckets contain a trade or `var(x) = 0` |
+| 49 | `tk_size_med_5m_log` | `ln(median trade notional + 1)` over W = 300 s; `None` if no trades |
+
+Why these twelve and these windows: 10 s / 30 s / 5 min are the standard
+short/medium/long microstructure horizons; imbalance, large-print
+imbalance, aggressor run, sub-minute return, vwap deviation, intensity,
+notional surprise, price impact and trade size are the textbook order-flow
+family. Exactly this set is run; no feature is added, dropped or re-windowed
+after a number exists. fs-4 model artifacts are refused against an fs-5
+matrix and vice versa (the existing version cross-check).
+
+Label unchanged: `fwd_bps` = `1e4 · ln(close_{t+H} / close_t)` at H = 15,
+30, 60 from the signal bar's close. This program deliberately changes the
+inputs and the execution, not the target — the third direction the closure
+names (a new label) is NOT part of this program.
+
+### 5.3 Maker entry: a pessimistic trade-through fill model
+
+The gate gains an entry mode `--entry maker` (default remains `taker`,
+Amendments 1–4 unchanged). Run 5 is gated under `--entry maker --exit atr`.
+
+- **Signal and threshold**: unchanged in form. At the signal bar's close `C`
+  a prediction `pred_bps` from the fold model; long if `pred_bps > 1.5 ×
+  round_trip`, short if `< −1.5 × round_trip`, where `round_trip` is now the
+  maker-entry round trip of §5.4. `--threshold-mult 1.5` is not changed.
+- **Order**: a post-only limit at `P = close` of the signal bar (long: bid at
+  `P`; short: ask at `P`), resting from `C + 1000 ms` (a fixed one-second
+  placement latency — an order cannot be on the book before it could
+  physically have been sent) until `C + 60 s` (the next bar's close). One
+  order per asset at a time; a resting order or an open position blocks new
+  signals for that asset exactly as `flat_after` does today.
+- **Fill rule (the conservative core)**: the order is filled iff a tape trade
+  with `ts_ms ∈ [C + 1000, C + 60 000]` prints at a price **strictly better
+  for us than P** — long: `price < P`; short: `price > P`. A trade AT `P`
+  never fills us (we do not claim queue priority; a print at our level is
+  assumed to have gone to orders ahead of us). Fill price = `P`, fill time =
+  that trade's `ts_ms`. If no such trade prints, the order is cancelled and
+  no trade occurs — a **miss**, counted, not skipped silently.
+- Why strict trade-through: without a tick-level book we cannot know queue
+  position, so the only fill claim that cannot be optimistic is "the market
+  traded through our price". This is *more* pessimistic than reality on
+  fills and *exactly as* pessimistic as reality on adverse selection: we are
+  filled precisely when price has just moved against the signal. That is the
+  economics being tested.
+- **Exit**: Amendment 3 unchanged in every parameter — ATR(14) Wilder on 1m
+  bars, `k = 4`, R:R 1.2, stop-wins-ties, time-exit fallback — with three
+  definitional consequences of a maker entry: (a) stop/target distances are
+  measured from the fill price `P` using ATR at the **signal** bar's close
+  (known at order placement, hence causal); (b) the exit walk starts at the
+  bar in which the fill occurred (open `C`), and that bar itself is checked
+  first, stop-wins-ties, since a fill and a stop can share a bar; (c) the
+  time exit is the close of the bar at `C + H·60 s` — the horizon runs from
+  the fill bar's open, i.e. one bar later than the taker path's, and it is
+  the same `[C, C+H]` window the label is measured over. All exits are
+  executed as **taker** (no maker fill claimed on the way out).
+- Every fold's report gains `n_signals`, `n_fills`, `fill_rate`, `n_misses`,
+  and mean `fill_delay_ms`, overall and per asset. Nothing about the gate
+  criterion changes: annualized Sharpe > 2.0 on daily net-of-cost returns,
+  out-of-sample folds only, all three horizons every run.
+
+### 5.4 Costs under maker entry
+
+`round_trip_bps = fee_maker + fee_taker + spread_bps_p75 / 2 + impact_bps`
+per asset-day, from the same frozen `costs-daily-3b.json` (Amendment 3b
+impact model, unchanged): one maker fee in, one taker fee out, one crossing
+of half the day's p75 spread on the taker exit, one side of impact on the
+taker exit. The maker entry pays no spread and no impact by construction —
+its price is `P` and its cost is the adverse selection the fill rule
+imposes. Thin-day (`impact_bps = None`) and 14-day-lookback rules unchanged.
+Fees: run 5 charges **VIP0 + BNB: maker 1.80 bps, taker 4.50 bps**
+(`docs/binance-um-fee-table-2026-08.md`, verified rows), and Amendment 1's
+fee fixed-point rule applies unchanged (map `projected_30d_volume_usd` to a
+tier; at most one re-run; the second run's verdict is the verdict; VIP1–8
+still require the user's authenticated fetch before any re-run at those
+tiers). Funding: Amendment 1's < 0.3 bps/trade bound still holds (holds
+are ≤ 61 minutes). Notional 5,000 unchanged.
+
+### 5.5 Everything else is unchanged
+
+Venue (Binance UM). Universe (run 4's 24 mapped assets, frozen). Matrix
+span 2024-08-01..2026-08-15, `--stride 5`. Fold schedule (anchored
+expanding, 90-day train floor / 30-day test / 30-day step, `MIN_ROWS =
+50,000`). Horizons 15/30/60, all three every run. Gate = OOS annualized
+Sharpe > 2.0 on daily net returns. The one-drop-one-rerun universe rule.
+The fee fixed-point rule. The FAIL branch: **if run 5 FAILs at these
+definitions, no window, threshold, latency, rest time, fill rule, exit
+parameter, feature or cost term is revisited against its numbers** — the
+project stops or a further *new* program is pre-registered on its own
+terms, exactly as this one is.
+
+### 5.6 What the diff must show, in this order
+
+1. `pull-binance-tape` + parquet tape store + manifest (with a test that a
+   stored day round-trips the archive rows losslessly and that a 404 day is
+   recorded, not fabricated).
+2. `TapeWindow` assembly in `scalper-data` (window bounds strictly `< C`,
+   tested with a trade at exactly `C` being excluded) and the twelve fs-5
+   features in `features-scalper` with golden values on a hand-built tape
+   (including the `None` conditions in the table above and the ±50 clip).
+3. `--entry maker` in `gate.rs`: the fill rule (tests: a print AT `P` does
+   not fill; a print strictly through `P` fills at `P` at that trade's
+   `ts_ms`; a print at `C + 999 ms` does not fill; no print → miss), the
+   fill-bar exit walk, the §5.4 round trip, the new report fields.
+4. Only then: `pull-binance-tape` for the span, `training-matrix` (fs-5),
+   `walk_forward_scalper.py` × 3 horizons, `gate --entry maker --exit atr`
+   × 3, and `docs/scalper-gate-run-5.md` written from the reports.
+
+Run 5 becomes the gate record for Program 2 only if eligible under
+Amendment 1's conditions (≥18-month matrix span; full mapped universe;
+fs-5 end to end; `--binance-costs`; all three horizons). Runs 1–4 stay on
+file exactly as written; run 4 remains the record for Program 1.
