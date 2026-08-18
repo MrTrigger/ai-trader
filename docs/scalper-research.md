@@ -914,3 +914,92 @@ three directions the Program 1 closure named, two (tick order flow, maker
 economics) have now been run and failed; the third (a different label than
 fixed-horizon return) has not been tested and this section, like the last,
 recommends nothing.
+
+## Amendment 6 (2026-08-18): Program 3 — cross-asset tick context (fs-6), taker execution, pre-registered
+
+*(A NEW signal program under the closure sections' own terms. It amends,
+and does not delete, §1–6 and Amendments 1–5; where it conflicts it
+governs; everything it does not name is unchanged. At the moment this text
+is written no fs-6 code exists and no number involving a BTC tick feature
+against any other asset's forward return has been computed or looked at.)*
+
+**Why this and not something else.** Two facts from the record motivate
+this program, read as *where* to look, not as numbers to tune against:
+(i) in both clean runs (4 and 5) the single largest-gain feature at h15 is
+`btc_ret_5` — BTC's own 5-minute return, joined at 1-minute resolution —
+i.e. what little the models find, they find largely in cross-asset
+context; (ii) Program 2's twelve tick features were all *own-asset* and
+added no IC. The tape allows the one obvious combination neither program
+tried: BTC's order flow and sub-minute return, at tick resolution, as
+context for every other asset's bar. Cross-asset lead-lag from the largest
+contract to the rest is a documented microstructure effect on centralized
+crypto venues; whether it survives at 15–60-minute horizons net of costs is
+exactly what the gate is for. The other closure-named direction (a
+different label) is deliberately NOT part of this program: at h15 — the
+horizon where the signal is strongest — 80% of run-4 exits and 79% of
+run-5 exits are time exits, so the fixed-horizon label already is the
+realized outcome there; changing it cannot be what is missing.
+
+**Execution: taker, exactly Amendments 1–4 (run 4's setup).** Program 2
+established that under a fill model that is not optimistic, maker entry
+fills adversely and lowers net per trade; this program does not re-run it.
+`gate --exit atr` (Amendment 3 exits, Amendment 3b costs, fees 4.50/1.80
+VIP0+BNB, `--threshold-mult 1.5`, `--notional 5000`), `--entry taker` (the
+default). The comparison this program makes is against run 4 (fs-4, taker):
+same folds, same window, same execution — only the feature set differs.
+
+### 6.1 fs-6: six BTC-context tick features appended, the 50 fs-5 features untouched
+
+`FEATURE_SET_VERSION = "fs-rust-scalper-6"`, 56 features. Indices 0–49 are
+byte-for-byte fs-5 (and 0–37 fs-4). Indices 50–55 are computed by
+`features-scalper` from a second `TapeSource` the caller serves for BTC
+(`BTCUSDT`'s tape), evaluated at the SAME close `C` as the asset's own bar,
+with the same window convention (`[C − W, C)`, strictly before the close),
+the same coverage discipline (a BTC minute that is `None`, or a skipped
+BTC minute, breaks BTC coverage and BTC's deques restart), and the same
+`Some`-only-if-finite rule. Definitions reuse Amendment 5 §5.2's table
+applied to BTC's tape:
+
+| # | name | definition |
+|---|------|------------|
+| 50 | `btc_tk_ret_10s` | Amendment 5 row 43 on BTC's tape at `C` |
+| 51 | `btc_tk_ret_30s` | row 44 on BTC's tape |
+| 52 | `btc_tk_imb_30s` | row 39 on BTC's tape |
+| 53 | `btc_tk_imb_5m` | row 40 on BTC's tape |
+| 54 | `btc_tk_intensity_10s` | row 46 on BTC's tape (BTC's own 60-minute baseline) |
+| 55 | `rel_tk_ret_30s` | `tk_ret_30s − btc_tk_ret_30s` (own index 44 minus index 51); `None` if either is `None` |
+
+For BTC itself the caller passes BTC's tape as both sources, so 50–54
+equal the own-asset features and 55 is `0.0` — the same no-special-casing
+convention `btc_ret_5` / `rel_ret_5` already use. Exactly these six are
+run; no feature is added, dropped or re-windowed after a number exists.
+Label unchanged (`fwd_bps` at H from the signal bar's close). fs-5 model
+artifacts are refused against an fs-6 matrix and vice versa.
+
+### 6.2 Everything else is unchanged
+
+Data: byte-frozen as run 5 left it — perp, book, flow, metrics, funding,
+universe (run 4's 24 mapped assets, the full universe; run 5's drop list
+does not carry over — §5's drop rule is applied afresh from this program's
+own first run), `costs-daily-3b.json`, and the tape (§5.1 span; no pull of
+any kind). Matrix span `2024-08-01..2026-08-15`, `--stride 5`. Fold
+schedule, `MIN_ROWS`, horizons 15/30/60 all every run, gate = OOS
+annualized Sharpe > 2.0 on daily net returns, one-drop-one-rerun rule, fee
+fixed-point rule, the FAIL branch: **if run 6 FAILs at these definitions,
+no window, feature, exit, cost or threshold term is revisited against its
+numbers.**
+
+### 6.3 What the diff must show, in this order
+
+1. `features-scalper`: `compute` takes a BTC `TapeSource` alongside the
+   asset's; six features per §6.1 with golden values on a hand-built pair
+   of tapes (including: BTC minute `None` → 50–55 `None` while 38–49 stay
+   as they were; BTC-as-own → 55 is `0.0`; a BTC trade at exactly `C` is
+   not visible), and the fs-5 parity assertion (fs-6 with `NoTape` for BTC
+   reproduces fs-5's 50 values with six `None`s appended).
+2. `training-matrix`: serve BTC's tape from the same `--tape-root` via a
+   second `TapeCursor` keyed on the universe file's BTC symbol; per-asset
+   None counts continue to print.
+3. Only then: `training-matrix` (fs-6) → `walk_forward_scalper.py` × 3 →
+   `gate --exit atr` × 3 (taker) → `docs/scalper-gate-run-6.md`, all three
+   horizons reported, drop rule applied afresh if any symbol qualifies.
