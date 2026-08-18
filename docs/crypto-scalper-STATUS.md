@@ -1,6 +1,6 @@
 # Crypto-Scalper — Project Status and Handoff
 
-**As of:** 2026-08-16. **Written for:** a fresh agent (or human) picking this up
+**As of:** 2026-08-18 (Program 2 addendum at the end; §1–8 below are the 2026-08-16 handoff, unchanged). **Written for:** a fresh agent (or human) picking this up
 after a machine reinstall, with no memory of the sessions that built it.
 Read this, then `docs/scalper-research.md` (the protocol), then the gate-run
 records, in that order. Everything below is verifiable from git and the
@@ -136,3 +136,48 @@ on a 12GB machine with the guards above.
    --fee-maker-bps 1.8 --notional 5000 --exit atr --data-root data --out
    /tmp/check.json` should reproduce `data/reports/gate-run-4-h15.json` byte
    for byte except `generated_utc`.
+
+
+---
+
+## 9. Addendum 2026-08-18 — machine restored; Program 2 run and closed
+
+**Restore.** The repo was restored onto a new machine (62 GB RAM / 32 cores
+— the `ulimit -v` guards in §5 are no longer needed) from
+`/mnt/tank/ai-trader-backup-2026-08-16/` per §8: data, var, `.env`, agent
+memory; `cargo test` (~630) and `pytest` (35) green; gate-run-4 h15
+reproduced byte-for-byte.
+
+**Program 2 (Amendment 5, `docs/scalper-research.md`).** User decision
+2026-08-18: continue under the FAIL branch with a new pre-registered
+program — fs-5 (fs-4 + twelve tick order-flow features from the raw
+aggTrades tape) and a maker entry with a strict trade-through fill model.
+Amendment committed (`2876108` + clarifications) before any code; then
+tape store (`863c129`, `pull-binance-tape`, 33 GB, 6.87 B trades,
+`data/binance-micro/tape/`), fs-5 (`2b322c7`), `gate --entry maker`
+(`0d22833`); then the run.
+
+**Gate run 5 — `docs/scalper-gate-run-5.md` — FAILS at all three
+horizons**, first run (24 assets) 0.365 / 0.188 / 0.432 and the §5
+one-allowed-drop re-run (CRV, FARTCOIN, LIT, XMR out; 20 assets; the
+verdict) 0.151 / 0.133 / −0.251. The tick features added no IC (h15
+0.0368 vs run 4's 0.0366); the maker fill (~90% filled, adversely) cut net
+per trade from +30 bps to +2–6 bps despite a ~40% cheaper round trip.
+Program 2 closed; FAIL branch invoked; nothing tuned.
+
+**Where things live now (in addition to §2):** protocol Amendment 5 +
+"Program 2 closed" in `docs/scalper-research.md`; run-5 record; tape
+puller/reader `service/crates/scalper-data/src/tape.rs`; tick features
+`service/crates/features-scalper/src/tick.rs` (`FEATURE_SET_VERSION =
+"fs-rust-scalper-5"`, 50 features); maker fill/simulation
+`service/crates/scalper-data/src/maker.rs`. Frozen data unchanged from
+run 4 plus the tape; new (gitignored) artifacts `data/matrices/gate-run-5{,b}.jsonl`,
+`data/models/gate-run-5{,b}-h*`, `data/reports/gate-run-5{,b}-h*.json`,
+`data/scalper-universe-run5b.json`. Taker path still reproduces run 4
+byte-for-byte.
+
+**Open.** Of the three continuation directions named at the Program 1
+closure, tick order flow and maker economics have now been tried and
+failed; a different label/target has not. Fee tiers VIP1–8 remain
+unverified (immaterial to any verdict so far). No live bot; nothing
+deployed.

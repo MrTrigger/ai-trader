@@ -884,3 +884,33 @@ Run 5 becomes the gate record for Program 2 only if eligible under
 Amendment 1's conditions (≥18-month matrix span; full mapped universe;
 fs-5 end to end; `--binance-costs`; all three horizons). Runs 1–4 stay on
 file exactly as written; run 4 remains the record for Program 1.
+
+## Program 2 closed (2026-08-18)
+
+Gate run 5 (`docs/scalper-gate-run-5.md`) is the record for Program 2. It
+is eligible under every condition in Amendments 1–5, and it **FAILS the gate
+at all three horizons** — first run (24 assets) h15 Sharpe 0.3649, h30
+0.1883, h60 0.4321; the §5 one-allowed-drop re-run (CRV, FARTCOIN, LIT, XMR
+excluded — the first time any symbol qualified — 20 assets) h15 0.1508, h30
+0.1331, h60 −0.2510, and the second run's verdict is the verdict. Fee tier
+provisional as in runs 2 and 4 (volume inside the disputed VIP1 band); a
+lower tier cannot plausibly close a 1.6–2.3-point gap and no unverified
+number is tested.
+
+What the program established, in the record's own words: the twelve tick
+order-flow features add no measurable ranking skill over fs-4 (pooled IC
+unchanged at h15, lower at h30/h60; 3–8% of model gain, none of it from the
+imbalance family), and the maker entry, priced by a strict trade-through
+fill rule, fills ~90% of orders adversely — net per trade falls from run 4's
++30 bps to +2–6 bps although the round trip is ~40% cheaper. The binding
+constraint of Program 1 — prediction magnitude — is the binding constraint
+of Program 2.
+
+Per Amendment 5 §5.5 the FAIL branch is invoked: no window, threshold,
+latency, rest time, fill rule, exit parameter, feature or cost term is
+revisited against these numbers. Program 2 is closed. Any continuation is a
+further new pre-registered program on its own terms — or stopping. Of the
+three directions the Program 1 closure named, two (tick order flow, maker
+economics) have now been run and failed; the third (a different label than
+fixed-horizon return) has not been tested and this section, like the last,
+recommends nothing.
