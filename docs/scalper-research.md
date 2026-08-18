@@ -710,10 +710,12 @@ assumes book state between bookDepth snapshots.
   `ts_ms: i64` (`transact_time`), `price: f64`, `qty: f64`,
   `is_buyer_maker: bool`, in archive row order. Same k-prefix identity rule
   as every other puller (the universe file is the sole identity source).
-- **Span: 2024-08-01 through 2026-08-15 inclusive** — the exact archive
-  window run 4's `binance-costs` and `training-matrix` were built on. Not
-  one day more: run 5's matrix span must equal run 4's so the two records
-  differ only in what this amendment changes.
+- **Span: `--start 2024-08-01 --end 2026-08-15`**, exclusive end like every
+  puller here — i.e. day files 2024-08-01 through **2026-08-14**, the last
+  day the frozen `flow`/`book` stores hold and the exact archive window run
+  4's `binance-costs` and `training-matrix` were built on. Not one day more:
+  run 5's matrix span must equal run 4's so the two records differ only in
+  what this amendment changes.
 - **Every other store is frozen byte-for-byte as run 4 left it**: `data/perp`,
   `data/binance-micro/{book,flow,metrics,funding}`, `data/scalper-universe.
   json`, `data/binance-micro/costs-daily-3b.json`. No pull, backfill or
