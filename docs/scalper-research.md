@@ -812,6 +812,20 @@ Amendments 1–4 unchanged). Run 5 is gated under `--entry maker --exit atr`.
   the fill bar's open, i.e. one bar later than the taker path's, and it is
   the same `[C, C+H]` window the label is measured over. All exits are
   executed as **taker** (no maker fill claimed on the way out).
+- *Clarification (2026-08-18, before any fill code exists):* the fill window
+  is taken half-open, `[C + 1000, C + 60 000)` ms, so the fill bar is always
+  the bar with open `C` (a print at exactly `C + 60 s` belongs to the next
+  minute and is not a fill — one ms fewer, never more). Inside the fill bar
+  the walk does not use OHLC: intrabar order IS known there from the tape,
+  so the fill bar is resolved on the tape from the fill trade onward, in
+  archive order — the first later print at or through the stop level exits
+  at the stop, at or through the target exits at the target (a print
+  before the fill can trigger nothing: we held no position yet). From the
+  next bar on, `exits::resolve_exit` walks OHLC exactly as Amendment 3
+  (stop-wins-ties, gapped-stop-at-open, time exit at the bar at
+  `C + H·60 s`). This is neither more nor less optimistic than the OHLC
+  fill-bar check §5.3(b) sketched — it is the exact version of it — and it
+  is stated here so the diff can be checked against it.
 - Every fold's report gains `n_signals`, `n_fills`, `fill_rate`, `n_misses`,
   and mean `fill_delay_ms`, overall and per asset. Nothing about the gate
   criterion changes: annualized Sharpe > 2.0 on daily net-of-cost returns,
