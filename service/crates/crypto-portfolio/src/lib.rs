@@ -1037,6 +1037,14 @@ fn reason(current: Decimal, target: Decimal) -> OrderReason {
 struct Turnover {
     spent: Decimal,
     turned_over: Decimal,
+    /// Weight of additions the net-exposure guard released past the turnover
+    /// budget to bring the projected book back inside `max_net_exposure`
+    /// (zero when the limit is unset or never bound).
+    net_guard_released: Decimal,
+    /// The book's projected net exposure after this plan's orders - what the
+    /// guard measured, before and after releasing.
+    net_before_guard: Decimal,
+    net_after_guard: Decimal,
 }
 
 /// Everything `diff` needs to know about the market, as opposed to the book.
@@ -1131,13 +1139,15 @@ fn diff(
     let mut turned_over = Decimal::ZERO;
     let mut dropped = Decimal::ZERO;
     let mut selected = Vec::new();
+    let mut deferred_candidates = Vec::new();
     for (asset, drift, notional, price, why, est) in candidates {
         if !free(why) && spent + drift.abs() > cfg.turnover_budget {
             dropped += drift.abs();
             skipped.push(format!("{asset}: trade deferred by turnover budget"));
+            deferred_candidates.push((asset, drift, notional, price, why, est));
             continue;
         }
-            // Only additions consume the allowance. Letting reductions eat it
+        // Only additions consume the allowance. Letting reductions eat it
         // would trade one hostage for another: a heavy de-risking day would
         // leave nothing to buy with, so the book would shed what the model
         // abandoned and never establish what it now wants.
@@ -1146,6 +1156,62 @@ fn diff(
         }
         turned_over += drift.abs();
         selected.push((asset, drift, notional, price, why, est));
+    }
+    // The net-exposure guard. `risk()` checks the TARGET's net, which the
+    // constructor keeps at zero by design; the book that exists after this
+    // plan is a different number, because the turnover budget lets every
+    // reduction through and defers additions. On a reversal day that shrinks
+    // one side while the other side's rebuild waits, and the book goes net
+    // without any plan ever asking for it (Phase 2 measured -13.2% against a
+    // 0.0% target). Restoring neutrality is risk REDUCTION, so it is treated
+    // exactly like a Reduce: it does not need the cap's permission. Deferred
+    // additions on the side that shrinks |net| are released, largest drift
+    // first, until the projected book is inside the limit or none remain.
+    // What it could not fix is disclosed as a warning, not hidden in a
+    // rejected plan that would leave the book where it is.
+    let projected_net = |sel: &[(String, Decimal, Decimal, Decimal, OrderReason, Estimate)]| {
+        let mut book: BTreeMap<&str, Decimal> =
+            current.iter().map(|(a, w)| (a.as_str(), *w)).collect();
+        for (asset, drift, ..) in sel {
+            *book.entry(asset.as_str()).or_default() += *drift;
+        }
+        book.values().sum::<Decimal>()
+    };
+    let net_before_guard = projected_net(&selected);
+    let mut net_after_guard = net_before_guard;
+    let mut net_guard_released = Decimal::ZERO;
+    if let Some(limit) = cfg.limits.max_net_exposure {
+        if net_before_guard.abs() > limit {
+            // Only additions that shrink |net|: longs when net is short of
+            // the band, shorts when it is over it.
+            let want_long = net_before_guard < Decimal::ZERO;
+            deferred_candidates.retain(|(_, drift, ..)| (*drift > Decimal::ZERO) == want_long);
+            deferred_candidates
+                .sort_by(|a, b| b.1.abs().cmp(&a.1.abs()).then_with(|| a.0.cmp(&b.0)));
+            let mut released_names = Vec::new();
+            for item in deferred_candidates {
+                if net_after_guard.abs() <= limit {
+                    break;
+                }
+                net_after_guard += item.1;
+                net_guard_released += item.1.abs();
+                turned_over += item.1.abs();
+                dropped -= item.1.abs();
+                skipped.retain(|m| m != &format!("{}: trade deferred by turnover budget", item.0));
+                released_names.push(item.0.clone());
+                selected.push(item);
+            }
+            if !released_names.is_empty() {
+                skipped.push(format!(
+                    "net exposure guard: released {} deferred addition(s) past the turnover \
+                     budget to bring projected net from {} toward |net| <= {}: {}",
+                    released_names.len(),
+                    q(net_before_guard, 4),
+                    limit,
+                    released_names.join(", ")
+                ));
+            }
+        }
     }
     let reason_rank = |reason: OrderReason| match reason {
         OrderReason::Exit => 0,
@@ -1177,7 +1243,19 @@ fn diff(
         });
         estimates.push(est);
     }
-    (orders, estimates, skipped, Turnover { spent, turned_over }, dropped)
+    (
+        orders,
+        estimates,
+        skipped,
+        Turnover {
+            spent,
+            turned_over,
+            net_guard_released,
+            net_before_guard,
+            net_after_guard,
+        },
+        dropped,
+    )
 }
 
 pub struct DecisionInput<'a> {
@@ -1363,6 +1441,9 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
             Turnover {
                 spent: Decimal::ZERO,
                 turned_over: Decimal::ZERO,
+                net_guard_released: Decimal::ZERO,
+                net_before_guard: Decimal::ZERO,
+                net_after_guard: Decimal::ZERO,
             },
             Decimal::ZERO,
         )
@@ -1410,6 +1491,33 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
     );
     if !cfg.costs.calibrated {
         warnings.push(warning(WarningKind::Other, "cost model is uncalibrated: the impact coefficient is assumed, not fitted to realised fills"));
+    }
+    if let Some(limit) = cfg.limits.max_net_exposure {
+        if !used.net_guard_released.is_zero() {
+            warnings.push(warning(
+                WarningKind::TurnoverCapped,
+                format!(
+                    "net exposure guard released {} weight of additions past the turnover \
+                     budget: projected net {} -> {} against |net| <= {}",
+                    q(used.net_guard_released, 4),
+                    q(used.net_before_guard, 4),
+                    q(used.net_after_guard, 4),
+                    limit
+                ),
+            ));
+        }
+        if report.passed && used.net_after_guard.abs() > limit {
+            warnings.push(warning(
+                WarningKind::Other,
+                format!(
+                    "projected net exposure {} exceeds max_net_exposure {} after this plan's \
+                     orders and nothing deferred could reduce it; the book is outside its \
+                     limit until a later plan can rebuild the light side",
+                    q(used.net_after_guard, 4),
+                    limit
+                ),
+            ));
+        }
     }
     if !dropped.is_zero() {
         warnings.push(warning(
@@ -1987,18 +2095,190 @@ mod tests {
         // with and the book would shed what the model dropped without ever
         // establishing what it now wants.
         let by: BTreeMap<_, _> = orders.iter().map(|o| (o.asset.as_str(), o)).collect();
-        assert_eq!(orders.len(), 3, "got {:?}", orders.iter().map(|o| &o.asset).collect::<Vec<_>>());
+        assert_eq!(
+            orders.len(),
+            3,
+            "got {:?}",
+            orders.iter().map(|o| &o.asset).collect::<Vec<_>>()
+        );
         assert_eq!(by["A"].reason, OrderReason::Reduce);
         assert_eq!(by["C"].reason, OrderReason::Reduce);
         assert_eq!(by["B"].reason, OrderReason::Increase);
-        assert_eq!(used.spent, Decimal::new(35, 2), "only B consumes the allowance");
+        assert_eq!(
+            used.spent,
+            Decimal::new(35, 2),
+            "only B consumes the allowance"
+        );
         assert_eq!(
             used.turned_over,
             Decimal::new(65, 2),
             "but the book really moved 0.65, and the disclosure must say so"
         );
         assert_eq!(dropped, Decimal::ZERO);
-        assert!(skipped.iter().all(|m| !m.contains("turnover")), "{skipped:?}");
+        assert!(
+            skipped.iter().all(|m| !m.contains("turnover")),
+            "{skipped:?}"
+        );
+    }
+
+    /// A reversal day: the book is +0.4 long / -0.4 short; the model exits the
+    /// longs (free) and wants two new longs and one new short (budgeted, 0.10
+    /// allowance). Without the guard the plan sheds 0.4 of longs, adds 0.10 of
+    /// the largest new position, and the projected book goes deeply net short.
+    /// With `max_net_exposure` set, the guard releases the deferred LONG
+    /// additions past the budget until the projected book is inside the band -
+    /// and never a short one, since that would push it further out.
+    #[test]
+    fn net_exposure_guard_releases_deferred_additions_on_the_light_side_only() {
+        let mut cfg = config();
+        cfg.turnover_budget = Decimal::new(1, 1);
+        cfg.limits.min_position_notional = Decimal::ZERO;
+        cfg.limits.max_net_exposure = Some(Decimal::new(1, 1)); // |net| <= 0.10
+                                                                // Book today: A,B long 0.2 each; S1,S2 short 0.2 each. Net 0.
+        let current = BTreeMap::from([
+            ("A".into(), Decimal::new(2, 1)),
+            ("B".into(), Decimal::new(2, 1)),
+            ("S1".into(), Decimal::new(-2, 1)),
+            ("S2".into(), Decimal::new(-2, 1)),
+        ]);
+        // Target: A,B out; L1 0.25 long, L2 0.15 long; S1,S2 kept; S3 0.15 short.
+        let weights = BTreeMap::from([
+            ("L1".into(), Decimal::new(25, 2)),
+            ("L2".into(), Decimal::new(15, 2)),
+            ("S1".into(), Decimal::new(-2, 1)),
+            ("S2".into(), Decimal::new(-2, 1)),
+            ("S3".into(), Decimal::new(-15, 2)),
+        ]);
+        let names = ["A", "B", "L1", "L2", "S1", "S2", "S3"];
+        let prices: BTreeMap<String, Decimal> = names
+            .iter()
+            .map(|n| (n.to_string(), Decimal::from(100)))
+            .collect();
+        let adv: BTreeMap<String, Option<Decimal>> = names
+            .iter()
+            .map(|n| (n.to_string(), Some(Decimal::from(100_000_000))))
+            .collect();
+        let vol: BTreeMap<String, Option<Decimal>> = names
+            .iter()
+            .map(|n| (n.to_string(), Some(Decimal::new(5, 1))))
+            .collect();
+        let market = Market {
+            prices: &prices,
+            adv: &adv,
+            vol: &vol,
+            profile: None,
+        };
+
+        // Without the limit: exits A,B (free); L1 (0.25) is the largest
+        // addition but exceeds the 0.10 allowance, as do L2 (0.15) and S3
+        // (0.15) - so NOTHING is added, and the projected book is 0 long /
+        // 0.4 short: net -0.40.
+        let mut cfg_off = cfg.clone();
+        cfg_off.limits.max_net_exposure = None;
+        let (orders, _, _, used, dropped) = diff(
+            &weights,
+            &current,
+            &market,
+            Decimal::from(100_000),
+            &cfg_off,
+        );
+        assert_eq!(
+            orders.len(),
+            2,
+            "{:?}",
+            orders.iter().map(|o| &o.asset).collect::<Vec<_>>()
+        );
+        assert_eq!(used.net_before_guard, Decimal::new(-4, 1));
+        assert_eq!(used.net_after_guard, Decimal::new(-4, 1));
+        assert_eq!(used.net_guard_released, Decimal::ZERO);
+        assert_eq!(dropped, Decimal::new(55, 2));
+
+        // With the limit: the guard releases L1 (largest first): net -0.15,
+        // still outside 0.10; then L2: net 0.00, inside. S3 is never released
+        // (it would push net the wrong way) and stays deferred.
+        let (orders, _, skipped, used, dropped) =
+            diff(&weights, &current, &market, Decimal::from(100_000), &cfg);
+        let names_out: Vec<&str> = orders.iter().map(|o| o.asset.as_str()).collect();
+        assert!(
+            names_out.contains(&"L1") && names_out.contains(&"L2"),
+            "{names_out:?}"
+        );
+        assert!(!names_out.contains(&"S3"), "{names_out:?}");
+        assert_eq!(orders.len(), 4);
+        assert_eq!(used.net_before_guard, Decimal::new(-4, 1));
+        assert_eq!(used.net_after_guard, Decimal::ZERO);
+        assert_eq!(used.net_guard_released, Decimal::new(4, 1));
+        assert_eq!(
+            used.spent,
+            Decimal::ZERO,
+            "released additions do not consume the allowance"
+        );
+        assert_eq!(used.turned_over, Decimal::new(8, 1));
+        assert_eq!(dropped, Decimal::new(15, 2), "S3 remains deferred");
+        assert!(
+            skipped
+                .iter()
+                .any(|m| m.starts_with("net exposure guard: released 2")),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|m| m == "S3: trade deferred by turnover budget"),
+            "{skipped:?}"
+        );
+        assert!(
+            !skipped
+                .iter()
+                .any(|m| m == "L1: trade deferred by turnover budget"),
+            "{skipped:?}"
+        );
+    }
+
+    /// The guard is a limit, not a target: a projected book already inside the
+    /// band releases nothing, and the turnover budget stays in charge.
+    #[test]
+    fn net_exposure_guard_is_idle_inside_the_band() {
+        let mut cfg = config();
+        cfg.turnover_budget = Decimal::new(1, 1);
+        cfg.limits.min_position_notional = Decimal::ZERO;
+        cfg.limits.max_net_exposure = Some(Decimal::new(1, 1));
+        let current = BTreeMap::from([
+            ("A".into(), Decimal::new(2, 1)),
+            ("S".into(), Decimal::new(-2, 1)),
+        ]);
+        // Wants to add 0.15 long and 0.15 short: net stays 0 either way; both
+        // exceed the 0.10 allowance and both stay deferred.
+        let weights = BTreeMap::from([
+            ("A".into(), Decimal::new(2, 1)),
+            ("S".into(), Decimal::new(-2, 1)),
+            ("L".into(), Decimal::new(15, 2)),
+            ("T".into(), Decimal::new(-15, 2)),
+        ]);
+        let names = ["A", "S", "L", "T"];
+        let prices: BTreeMap<String, Decimal> = names
+            .iter()
+            .map(|n| (n.to_string(), Decimal::from(100)))
+            .collect();
+        let adv: BTreeMap<String, Option<Decimal>> = names
+            .iter()
+            .map(|n| (n.to_string(), Some(Decimal::from(100_000_000))))
+            .collect();
+        let vol: BTreeMap<String, Option<Decimal>> = names
+            .iter()
+            .map(|n| (n.to_string(), Some(Decimal::new(5, 1))))
+            .collect();
+        let market = Market {
+            prices: &prices,
+            adv: &adv,
+            vol: &vol,
+            profile: None,
+        };
+        let (orders, _, _, used, dropped) =
+            diff(&weights, &current, &market, Decimal::from(100_000), &cfg);
+        assert!(orders.is_empty());
+        assert_eq!(used.net_guard_released, Decimal::ZERO);
+        assert_eq!(dropped, Decimal::new(3, 1));
     }
 
     /// The cap still binds on additions, which is the whole point of keeping it.
@@ -2016,7 +2296,11 @@ mod tests {
         ]);
         let current = BTreeMap::new();
         let three = |v: Decimal| {
-            BTreeMap::from([("A".to_string(), v), ("B".to_string(), v), ("C".to_string(), v)])
+            BTreeMap::from([
+                ("A".to_string(), v),
+                ("B".to_string(), v),
+                ("C".to_string(), v),
+            ])
         };
         let three_opt = |v: Decimal| {
             BTreeMap::from([
@@ -2045,10 +2329,7 @@ mod tests {
         assert_eq!(used.spent, Decimal::new(3, 1));
         assert_eq!(used.turned_over, Decimal::new(3, 1), "no reductions here");
         assert_eq!(dropped, Decimal::new(6, 1));
-        assert_eq!(
-            skipped.iter().filter(|m| m.contains("turnover")).count(),
-            2
-        );
+        assert_eq!(skipped.iter().filter(|m| m.contains("turnover")).count(), 2);
     }
 
     /// The case that cost real money: the model abandons a name overnight and
@@ -2212,6 +2493,11 @@ mod tests {
     fn rust_plan_round_trips_through_the_executor_contract() {
         let mut cfg = config();
         cfg.limits.max_cluster_exposure = None;
+        // A two-name long-only fixture is net-long by construction; this test
+        // is about the plan's shape surviving the executor contract, not the
+        // book's neutrality, so the net limit is lifted the same way the
+        // cluster limit is.
+        cfg.limits.max_net_exposure = None;
         let as_of = "2026-08-01T00:00:00Z".parse().unwrap();
         let features = vec![
             row("BTC", as_of - TimeDelta::days(1), 100.0),

@@ -251,6 +251,7 @@ mod tests {
                 }),
                 cash: Decimal::ZERO,
                 gross_exposure: Decimal::ZERO,
+                net_exposure: Decimal::ZERO,
                 status: Status::Accepted,
                 fills: Vec::new(),
                 plan_id: uuid::Uuid::nil(),
@@ -417,8 +418,11 @@ pub fn bootstrap_delta(
             "{n} steps cannot be block-bootstrapped at block {block}"
         ));
     }
-    let (base_r, var_r): (Vec<f64>, Vec<f64>) =
-        baseline.iter().zip(variant).map(|(a, b)| (a.1, b.1)).unzip();
+    let (base_r, var_r): (Vec<f64>, Vec<f64>) = baseline
+        .iter()
+        .zip(variant)
+        .map(|(a, b)| (a.1, b.1))
+        .unzip();
     let observed = sharpe_of(&var_r, periods_per_year) - sharpe_of(&base_r, periods_per_year);
 
     let blocks = n.div_ceil(block);
@@ -493,7 +497,11 @@ mod bootstrap_tests {
 
     #[test]
     fn an_identical_variant_has_no_measurable_edge() {
-        let a = series(&(0..300).map(|i| ((i % 7) as f64 - 3.0) / 100.0).collect::<Vec<_>>());
+        let a = series(
+            &(0..300)
+                .map(|i| ((i % 7) as f64 - 3.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         let r = bootstrap_delta(&a, &a, 20, 400, 365.0, 42).unwrap();
         assert_eq!(r.observed, 0.0);
         assert_eq!(r.p05, 0.0);
@@ -514,8 +522,16 @@ mod bootstrap_tests {
 
     #[test]
     fn it_is_reproducible_and_refuses_mismatched_runs() {
-        let a = series(&(0..300).map(|i| ((i % 5) as f64 - 2.0) / 100.0).collect::<Vec<_>>());
-        let b = series(&(0..300).map(|i| ((i % 5) as f64 - 1.9) / 100.0).collect::<Vec<_>>());
+        let a = series(
+            &(0..300)
+                .map(|i| ((i % 5) as f64 - 2.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
+        let b = series(
+            &(0..300)
+                .map(|i| ((i % 5) as f64 - 1.9) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         let one = bootstrap_delta(&a, &b, 20, 200, 365.0, 99).unwrap();
         let two = bootstrap_delta(&a, &b, 20, 200, 365.0, 99).unwrap();
         assert_eq!(one.p05, two.p05, "same seed, same interval");

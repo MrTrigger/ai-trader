@@ -50,6 +50,13 @@ pub struct Step {
     pub cash: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub gross_exposure: Decimal,
+    /// The book's net exposure (sum of signed position weights over NAV)
+    /// AFTER this step's fills, marked at this step's prices - the number
+    /// `max_net_exposure` is about, recorded so a replay can show the
+    /// realized distribution and not just the plan's target. Older fold
+    /// files lack it and read as zero.
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub net_exposure: Decimal,
     pub status: Status,
     pub fills: Vec<Fill>,
     pub plan_id: uuid::Uuid,
@@ -327,11 +334,26 @@ pub fn replay_prepared_stepped(
         let (next, filled) = apply(&decision.plan.orders, &portfolio, &prices, &fills, as_of);
         portfolio = next;
         let nav = mark(&portfolio, &prices);
+        let net_exposure = if nav > Decimal::ZERO {
+            portfolio
+                .positions
+                .iter()
+                .fold(Decimal::ZERO, |acc, position| {
+                    acc + prices
+                        .get(&position.asset)
+                        .map(|price| position.qty * *price)
+                        .unwrap_or_default()
+                })
+                / nav
+        } else {
+            Decimal::ZERO
+        };
         steps.push(Step {
             as_of,
             nav,
             cash: portfolio.cash,
             gross_exposure: decision.plan.nav.gross_exposure,
+            net_exposure,
             status: decision.plan.status,
             fills: filled,
             plan_id: decision.plan.plan_id,
@@ -640,7 +662,7 @@ fn canonical(asset: &str) -> bool {
 mod tests {
     use super::*;
 
-        use chrono::NaiveDate;
+    use chrono::NaiveDate;
 
     fn book(asset: &str, qty: i64) -> Portfolio {
         Portfolio {
@@ -671,8 +693,20 @@ mod tests {
     fn funding_charges_the_long_and_pays_the_short() {
         let prices = BTreeMap::from([("BTC".to_string(), Decimal::from(100))]);
         let table = rates(&[("2026-01-01", 0.001)]);
-        let long = funding_carry(&book("BTC", 10), &prices, &table, Some(at("2026-01-01")), at("2026-01-02"));
-        let short = funding_carry(&book("BTC", -10), &prices, &table, Some(at("2026-01-01")), at("2026-01-02"));
+        let long = funding_carry(
+            &book("BTC", 10),
+            &prices,
+            &table,
+            Some(at("2026-01-01")),
+            at("2026-01-02"),
+        );
+        let short = funding_carry(
+            &book("BTC", -10),
+            &prices,
+            &table,
+            Some(at("2026-01-01")),
+            at("2026-01-02"),
+        );
         // 10 units at 100 is 1000 of notional; 0.1% of it is 1.
         assert_eq!(long, Decimal::from(-1));
         assert_eq!(short, Decimal::from(1));
@@ -741,6 +775,7 @@ mod tests {
             nav: Decimal::from(nav),
             cash: Decimal::from(nav),
             gross_exposure: Decimal::ZERO,
+            net_exposure: Decimal::ZERO,
             status: Status::Accepted,
             fills: Vec::new(),
             plan_id: uuid::Uuid::nil(),

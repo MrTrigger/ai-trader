@@ -218,10 +218,26 @@ max_cluster_exposure = "0.40"
 # tighten this. See risk.UNKNOWN_BETA.
 max_benchmark_beta = "1.25"
 
-# Not enforced yet. Left explicitly null rather than set to a permissive number,
-# so the run discloses it as unenforced instead of implying it passed.
-#   max_net_exposure - needs shorts to be meaningful
-max_net_exposure = ""
+# |sum of weights|, i.e. how far the book may sit from dollar-neutral.
+#
+# Enforced since 2026-08-19, in two places. (1) The plan's TARGET is checked
+# by the risk report like every other limit - the constructor keeps the target
+# at zero net by design, so this only fires when the participation cap leaves
+# one side short. (2) The book that will EXIST after the plan's orders is
+# checked in the rebalance: the turnover budget lets every reduction through
+# and defers additions, so on a reversal day one side shrinks while the
+# other side's rebuild waits, and the book goes net without any plan asking
+# for it (Phase 2 paper: -13.2% against a 0.0% target). Restoring neutrality
+# is risk reduction, so deferred additions on the light side are released
+# past the budget until the projected book is inside this band; what cannot
+# be fixed is disclosed as a warning rather than hidden in a rejected plan
+# that would leave the book where it is.
+#
+# 0.10 is a risk-appetite number, not a fitted one: a tenth of NAV of
+# unintended direction on a book whose whole thesis is cross-sectional.
+# Tightening it costs turnover on reversal days; loosening it is a decision
+# to carry market beta the model never asked for.
+max_net_exposure = "0.10"
 
 # Correlated groups, for max_cluster_exposure above. Crude and present beats
 # sophisticated and Phase 5: this is a hand-maintained sector map, not a
