@@ -30,3 +30,28 @@ adopted if its measured cost is within noise** (interval includes zero and
 fills, at no measured price. 0.10 is reported for the curve and adopted only
 if it is also within noise, which is not expected (it binds on ~22% of
 days and flattens the edge/vol sizing). Nothing else is changed.
+
+## Results (same day, run as registered)
+
+| `max_position` | mean Sharpe | compounded | 9/9 | mean maxDD | turnover | days largest name >15% (post-fill) | largest \|w\| p99 | bootstrap Δ vs 0.25 |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| 0.25 (frozen) | 2.113 | +1189% | yes | −11.6% | 0.809 | 31 | 15.4% | — |
+| 0.15 | 2.096 | +1155% | yes | −11.7% | 0.808 | 29 | 15.0% | −0.014 [−0.027, −0.004] |
+| 0.10 | 1.979 | +917% | yes | −11.5% | 0.785 | 1 | 10.0% | −0.115 [−0.181, −0.049] |
+
+**Reading.** The >15% days the frozen book shows are mark-to-market drift
+after the fill — the plan never asked for more than ~15% in a name — so a
+plan-time cap of 0.15 removes almost none of them (31 → 29) while costing a
+small, measurable 0.014. A cap of 0.10 does remove the tail and costs 0.12
+Sharpe and ~270 points of compounded return by flattening the edge/vol
+sizing on roughly a fifth of days. Neither meets the pre-registered bar
+(0.15's interval excludes zero and it does not achieve the goal; 0.10 is
+not within noise).
+
+**Decision.** `max_position` stays at 0.25. The single-name tail the book
+runs (p99 ≈ 15%, ~1.5% of rebalances) is intraday drift bounded by the daily
+cycle, not a construction choice; the construction itself sizes to 8–12% at
+most. The E/F concentration failure belongs to the rejected labels, which
+thin a side; the frozen ranker does not. Closed; next risk item is the one
+the capital plan already names — the impact coefficient against the new
+denominator.
