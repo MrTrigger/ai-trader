@@ -220,3 +220,23 @@ base rate plus noise; it never sees the bear coming and does not react once
 it is there. The ranker's cross-sectional skill is real; its timing skill is
 nil under any of the three labels. The balanced book is right not because
 direction is undesirable but because nothing in this model can see it.
+
+### What F and E were getting wrong (decomposition, same day)
+
+Daily return = net × market + residual. A: residual sd 114 bp, Sharpe 1.98,
+worst day −8.6%. F: net×market part sd 159 bp, residual sd 298 bp (Sharpe
+0.59), worst days −22% (2021-05-19, net ≈ +0.7, long HOT/UNI/ETC/TRX at
+5–6% each into a −13% BTC day), −12%/−11% (2022-05-09/11, Terra week, long
+LTC/BNB/AVAX/ROSE then BTC/XMR/BNB/LTC), −11% (2022-01-21, long YFI/OMG/
+ETH/XRP). Regression beta to BTC ≈ 0 over the whole sample only because the
+tilt is persistently long regardless of direction: it takes every crash and
+earns no premium on ordinary days. E (balanced, same label): worst day
+−38.8% on 2026-07-24 — a DEXE short at the 0.25 `max_position` cap,
+squeezed; when a label thins one side, the balanced constructor puts 0.40 of
+gross into it and a single name reaches a quarter of NAV. Two causes, then:
+timing (long into every major sell-off in the sample) and concentration
+(a one-sided list plus a 25% per-name cap). A has neither because the
+median-centred rank keeps both sides ~12/12. Flag for the frozen book:
+`max_position = 0.25` is generous if a side ever thins; it does not bind in
+A's replay but belongs on the open-items list next to collapsed-asset
+shorts.
