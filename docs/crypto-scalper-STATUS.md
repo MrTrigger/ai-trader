@@ -198,3 +198,21 @@ run at IC 0.02–0.04, Sharpe 0.1–0.8. Nothing tuned, nothing deployed.
 New gitignored artifacts: `data/matrices/gate-run-6{,b}.jsonl`,
 `data/models/gate-run-6{,b}-h*`, `data/reports/gate-run-6{,b}-h*.json`,
 `data/scalper-universe-run6b.json`.
+
+
+## 11. Verdict 2026-08-19 — the scalper line is closed
+
+After a research round (`docs/scalper-research-round-2026-08.md`: four
+independent literature/industry surveys read against runs 4–6), the
+1-minute scalper is closed as a *direction*, not just as three programs. The
+verdict and its reasons are in `docs/scalper-research.md`, final section
+"Verdict (2026-08-19)". In short: the 15–60-minute predictable component is
+real and ≈ IC 0.01–0.04 — exactly what the best outside studies find — and
+an order of magnitude below the cost of trading it as a taker or, honestly
+modelled, as a maker; the professionals' documented P&L is speed, queue,
+rebates, inventory and flow, not minute-scale prediction. The
+medium-frequency book the evidence favours already exists (`crypto-portfolio`,
+Phase 2 passed, expected live Sharpe 1.0–1.3); effort moves there. Scalper
+tooling (tape store, `maker.rs` fill model, time-varying costs) is kept for
+that bot's execution/capacity work. Nothing in this repo is deployed as a
+scalper; nothing trades.

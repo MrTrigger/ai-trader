@@ -1049,3 +1049,54 @@ line as a direction and, if a systematic crypto book is still the goal,
 pre-registering a separate medium-frequency project (daily-bar trend on
 liquid perps + funding carry sleeve, expected net Sharpe ~1). No amendment
 is made by this section; nothing here is a number against any gate.
+
+## Verdict (2026-08-19): the 1-minute scalper line is closed
+
+This section closes the line, not another program. It is the reading of the
+whole record — six gate runs, four clean, three pre-registered programs, one
+frozen 24-month Binance UM record — together with the outside evidence in
+`docs/scalper-research-round-2026-08.md`.
+
+**What was tested, without tuning.** Program 1: minute-bar price/volume
+features plus Binance microstructure aggregates (fs-1..4), taker execution,
+fixed-time and then ATR exits — run 4, the first clean run, Sharpe 0.76 /
+0.69 / 0.51 at 15/30/60 min. Program 2: twelve tick order-flow features from
+the raw aggTrades tape plus a maker entry under a strict trade-through fill
+model — run 5, 0.36 / 0.19 / 0.43 (re-run 0.15 / 0.13 / −0.25). Program 3:
+BTC tick context for every asset, taker — run 6, 0.60 / 0.73 / 0.67 (re-run
+0.67 / 0.44 / 0.56). Pooled out-of-sample IC in every clean run: 0.01–0.04.
+Runs 1–3 are on file as invalid (a 5-minute look-ahead in the metrics join,
+found by this protocol's own audit, produced Sharpe 17.9 that was never
+believed).
+
+**Why it is dead, in one paragraph.** The predictable component of
+15–60-minute forward returns on liquid Binance perps, from public data, is
+real and tiny — the same IC ≈ 0.01–0.04 that the field's most careful 2025–26
+studies find — and it is an order of magnitude too small to clear the cost of
+trading it: ~11–25 bps as a taker, and as a maker the cost is not fees but
+adverse selection, which our own honest fill model and a 400,000-order live
+experiment on the same contract both put at more than the whole edge. Richer
+own-asset order flow did not add ranking skill; BTC context at tick
+resolution was used heavily in-sample and added none out of sample. The firms
+that make money in this market make it from speed, queue position, rebate
+tiers, inventory and flow — none of which a non-colocated VIP-0 account has —
+and none of them documents minute-scale directional prediction as a source of
+P&L. Nothing tunable would have changed this: the FAIL branch was invoked
+three times precisely so that no threshold, window, exit or fee could be
+moved to manufacture a PASS.
+
+**What is not closed.** The medium-frequency systematic crypto book already
+exists — `crypto-portfolio`, daily cadence, frozen signal, walk-forward
+Sharpe ≈ 2.0–2.2, expected live 1.0–1.3, Phase 2 passed — and the outside
+evidence favours exactly that horizon and that expectation. The scalper's
+tooling (tape store, honest fill model, time-varying costs) is retained for
+that bot's execution and capacity work, which is what its tranche-two gate
+requires. Any future short-horizon program would need a genuinely different
+position — paid full-depth data, colocation, live minimum-size probing — and
+the best public evidence says even that barely breaks even; it is not
+recommended.
+
+**Reopening.** This verdict is reopened only by evidence, not by a new idea
+about the same data: a demonstrated, pre-registered, out-of-sample signal at
+these horizons on this venue class, or a change in the account's position
+(rebate tier, colocation) that changes the cost side by more than the edge.
