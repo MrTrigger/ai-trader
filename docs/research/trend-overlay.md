@@ -119,3 +119,32 @@ smoothing is revisited. `risk_adjusted_tilted` and `breadth_trend` stay in
 the code as the measured alternative. If the overlay is ever reconsidered it
 should be on *live* evidence of a sustained bear where the flat book's
 kill-criteria are under pressure — the one regime where it measurably helped.
+
+## Sweep with holdout — pre-registered (2026-08-19, before any run)
+
+User direction: optimise the overlay for P&L and Sharpe. A sweep scored on
+all nine folds would find an in-sample winner by arithmetic; this one is
+scored on a **tuning set** and judged once on a **holdout**.
+
+- Tuning set: folds 1–5 (2020-09-18..2023-12-16). Holdout: folds 6–9
+  (2023-12-17..2026-07-30), not read until one config is selected.
+- Grid, fixed now (24 configs): `band ∈ {0.15, 0.30, 0.45}` ×
+  `horizons ∈ {(7,30), (20,60), (30,90), (60,120)}` days ×
+  `vol_scale ∈ {off, on}` where *on* multiplies N by
+  `min(1, 0.60 / median_30d_annualised_vol of the eligible universe)`.
+  Breadth definition unchanged (`2·share(ret_h>0) − 1`, mean over the two
+  horizons). Ranker, gross, costs, folds unchanged.
+- Selection: highest mean Sharpe over folds 1–5. One look.
+- Decision: adopt only if the selected config beats the flat book on folds
+  6–9 with a bootstrap 90% interval excluding zero; otherwise the sweep is
+  recorded and the overlay stays unadopted. 24 trials are reported as 24
+  trials; the in-sample surface is reported in full so a plateau can be told
+  from a spike.
+- Expectation, written now: the in-sample winner will show +0.2–0.5 Sharpe
+  over flat on folds 1–5 (selection effect on ~1,200 days); on the holdout
+  it will most likely be within noise of flat, as the unswept overlay was.
+
+The ret_7 and ret_20/60/120 horizons are features the planner already
+carries (`x_ret_7`, `x_ret_30`, `x_ret_90`, `x_ret_180`) except 20, 60 and
+120 — those are computed for this sweep from the same daily bars inside the
+overlay code, point-in-time, and nothing else.
