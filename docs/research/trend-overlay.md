@@ -129,7 +129,7 @@ scored on a **tuning set** and judged once on a **holdout**.
 - Tuning set: folds 1–5 (2020-09-18..2023-12-16). Holdout: folds 6–9
   (2023-12-17..2026-07-30), not read until one config is selected.
 - Grid, fixed now (24 configs): `band ∈ {0.15, 0.30, 0.45}` ×
-  `horizons ∈ {(7,30), (20,60), (30,90), (60,120)}` days ×
+  `horizons ∈ {(7,30), (30,90), (7,90), (90,180)}` days ×
   `vol_scale ∈ {off, on}` where *on* multiplies N by
   `min(1, 0.60 / median_30d_annualised_vol of the eligible universe)`.
   Breadth definition unchanged (`2·share(ret_h>0) − 1`, mean over the two
@@ -144,7 +144,7 @@ scored on a **tuning set** and judged once on a **holdout**.
   over flat on folds 1–5 (selection effect on ~1,200 days); on the holdout
   it will most likely be within noise of flat, as the unswept overlay was.
 
-The ret_7 and ret_20/60/120 horizons are features the planner already
-carries (`x_ret_7`, `x_ret_30`, `x_ret_90`, `x_ret_180`) except 20, 60 and
-120 — those are computed for this sweep from the same daily bars inside the
-overlay code, point-in-time, and nothing else.
+All four horizons are features the planner already carries (`x_ret_7`,
+`x_ret_30`, `x_ret_90`, `x_ret_180`), and the vol scalar uses `x_vol_30`
+(annualised). Nothing new is computed. *(Corrected before any run: the first
+draft listed 20/60/120-day horizons, which are not carried as features.)*

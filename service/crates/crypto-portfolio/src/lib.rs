@@ -544,11 +544,46 @@ struct Construction {
     notes: Vec<String>,
 }
 
+/// Breadth trend for the trend overlay (`docs/research/trend-overlay.md`):
+/// for h in {30, 90}, `b_h = 2 * share(ret_h > 0) - 1` over the eligible
+/// universe's latest rows; `trend = (b_30 + b_90) / 2` in [-1, 1]. `None`
+/// if either horizon has no row with a value (the rule cannot be evaluated,
+/// and the constructor that needs it refuses rather than assuming flat).
+fn breadth_trend(cross: &[&DailyRow]) -> Option<Decimal> {
+    fn breadth(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+        let v: Vec<f64> = values.flatten().collect();
+        if v.is_empty() {
+            return None;
+        }
+        let up = v.iter().filter(|x| **x > 0.0).count() as f64;
+        Some(2.0 * up / v.len() as f64 - 1.0)
+    }
+    let b30 = breadth(cross.iter().map(|r| r.ret_30))?;
+    let b90 = breadth(cross.iter().map(|r| r.ret_90))?;
+    d((b30 + b90) / 2.0).ok()
+}
+
+/// The overlay's band: |N| <= 0.30 of NAV (pre-registered, not a knob).
+const TREND_BAND: Decimal = Decimal::from_parts(30, 0, 0, false, 2);
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn construct(
     signals: &[Signal],
     cfg: &Config,
     nav: Decimal,
     profile: Option<&liquidity::Profile>,
+) -> Result<Construction, String> {
+    construct_with_tilt(signals, cfg, nav, profile, None)
+}
+
+/// `tilt` is the breadth trend in [-1, 1] (see `breadth_trend`), consumed
+/// only by `risk_adjusted_tilted`; every other constructor ignores it.
+fn construct_with_tilt(
+    signals: &[Signal],
+    cfg: &Config,
+    nav: Decimal,
+    profile: Option<&liquidity::Profile>,
+    tilt: Option<Decimal>,
 ) -> Result<Construction, String> {
     let mut weights = BTreeMap::new();
     let mut notes = Vec::new();
@@ -755,6 +790,111 @@ fn construct(
                 let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
                 notes.push(format!(
                     "{} long ({}) and {} short ({}), sized by edge/volatility across both sides; net {}",
+                    weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                    q(long, 3),
+                    weights.values().filter(|v| **v < Decimal::ZERO).count(),
+                    q(short.abs(), 3),
+                    q(long + short, 3)
+                ));
+            }
+        }
+        "risk_adjusted_tilted" => {
+            // docs/research/trend-overlay.md: the frozen risk_adjusted
+            // selection and within-side edge/vol sizing, with the two sleeves
+            // set from a net target N = TREND_BAND * tilt instead of half the
+            // gross each: long = (G+N)/2, short = (G-N)/2. The ranker still
+            // picks the names; the overlay only says how much net.
+            let Some(tilt) = tilt else {
+                return Err("risk_adjusted_tilted needs the breadth trend (ret_30/ret_90 over the eligible universe) and none could be computed".into());
+            };
+            let n_target = TREND_BAND * tilt;
+            let long_sleeve = (cfg.target_gross_exposure + n_target) / Decimal::from(2);
+            let short_sleeve = (cfg.target_gross_exposure - n_target) / Decimal::from(2);
+            let floor = Decimal::from(2) * (cfg.costs.commission_bps + cfg.costs.spread_bps) / BPS;
+            let usable: Vec<_> = signals
+                .iter()
+                .filter_map(|s| {
+                    s.volatility
+                        .filter(|v| *v > Decimal::ZERO && s.conviction >= floor)
+                        .map(|v| (s, v))
+                })
+                .collect();
+            let mut all: Vec<_> = usable.clone();
+            all.sort_by(|(a, _), (b, _)| {
+                b.conviction
+                    .partial_cmp(&a.conviction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all.truncate(24);
+            let longs: Vec<_> = all.iter().copied().filter(|(s, _)| s.direction == Direction::Long).collect();
+            let shorts: Vec<_> = all.iter().copied().filter(|(s, _)| s.direction == Direction::Short).collect();
+            if longs.len() < 2 || shorts.len() < 2 {
+                notes.push(format!(
+                    "top-24 book has {} long and {} short; a two-sided book cannot form",
+                    longs.len(),
+                    shorts.len()
+                ));
+            } else {
+                for (side, sign, sleeve) in [(longs, Decimal::ONE, long_sleeve), (shorts, -Decimal::ONE, short_sleeve)] {
+                    let total: Decimal = side.iter().map(|(s, vol)| s.conviction / *vol).sum();
+                    for (s, vol) in side {
+                        weights.insert(s.asset.clone(), sign * sleeve * (s.conviction / vol) / total);
+                    }
+                }
+                let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+                if largest > cfg.limits.max_position {
+                    let scale = cfg.limits.max_position / largest;
+                    for weight in weights.values_mut() {
+                        *weight *= scale;
+                    }
+                    notes.push(format!("per-position cap binds: whole book scaled by {}", q(scale, 3)));
+                }
+                notes.push(format!(
+                    "trend overlay: breadth trend {} -> net target {} (long sleeve {}, short sleeve {}); {} long and {} short, sized by edge/volatility",
+                    q(tilt, 3),
+                    q(n_target, 3),
+                    q(long_sleeve, 3),
+                    q(short_sleeve, 3),
+                    weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                    weights.values().filter(|v| **v < Decimal::ZERO).count()
+                ));
+            }
+        }
+        "top30_by_score" => {
+            // The user's spec, literally (2026-08-19): take the top 30 by
+            // |expected return| regardless of side, divide the gross in
+            // proportion to |expected return| (no volatility scaling, no
+            // per-side split), cap per name. Net exposure is whatever the
+            // list says. Exists to test that spec as written; it is not the
+            // frozen constructor.
+            let floor = Decimal::from(2) * (cfg.costs.commission_bps + cfg.costs.spread_bps) / BPS;
+            let mut usable: Vec<_> = signals.iter().filter(|s| s.conviction >= floor).collect();
+            usable.sort_by(|a, b| {
+                b.conviction
+                    .partial_cmp(&a.conviction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            usable.truncate(30);
+            if usable.is_empty() {
+                notes.push("no signal cleared the cost floor; target is flat".into());
+            } else {
+                let total: Decimal = usable.iter().map(|s| s.conviction).sum();
+                for s in &usable {
+                    let sign = if s.direction == Direction::Long { Decimal::ONE } else { -Decimal::ONE };
+                    weights.insert(s.asset.clone(), sign * cfg.target_gross_exposure * s.conviction / total);
+                }
+                let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+                if largest > cfg.limits.max_position {
+                    let scale = cfg.limits.max_position / largest;
+                    for weight in weights.values_mut() {
+                        *weight *= scale;
+                    }
+                    notes.push(format!("per-position cap binds: whole book scaled by {}", q(scale, 3)));
+                }
+                let long: Decimal = weights.values().filter(|v| **v > Decimal::ZERO).sum();
+                let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
+                notes.push(format!(
+                    "top-30 by score: {} long ({}) and {} short ({}), sized by score; net {}",
                     weights.values().filter(|v| **v > Decimal::ZERO).count(),
                     q(long, 3),
                     weights.values().filter(|v| **v < Decimal::ZERO).count(),
@@ -1462,7 +1602,8 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         None => None,
     };
     let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg, profile.as_ref())?;
-    let construction = construct(&generated.values, cfg, nav, profile.as_ref())?;
+    let tilt = breadth_trend(&cross);
+    let construction = construct_with_tilt(&generated.values, cfg, nav, profile.as_ref(), tilt)?;
     let betas: BTreeMap<_, _> = latest
         .iter()
         .map(|(a, r)| Ok((a.clone(), r.beta_bench.map(d).transpose()?.map(|v| q(v, 6)))))
@@ -2627,6 +2768,61 @@ mod tests {
             .max()
             .unwrap();
         assert!(biggest_short > biggest_long, "{:?}", out_b.weights);
+    }
+
+    /// Trend overlay: breadth -1 -> N = -0.30 -> sleeves 0.25 long / 0.55
+    /// short on 0.80 gross; breadth 0 -> the frozen 0.40/0.40; the ranker's
+    /// selection is identical either way. Without a tilt the constructor
+    /// refuses rather than assuming flat.
+    #[test]
+    fn tilted_constructor_sets_sleeves_from_the_breadth_trend() {
+        let mut cfg = config();
+        cfg.constructor = "risk_adjusted_tilted".into();
+        cfg.target_gross_exposure = Decimal::new(8, 1);
+        // Wide per-name cap so the sleeve arithmetic is visible unscaled.
+        cfg.limits.max_position = Decimal::new(5, 1);
+        let mk = |a: &str, dir: Direction, conv: Decimal| Signal {
+            asset: a.into(),
+            direction: dir,
+            conviction: conv,
+            volatility: Some(Decimal::new(1, 1)),
+        };
+        let signals = vec![
+            mk("L1", Direction::Long, Decimal::new(4, 2)),
+            mk("L2", Direction::Long, Decimal::new(2, 2)),
+            mk("S1", Direction::Short, Decimal::new(4, 2)),
+            mk("S2", Direction::Short, Decimal::new(2, 2)),
+        ];
+        let out = construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, Some(-Decimal::ONE)).unwrap();
+        let long: Decimal = out.weights.values().filter(|v| **v > Decimal::ZERO).sum();
+        let short: Decimal = out.weights.values().filter(|v| **v < Decimal::ZERO).map(|v| v.abs()).sum();
+        assert_eq!(long, Decimal::new(25, 2), "{:?}", out.weights);
+        assert_eq!(short, Decimal::new(55, 2), "{:?}", out.weights);
+        // within the short side, 2:1 by edge/vol
+        assert_eq!(out.weights["S1"], -Decimal::new(55, 2) * Decimal::from(2) / Decimal::from(3));
+        let flat = construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, Some(Decimal::ZERO)).unwrap();
+        let long0: Decimal = flat.weights.values().filter(|v| **v > Decimal::ZERO).sum();
+        assert_eq!(long0, Decimal::new(4, 1));
+        assert!(construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, None).is_err());
+    }
+
+    #[test]
+    fn breadth_trend_is_the_mean_of_two_horizons_breadths() {
+        let as_of: DateTime<Utc> = "2026-08-01T00:00:00Z".parse().unwrap();
+        let mut rows: Vec<DailyRow> = (0..4).map(|i| row(&format!("A{i}"), as_of, 100.0)).collect();
+        // ret_30: 3 of 4 up -> b30 = 0.5 ; ret_90: 1 of 4 up -> b90 = -0.5 ; trend 0
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.ret_30 = Some(if i < 3 { 0.1 } else { -0.1 });
+            r.ret_90 = Some(if i < 1 { 0.1 } else { -0.1 });
+        }
+        let refs: Vec<&DailyRow> = rows.iter().collect();
+        assert_eq!(breadth_trend(&refs), Some(Decimal::ZERO));
+        for r in rows.iter_mut() { r.ret_90 = Some(-0.2); }
+        let refs: Vec<&DailyRow> = rows.iter().collect();
+        assert_eq!(breadth_trend(&refs), Some(Decimal::new(-25, 2))); // (0.5 + -1)/2
+        for r in rows.iter_mut() { r.ret_90 = None; }
+        let refs: Vec<&DailyRow> = rows.iter().collect();
+        assert_eq!(breadth_trend(&refs), None);
     }
 
     #[test]

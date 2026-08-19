@@ -277,8 +277,37 @@ pub fn replay_prepared_stepped(
     // because a book that does not exist yet cannot have been funded.
     let mut last_priced: Option<DateTime<Utc>> = None;
     let mut funding_total = Decimal::ZERO;
+    // Last price seen for every asset the book has touched, for settling a
+    // position whose asset stops trading (below).
+    let mut last_price: BTreeMap<String, Decimal> = BTreeMap::new();
+    let mut settled_total = 0usize;
     let mut as_of = start;
     while as_of <= end {
+        // Venue identity breaks. The daily store has no transient holes (every
+        // gap of 2+ days in 659 assets since 2020-09 is a real venue event,
+        // and most are ticker redenominations - LUNA 2022-05-13 -> 05-31 is
+        // 20,000x, COCOS 1000x, QUICK 1/1000). A venue settles a delisted
+        // contract at its last mark; this loop used to keep the position as a
+        // ghost marked at zero and then re-mark it at whatever the ticker
+        // meant next (a -4.5% LUNA short read -45% of NAV on the reborn
+        // series - docs/research/net-exposure-guard.md). So: a held position
+        // whose asset has no bar today is settled at its last known price,
+        // disclosed, and gone. The reborn series is a new identity as far as
+        // the features are concerned already (their windows poison across
+        // the gap), so nothing re-enters it until it has history again.
+        if let Some(opens) = prepared.opens.get(&as_of) {
+            let settled = settle_missing(&mut portfolio, opens, &last_price);
+            settled_total += settled.len();
+            for (asset, qty, px) in settled {
+                disclosures.push(format!(
+                    "{}: {asset} has no bar; position {qty} settled at last price {px} (venue identity break)",
+                    as_of.date_naive()
+                ));
+            }
+            for (asset, px) in opens {
+                last_price.insert(asset.clone(), *px);
+            }
+        }
         let members = match universe::load(root, as_of) {
             Ok(members) => members,
             Err(error) => {
@@ -367,6 +396,14 @@ pub fn replay_prepared_stepped(
         as_of += cadence;
     }
 
+    if settled_total > 0 {
+        disclosures.insert(
+            0,
+            format!(
+                "{settled_total} position(s) settled at last price because the asset stopped trading (venue identity break); see per-date lines"
+            ),
+        );
+    }
     if gate_failures > 0 {
         disclosures.insert(
             0,
@@ -487,6 +524,34 @@ fn apply(
         .map(|(asset, qty)| Position { asset, qty })
         .collect();
     (Portfolio { cash, positions }, fills)
+}
+
+/// Settle every held position whose asset has no price today at its last
+/// known price - what a venue does when a contract stops trading - and
+/// return what was settled as `(asset, qty, price)`. A position never priced
+/// at all is kept: there is nothing to settle it at.
+fn settle_missing(
+    book: &mut Portfolio,
+    today: &BTreeMap<String, Decimal>,
+    last_price: &BTreeMap<String, Decimal>,
+) -> Vec<(String, Decimal, Decimal)> {
+    let mut settled = Vec::new();
+    let mut kept = Vec::with_capacity(book.positions.len());
+    for position in book.positions.drain(..) {
+        if position.qty.is_zero() || today.contains_key(&position.asset) {
+            kept.push(position);
+            continue;
+        }
+        match last_price.get(&position.asset) {
+            Some(px) => {
+                book.cash += position.qty * *px;
+                settled.push((position.asset, position.qty, *px));
+            }
+            None => kept.push(position),
+        }
+    }
+    book.positions = kept;
+    settled
 }
 
 fn mark(book: &Portfolio, prices: &BTreeMap<String, Decimal>) -> Decimal {
@@ -767,6 +832,37 @@ mod tests {
             at("2026-01-04"),
         );
         assert_eq!(carry, Decimal::from(-3));
+    }
+
+    /// LUNA, May 2022: a short of 1,000,000 units at $0.00005 (worth -$50)
+    /// whose ticker disappears and comes back 18 days later at $8.87. Before:
+    /// a ghost marked at zero, then -$8.87M. Now: settled at $0.00005 the day
+    /// the bar is missing, cash -$50, position gone; a long in a live asset
+    /// and a never-priced position are untouched.
+    #[test]
+    fn a_position_whose_asset_stops_trading_is_settled_at_its_last_price() {
+        let mut book = Portfolio {
+            cash: Decimal::from(100_000),
+            positions: vec![
+                Position { asset: "LUNA".into(), qty: Decimal::from(-1_000_000) },
+                Position { asset: "BTC".into(), qty: Decimal::new(5, 1) },
+                Position { asset: "NEW".into(), qty: Decimal::from(10) },
+            ],
+        };
+        let today = BTreeMap::from([("BTC".to_string(), Decimal::from(30_000))]);
+        let last = BTreeMap::from([
+            ("LUNA".to_string(), Decimal::new(5, 5)),
+            ("BTC".to_string(), Decimal::from(29_000)),
+        ]);
+        let settled = settle_missing(&mut book, &today, &last);
+        assert_eq!(settled, vec![("LUNA".to_string(), Decimal::from(-1_000_000), Decimal::new(5, 5))]);
+        assert_eq!(book.cash, Decimal::from(100_000) - Decimal::from(50));
+        let names: Vec<&str> = book.positions.iter().map(|p| p.asset.as_str()).collect();
+        assert_eq!(names, vec!["BTC", "NEW"]);
+        // Reborn LUNA at $8.87 the next day is not our problem any more.
+        let reborn = BTreeMap::from([("BTC".to_string(), Decimal::from(30_000)), ("LUNA".to_string(), Decimal::new(887, 2))]);
+        assert!(settle_missing(&mut book, &reborn, &last).is_empty());
+        assert_eq!(book.cash, Decimal::from(99_950));
     }
 
     fn step(day: i64, nav: i64) -> Step {
