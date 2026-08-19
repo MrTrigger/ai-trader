@@ -498,7 +498,7 @@ fn generate_signal(
                     // into return units here rather than teaching every
                     // constructor about reward types.
                     let expected_return = match model.reward.as_str() {
-                        "per_risk" => score.abs() * volatility,
+                        "per_risk" | "per_risk_abs" => score.abs() * volatility,
                         _ => score.abs(),
                     };
                     out.push(Signal {

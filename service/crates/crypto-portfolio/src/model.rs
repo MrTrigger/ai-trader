@@ -27,8 +27,11 @@ pub struct Model {
     /// demean(ret); "per_risk" is demean(ret/vol), whose output is already in
     /// return-per-unit-risk units. Inference has to know which, because a
     /// per-risk score divided by volatility again would double-count risk and
-    /// quietly rebuild the concentration the sizing study removed. Absent on
-    /// artefacts fit before the field existed, all of which were "return".
+    /// quietly rebuild the concentration the sizing study removed.
+    /// "per_risk_abs" is ret/vol NOT demeaned within date (the sign carries
+    /// market direction; docs/research/absolute-label-unbalanced.md) and is
+    /// converted exactly like "per_risk". Absent on artefacts fit before the
+    /// field existed, all of which were "return".
     #[serde(default = "default_reward")]
     pub reward: String,
     pub tree_info: Vec<Tree>,

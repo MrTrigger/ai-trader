@@ -44,9 +44,12 @@ def load_matrix(path: Path, through: date, reward: str = "return"):
     rows = [row for row in rows if date.fromisoformat(row["date"]) <= through]
     if len(rows) < 3_000:
         raise ValueError(f"only {len(rows)} rows through {through}; refusing a small fit")
-    if reward == "per_risk":
-        # demean(ret/vol) within each date, from the raw columns Rust emits.
-        # Rows without a vol estimate cannot join this reward and are dropped
+    if reward in ("per_risk", "per_risk_abs"):
+        # per_risk: demean(ret/vol) within each date, from the raw columns
+        # Rust emits. per_risk_abs: ret/vol NOT demeaned - the sign carries
+        # market direction, which a demeaned or ranked label throws away by
+        # construction (docs/research/absolute-label-unbalanced.md). Rows
+        # without a vol estimate cannot join either reward and are dropped
         # from the FIT only - inference still scores every eligible name.
         from collections import defaultdict
 
@@ -57,6 +60,8 @@ def load_matrix(path: Path, through: date, reward: str = "return"):
         kept = []
         for day_rows in byday.values():
             mean = sum(r["raw_ret"] / r["vol"] for r in day_rows) / len(day_rows)
+            if reward == "per_risk_abs":
+                mean = 0.0
             for r in day_rows:
                 r["_y"] = r["raw_ret"] / r["vol"] - mean
                 kept.append(r)
@@ -80,11 +85,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--reward",
-        choices=["return", "per_risk"],
+        choices=["return", "per_risk", "per_risk_abs"],
         default="return",
-        help="what the trees predict: demean(ret), or demean(ret/vol) whose "
-        "score is already per unit of risk. Recorded on the artefact so "
-        "inference multiplies vol back exactly once.",
+        help="what the trees predict: demean(ret), demean(ret/vol), or ret/vol "
+        "not demeaned (per_risk_abs - the sign carries market direction). "
+        "Recorded on the artefact so inference multiplies vol back exactly "
+        "once for both per-risk forms.",
     )
     args = parser.parse_args()
 

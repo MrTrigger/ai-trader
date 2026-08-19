@@ -87,11 +87,20 @@ for i in "${!BOUNDS[@]}"; do
 
   # A per-fold config, because `backtest` takes its model from the config and
   # the whole point is that each fold uses a different one.
+  # WF_CONSTRUCTOR / WF_MAX_NET_EXPOSURE: optional overrides for the per-fold
+  # config, so a construction experiment can be run from one invocation
+  # without hand-editing nine files (absolute-label-unbalanced.md). Unset =
+  # whatever config/default.toml says.
+  WF_CONSTRUCTOR="${WF_CONSTRUCTOR:-}" WF_MAX_NET_EXPOSURE="${WF_MAX_NET_EXPOSURE-__unset__}" \
   python3 - "$CFG" "$MODEL" <<'PY'
-import re, sys, pathlib
+import os, re, sys, pathlib
 cfg, model = sys.argv[1], sys.argv[2]
 text = pathlib.Path("config/default.toml").read_text()
 text = re.sub(r'^model_path\s*=.*$', f'model_path = "{model}"', text, flags=re.M)
+if os.environ.get("WF_CONSTRUCTOR"):
+    text = re.sub(r'^constructor\s*=.*$', f'constructor = "{os.environ["WF_CONSTRUCTOR"]}"', text, flags=re.M)
+if os.environ.get("WF_MAX_NET_EXPOSURE", "__unset__") != "__unset__":
+    text = re.sub(r'^max_net_exposure\s*=.*$', f'max_net_exposure = "{os.environ["WF_MAX_NET_EXPOSURE"]}"', text, flags=re.M)
 pathlib.Path(cfg).write_text(text)
 PY
 
