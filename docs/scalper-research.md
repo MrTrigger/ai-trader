@@ -1029,3 +1029,23 @@ one closure-named direction never run (a different label/target) remains
 untested, and the honest prior from the record is that it addresses the
 wrong constraint (at h15 ~80% of exits are time exits, so the label already
 is the outcome).
+
+
+## Research round (2026-08-19)
+
+`docs/scalper-research-round-2026-08.md` surveys the 2021–2026 literature on
+short-horizon crypto predictability, market-making/execution economics,
+industry practice, and medium-frequency evidence, and reads gate runs 4–6
+against it. Its conclusion is recorded here for the protocol: the outside
+evidence predicts exactly what the six runs found (IC 0.02–0.04, net Sharpe
+< 1 at 15–60 minutes from public data, maker execution adversely selected),
+no credible source supports a Sharpe > 2 signal at this horizon for this
+participant, and the professionals' documented P&L comes from speed, queue,
+rebates, inventory and flow — not minute-scale prediction. One data
+correction: Binance did publish a UM `bookTicker` archive for 2023-05-16
+through 2024-03-31 (verified 2026-08-19); Amendment 5's statement holds for
+the 24-month record. The document recommends closing the 1-minute scalper
+line as a direction and, if a systematic crypto book is still the goal,
+pre-registering a separate medium-frequency project (daily-bar trend on
+liquid perps + funding carry sleeve, expected net Sharpe ~1). No amendment
+is made by this section; nothing here is a number against any gate.
