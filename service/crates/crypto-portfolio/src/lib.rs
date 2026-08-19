@@ -700,6 +700,69 @@ fn construct(
                 }
             }
         }
+        "risk_adjusted_unbalanced" => {
+            // The same selection as `risk_adjusted` - the top 24 by |expected
+            // return| across both sides, above the cost floor - sized by
+            // edge/volatility JOINTLY to the gross target, with no per-side
+            // split. `risk_adjusted` hands each side exactly half the gross,
+            // which on a 20-long/4-short day concentrates 0.40 in the four
+            // names the model liked least; this constructor lets the book be
+            // as long or as short as the ranked list says. Net exposure is
+            // whatever falls out and is reported, not targeted; the risk
+            // report's `max_net_exposure` is the only thing that bounds it.
+            let floor = Decimal::from(2) * (cfg.costs.commission_bps + cfg.costs.spread_bps) / BPS;
+            let mut usable: Vec<_> = signals
+                .iter()
+                .filter_map(|s| {
+                    s.volatility
+                        .filter(|v| *v > Decimal::ZERO && s.conviction >= floor)
+                        .map(|v| (s, v))
+                })
+                .collect();
+            usable.sort_by(|(a, _), (b, _)| {
+                b.conviction
+                    .partial_cmp(&a.conviction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            usable.truncate(24);
+            if usable.is_empty() {
+                notes.push("no signal cleared the cost floor; target is flat".into());
+            } else {
+                let total: Decimal = usable.iter().map(|(s, vol)| s.conviction / *vol).sum();
+                for (s, vol) in &usable {
+                    let sign = if s.direction == Direction::Long {
+                        Decimal::ONE
+                    } else {
+                        -Decimal::ONE
+                    };
+                    weights.insert(
+                        s.asset.clone(),
+                        sign * cfg.target_gross_exposure * (s.conviction / *vol) / total,
+                    );
+                }
+                let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+                if largest > cfg.limits.max_position {
+                    let scale = cfg.limits.max_position / largest;
+                    for weight in weights.values_mut() {
+                        *weight *= scale;
+                    }
+                    notes.push(format!(
+                        "per-position cap binds: whole book scaled by {}",
+                        q(scale, 3)
+                    ));
+                }
+                let long: Decimal = weights.values().filter(|v| **v > Decimal::ZERO).sum();
+                let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
+                notes.push(format!(
+                    "{} long ({}) and {} short ({}), sized by edge/volatility across both sides; net {}",
+                    weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                    q(long, 3),
+                    weights.values().filter(|v| **v < Decimal::ZERO).count(),
+                    q(short.abs(), 3),
+                    q(long + short, 3)
+                ));
+            }
+        }
         other => return Err(format!("unknown constructor {other:?}")),
     }
     notes.extend(cap_by_participation(&mut weights, cfg, nav, profile));
@@ -2487,6 +2550,83 @@ mod tests {
             out.weights.values().filter(|w| **w < Decimal::ZERO).count(),
             2
         );
+    }
+
+    /// 3 longs / 1 short of equal edge and vol: `risk_adjusted` gives the lone
+    /// short 0.40 and each long 0.133; `risk_adjusted_unbalanced` gives every
+    /// name 0.20 and the book is 0.60 long / 0.20 short - the ranked list, not
+    /// a manufactured balance. (Two shorts are needed for the balanced one to
+    /// form at all, so it gets a second short of tiny edge.)
+    #[test]
+    fn unbalanced_constructor_sizes_the_ranked_list_across_sides() {
+        let mut cfg = config();
+        cfg.constructor = "risk_adjusted_unbalanced".into();
+        cfg.target_gross_exposure = Decimal::new(8, 1);
+        cfg.limits.max_position = Decimal::new(25, 2);
+        let mk = |a: &str, dir: Direction, conv: Decimal| Signal {
+            asset: a.into(),
+            direction: dir,
+            conviction: conv,
+            volatility: Some(Decimal::new(1, 1)),
+        };
+        let signals = vec![
+            mk("L1", Direction::Long, Decimal::new(4, 2)),
+            mk("L2", Direction::Long, Decimal::new(4, 2)),
+            mk("L3", Direction::Long, Decimal::new(4, 2)),
+            mk("S1", Direction::Short, Decimal::new(4, 2)),
+        ];
+        let out = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert_eq!(out.weights.len(), 4);
+        for w in out.weights.values() {
+            assert_eq!(w.abs(), Decimal::new(2, 1), "{:?}", out.weights);
+        }
+        let net: Decimal = out.weights.values().sum();
+        assert_eq!(net, Decimal::new(4, 1));
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("3 long") && n.contains("1 short")),
+            "{:?}",
+            out.notes
+        );
+
+        // The balanced constructor on the same list plus a second, weak short:
+        // the short side still gets 0.40 between two names.
+        let mut balanced = cfg.clone();
+        balanced.constructor = "risk_adjusted".into();
+        let mut two_shorts = signals.clone();
+        two_shorts.push(mk("S2", Direction::Short, Decimal::new(1, 2)));
+        let out_b = construct(&two_shorts, &balanced, Decimal::from(100_000), None).unwrap();
+        let short_side: Decimal = out_b
+            .weights
+            .values()
+            .filter(|v| **v < Decimal::ZERO)
+            .map(|v| v.abs())
+            .sum();
+        let long_side: Decimal = out_b.weights.values().filter(|v| **v > Decimal::ZERO).sum();
+        // Equal sides by construction (both 0.40, then scaled together when
+        // the 0.25 per-position cap binds on the concentrated short) - two
+        // weak shorts carry as much of the book as three strong longs.
+        assert!(
+            (short_side - long_side).abs() < Decimal::new(1, 6),
+            "{:?}",
+            out_b.weights
+        );
+        let biggest_short = out_b
+            .weights
+            .values()
+            .filter(|v| **v < Decimal::ZERO)
+            .map(|v| v.abs())
+            .max()
+            .unwrap();
+        let biggest_long = out_b
+            .weights
+            .values()
+            .filter(|v| **v > Decimal::ZERO)
+            .copied()
+            .max()
+            .unwrap();
+        assert!(biggest_short > biggest_long, "{:?}", out_b.weights);
     }
 
     #[test]
