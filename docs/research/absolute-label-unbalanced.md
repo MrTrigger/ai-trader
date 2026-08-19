@@ -240,3 +240,16 @@ median-centred rank keeps both sides ~12/12. Flag for the frozen book:
 `max_position = 0.25` is generous if a side ever thins; it does not bind in
 A's replay but belongs on the open-items list next to collapsed-asset
 shorts.
+
+
+### The spec, literally: top-30 by |score|, weights ∝ score (same day)
+
+`top30_by_score` on the rank models (B-style) and on the signed models
+(F-style): rank → Sharpe 1.12, 7/9, worst DD −43%, vs A −1.02 [−1.47, −0.51];
+signed → 1.27, 8/9, compounded +1907% (the highest of all), worst DD −49%,
+net > +0.2 on 55% of days, 2022 H1 fold −0.60. The literal spec reproduces
+the two findings it was run to check: with the rank score the list is not
+one-sided (|net| > 0.4 on 0.9% of days); with the signed score it is
+one-sided and long — the same long tilt into every sell-off, plus heavier
+concentration from sizing by raw score. Nothing about 24-vs-30 or ÷vol
+changed the conclusion.

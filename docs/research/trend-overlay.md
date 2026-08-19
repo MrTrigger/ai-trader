@@ -70,6 +70,52 @@ better sources; bolted onto a Sharpe-2 flat book at 0.3 band it most likely
 adds drawdown in the turns and a little return in the trends, netting near
 zero. If it wins it wins on 2022.
 
-## Results
+## Results (2026-08-19, same day, run as registered)
 
-*(none at the time of writing)*
+Nine folds, frozen fold models, replay only; both sides on the same binary
+(settlement fix applied).
+
+| | flat (`risk_adjusted`) | overlay (`risk_adjusted_tilted`, band 0.30) |
+|---|---:|---:|
+| mean Sharpe | 2.11 | 1.74 |
+| compounded | +1189% | +1309% |
+| folds positive | 9/9 | 9/9 |
+| mean max drawdown | −11.6% | −13.9% |
+| worst fold drawdown | −17.6% | −19.7% |
+| turnover / rebalance | 0.809 | 0.810 |
+| realized net p5 / p50 / p95 | −0.02 / 0.00 / +0.06 | −0.22 / −0.01 / +0.26 |
+
+Per-fold Sharpe flat → overlay: 5.57→5.28, 2.83→1.86, **1.98→1.75**,
+1.56→0.58, 1.86→1.74, 0.28→0.60, 1.70→1.63, 2.41→1.70, 0.83→0.54. Per-fold
+return flat → overlay: +112→+166, +53→+38, **+30→+41 (2022 H1)**, +17→+7,
++25→+27, +3→+8, +25→+29, +43→+33, +14→+8. 2022 H1 max drawdown −10.9% →
+−12.1%.
+
+`crypto-portfolio compare`: **observed Δ −0.29, 90% interval [−0.61, +0.02]**
+— includes zero; the evidence does not separate them, and the point estimate
+is against.
+
+**The overlay's own timing (reported as promised).** corr(N_t, BTC_{t+1}) =
+0.029. Inside 30-day drawdowns > 20% the book was net short on **92%** of
+days (median −0.16); inside 30-day rallies > 20% net long (median +0.19).
+Monthly, Nov-2021..Jul-2022: +0.16, −0.08, −0.07, −0.20, −0.16, −0.04,
+−0.13, −0.23, −0.13 — short through the whole bear, one month late at the
+top, exactly as the expectation paragraph said. It is the first directional
+variant on this record whose tilt points the right way in the bear.
+
+**Reading.** The rule does what it claims: it is short in bears and long in
+bulls, it lifts 2022 H1 (+30% → +41%) and the compounded total (+1189% →
++1309%), and it keeps 9/9 folds positive. It pays for that at the turns and
+in chop — folds 2 (into the Nov-2021 top), 4 (the 2022-23 bottom), 8 and 9 —
+and the net effect on risk-adjusted return is negative by a third of a
+Sharpe with an interval that touches zero. A slow trend signal bolted onto a
+Sharpe-2 flat book adds a little return and more variance; per unit of risk
+it is not an improvement on this record.
+
+**Decision (per the rule).** Not adopted: it does not beat the flat book with
+an interval excluding zero, and the 2022 drawdown is marginally worse, not
+better. Indistinguishable-to-worse → keep flat. No band, horizon, weighting or
+smoothing is revisited. `risk_adjusted_tilted` and `breadth_trend` stay in
+the code as the measured alternative. If the overlay is ever reconsidered it
+should be on *live* evidence of a sustained bear where the flat book's
+kill-criteria are under pressure — the one regime where it measurably helped.
