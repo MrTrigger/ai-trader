@@ -205,3 +205,18 @@ risk-adjusted terms: every route to direction imports the market's drift,
 and the ranker's edge is the cross-section. Closed on evidence; reopened
 only by a pre-registered market-direction component with its own target,
 not by another label for the ranker.
+
+### Does F's tilt anticipate anything? (measured, same day)
+
+Correlation of F's realized net exposure on day *t* with BTC's return on
+*t+1*: **0.013** over 2,142 rebalances (per fold −0.03 … +0.04). Before
+next-day BTC moves < −3% (n=224) the book's net median was +0.41, net-short
+18% of the time; before moves > +3% (n=259): +0.46 / 17% — indistinguishable.
+Inside regimes where BTC was already down > 20% over 30 days (n=158): net
+median **+0.47** (rallies: +0.37). Monthly, Nov-2021..Jun-2022, F's median
+net against BTC's month: +0.58/−6.5%, +0.61/−19%, +0.62/−19%, +0.46/+12%,
++0.48/+3%, +0.61/−19%, +0.54/−17%, +0.51/−33%. The tilt is the training
+base rate plus noise; it never sees the bear coming and does not react once
+it is there. The ranker's cross-sectional skill is real; its timing skill is
+nil under any of the three labels. The balanced book is right not because
+direction is undesirable but because nothing in this model can see it.
