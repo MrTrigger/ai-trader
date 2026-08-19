@@ -169,3 +169,39 @@ frozen config changes only if F beats A with a 90% interval excluding zero
 and no worse 2022 drawdown. Expectation written now: F's net will move with
 the market, far less violently than D's; its Sharpe most likely lands
 between B and A.
+
+### E / F results (same day, run as registered)
+
+| cell | mean Sharpe | compounded | folds + | mean maxDD | worst fold DD | realized net p5 / p50 / p95 |
+|---|---:|---:|---:|---:|---:|---|
+| E signed-rank × balanced | 1.49 | +501% | 8/9 | −16.9% | −47.2% | −0.25 / 0.00 / +0.07 |
+| F signed-rank × unbalanced | 1.18 | +1106% | 7/9 | −26.7% | −52.7% | −0.54 / +0.36 / +0.77 |
+
+Per-fold Sharpe E: `1.66 1.44 2.58 1.56 1.22 1.85 2.27 1.81 −0.94`;
+F: `3.99 1.31 −1.33 1.71 1.51 0.99 2.39 −0.69 0.72`. F per-fold return vs A:
++290/+56, +51/+58, **−43/+39 (2022 H1)**, +43/+11, +24/+18, +23/+7,
++81/+46, **−21/+42**, +14/+13. F realized net median by fold: +0.49, +0.57,
++0.56, +0.30, +0.31, +0.31, +0.27, +0.17, +0.10 — long-biased throughout,
+most in 2020–22.
+
+Bootstrap: **F vs A −0.86 [−1.68, −0.07]** (excludes zero); E vs A −0.83
+[−1.58, +0.04]; F vs E −0.04 [−1.14, +0.92].
+
+**Reading.** The signed-magnitude label did what it was designed to do — the
+list is genuinely directional and less violent than D's — and it is still
+long-biased, because the drift enters through the sign mix and the larger
+magnitudes of up-moves in the training windows; fold 3 ran net +0.56 into
+the 2022 bear and lost 43%. F's compounded return is the highest in the
+table and that is the trap: it is a long-crypto tilt on top of the ranker,
+earned in rallies, with 2.3× the drawdowns and a −53% fold — it would breach
+the capital plan's live kill criterion (DD > 25%) in its first bear market.
+The label also costs the ranker skill even when hedged flat (E vs A −0.83).
+
+**Decision (per the rule).** F does not beat A; it loses on both criteria.
+The frozen config stands. Directional selection has now been tested three
+ways on the same folds — float the ranked list (B), absolute label (D),
+signed-magnitude label (F) — and the balanced ranker wins each time on
+risk-adjusted terms: every route to direction imports the market's drift,
+and the ranker's edge is the cross-section. Closed on evidence; reopened
+only by a pre-registered market-direction component with its own target,
+not by another label for the ranker.
