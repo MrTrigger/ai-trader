@@ -148,3 +148,39 @@ All four horizons are features the planner already carries (`x_ret_7`,
 `x_ret_30`, `x_ret_90`, `x_ret_180`), and the vol scalar uses `x_vol_30`
 (annualised). Nothing new is computed. *(Corrected before any run: the first
 draft listed 20/60/120-day horizons, which are not carried as features.)*
+
+### Sweep results (2026-08-19, run as registered; 24 configs × folds 1–5, then one config × folds 6–9)
+
+Flat book on the tuning folds: mean Sharpe 2.759, compounded +518%. **No
+config beats it.** Ranked by tuning-set mean Sharpe (Δ vs flat):
+
+| rank | config | mean Sharpe | Δ | compounded | worst DD |
+|---:|---|---:|---:|---:|---:|
+| 1 | b0.15 h7/30 vol-on | 2.750 | −0.009 | +553% | −15.7% |
+| 2 | b0.15 h7/90 vol-on | 2.732 | −0.027 | +547% | −16.4% |
+| 3 | b0.15 h30/90 vol-on | 2.703 | −0.055 | +533% | −16.0% |
+| 4 | b0.30 h7/30 vol-on | 2.671 | −0.088 | +597% | −16.6% |
+| … | | | | | |
+| 12 | b0.45 h7/30 vol-on | 2.445 | −0.314 | +576% | −18.1% |
+| 17 | b0.30 h30/90 vol-off (the registered base) | 2.241 | −0.517 | +600% | −19.7% |
+| 24 | b0.45 h90/180 vol-off | 1.841 | −0.918 | +664% | −21.0% |
+
+The surface is monotone and smooth, not spiky: Sharpe falls with the band
+(0.15 → 0.30 → 0.45: −0.05 / −0.35 / −0.60 on average), vol-scaling helps
+at every band (it shrinks the tilt), horizons barely matter. Compounded
+return rises with the band (the beta), Sharpe falls with it, drawdowns
+deepen with it. The optimum of this family on the tuning set is "as little
+overlay as possible": the winner is within rounding of flat.
+
+**Holdout, the one look** (selected `b0.15_h7-30_von`, folds 6–9): flat
+0.28 / 1.70 / 2.41 / 0.83 → overlay 0.32 / 1.59 / 2.20 / 0.61; mean 1.305 →
+1.179; bootstrap **Δ −0.13, 90% interval [−0.27, +0.02]**, variant ahead in
+7% of resamples. Worse, not separable, on the folds it never saw.
+
+**Decision.** Not adopted. The sweep found no configuration of a breadth-
+trend overlay that improves the flat book's risk-adjusted return on this
+record — in-sample or out — and the ones that raise total return do so by
+carrying market beta, which the capital plan's kill criteria price at more
+than it pays. The question "can a trend overlay improve P&L and Sharpe" is
+answered on evidence for this rule family: P&L yes (with beta), Sharpe no.
+24 trials are recorded above; nothing is adopted from them.
