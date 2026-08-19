@@ -131,6 +131,26 @@ def main() -> None:
             for r, i in enumerate(order):
                 y[i] = 2.0 * r / n - 1.0
         print("reward replaced by within-date uniform rank")
+    elif os.environ.get("TRAIN_RANK") == "signed":
+        # Signed magnitude rank (docs/research/absolute-label-unbalanced.md,
+        # cells E/F): rank |y| across ALL names of the day jointly onto
+        # (0, 1], then re-attach sign(y). The biggest move of the day is +-1,
+        # a mid-sized move about +-0.5, a flat name ~0 of either sign; the
+        # long/short count follows the real signs of the day, magnitudes are
+        # comparable across sides, and no raw drift magnitude survives. Meant
+        # for the NON-demeaned per_risk_abs input (sign = actual direction);
+        # with a demeaned reward the sign would be relative to the median.
+        from collections import defaultdict
+        byday = defaultdict(list)
+        for i, row in enumerate(rows):
+            byday[(row["date"], row.get("slot", 0))].append(i)
+        for ixs in byday.values():
+            order = sorted(ixs, key=lambda i: abs(y[i]))
+            n = max(1, len(order))
+            for r, i in enumerate(order):
+                mag = (r + 1.0) / n
+                y[i] = mag if y[i] > 0 else (-mag if y[i] < 0 else 0.0)
+        print("reward replaced by within-date signed magnitude rank")
 
     n_seeds = int(os.environ.get("TRAIN_SEEDS", "1"))
     def scale_leaves(node, k):

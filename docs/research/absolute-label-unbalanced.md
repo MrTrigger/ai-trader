@@ -146,3 +146,26 @@ a strong view flat — is sound in a world where the model's view of market
 direction is worth having. On this record, with these features at a 24-hour
 horizon, it isn't: the model's cross-sectional ranking is the asset, and the
 balance is what protects it from the model's timing.
+
+## Addendum (2026-08-19, pre-registered before training): signed magnitude rank — cells E / F
+
+**Why.** The user's intent is directional *selection*, not a directional
+*drift*: on a day when 20 names fall and 10 rise, the list should be 20
+short / 10 long, with magnitudes comparable across sides. The median-centred
+rank (A/B) cannot express that (half the list is "long" by construction);
+the absolute label (C/D) expresses it but carries the bull-market drift and
+learned it. A label in between: **rank |ret/vol| jointly across all names of
+the day onto (0, 1], then re-attach the real sign.** The biggest move of the
+day is ±1, a mid-sized move ≈ ±0.5, a flat name ≈ 0; ordering within a side
+is preserved; long/short count follows the day's real signs; no raw drift
+magnitude survives (the only market information is the sign mix, whose
+half-year mean ranges 44–53% up in this matrix).
+
+**What is run.** `TRAIN_RANK=signed --reward per_risk_abs` (sign = actual
+direction), otherwise the frozen recipe; the same nine folds from the same
+matrix; priced balanced (**E**) and unbalanced (**F**). Same reports, same
+bootstrap comparisons (E vs A, F vs A, F vs E), same decision rule: the
+frozen config changes only if F beats A with a 90% interval excluding zero
+and no worse 2022 drawdown. Expectation written now: F's net will move with
+the market, far less violently than D's; its Sharpe most likely lands
+between B and A.
