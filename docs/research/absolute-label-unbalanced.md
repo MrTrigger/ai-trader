@@ -58,7 +58,91 @@ that plus beta. If D wins, it wins because the model finds a timing signal
 the rank label had been discarding — which would be worth knowing and worth
 believing only with the interval.
 
-## Results
+## Results (2026-08-19, same day, run exactly as registered)
 
-*(to be filled from the runs; nothing below this line exists at the time of
-pre-registration)*
+Nine folds 2020-09-18..2026-07-30, two-day purge, funding charged, 1×
+slippage, `max_net_exposure` unset everywhere. One matrix
+(`data/models/training.jsonl`, fs-rust-crypto-4, 67 features), two
+trainings (`TRAIN_RANK=1 --reward per_risk`; `--reward per_risk_abs`), four
+pricings. The absolute walk-forward's first attempt died on fold 4 with a
+`SIGILL` in `String::clone` inside feature preparation — not reproducible,
+no panic message, the third unrelated process crash on this new machine in
+two days (ghostty ×2, 1Password); it re-ran clean and is recorded here as a
+hardware suspicion, not a software finding.
+
+| cell | mean Sharpe | compounded | folds + | mean maxDD | turnover | realized net p5 / p50 / p95 |
+|---|---:|---:|---:|---:|---:|---|
+| **A** rank × balanced (re-trained) | 2.06 | +1019% | 9/9 | −0.114 | 0.809 | −0.02 / 0.00 / +0.05 |
+| **B** rank × unbalanced | 1.55 | +647% | 8/9 | −0.138 | 0.805 | −0.17 / +0.03 / +0.24 |
+| **C** absolute × balanced | 1.35 | +493% | 8/9 | −0.134 | 0.757 | −0.24 / 0.00 / +0.18 |
+| **D** absolute × unbalanced | **1.03** | +407% | **6/9** | **−0.276** | 0.808 | **−0.69 / +0.23 / +0.77** |
+| frozen record (rank × balanced, 9 Aug models) | 2.21 | +1450% | 9/9 | −0.115 | 0.802 | −0.02 / 0.00 / +0.06 |
+
+Per-fold Sharpe:
+
+| fold | window | A | B | C | D | frozen |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | 2020-09..2021-05 | 2.89 | 3.00 | 3.64 | 4.55 | 5.64 |
+| 2 | 2021-05..2022-01 | 3.67 | 2.12 | 2.89 | −0.09 | 2.83 |
+| 3 | 2022-01..2022-08 | 2.46 | 1.39 | 1.99 | −0.77 | 2.02 |
+| 4 | 2022-08..2023-04 | 1.01 | 0.71 | 0.47 | 0.66 | 1.80 |
+| 5 | 2023-04..2023-12 | 1.36 | 1.46 | 1.24 | 2.42 | 1.86 |
+| 6 | 2023-12..2024-08 | 0.59 | −0.26 | 1.37 | 1.30 | 0.28 |
+| 7 | 2024-08..2025-04 | 3.19 | 2.35 | −1.21 | 0.85 | 2.17 |
+| 8 | 2025-04..2025-11 | 2.57 | 2.35 | 1.30 | 0.68 | 2.41 |
+| 9 | 2025-11..2026-07 | 0.82 | 0.83 | 0.48 | −0.30 | 0.91 |
+
+Max drawdown per fold, A vs D: −10/−11%, −10/**−56%**, −13/−34%, −14/−29%,
+−14/−15%, −12/**−42%**, −6/−20%, −9/−20%, −16/−21%.
+
+`crypto-portfolio compare` (block bootstrap, 2,133 steps, 20-day blocks):
+
+| comparison | observed Δ | 90% interval | variant ahead |
+|---|---:|---|---:|
+| **D vs A** (the question) | **−1.16** | **[−2.03, −0.36]** — excludes zero | 1% |
+| C vs A (label alone, balanced) | −0.64 | [−1.37, +0.16] | 9% |
+| D vs C (construction alone, absolute model) | −0.56 | [−1.44, +0.37] | 16% |
+| B vs A (construction alone, rank model) | −0.45 | [−0.76, −0.13] — excludes zero | 1% |
+| A vs frozen record (re-train drift) | −0.11 | [−0.56, +0.28] | 33% |
+
+**Reading.**
+
+- The re-trained rank/balanced book (A) reproduces the frozen record within
+  noise (−0.11, interval spans zero), so every cell shares a comparable
+  baseline; the residual gap is matrix revision since 9 August and nine-fold
+  sampling, not a change in the recipe.
+- **The absolute label did what it was supposed to do** — the model's sign
+  now carries market direction, and cell D's book really moves with it:
+  realized net median +0.23, p10/p90 −0.69/+0.77, against the rank book's
+  ±0.05. This was a fair test of "buy the best of the ranked list, short-heavy
+  in a falling market, long-heavy in a rising one".
+- **And it is worse, decisively.** D vs A: −1.16 Sharpe, interval
+  [−2.03, −0.36]; 6 of 9 folds positive; mean max drawdown 2.4× A's. The
+  timing the model learned is long-biased (bull-market training) and wrong
+  when it matters: fold 2 (2021-05..2022-01) ran net +0.62 median into the
+  top and drew down 56%; fold 3 (2022 H1) net +0.39 median through the bear,
+  Sharpe −0.77. Where D wins (folds 1, 5, 6) it is long in rallies. That is
+  market beta with a noisy timer, which is what the literature says 24-hour
+  crypto direction is (`docs/scalper-research-round-2026-08.md` §4).
+- **The label hurts even hedged** (C vs A −0.64; fold 7 −1.21): removing the
+  demeaning teaches the trees the market component at the expense of the
+  cross-sectional one, and the balanced constructor then throws the market
+  component away — the worst of both.
+- The construction effect alone (B vs A, −0.45, excludes zero) is the result
+  already recorded in `unbalanced-constructor.md`, confirmed on fresh models.
+
+**Decision (per the rule written above).** D does not beat A; it loses on
+both criteria — Sharpe interval and 2022 drawdown. **The frozen config
+stands: rank label, `risk_adjusted` (balanced), daily cadence, with
+`max_net_exposure = 0.10` as the drift guard around a book that is, by
+construction and by evidence, meant to be flat.** The label axis the freeze
+note listed as untested is now tested: an absolute label is worse, with and
+without the balance. `per_risk_abs` and `risk_adjusted_unbalanced` stay in
+the code as named, measured alternatives; no re-tuning of either follows from
+this note, and the question is closed unless live evidence reopens it.
+
+**What this does say about the user's intent.** The intuition — don't hedge
+a strong view flat — is sound in a world where the model's view of market
+direction is worth having. On this record, with these features at a 24-hour
+horizon, it isn't: the model's cross-sectional ranking is the asset, and the
+balance is what protects it from the model's timing.
