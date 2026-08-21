@@ -205,3 +205,16 @@ stablecoins, FRED) land as `data-pull` extensions with their own manifests;
 V4 training in Python per the house rule. Results, trial counts, and the
 holdout look are recorded here; the gate decides deployment, not
 enthusiasm.
+
+### Round 2, tuning-set results for the deterministic versions (2026-08-21; folds 1–5 only, holdout untouched)
+
+V1 Donchian long-flat mean Sharpe **0.60** (3.03, 0.03, −1.58, −0.25, 1.77),
+worst fold DD −5.3%, turnover 0.011; V2 Donchian L/S **0.63** (2.65, −0.27,
++0.98, −1.33, 1.14), worst DD −6.9%; V3 tsmom-z weekly 0.45. Round-1
+baseline on the same folds: 0.30, worst DD −17.0%. The practitioner
+mechanics replicate in kind (double the Sharpe, a third of the drawdown,
+negligible costs) and not in size (0.6, not 1.5 — no 2022–23 profit, as the
+research caveat predicted). The long-flat vs long-short ablation is a wash
+on this window (shorts earned 2022 H1 and repaid it in the Jan-23 V).
+Deterministic family plateau: ~0.6 tuning-set. V4 (trained models) is the
+remaining pre-registered lever; V5 composition follows V4.
