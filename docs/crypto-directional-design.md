@@ -32,11 +32,14 @@ plan/risk/dashboard machinery. What differs is signal and construction:
   `s_i = mean over h ∈ {30, 90, 180} of sign(ret_h)` ∈ {−1, −⅓, +⅓, +1}.
   Direction = sign(s_i), zero s_i = flat. Three canonical horizons, equal
   weight; no tuning in round 1.
-- **Sizing (vol-targeted risk parity):** per-coin weight
-  `w_i = s_i · (σ_target / σ_i) / N`, `σ_i` = 30-day annualised vol (the
-  existing `x_vol_30`), `σ_target = 0.40` per-coin budget; book scaled so
-  **realized book vol targets 20% annualised** (estimated from the trailing
-  60-day book return; scale capped so gross ≤ 1.0). `max_position = 0.15`.
+- **Sizing (vol parity, ex-ante):** `w_i ∝ s_i / σ_i` (`σ_i` = the existing
+  30-day annualised `x_vol_30`), normalised so `Σ|w_i|·σ_i = 0.25` — an
+  ex-ante book-vol proxy under full correlation, i.e. deliberately
+  conservative; realised book vol will land below 25%. Gross capped at 1.0,
+  `max_position = 0.15`, whole-book scale when a cap binds. *(Amended before
+  any run: the first draft targeted realised trailing book vol, which needs
+  state the stateless daily planner does not carry; trailing-vol targeting
+  is a later, pre-registered axis, not a round-1 feature.)*
 - **Both directions**, no balance constraint — the whole book may be short
   (2022) or long (now). This is the user's directional instinct in the
   object where it belongs.
