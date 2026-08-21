@@ -955,6 +955,39 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the round-2 market matrix (docs/crypto-directional-design.md V4):
+/// one row per day, market features + vol-scaled forward labels, from the
+/// daily store, the funding table, and the raw pulls in
+/// {data-root}/directional/. Deterministic; rebuild any time.
+fn cmd_directional_matrix(args: &[String]) -> Result<(), String> {
+    let root = std::path::PathBuf::from(need(args, "--data-root")?);
+    let out = std::path::PathBuf::from(need(args, "--out")?);
+    let daily_bars: Vec<_> = crypto_portfolio::store::read(&root, 86_400)?;
+    if daily_bars.is_empty() {
+        return Err("daily store is empty".into());
+    }
+    let listings = crypto_portfolio::store::funding_listings(&root)?;
+    let funding = crypto_portfolio::funding::load(&root)?;
+    let daily = features_crypto::daily(
+        &daily_bars,
+        Some("BTC"),
+        &listings,
+        &funding,
+        features_crypto::FundingWindow::Trailing,
+    )?;
+    let rows = crypto_portfolio::directional::build_market_matrix(&daily, &root)?;
+    crypto_portfolio::directional::write_matrix(&rows, &out)?;
+    let labeled = rows.iter().filter(|r| !r.labels.is_empty()).count();
+    println!(
+        "wrote {} market row(s) ({labeled} with labels) {}..{} -> {}",
+        rows.len(),
+        rows.first().map(|r| r.date.to_string()).unwrap_or_default(),
+        rows.last().map(|r| r.date.to_string()).unwrap_or_default(),
+        out.display()
+    );
+    Ok(())
+}
+
 fn cmd_backtest(args: &[String]) -> Result<(), String> {
     use std::str::FromStr;
 
@@ -1401,6 +1434,7 @@ fn main() -> ExitCode {
         Some("model-check") => cmd_model_check(&args[1..]),
         Some("training-matrix") => cmd_training_matrix(&args[1..]),
         Some("backtest") => cmd_backtest(&args[1..]),
+        Some("directional-matrix") => cmd_directional_matrix(&args[1..]),
         Some("gate") => cmd_gate(&args[1..]),
         Some("ic") => cmd_ic(&args[1..]),
         Some("sweep") => cmd_sweep(&args[1..]),

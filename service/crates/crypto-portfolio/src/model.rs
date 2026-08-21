@@ -78,7 +78,7 @@ pub struct Node {
 }
 
 impl Node {
-    fn predict(&self, values: &[f64]) -> Result<f64, String> {
+    pub(crate) fn predict(&self, values: &[f64]) -> Result<f64, String> {
         if let Some(value) = self.leaf_value {
             return Ok(value);
         }

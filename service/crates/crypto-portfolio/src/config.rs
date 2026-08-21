@@ -78,6 +78,10 @@ pub struct Config {
     /// Entries and exits are never banded. Zero (the default, and the
     /// frozen bot's value) disables it.
     pub rebalance_drift_band: Decimal,
+    /// Round-2 V4: the market matrix (features) and timing-model artifact
+    /// the `market_model_tilt` signal reads. Unset for every other signal.
+    pub market_matrix_path: Option<String>,
+    pub timing_model_path: Option<String>,
     pub model_path: Option<String>,
     pub limits: RiskLimits,
     pub clusters: BTreeMap<String, String>,
@@ -258,6 +262,16 @@ impl Config {
                 .map(|_| dec(p, "rebalance_drift_band"))
                 .transpose()?
                 .unwrap_or(Decimal::ZERO),
+            market_matrix_path: p
+                .get("market_matrix_path")
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+            timing_model_path: p
+                .get("timing_model_path")
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
             model_path: p
                 .get("model_path")
                 .and_then(Value::as_str)

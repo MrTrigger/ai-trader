@@ -8,6 +8,7 @@ pub mod backtest;
 pub mod binance;
 pub mod binance_archive;
 pub mod config;
+pub mod directional;
 pub mod funding;
 pub mod gate;
 pub mod ic;
@@ -395,6 +396,83 @@ fn generate_signal(
                 });
             }
             out
+        }
+        "market_model_tilt" => {
+            // Round-2 V4a: one market-level prediction per day from the
+            // timing model, applied as a uniform signed conviction across
+            // the top max_holdings by liquidity - the model decides the
+            // lean, the vol-parity constructor sizes it. Features come from
+            // the pre-built market matrix (the same rows training used), so
+            // train and inference cannot disagree on a feature.
+            scoring_version = "market-timing-1".into();
+            let matrix_path = cfg
+                .market_matrix_path
+                .as_deref()
+                .ok_or("market_model_tilt needs market_matrix_path")?;
+            let model_path = cfg
+                .timing_model_path
+                .as_deref()
+                .ok_or("market_model_tilt needs timing_model_path")?;
+            let matrix = directional::read_matrix(std::path::Path::new(matrix_path))?;
+            let model = directional::TimingModel::load(std::path::Path::new(model_path))?;
+            model_id = Some(format!("timing:{}", model.trained_through));
+            let Some(row) = matrix.iter().rev().find(|r| r.date <= score_date) else {
+                notes.push(format!(
+                    "no market row at or before {score_date}; target is flat"
+                ));
+                return Ok(Signals {
+                    values: Vec::new(),
+                    notes,
+                    warnings,
+                    scoring_version,
+                    model_id,
+                });
+            };
+            if (score_date - row.date).num_days() > 3 {
+                notes.push(format!(
+                    "market row {} is stale for {score_date}; target is flat",
+                    row.date
+                ));
+                return Ok(Signals {
+                    values: Vec::new(),
+                    notes,
+                    warnings,
+                    scoring_version,
+                    model_id,
+                });
+            }
+            let resp = model.response(row)?;
+            notes.push(format!(
+                "timing model: market row {} -> response {:.3}",
+                row.date, resp
+            ));
+            if resp == 0.0 {
+                Vec::new()
+            } else {
+                rows.sort_by(|a, b| {
+                    b.adv_quote
+                        .unwrap_or(0.0)
+                        .total_cmp(&a.adv_quote.unwrap_or(0.0))
+                        .then_with(|| a.asset.cmp(&b.asset))
+                });
+                let mut out = Vec::new();
+                for r in rows.iter().take(cfg.max_holdings) {
+                    let Some(vol) = r.vol_90.or(r.vol_30).filter(|v| *v > 0.0) else {
+                        continue;
+                    };
+                    out.push(Signal {
+                        asset: r.asset.clone(),
+                        direction: if resp > 0.0 {
+                            Direction::Long
+                        } else {
+                            Direction::Short
+                        },
+                        conviction: d(resp.abs())?,
+                        volatility: Some(d(vol)?),
+                    });
+                }
+                out
+            }
         }
         "xs_momentum" => {
             if rows.len() < cfg.min_cross_section {
