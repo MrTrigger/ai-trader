@@ -135,3 +135,15 @@ pre-registered design (features, label horizon, model family, folds 1–5
 tuning / 6–9 holdout, gate) → build → one holdout look per round, trials
 counted. The research round's outputs will be recorded in
 docs/research/directional-round-2-research.md before any design is fixed.
+
+**Scope addition (user, same day): the horizon is an axis.** Round 2 tests
+multiple label horizons / holding periods rather than assuming daily. The
+testable range is hours → weeks: sub-hour holds are excluded by the scalper
+record's cost arithmetic (gate runs 4–6: predictable component a few bp vs
+11–25 bp taker round trip, maker adversely selected — the bound binds any
+signal at that holding period, directional included) unless the horizon
+research overturns it with costed evidence. Candidate label horizons for the
+design, to be fixed after the research lands: {12h, 1d, 3d, 7d, 14d, 30d};
+sub-daily variants use the existing hourly features and the backtest's
+cadence-hours grid. Each tested version follows the same tuning/holdout
+discipline; versions are counted as trials.
