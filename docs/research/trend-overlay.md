@@ -197,3 +197,16 @@ book targets net 0` — whatever constructor runs. The paper run's records
 (Postgres, run history) therefore accrue the overlay's daily request
 alongside realized returns, and in a few months "what would the lean have
 earned, live" is a query, not a backtest. The book itself is unchanged.
+
+## What the flat book does on big market days (measured 2026-08-21)
+
+Conditional on next-day BTC move, over the nine settled folds (2,133 days):
+mean book return **+18.6 bp** on days BTC < −5% (n=87), +21.9 bp on
+−5%..−2%, +9.0 bp on quiet ±2%, +15.6 bp on +2%..+5%, **+21.2 bp** on
+BTC > +5% (n=103); hit rate 55–59% everywhere. The flat book's best days
+are the big days, in BOTH directions — dispersion rises with the move and
+the cross-section harvests it. It captures ~0.2% of a wild day against the
+index's ±10%, sign-agnostically; over the window that compounded to +1189%
+against BTC's +492% at a fifth of the drawdown. "Capture the 10%" is a
+sign-prediction claim (measured corr 0.01–0.03, six designs); "capture the
+dispersion the 10% creates" is what the book already does.
