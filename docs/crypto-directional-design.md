@@ -77,3 +77,47 @@ Chop: 2023-24 sideways stretches will bleed; the 2022 short leg and 2020-21/
 2024-25 longs must pay for them. If round 1 lands under Sharpe ~0.5 on the
 nine folds, the literature numbers were flattered by their samples and this
 project stops at one round rather than sweeping its way to a mirage.
+
+## Round 1 results (2026-08-21, run as registered)
+
+Nine fold windows, deterministic signal, funding charged, 1× slippage:
+
+| fold | window | Sharpe | return | maxDD | ann vol | net p10/p50/p90 |
+|---:|---|---:|---:|---:|---:|---|
+| 1 | 2020-09..2021-05 | **3.09** | +45.1% | −5.6% | 19% | +0.15/+0.18/+0.32 |
+| 2 | 2021-05..2022-01 | −0.01 | −0.7% | −9.1% | 14% | −0.02/+0.09/+0.24 |
+| 3 | 2022-01..2022-08 | −0.22 | −3.4% | −13.0% | 17% | −0.24/−0.18/+0.04 |
+| 4 | 2022-08..2023-04 | **−1.62** | **−15.6%** | −17.0% | 16% | −0.38/−0.08/+0.31 |
+| 5 | 2023-04..2023-12 | 0.24 | +1.3% | −9.5% | 11% | −0.32/−0.01/+0.27 |
+| 6 | 2023-12..2024-08 | 0.73 | +6.8% | −7.9% | 16% | −0.15/+0.19/+0.35 |
+| 7 | 2024-08..2025-04 | −0.62 | −6.4% | −13.5% | 15% | −0.20/+0.16/+0.26 |
+| 8 | 2025-04..2025-11 | −0.20 | −3.0% | −11.2% | 17% | −0.22/+0.23/+0.45 |
+| 9 | 2025-11..2026-07 | 0.40 | +3.5% | −8.4% | 16% | −0.32/−0.22/+0.06 |
+
+**Mean Sharpe 0.198, compounded +19.3%, 4/9 positive.** Benchmark
+vol-targeted-20% BTC over the same window: +125%, Sharpe 0.74. The gate
+(≥1.0, beat the benchmark, 2022 profitable) fails on every criterion.
+Mechanics: one clean trend (fold 1, the 2020-21 run, Sharpe 3.1), then
+whipsaw. The book *did* go short in 2022 (fold 3 net median −0.18) and
+still lost slightly, because it turned short late and paid every relief
+rally; fold 4 was short into the Jan-2023 V-recovery for −15.6%. Turnover
+0.05–0.11/rebalance — cost drag is negligible; the failure is the signal,
+not the execution. This replicates the *honest* end of the literature
+(simple daily TSMOM ≈ 0.4 gross, negative 2022–23) rather than the
+marketed end (ensemble numbers on flattered samples).
+
+## Stop (per §4, applied as written)
+
+Round 1 landed under Sharpe 0.5. **The project stops at one round.** The
+whipsaw losses are structural to daily trend on this asset class in
+2021–2026 — no axis in the §3 sweep list (horizons, vol target, breadth of
+universe, cadence, rule family) removes reversal risk; a sweep winner would
+be selected precisely against the 2022–23 whipsaws the base rule failed on,
+which is the mirage §4 names. The standing directional experiments are the
+live ones: the shadow-overlay line accruing daily in the paper run, and the
+flat book's own conditional record (+19/+21 bp on big days both ways).
+Reopening requires either live shadow evidence that a lean pays, or a
+directional signal from outside this data (not price/breadth of the same
+bars). The frozen cross-sectional bot is unaffected; `tsmom_ensemble` /
+`tsmom_vol_parity` / `config/directional.toml` remain in the repo as the
+measured round-1 record.
