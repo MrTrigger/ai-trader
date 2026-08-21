@@ -313,6 +313,89 @@ fn generate_signal(
             }
             out
         }
+        "donchian_ensemble" | "donchian_ensemble_ls" => {
+            // Round-2 V1/V2 (docs/crypto-directional-design.md): the
+            // Donchian ensemble state computed causally in features-crypto.
+            // V1: long-flat, conviction = share of the nine sub-strategies
+            // long. V2: conviction = |long share - short share|, direction
+            // its sign. Universe: top max_holdings by rank-day liquidity.
+            scoring_version = "donchian-ensemble-1".into();
+            let ls = cfg.signal == "donchian_ensemble_ls";
+            rows.sort_by(|a, b| {
+                b.adv_quote
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.adv_quote.unwrap_or(0.0))
+                    .then_with(|| a.asset.cmp(&b.asset))
+            });
+            let mut out = Vec::new();
+            for r in rows.iter().take(cfg.max_holdings) {
+                let (Some(long), Some(short)) = (r.don_long, r.don_short) else {
+                    notes.push(format!("{}: donchian state not warm; not scored", r.asset));
+                    continue;
+                };
+                let vol = r.vol_90.or(r.vol_30);
+                let Some(vol) = vol.filter(|v| *v > 0.0) else {
+                    notes.push(format!("{}: no volatility estimate; not scored", r.asset));
+                    continue;
+                };
+                let s = if ls { long - short } else { long };
+                if s == 0.0 {
+                    continue; // flat is a real state, not a signal
+                }
+                out.push(Signal {
+                    asset: r.asset.clone(),
+                    direction: if s > 0.0 {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    },
+                    conviction: d(s.abs())?,
+                    volatility: Some(d(vol)?),
+                });
+            }
+            out
+        }
+        "tsmom_z" => {
+            // Round-2 V3: slow TSMOM with a CONTINUOUS clipped response -
+            // z_h = ret_h / (sigma_ann * sqrt(h/365)) per horizon h in
+            // {30, 90, 180}, response = clip(mean z, +-2) / 2 in [-1, 1].
+            scoring_version = "tsmom-z-1".into();
+            rows.sort_by(|a, b| {
+                b.adv_quote
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.adv_quote.unwrap_or(0.0))
+                    .then_with(|| a.asset.cmp(&b.asset))
+            });
+            let mut out = Vec::new();
+            for r in rows.iter().take(cfg.max_holdings) {
+                let (Some(r30), Some(r90), Some(r180), Some(vol)) =
+                    (r.ret_30, r.ret_90, r.ret_180, r.vol_90.or(r.vol_30))
+                else {
+                    notes.push(format!("{}: missing a horizon or vol; not scored", r.asset));
+                    continue;
+                };
+                if vol <= 0.0 {
+                    continue;
+                }
+                let z = |ret: f64, h: f64| ret / (vol * (h / 365.0).sqrt());
+                let mean_z = (z(r30, 30.0) + z(r90, 90.0) + z(r180, 180.0)) / 3.0;
+                let resp = (mean_z.clamp(-2.0, 2.0)) / 2.0;
+                if resp == 0.0 {
+                    continue;
+                }
+                out.push(Signal {
+                    asset: r.asset.clone(),
+                    direction: if resp > 0.0 {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    },
+                    conviction: d(resp.abs())?,
+                    volatility: Some(d(vol)?),
+                });
+            }
+            out
+        }
         "xs_momentum" => {
             if rows.len() < cfg.min_cross_section {
                 warnings.push(warning(WarningKind::DegenerateFeature, format!(
@@ -1010,6 +1093,60 @@ fn construct_with_tilt(
                 ));
             }
         }
+        "donchian_vol_sized" => {
+            // Round-2 sizing (pre-registered): weight_i = sign * conviction_i
+            // * min(0.25 / sigma_i, 2) / max_holdings. The divisor is the
+            // UNIVERSE size, not the scored count - a book with few active
+            // signals is meant to be mostly cash, not levered up.
+            let n = Decimal::from(cfg.max_holdings.max(1) as u64);
+            let cap = Decimal::from(2);
+            let budget = Decimal::new(25, 2);
+            for s in signals {
+                let Some(vol) = s.volatility.filter(|v| *v > Decimal::ZERO) else {
+                    continue;
+                };
+                let sign = if s.direction == Direction::Long {
+                    Decimal::ONE
+                } else {
+                    -Decimal::ONE
+                };
+                let lever = (budget / vol).min(cap);
+                weights.insert(s.asset.clone(), sign * s.conviction * lever / n);
+            }
+            let gross: Decimal = weights.values().map(|v| v.abs()).sum();
+            if gross > cfg.target_gross_exposure {
+                let scale = cfg.target_gross_exposure / gross;
+                for w in weights.values_mut() {
+                    *w *= scale;
+                }
+                notes.push(format!(
+                    "gross cap binds: whole book scaled by {}",
+                    q(scale, 3)
+                ));
+            }
+            let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+            if largest > cfg.limits.max_position {
+                let scale = cfg.limits.max_position / largest;
+                for w in weights.values_mut() {
+                    *w *= scale;
+                }
+                notes.push(format!(
+                    "per-position cap binds: whole book scaled by {}",
+                    q(scale, 3)
+                ));
+            }
+            let long: Decimal = weights.values().filter(|v| **v > Decimal::ZERO).sum();
+            let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
+            notes.push(format!(
+                "donchian vol-sized: {} long ({}) / {} short ({}), net {}, gross {}",
+                weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                q(long, 3),
+                weights.values().filter(|v| **v < Decimal::ZERO).count(),
+                q(short.abs(), 3),
+                q(long + short, 3),
+                q(long - short, 3)
+            ));
+        }
         "top30_by_score" => {
             // The user's spec, literally (2026-08-19): take the top 30 by
             // |expected return| regardless of side, divide the gross in
@@ -1462,6 +1599,18 @@ fn diff(
         if why != OrderReason::Exit {
             if notional.abs() < cfg.limits.min_position_notional {
                 skipped.push(format!("{asset}: notional below minimum"));
+                continue;
+            }
+            // Round-2 no-trade band (docs/crypto-directional-design.md):
+            // resizes under the band are noise; entries/exits and sign
+            // flips always trade. Off (zero) for the frozen bot.
+            if cfg.rebalance_drift_band > Decimal::ZERO
+                && matches!(why, OrderReason::Increase | OrderReason::Reduce)
+                && !now.is_zero()
+                && target.is_sign_positive() == now.is_sign_positive()
+                && drift.abs() < cfg.rebalance_drift_band * now.abs()
+            {
+                skipped.push(format!("{asset}: resize under the drift band"));
                 continue;
             }
             if drift.abs() * BPS < estimate.total * Decimal::from(2) * cfg.rebalance_cost_multiple {
@@ -2125,6 +2274,8 @@ mod tests {
             gc_regime_filter: Some(close),
             gc_regime_upper: Some(close * 1.1),
             gc_regime_slope: Some(0.01),
+            don_long: None,
+            don_short: None,
         }
     }
 

@@ -230,6 +230,15 @@ pub struct DailyRow {
     pub gc_regime_filter: Option<f64>,
     pub gc_regime_upper: Option<f64>,
     pub gc_regime_slope: Option<f64>,
+    /// Donchian long-flat ensemble state in [0, 1]: the share of the nine
+    /// sub-strategies (lookbacks 5..360d, entry at the n-day max close,
+    /// exit at a ratcheting channel-midpoint trailing stop) that are LONG
+    /// as of this close. `docs/crypto-directional-design.md`, round 2, V1.
+    /// None until the shortest lookback has a full window.
+    pub don_long: Option<f64>,
+    /// The mirrored short-side ensemble share (entry at the n-day min
+    /// close, stop ratcheting down), for the V2 ablation.
+    pub don_short: Option<f64>,
 }
 
 impl DailyRow {
@@ -487,6 +496,84 @@ pub enum FundingWindow {
     ForwardLeakyDiagnostic,
 }
 
+/// Donchian lookbacks for the directional round-2 ensemble - the published
+/// configuration (Zarattini-Pagani-Barbon 2025), not a tuned set.
+const DONCHIAN_LOOKBACKS: [usize; 9] = [5, 10, 20, 30, 60, 90, 150, 250, 360];
+
+/// One sub-strategy's state: long side and short side are independent
+/// (both can be flat; both being active nets to zero in the L/S variant).
+#[derive(Clone, Copy, Default)]
+struct DonchianState {
+    long: bool,
+    long_stop: f64,
+    short: bool,
+    short_stop: f64,
+}
+
+/// Advance all nine sub-strategies to `closes[i]` (window = the last n
+/// closes INCLUDING today) and return `(share long, share short)`, or
+/// `None` before the shortest window fills. Entry: close equals the n-day
+/// extreme. Exit: close at or through the trailing stop, which ratchets
+/// monotonically at the channel midpoint - the stop that applies to day t
+/// was set from day t-1's mid, so today's exit never uses today's mid.
+fn donchian_step(
+    states: &mut [DonchianState; 9],
+    closes: &[f64],
+    i: usize,
+) -> (Option<f64>, Option<f64>) {
+    let mut long = 0usize;
+    let mut short = 0usize;
+    let mut any = false;
+    for (k, &n) in DONCHIAN_LOOKBACKS.iter().enumerate() {
+        if i + 1 < n {
+            continue;
+        }
+        any = true;
+        let window = &closes[i + 1 - n..=i];
+        let hi = window.iter().cloned().fold(f64::MIN, f64::max);
+        let lo = window.iter().cloned().fold(f64::MAX, f64::min);
+        let mid = (hi + lo) / 2.0;
+        let close = closes[i];
+        let st = &mut states[k];
+        // Exits first, against the stop as ratcheted through yesterday.
+        if st.long && close <= st.long_stop {
+            st.long = false;
+        }
+        if st.short && close >= st.short_stop {
+            st.short = false;
+        }
+        // Entries at the extremes (a re-entry on the exit day is allowed
+        // only if the close is itself the extreme, which a stop-out close
+        // cannot simultaneously be for the same side).
+        if !st.long && close >= hi {
+            st.long = true;
+            st.long_stop = mid;
+        }
+        if !st.short && close <= lo {
+            st.short = true;
+            st.short_stop = mid;
+        }
+        // Ratchet for tomorrow.
+        if st.long {
+            st.long_stop = st.long_stop.max(mid);
+        }
+        if st.short {
+            st.short_stop = st.short_stop.min(mid);
+        }
+        if st.long {
+            long += 1;
+        }
+        if st.short {
+            short += 1;
+        }
+    }
+    if !any {
+        return (None, None);
+    }
+    let n = DONCHIAN_LOOKBACKS.len() as f64;
+    (Some(long as f64 / n), Some(short as f64 / n))
+}
+
 pub fn daily(
     bars: &[Bar],
     benchmark: Option<&str>,
@@ -511,6 +598,7 @@ pub fn daily(
         let mut breakout_age = None;
         // Histories for the fast-daily rolling windows.
         let mut trs: Vec<f64> = Vec::with_capacity(bars.len());
+        let mut donchian = [DonchianState::default(); 9];
         let asset_funding = funding.get(&asset);
 
         for (i, bar) in bars.iter().enumerate() {
@@ -737,6 +825,7 @@ pub fn daily(
                 .zip(ret_90_now.filter(|r| *r != 0.0))
                 .and_then(|(v, r)| finite(v / r.abs()));
 
+            let (don_long, don_short) = donchian_step(&mut donchian, &closes, i);
             rows.push(DailyRow {
                 ts_utc: bar.ts_utc,
                 asset: asset.clone(),
@@ -798,6 +887,8 @@ pub fn daily(
                 gc_upper,
                 gc_lower,
                 gc_breakout_age: breakout_age,
+                don_long,
+                don_short,
                 gc_regime_filter,
                 gc_regime_upper,
                 gc_regime_slope,
@@ -1098,6 +1189,38 @@ pub fn validate_selection(names: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The Donchian round-2 machine on a hand path, shortest lookback (5):
+    /// a fresh 5-day high enters long with the stop at the channel mid; the
+    /// stop ratchets up as the channel rises; a close at the stop exits;
+    /// a crash to 5-day lows enters the short side.
+    #[test]
+    fn donchian_ensemble_enters_ratchets_stops_out_and_shorts() {
+        let mut st = [DonchianState::default(); 9];
+        // 4 flat days then a breakout day: window [1,1,1,1,2] hi=2 lo=1 mid=1.5
+        let mut closes = vec![1.0, 1.0, 1.0, 1.0, 2.0];
+        for i in 0..4 {
+            assert_eq!(donchian_step(&mut st, &closes, i), (None, None));
+        }
+        let (l, sh) = donchian_step(&mut st, &closes, 4);
+        assert_eq!((l, sh), (Some(1.0 / 9.0), Some(0.0)));
+        assert!(st[0].long && (st[0].long_stop - 1.5).abs() < 1e-12);
+        // Rise: window [1,1,1,2,3] mid = 2.0 -> stop ratchets to 2.0
+        closes.push(3.0);
+        let (l, _) = donchian_step(&mut st, &closes, 5);
+        assert_eq!(l, Some(1.0 / 9.0));
+        assert!((st[0].long_stop - 2.0).abs() < 1e-12);
+        // Close at the stop: exit, and 2.0 is not the 5-day low ([1,1,2,3,2]
+        // lo=1) so no short entry.
+        closes.push(2.0);
+        let (l, sh) = donchian_step(&mut st, &closes, 6);
+        assert_eq!((l, sh), (Some(0.0), Some(0.0)));
+        // Crash to the 5-day low: short side enters with its stop at mid.
+        closes.push(0.5);
+        let (l, sh) = donchian_step(&mut st, &closes, 7);
+        assert_eq!((l, sh), (Some(0.0), Some(1.0 / 9.0)));
+        assert!(st[0].short && (st[0].short_stop - 1.75).abs() < 1e-12);
+    }
+
     use super::*;
     use chrono::TimeDelta;
 

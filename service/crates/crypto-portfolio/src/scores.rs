@@ -241,6 +241,8 @@ mod tests {
             gc_regime_filter: None,
             gc_regime_upper: None,
             gc_regime_slope: None,
+            don_long: None,
+            don_short: None,
         }
     }
 

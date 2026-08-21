@@ -73,6 +73,11 @@ pub struct Config {
     pub min_history_bars: u32,
     pub rebalance_cost_multiple: Decimal,
     pub turnover_budget: Decimal,
+    /// Round-2 no-trade band: a resize (Increase/Reduce, same sign) whose
+    /// |drift| is under this fraction of the CURRENT position is skipped.
+    /// Entries and exits are never banded. Zero (the default, and the
+    /// frozen bot's value) disables it.
+    pub rebalance_drift_band: Decimal,
     pub model_path: Option<String>,
     pub limits: RiskLimits,
     pub clusters: BTreeMap<String, String>,
@@ -248,6 +253,11 @@ impl Config {
                 .map_err(|e| e.to_string())?,
             rebalance_cost_multiple: dec(p, "rebalance_cost_multiple")?,
             turnover_budget: dec(p, "turnover_budget")?,
+            rebalance_drift_band: p
+                .get("rebalance_drift_band")
+                .map(|_| dec(p, "rebalance_drift_band"))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO),
             model_path: p
                 .get("model_path")
                 .and_then(Value::as_str)
