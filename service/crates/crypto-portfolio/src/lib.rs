@@ -356,6 +356,49 @@ fn generate_signal(
             }
             out
         }
+        "donchian_strength_select" => {
+            // Round-2 V6: cross-sectional selection by trend STRENGTH. From
+            // the top-30 by liquidity, rank by |don_long - don_short| and
+            // keep the 10 strongest with a nonzero net signal, each in its
+            // own direction - concentrated where the directional potential
+            // is, instead of holding everything the liquidity screen admits.
+            scoring_version = "donchian-strength-1".into();
+            rows.sort_by(|a, b| {
+                b.adv_quote
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.adv_quote.unwrap_or(0.0))
+                    .then_with(|| a.asset.cmp(&b.asset))
+            });
+            let mut scored: Vec<(&&DailyRow, f64, f64)> = Vec::new();
+            for r in rows.iter().take(30) {
+                let (Some(long), Some(short)) = (r.don_long, r.don_short) else {
+                    continue;
+                };
+                let Some(vol) = r.vol_90.or(r.vol_30).filter(|v| *v > 0.0) else {
+                    continue;
+                };
+                let s = long - short;
+                if s != 0.0 {
+                    scored.push((r, s, vol));
+                }
+            }
+            scored.sort_by(|a, b| {
+                b.1.abs()
+                    .total_cmp(&a.1.abs())
+                    .then_with(|| a.0.asset.cmp(&b.0.asset))
+            });
+            scored.truncate(10);
+            let mut out = Vec::new();
+            for (r, s, vol) in scored {
+                out.push(Signal {
+                    asset: r.asset.clone(),
+                    direction: if s > 0.0 { Direction::Long } else { Direction::Short },
+                    conviction: d(s.abs())?,
+                    volatility: Some(d(vol)?),
+                });
+            }
+            out
+        }
         "tsmom_z" => {
             // Round-2 V3: slow TSMOM with a CONTINUOUS clipped response -
             // z_h = ret_h / (sigma_ann * sqrt(h/365)) per horizon h in
