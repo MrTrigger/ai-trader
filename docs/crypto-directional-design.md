@@ -230,3 +230,40 @@ concentrated in the best movers, net free. Evidence basis: cross-sectional
 trend selection is the strongest documented net effect in the horizon
 survey (Fieberg et al., JFQA 2024). Counted as a trial; selection across
 V1–V6 by tuning mean Sharpe, then the one holdout look.
+
+### Round 2 results and gate (2026-08-21, run as registered)
+
+Tuning (folds 1–5): V1 0.60, V2 0.63, V3 0.45, V4a (trained market model,
+full-OI matrix) **−0.67 / −0.90 / −1.25** at labels 7/14/30d, V6
+(strength-select, added pre-holdout) **1.26**, baseline 0.30. V4b not run —
+recorded skip: both its priors (V4a here; the per-coin absolute-label
+experiments on the ranker folds) are strongly negative, and the trial has
+no plausible path to the gate. V5 not run: its precondition (V4a beating
+round 1 on tuning) failed. One data correction en route: the Binance
+metrics archive quotes empty cells from 2021-12-30 (`""`); the parser now
+reads them as "not computed" and the OI backfill covers 2020-09..2026-08
+for BTC and ETH.
+
+Selection by tuning mean: **V6**. Holdout (folds 6–9, one look): **0.49**.
+Nine folds: 3.82, 0.09, 0.69, −0.33, 2.04, 0.73, 1.37, −0.87, 0.71 —
+fold-mean 0.92, pooled daily Sharpe 1.01, compounded +124%, 7/9 positive,
+worst DD −12.8%, **2022 (folds 3+4) +3.0%** — the first version in either
+round with a profitable bear. Gate: (1) ≥1.0 — at the line (pooled 1.01,
+fold-mean 0.92); (2) beat vol-targeted BTC (0.76) with a 90% interval
+excluding zero — **FAILED**: +0.24 [−0.81, +1.30], 64% of resamples;
+(3) 2022 profitable — passed; (4) 50/50 with the flat book ≥ flat — passed
+on the point estimate (2.20 vs 2.05, [−0.22, +0.50]). **Not deployed, per
+the gate.** The tuning→holdout shrink (1.26 → 0.49) is the selection
+effect the protocol exists to expose; the nine-fold level matches the top
+of the research round's realistic range (0.5–1.0).
+
+**Standing.** The trained-model question is answered negatively and
+thoroughly (V4a at three labels, plus D/F/top-30 on the ranker folds).
+The best directional object on this record is V6 — the user's
+strength-selection idea — at ~0.9–1.0 with low drawdowns and a positive
+bear, worth roughly nothing net over vol-targeted BTC *with statistical
+confidence* on four holdout folds. Options recorded for the user: a round
+3 on the selection axis (N, universe breadth, strength measure — same
+tuning/holdout discipline, trials counted), a live shadow line for V6
+(like the trend overlay's), or stop here with V6 on the shelf. No
+deployment without the gate.
