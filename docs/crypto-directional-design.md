@@ -218,3 +218,15 @@ research caveat predicted). The long-flat vs long-short ablation is a wash
 on this window (shorts earned 2022 H1 and repaid it in the Jan-23 V).
 Deterministic family plateau: ~0.6 tuning-set. V4 (trained models) is the
 remaining pre-registered lever; V5 composition follows V4.
+
+**V6 added (2026-08-21, user direction, BEFORE any holdout look — no holdout
+has been read yet; the interrupted V2 look was not taken).** The existing
+versions hold the top-15 by liquidity and let each coin's signal set its
+position; nothing selects for directional *strength*. V6: from the top-30
+by rank-day liquidity, rank by ensemble trend strength `|don_long −
+don_short|`, take the 10 strongest with strength > 0, position in each
+coin's own net signal direction, vol-parity sized to the same budget —
+concentrated in the best movers, net free. Evidence basis: cross-sectional
+trend selection is the strongest documented net effect in the horizon
+survey (Fieberg et al., JFQA 2024). Counted as a trial; selection across
+V1–V6 by tuning mean Sharpe, then the one holdout look.
