@@ -121,3 +121,17 @@ directional signal from outside this data (not price/breadth of the same
 bars). The frozen cross-sectional bot is unaffected; `tsmom_ensemble` /
 `tsmom_vol_parity` / `config/directional.toml` remain in the repo as the
 measured round-1 record.
+
+
+## Round 2 authorized (2026-08-21, user override of §4)
+
+User decision, recorded verbatim in intent: round 1 "went way too fast";
+the §4 stop is overridden. Round 2 scope, set by the user: (1) research
+state-of-the-art thinking for directional crypto across horizons; (2) train
+model(s) tailored to this bot — i.e. a market-direction target of its own,
+not the ranker's label and not a three-line rule. Round 1 (Sharpe 0.198)
+stands as the baseline round 2 must beat. Discipline unchanged: research →
+pre-registered design (features, label horizon, model family, folds 1–5
+tuning / 6–9 holdout, gate) → build → one holdout look per round, trials
+counted. The research round's outputs will be recorded in
+docs/research/directional-round-2-research.md before any design is fixed.
