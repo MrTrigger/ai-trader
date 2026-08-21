@@ -608,7 +608,9 @@ pub fn parse_metrics_zip(bytes: &[u8], asset: &str) -> Result<Vec<MetricsRow>, S
         // Empty cell -> None (Binance's own "not computed" marker); a
         // non-empty cell that fails to parse is still a hard error.
         let f = |i: usize| -> Result<Option<f64>, String> {
-            let raw = cols[i].trim();
+            // Some archive eras quote the fields; `""` is the same "not
+            // computed" marker as an empty cell (first seen 2021-12-30).
+            let raw = cols[i].trim().trim_matches('"').trim();
             if raw.is_empty() {
                 return Ok(None);
             }
