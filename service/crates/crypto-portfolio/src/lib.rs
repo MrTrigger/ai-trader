@@ -549,7 +549,7 @@ struct Construction {
 /// universe's latest rows; `trend = (b_30 + b_90) / 2` in [-1, 1]. `None`
 /// if either horizon has no row with a value (the rule cannot be evaluated,
 /// and the constructor that needs it refuses rather than assuming flat).
-fn breadth_trend(cross: &[&DailyRow]) -> Option<Decimal> {
+fn breadth_trend(cross: &[&DailyRow], overlay: &config::Overlay) -> Option<Decimal> {
     fn breadth(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
         let v: Vec<f64> = values.flatten().collect();
         if v.is_empty() {
@@ -558,13 +558,31 @@ fn breadth_trend(cross: &[&DailyRow]) -> Option<Decimal> {
         let up = v.iter().filter(|x| **x > 0.0).count() as f64;
         Some(2.0 * up / v.len() as f64 - 1.0)
     }
-    let b30 = breadth(cross.iter().map(|r| r.ret_30))?;
-    let b90 = breadth(cross.iter().map(|r| r.ret_90))?;
-    d((b30 + b90) / 2.0).ok()
+    let ret_h = |r: &DailyRow, h: u32| -> Option<f64> {
+        match h {
+            7 => r.ret_7,
+            30 => r.ret_30,
+            90 => r.ret_90,
+            180 => r.ret_180,
+            _ => None,
+        }
+    };
+    let ba = breadth(cross.iter().map(|r| ret_h(r, overlay.horizon_a)))?;
+    let bb = breadth(cross.iter().map(|r| ret_h(r, overlay.horizon_b)))?;
+    let mut trend = (ba + bb) / 2.0;
+    if let Some(target) = overlay.vol_target {
+        // Sweep variant: scale the tilt down when the universe is volatile.
+        let mut vols: Vec<f64> = cross.iter().filter_map(|r| r.vol_30).filter(|v| *v > 0.0).collect();
+        if vols.is_empty() {
+            return None;
+        }
+        vols.sort_by(|a, b| a.total_cmp(b));
+        let med = vols[vols.len() / 2];
+        let target: f64 = target.to_string().parse().ok()?;
+        trend *= (target / med).min(1.0);
+    }
+    d(trend).ok()
 }
-
-/// The overlay's band: |N| <= 0.30 of NAV (pre-registered, not a knob).
-const TREND_BAND: Decimal = Decimal::from_parts(30, 0, 0, false, 2);
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn construct(
@@ -807,7 +825,7 @@ fn construct_with_tilt(
             let Some(tilt) = tilt else {
                 return Err("risk_adjusted_tilted needs the breadth trend (ret_30/ret_90 over the eligible universe) and none could be computed".into());
             };
-            let n_target = TREND_BAND * tilt;
+            let n_target = cfg.overlay.band * tilt;
             let long_sleeve = (cfg.target_gross_exposure + n_target) / Decimal::from(2);
             let short_sleeve = (cfg.target_gross_exposure - n_target) / Decimal::from(2);
             let floor = Decimal::from(2) * (cfg.costs.commission_bps + cfg.costs.spread_bps) / BPS;
@@ -1602,8 +1620,27 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
         None => None,
     };
     let generated = generate_signal(&cross, &hourly, newest_feature_date, cfg, profile.as_ref())?;
-    let tilt = breadth_trend(&cross);
+    let tilt = breadth_trend(&cross, &cfg.overlay);
     let construction = construct_with_tilt(&generated.values, cfg, nav, profile.as_ref(), tilt)?;
+    // Shadow overlay (docs/research/trend-overlay.md, "reopened on live
+    // evidence"): whatever constructor runs, every plan records what the
+    // breadth-trend overlay WOULD have requested, so the paper run accrues a
+    // live answer to "what would the lean have earned" without the book
+    // taking any of it. A measurement line, not a decision.
+    let shadow_overlay = if cfg.constructor != "risk_adjusted_tilted" {
+        tilt.map(|t| {
+            format!(
+                "shadow overlay: breadth trend {} (h{}/h{}) would target net {} at band {}; book targets net 0",
+                q(t, 3),
+                cfg.overlay.horizon_a,
+                cfg.overlay.horizon_b,
+                q(cfg.overlay.band * t, 3),
+                cfg.overlay.band
+            )
+        })
+    } else {
+        None
+    };
     let betas: BTreeMap<_, _> = latest
         .iter()
         .map(|(a, r)| Ok((a.clone(), r.beta_bench.map(d).transpose()?.map(|v| q(v, 6)))))
@@ -1654,6 +1691,9 @@ pub fn decide(input: DecisionInput<'_>) -> Result<DecisionResult, String> {
     };
 
     let mut warnings = generated.warnings;
+    if let Some(line) = shadow_overlay {
+        warnings.push(warning(WarningKind::Other, line));
+    }
     // A cap that quietly reshapes the book belongs on the artefact, not in a
     // log line. `TurnoverCapped` is the nearest existing kind and reads the
     // same way: the plan wanted more than it was allowed to do.
@@ -2816,13 +2856,13 @@ mod tests {
             r.ret_90 = Some(if i < 1 { 0.1 } else { -0.1 });
         }
         let refs: Vec<&DailyRow> = rows.iter().collect();
-        assert_eq!(breadth_trend(&refs), Some(Decimal::ZERO));
+        assert_eq!(breadth_trend(&refs, &config::Overlay::default()), Some(Decimal::ZERO));
         for r in rows.iter_mut() { r.ret_90 = Some(-0.2); }
         let refs: Vec<&DailyRow> = rows.iter().collect();
-        assert_eq!(breadth_trend(&refs), Some(Decimal::new(-25, 2))); // (0.5 + -1)/2
+        assert_eq!(breadth_trend(&refs, &config::Overlay::default()), Some(Decimal::new(-25, 2))); // (0.5 + -1)/2
         for r in rows.iter_mut() { r.ret_90 = None; }
         let refs: Vec<&DailyRow> = rows.iter().collect();
-        assert_eq!(breadth_trend(&refs), None);
+        assert_eq!(breadth_trend(&refs, &config::Overlay::default()), None);
     }
 
     #[test]
@@ -2858,6 +2898,17 @@ mod tests {
         .unwrap();
         assert_eq!(out.plan.status, Status::Accepted);
         assert_eq!(out.plan.orders.len(), 2);
+        // Every non-tilted plan records what the shadow overlay would have
+        // asked for - the live-evidence line the trend-overlay study left
+        // behind. Two rising fixtures: breadth +1, net target = band.
+        assert!(
+            out.plan
+                .warnings
+                .iter()
+                .any(|w| w.message.starts_with("shadow overlay: breadth trend")),
+            "{:?}",
+            out.plan.warnings
+        );
         Plan::parse(&canonical_json(&out.plan).unwrap()).unwrap();
     }
 

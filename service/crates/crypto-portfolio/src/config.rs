@@ -77,6 +77,30 @@ pub struct Config {
     pub limits: RiskLimits,
     pub clusters: BTreeMap<String, String>,
     pub costs: CostModel,
+    pub overlay: Overlay,
+}
+
+/// Trend overlay parameters (`docs/research/trend-overlay.md`). Absent
+/// `[overlay]` = the pre-registered base rule: band 0.30, horizons 30/90,
+/// no vol scaling. Read only by `risk_adjusted_tilted`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlay {
+    pub band: Decimal,
+    pub horizon_a: u32,
+    pub horizon_b: u32,
+    /// If set, N is multiplied by `min(1, vol_target / median x_vol_30)`.
+    pub vol_target: Option<Decimal>,
+}
+
+impl Default for Overlay {
+    fn default() -> Self {
+        Overlay {
+            band: Decimal::new(30, 2),
+            horizon_a: 30,
+            horizon_b: 90,
+            vol_target: None,
+        }
+    }
 }
 
 fn table<'a>(root: &'a Value, key: &str) -> Result<&'a toml::value::Table, String> {
@@ -232,6 +256,15 @@ impl Config {
             limits,
             clusters,
             costs,
+            overlay: match root.get("overlay").and_then(Value::as_table) {
+                None => Overlay::default(),
+                Some(o) => Overlay {
+                    band: dec(o, "band")?,
+                    horizon_a: u32::try_from(usize_value(o, "horizon_a")?).map_err(|e| e.to_string())?,
+                    horizon_b: u32::try_from(usize_value(o, "horizon_b")?).map_err(|e| e.to_string())?,
+                    vol_target: opt_dec(o, "vol_target")?,
+                },
+            },
         };
         cfg.validate()?;
         Ok(cfg)

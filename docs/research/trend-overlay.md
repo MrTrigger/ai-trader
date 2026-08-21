@@ -184,3 +184,16 @@ carrying market beta, which the capital plan's kill criteria price at more
 than it pays. The question "can a trend overlay improve P&L and Sharpe" is
 answered on evidence for this rule family: P&L yes (with beta), Sharpe no.
 24 trials are recorded above; nothing is adopted from them.
+
+## Shadow measurement (2026-08-19, live)
+
+Prompted by the live paper book sitting flat through the 2026-08-21 rally
+(BTC +10%/24h; the book earned the spread, +$989 unrealized on the day,
+after a −3.9% squeeze dip — both exactly the flat design). The overlay would
+currently lean long; the backtest says that lean does not pay on average;
+the honest arbiter is live data. Every plan now records a warning line —
+`shadow overlay: breadth trend T (h30/h90) would target net N at band 0.30;
+book targets net 0` — whatever constructor runs. The paper run's records
+(Postgres, run history) therefore accrue the overlay's daily request
+alongside realized returns, and in a few months "what would the lean have
+earned, live" is a query, not a backtest. The book itself is unchanged.
