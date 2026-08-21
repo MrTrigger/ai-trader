@@ -147,3 +147,61 @@ design, to be fixed after the research lands: {12h, 1d, 3d, 7d, 14d, 30d};
 sub-daily variants use the existing hourly features and the backtest's
 cadence-hours grid. Each tested version follows the same tuning/holdout
 discipline; versions are counted as trials.
+
+## Round 2 pre-registration (2026-08-21, after the research, before any number)
+
+Research basis: `docs/research/directional-round-2-research.md`. Round 1
+(0.198) is the baseline. Realistic target from the evidence: 0.5–1.0; the
+§3 adoption gate (≥1.0 net, beat vol-targeted BTC with interval, 2022
+profitable, 50/50 with the flat book ≥ flat alone) is unchanged — a round-2
+winner below the gate is recorded, not deployed.
+
+**Horizon decision (from §1 of the synthesis):** versions live at
+days-to-weeks effective holds, expressed through signal speed and exit
+style. Sub-12h versions are excluded — zero published net-positive results
+at VIP0 costs, and our own sub-hour record — unless a later round brings
+maker-verified sub-5bp execution evidence.
+
+**Versions (each a counted trial; tuning = folds 1–5, one holdout look =
+folds 6–9; selection by tuning mean Sharpe; the holdout is never used to
+select):**
+
+- **V1 — Donchian long-flat ensemble (the anchor, deterministic).**
+  Per coin: 9 sub-strategies, lookbacks n ∈ {5,10,20,30,60,90,150,250,360}d.
+  Entry: close = n-day max close → long. Exit: close ≤ trailing stop;
+  TrailingStop ratchets up at the Donchian channel midpoint. Position =
+  mean of the 9 states ∈ [0,1] (graded by ensemble agreement), NO shorts.
+  Sizing: weight_i = pos_i · min(0.25/σ90_i, 2)/N over the top-15 by
+  rank-day liquidity; gross ≤ 1.0; rebalance drift band 20% (signal trades
+  immediate). This is the Zarattini configuration as published, on our
+  window, our costs, our universe machinery.
+- **V2 — V1 with symmetric shorts** (Donchian low entry, ratcheting stop
+  above): measures the long-flat-vs-long-short ablation on OUR record.
+- **V3 — vol-managed slow TSMOM with continuous response:** round-1's
+  30/90/180 horizons but response = clipped z of trend (±2), σ90-scaled,
+  book vol-targeted, weekly decision grid. Tests Kang–Ryu/Man's "slow +
+  risk-managed" claim against V1's "fast + asymmetric exits".
+- **V4 — trained market-direction model (the user's ask), two variants:**
+  (a) market-level LightGBM, one row per day, labels = vol-scaled forward
+  market return at h ∈ {7d, 14d, 30d} (three label versions, counted),
+  features from verified point-in-time sources: multi-horizon breadth and
+  trend, realized vol and vol-of-vol, funding aggregates (level, dispersion,
+  extremes — in-repo since 2019), OI/positioning changes (Binance metrics
+  backfilled to 2020-09), DVOL level/premium (2021+, missing-before
+  handled as None), stablecoin supply growth, DXY/rates trend; output →
+  net tilt via clipped z into the V3 machinery. (b) per-coin LightGBM with
+  a 7d label on the top-15 (per-coin trend/vol/funding + the market
+  features), signed vol-parity book. Walk-forward per fold; purged like
+  the frozen recipe; TRAIN_* hygiene identical.
+- **V5 — best-of composition:** the tuning-set winner among V1–V3 combined
+  with V4a as a de-risking condition only (model says strongly against →
+  halve the tilt), if and only if both parts individually beat round 1 on
+  the tuning set. No other combinations.
+
+**Build order:** Donchian/EWMAC state columns in `features-crypto`
+(computed causally from bars, like every feature); V1–V3 run on the
+existing replay rig; the V4 data pullers (metrics backfill, DVOL,
+stablecoins, FRED) land as `data-pull` extensions with their own manifests;
+V4 training in Python per the house rule. Results, trial counts, and the
+holdout look are recorded here; the gate decides deployment, not
+enthusiasm.
