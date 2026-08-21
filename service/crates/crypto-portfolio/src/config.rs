@@ -260,8 +260,10 @@ impl Config {
                 None => Overlay::default(),
                 Some(o) => Overlay {
                     band: dec(o, "band")?,
-                    horizon_a: u32::try_from(usize_value(o, "horizon_a")?).map_err(|e| e.to_string())?,
-                    horizon_b: u32::try_from(usize_value(o, "horizon_b")?).map_err(|e| e.to_string())?,
+                    horizon_a: u32::try_from(usize_value(o, "horizon_a")?)
+                        .map_err(|e| e.to_string())?,
+                    horizon_b: u32::try_from(usize_value(o, "horizon_b")?)
+                        .map_err(|e| e.to_string())?,
                     vol_target: opt_dec(o, "vol_target")?,
                 },
             },

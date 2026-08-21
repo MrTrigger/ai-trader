@@ -265,6 +265,54 @@ fn generate_signal(
                 })
                 .collect::<Result<_, String>>()?
         }
+        "tsmom_ensemble" => {
+            // crypto-directional round 1 (docs/crypto-directional-design.md):
+            // per coin, the mean of sign(ret_h) over h in {30, 90, 180} days.
+            // Deterministic; no model, no cross-sectional demeaning - the
+            // sign IS the market view, which is this bot's whole point.
+            // Universe: the top max_holdings by rank-day liquidity among
+            // eligible names; a name missing any horizon or vol is skipped
+            // by name (young listings), never scored neutral.
+            scoring_version = "tsmom-ensemble-1".into();
+            rows.sort_by(|a, b| {
+                b.adv_quote
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.adv_quote.unwrap_or(0.0))
+                    .then_with(|| a.asset.cmp(&b.asset))
+            });
+            let mut out = Vec::new();
+            for r in rows.iter().take(cfg.max_holdings) {
+                let (Some(r30), Some(r90), Some(r180), Some(vol)) =
+                    (r.ret_30, r.ret_90, r.ret_180, r.vol_30)
+                else {
+                    notes.push(format!(
+                        "{}: missing a trend horizon or vol; not scored",
+                        r.asset
+                    ));
+                    continue;
+                };
+                if vol <= 0.0 {
+                    notes.push(format!("{}: non-positive vol; not scored", r.asset));
+                    continue;
+                }
+                let s = (r30.signum() + r90.signum() + r180.signum()) / 3.0;
+                if s == 0.0 {
+                    notes.push(format!("{}: horizons disagree to zero; flat", r.asset));
+                    continue;
+                }
+                out.push(Signal {
+                    asset: r.asset.clone(),
+                    direction: if s > 0.0 {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    },
+                    conviction: d(s.abs())?,
+                    volatility: Some(d(vol)?),
+                });
+            }
+            out
+        }
         "xs_momentum" => {
             if rows.len() < cfg.min_cross_section {
                 warnings.push(warning(WarningKind::DegenerateFeature, format!(
@@ -572,7 +620,11 @@ fn breadth_trend(cross: &[&DailyRow], overlay: &config::Overlay) -> Option<Decim
     let mut trend = (ba + bb) / 2.0;
     if let Some(target) = overlay.vol_target {
         // Sweep variant: scale the tilt down when the universe is volatile.
-        let mut vols: Vec<f64> = cross.iter().filter_map(|r| r.vol_30).filter(|v| *v > 0.0).collect();
+        let mut vols: Vec<f64> = cross
+            .iter()
+            .filter_map(|r| r.vol_30)
+            .filter(|v| *v > 0.0)
+            .collect();
         if vols.is_empty() {
             return None;
         }
@@ -844,8 +896,16 @@ fn construct_with_tilt(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             all.truncate(24);
-            let longs: Vec<_> = all.iter().copied().filter(|(s, _)| s.direction == Direction::Long).collect();
-            let shorts: Vec<_> = all.iter().copied().filter(|(s, _)| s.direction == Direction::Short).collect();
+            let longs: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|(s, _)| s.direction == Direction::Long)
+                .collect();
+            let shorts: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|(s, _)| s.direction == Direction::Short)
+                .collect();
             if longs.len() < 2 || shorts.len() < 2 {
                 notes.push(format!(
                     "top-24 book has {} long and {} short; a two-sided book cannot form",
@@ -853,10 +913,16 @@ fn construct_with_tilt(
                     shorts.len()
                 ));
             } else {
-                for (side, sign, sleeve) in [(longs, Decimal::ONE, long_sleeve), (shorts, -Decimal::ONE, short_sleeve)] {
+                for (side, sign, sleeve) in [
+                    (longs, Decimal::ONE, long_sleeve),
+                    (shorts, -Decimal::ONE, short_sleeve),
+                ] {
                     let total: Decimal = side.iter().map(|(s, vol)| s.conviction / *vol).sum();
                     for (s, vol) in side {
-                        weights.insert(s.asset.clone(), sign * sleeve * (s.conviction / vol) / total);
+                        weights.insert(
+                            s.asset.clone(),
+                            sign * sleeve * (s.conviction / vol) / total,
+                        );
                     }
                 }
                 let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
@@ -865,7 +931,10 @@ fn construct_with_tilt(
                     for weight in weights.values_mut() {
                         *weight *= scale;
                     }
-                    notes.push(format!("per-position cap binds: whole book scaled by {}", q(scale, 3)));
+                    notes.push(format!(
+                        "per-position cap binds: whole book scaled by {}",
+                        q(scale, 3)
+                    ));
                 }
                 notes.push(format!(
                     "trend overlay: breadth trend {} -> net target {} (long sleeve {}, short sleeve {}); {} long and {} short, sized by edge/volatility",
@@ -875,6 +944,69 @@ fn construct_with_tilt(
                     q(short_sleeve, 3),
                     weights.values().filter(|v| **v > Decimal::ZERO).count(),
                     weights.values().filter(|v| **v < Decimal::ZERO).count()
+                ));
+            }
+        }
+        "tsmom_vol_parity" => {
+            // crypto-directional round 1: w_i proportional to s_i / sigma_i,
+            // normalised so sum(|w_i| * sigma_i) = VOL_BUDGET (an ex-ante
+            // book-vol proxy under full correlation), gross capped at the
+            // target, per-name capped, whole-book scale when a cap binds.
+            // No cost floor on conviction: trend positions are held for
+            // weeks and the rebalance deadband already gates small trades.
+            const VOL_BUDGET: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
+            let usable: Vec<_> = signals
+                .iter()
+                .filter_map(|s| s.volatility.filter(|v| *v > Decimal::ZERO).map(|v| (s, v)))
+                .collect();
+            if usable.is_empty() {
+                notes.push("no scored names; target is flat".into());
+            } else {
+                let denom: Decimal = usable.iter().map(|(s, _)| s.conviction).sum();
+                // w_i = sign * (conviction_i / sigma_i) * k with k chosen so
+                // sum |w_i| sigma_i = min(VOL_BUDGET budget, gross-implied):
+                // sum |w_i| sigma_i = k * sum conviction_i => k = VOL_BUDGET / denom.
+                let k = VOL_BUDGET / denom;
+                for (s, vol) in &usable {
+                    let sign = if s.direction == Direction::Long {
+                        Decimal::ONE
+                    } else {
+                        -Decimal::ONE
+                    };
+                    weights.insert(s.asset.clone(), sign * k * s.conviction / *vol);
+                }
+                let gross: Decimal = weights.values().map(|v| v.abs()).sum();
+                if gross > cfg.target_gross_exposure {
+                    let scale = cfg.target_gross_exposure / gross;
+                    for w in weights.values_mut() {
+                        *w *= scale;
+                    }
+                    notes.push(format!(
+                        "gross cap binds: whole book scaled by {}",
+                        q(scale, 3)
+                    ));
+                }
+                let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
+                if largest > cfg.limits.max_position {
+                    let scale = cfg.limits.max_position / largest;
+                    for w in weights.values_mut() {
+                        *w *= scale;
+                    }
+                    notes.push(format!(
+                        "per-position cap binds: whole book scaled by {}",
+                        q(scale, 3)
+                    ));
+                }
+                let long: Decimal = weights.values().filter(|v| **v > Decimal::ZERO).sum();
+                let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
+                notes.push(format!(
+                    "tsmom vol parity: {} long ({}) / {} short ({}), net {}, ex-ante vol budget {}",
+                    weights.values().filter(|v| **v > Decimal::ZERO).count(),
+                    q(long, 3),
+                    weights.values().filter(|v| **v < Decimal::ZERO).count(),
+                    q(short.abs(), 3),
+                    q(long + short, 3),
+                    VOL_BUDGET
                 ));
             }
         }
@@ -898,8 +1030,15 @@ fn construct_with_tilt(
             } else {
                 let total: Decimal = usable.iter().map(|s| s.conviction).sum();
                 for s in &usable {
-                    let sign = if s.direction == Direction::Long { Decimal::ONE } else { -Decimal::ONE };
-                    weights.insert(s.asset.clone(), sign * cfg.target_gross_exposure * s.conviction / total);
+                    let sign = if s.direction == Direction::Long {
+                        Decimal::ONE
+                    } else {
+                        -Decimal::ONE
+                    };
+                    weights.insert(
+                        s.asset.clone(),
+                        sign * cfg.target_gross_exposure * s.conviction / total,
+                    );
                 }
                 let largest = weights.values().map(|v| v.abs()).max().unwrap_or_default();
                 if largest > cfg.limits.max_position {
@@ -907,7 +1046,10 @@ fn construct_with_tilt(
                     for weight in weights.values_mut() {
                         *weight *= scale;
                     }
-                    notes.push(format!("per-position cap binds: whole book scaled by {}", q(scale, 3)));
+                    notes.push(format!(
+                        "per-position cap binds: whole book scaled by {}",
+                        q(scale, 3)
+                    ));
                 }
                 let long: Decimal = weights.values().filter(|v| **v > Decimal::ZERO).sum();
                 let short: Decimal = weights.values().filter(|v| **v < Decimal::ZERO).sum();
@@ -2833,14 +2975,36 @@ mod tests {
             mk("S1", Direction::Short, Decimal::new(4, 2)),
             mk("S2", Direction::Short, Decimal::new(2, 2)),
         ];
-        let out = construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, Some(-Decimal::ONE)).unwrap();
+        let out = construct_with_tilt(
+            &signals,
+            &cfg,
+            Decimal::from(100_000),
+            None,
+            Some(-Decimal::ONE),
+        )
+        .unwrap();
         let long: Decimal = out.weights.values().filter(|v| **v > Decimal::ZERO).sum();
-        let short: Decimal = out.weights.values().filter(|v| **v < Decimal::ZERO).map(|v| v.abs()).sum();
+        let short: Decimal = out
+            .weights
+            .values()
+            .filter(|v| **v < Decimal::ZERO)
+            .map(|v| v.abs())
+            .sum();
         assert_eq!(long, Decimal::new(25, 2), "{:?}", out.weights);
         assert_eq!(short, Decimal::new(55, 2), "{:?}", out.weights);
         // within the short side, 2:1 by edge/vol
-        assert_eq!(out.weights["S1"], -Decimal::new(55, 2) * Decimal::from(2) / Decimal::from(3));
-        let flat = construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, Some(Decimal::ZERO)).unwrap();
+        assert_eq!(
+            out.weights["S1"],
+            -Decimal::new(55, 2) * Decimal::from(2) / Decimal::from(3)
+        );
+        let flat = construct_with_tilt(
+            &signals,
+            &cfg,
+            Decimal::from(100_000),
+            None,
+            Some(Decimal::ZERO),
+        )
+        .unwrap();
         let long0: Decimal = flat.weights.values().filter(|v| **v > Decimal::ZERO).sum();
         assert_eq!(long0, Decimal::new(4, 1));
         assert!(construct_with_tilt(&signals, &cfg, Decimal::from(100_000), None, None).is_err());
@@ -2849,20 +3013,92 @@ mod tests {
     #[test]
     fn breadth_trend_is_the_mean_of_two_horizons_breadths() {
         let as_of: DateTime<Utc> = "2026-08-01T00:00:00Z".parse().unwrap();
-        let mut rows: Vec<DailyRow> = (0..4).map(|i| row(&format!("A{i}"), as_of, 100.0)).collect();
+        let mut rows: Vec<DailyRow> = (0..4)
+            .map(|i| row(&format!("A{i}"), as_of, 100.0))
+            .collect();
         // ret_30: 3 of 4 up -> b30 = 0.5 ; ret_90: 1 of 4 up -> b90 = -0.5 ; trend 0
         for (i, r) in rows.iter_mut().enumerate() {
             r.ret_30 = Some(if i < 3 { 0.1 } else { -0.1 });
             r.ret_90 = Some(if i < 1 { 0.1 } else { -0.1 });
         }
         let refs: Vec<&DailyRow> = rows.iter().collect();
-        assert_eq!(breadth_trend(&refs, &config::Overlay::default()), Some(Decimal::ZERO));
-        for r in rows.iter_mut() { r.ret_90 = Some(-0.2); }
+        assert_eq!(
+            breadth_trend(&refs, &config::Overlay::default()),
+            Some(Decimal::ZERO)
+        );
+        for r in rows.iter_mut() {
+            r.ret_90 = Some(-0.2);
+        }
         let refs: Vec<&DailyRow> = rows.iter().collect();
-        assert_eq!(breadth_trend(&refs, &config::Overlay::default()), Some(Decimal::new(-25, 2))); // (0.5 + -1)/2
-        for r in rows.iter_mut() { r.ret_90 = None; }
+        assert_eq!(
+            breadth_trend(&refs, &config::Overlay::default()),
+            Some(Decimal::new(-25, 2))
+        ); // (0.5 + -1)/2
+        for r in rows.iter_mut() {
+            r.ret_90 = None;
+        }
         let refs: Vec<&DailyRow> = rows.iter().collect();
         assert_eq!(breadth_trend(&refs, &config::Overlay::default()), None);
+    }
+
+    /// crypto-directional round 1: mixed-sign trend book. Two coins in a
+    /// full uptrend (s=+1), one in a full downtrend (s=-1), one with mixed
+    /// horizons (s=+1/3), sized 1/sigma to an ex-ante vol budget of 0.25.
+    #[test]
+    fn tsmom_vol_parity_sizes_signed_trends_to_the_vol_budget() {
+        let mut cfg = config();
+        cfg.constructor = "tsmom_vol_parity".into();
+        cfg.target_gross_exposure = Decimal::ONE;
+        // Wide cap so the budget arithmetic is visible unscaled; the cap
+        // path is exercised by the shared whole-book-scale code elsewhere.
+        cfg.limits.max_position = Decimal::new(5, 1);
+        let mk = |a: &str, dir: Direction, conv: &str, vol: &str| Signal {
+            asset: a.into(),
+            direction: dir,
+            conviction: conv.parse().unwrap(),
+            volatility: Some(vol.parse().unwrap()),
+        };
+        let signals = vec![
+            mk("UP1", Direction::Long, "1", "0.5"),
+            mk("UP2", Direction::Long, "1", "1.0"),
+            mk("DN1", Direction::Short, "1", "0.5"),
+            mk("MIX", Direction::Long, "0.3333", "0.5"),
+        ];
+        let out = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        // sum conviction = 3.3333 -> k = 0.25/3.3333 = 0.075;
+        // |w|*sigma per name = k*conviction: 0.075, 0.075, 0.075, 0.025 -> sums to 0.25.
+        let vols = BTreeMap::from([("UP1", 0.5), ("UP2", 1.0), ("DN1", 0.5), ("MIX", 0.5)]);
+        let exante: f64 = out
+            .weights
+            .iter()
+            .map(|(a, w)| {
+                let wf: f64 = w.abs().to_string().parse().unwrap();
+                wf * vols[a.as_str()]
+            })
+            .sum();
+        assert!((exante - 0.25).abs() < 1e-6, "{exante} {:?}", out.weights);
+        assert!(out.weights["UP1"] > Decimal::ZERO && out.weights["DN1"] < Decimal::ZERO);
+        assert_eq!(out.weights["UP1"], -out.weights["DN1"]);
+        assert_eq!(
+            out.weights["UP1"],
+            out.weights["UP2"] * Decimal::from(2),
+            "half the vol, twice the weight"
+        );
+        assert!(
+            out.weights["MIX"] < out.weights["UP1"],
+            "weaker trend, smaller weight"
+        );
+        // A one-sided book is legal: all-long input stays all-long.
+        let all_long: Vec<Signal> = signals
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s.direction = Direction::Long;
+                s
+            })
+            .collect();
+        let out2 = construct(&all_long, &cfg, Decimal::from(100_000), None).unwrap();
+        assert!(out2.weights.values().all(|w| *w > Decimal::ZERO));
     }
 
     #[test]

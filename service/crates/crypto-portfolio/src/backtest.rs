@@ -844,9 +844,18 @@ mod tests {
         let mut book = Portfolio {
             cash: Decimal::from(100_000),
             positions: vec![
-                Position { asset: "LUNA".into(), qty: Decimal::from(-1_000_000) },
-                Position { asset: "BTC".into(), qty: Decimal::new(5, 1) },
-                Position { asset: "NEW".into(), qty: Decimal::from(10) },
+                Position {
+                    asset: "LUNA".into(),
+                    qty: Decimal::from(-1_000_000),
+                },
+                Position {
+                    asset: "BTC".into(),
+                    qty: Decimal::new(5, 1),
+                },
+                Position {
+                    asset: "NEW".into(),
+                    qty: Decimal::from(10),
+                },
             ],
         };
         let today = BTreeMap::from([("BTC".to_string(), Decimal::from(30_000))]);
@@ -855,12 +864,22 @@ mod tests {
             ("BTC".to_string(), Decimal::from(29_000)),
         ]);
         let settled = settle_missing(&mut book, &today, &last);
-        assert_eq!(settled, vec![("LUNA".to_string(), Decimal::from(-1_000_000), Decimal::new(5, 5))]);
+        assert_eq!(
+            settled,
+            vec![(
+                "LUNA".to_string(),
+                Decimal::from(-1_000_000),
+                Decimal::new(5, 5)
+            )]
+        );
         assert_eq!(book.cash, Decimal::from(100_000) - Decimal::from(50));
         let names: Vec<&str> = book.positions.iter().map(|p| p.asset.as_str()).collect();
         assert_eq!(names, vec!["BTC", "NEW"]);
         // Reborn LUNA at $8.87 the next day is not our problem any more.
-        let reborn = BTreeMap::from([("BTC".to_string(), Decimal::from(30_000)), ("LUNA".to_string(), Decimal::new(887, 2))]);
+        let reborn = BTreeMap::from([
+            ("BTC".to_string(), Decimal::from(30_000)),
+            ("LUNA".to_string(), Decimal::new(887, 2)),
+        ]);
         assert!(settle_missing(&mut book, &reborn, &last).is_empty());
         assert_eq!(book.cash, Decimal::from(99_950));
     }
