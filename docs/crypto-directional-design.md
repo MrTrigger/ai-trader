@@ -267,3 +267,22 @@ confidence* on four holdout folds. Options recorded for the user: a round
 tuning/holdout discipline, trials counted), a live shadow line for V6
 (like the trend overlay's), or stop here with V6 on the shelf. No
 deployment without the gate.
+
+## Round 3 pre-registration (2026-08-21, user-directed, before any run)
+
+User: broaden the selection — "more like top 30" — and no live shadow until
+the backtest shows more promise. Round 3 sweeps the SELECTION AXIS ONLY:
+
+- Grid (6 cells, V6 = P30/N10 already measured; 5 new):
+  pool P ∈ {top-30, top-60 by rank-day liquidity} × selected N ∈ {10, 20,
+  30} strongest by `|don_long − don_short|`, own direction, vol-parity to
+  the same budget, same caps and drift band. P30/N30 is breadth without
+  selection (every scored top-30 name in its own direction), separating
+  breadth from selection. Strength measure, signal family, sizing: frozen
+  from round 2.
+- Tuning folds 1–5 → one selection across all six cells → one holdout look
+  → the unchanged §3 gate. Cells are counted trials (round total: 6).
+- Costs: unchanged machinery; ranks 31–60 carry their own measured/estimated
+  spreads and impact — if breadth beyond the liquid core is expensive, the
+  folds will say so (Man's finding: Sharpe declines past ~15 coins once
+  costs bind; Zarattini's: flat 10–50. Round 3 adjudicates for our book).
