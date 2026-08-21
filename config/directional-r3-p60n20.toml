@@ -1,0 +1,294 @@
+[meta]
+ruleset_version = "phase0"
+# Identity registry key — must match a registered row in the bots table.
+bot_id = "crypto-directional-r3-p60n20"
+
+[portfolio]
+quote_currency = "USD"
+interval_s = 86400
+target_gross_exposure = "1.00"
+# equal_weight is the baseline every constructor must beat; conviction_tilt
+# and inverse_vol are the candidates. Compared, not argued about (4.5).
+constructor = "donchian_vol_sized"
+
+# The learned cross-sectional ranker. TWO candidates failed the Phase 1 gate and
+# neither may be named here: `xs_momentum` and `gc_breakout`. See
+# docs/phase-1-findings.md. This field naming a signal that failed its gate
+# would be the softest possible version of shipping it.
+#
+# `ml_ranker` is the one that passed: out-of-sample IC positive in all six
+# expanding folds, both nulls systematically negative. Until now the config
+# still named the placeholder, so the paper book was forward-testing an
+# equal-weight long-only basket that claims no edge - not the strategy the
+# backtest measured.
+signal = "donchian_strength_select"
+
+# No fallback model is permitted: `ml_ranker` refuses to run without this, and
+# refuses an artifact whose feature catalogue or ordered feature names disagree
+# with the Rust runtime's own. The artifact carries `trained_through`, and
+# scoring on or before that date is refused rather than silently allowed.
+model_path = ""
+
+# How many names the signal holds. Distinct from limits.max_position_count,
+# which is a hard risk limit: this is what the strategy intends, that is what it
+# may not exceed.
+max_holdings = 20
+selection_pool = 60
+
+# Below this many rankable assets a cross-sectional signal declines to rank.
+# "Top 10 of 11" is holding almost everything and calling it a signal.
+min_cross_section = 15
+
+# Intervals between decisions. Weekly on daily bars: the horizon is
+# hours-to-weeks, and every rebalance costs spread. Swept, not assumed (10.3).
+# Daily, because the model is trained to predict the 24h return from a fill 1h
+# after the signal (`training::build(.., 1, 24)`) and the horizon is not
+# configurable. At 7 the book held a one-day forecast for a week: one day of
+# signal and six of drift, paying spread to get in. Walk-forward folds at 7 came
+# out negative while the model's own out-of-sample rank IC is +0.032 (t 5.76).
+#
+# NOT the cadence the research picked. docs/research/cadence.json chose "weekly,
+# 7 tranches" - seven staggered sleeves, a seventh of the book turning over each
+# day - which beat daily on Sharpe (1.30 vs 0.94). Tranching was never migrated
+# to Rust: `backtest.rs` computes one cadence and rotates the whole book on it.
+# Until that exists, daily is the only setting that matches what the model was
+# trained to forecast.
+rebalance_every = 1
+
+# Superseded by `crypto-portfolio universe-rank`, which ranks by trailing liquidity
+# from the bar store and records a point-in-time snapshot per decision date.
+# Kept only for `universe record`, the Phase 0 configured-list path.
+universe = ["BTC", "ETH", "SOL"]
+
+# What portfolio beta is measured against (spec 6.2). BTC for crypto, SPY for
+# equities later - same code, different benchmark. It does not have to be in the
+# universe: it is featurized either way, because it is the yardstick and not a
+# holding.
+benchmark = "BTC"
+
+# Eligibility floor: below this median daily quote turnover an asset is not
+# tradeable at our size regardless of what its signal says.
+#
+# A SCREEN, not a selector. Selection is the liquidity rank in
+# `universe rank`; this only removes what could not be traded. The Phase 0
+# value of 50M was chosen when the universe was three configured names, and as
+# a screen over a ranked universe it silently became the selector: in 2026 only
+# 8 assets cleared it, which would have collapsed the cross-section below
+# `min_cross_section` and left the book flat for a whole period.
+#
+# 5M against a 10-name book of ~$10k positions is two orders of magnitude of
+# headroom, which is what a screen should be.
+min_dollar_volume = "5000000"
+
+# The same screen, keyed to the hours this bot actually sends orders in.
+#
+# A whole day is the wrong window to screen on, because it is not the window we
+# trade. KAITO clears the 5M daily floor comfortably and trades $55,720 in the
+# 01:00-02:00 UTC hour we cross it - we sent $9,141 into that. It is where the
+# live book capture found a 4.9-15.3bp spread against the flat 0.50 the model
+# charged, a 17.4bp crossing cost against a modelled 3.1, and it is the one
+# name that took realised cost to 1.53x the model, right on the written kill
+# line. Excluding it, cost came out at 1.02x - the model was not broadly
+# miscalibrated, one illiquid name was.
+#
+# So this is the cheap half of the fix and `participation_limit` is the
+# expensive half. The cap sizes a thin name down (KAITO to 0.46% of NAV at
+# $600k); the screen keeps it out of the cross-section altogether, which costs
+# nothing and does not spend a holding slot on a position too small to matter.
+#
+# Requires `liquidity_profile`: a name it has not measured keeps its
+# eligibility rather than being assumed thin. Off - zero is the shipped
+# behaviour. Turning it on changes what the book holds and has not been through
+# a walk-forward.
+#
+# 250000 is the value the 2026-08-12 measurement argues for: ~27x the largest
+# order the planner wanted to place in that hour, and above it the whole
+# measured cost excess disappears.
+# min_hourly_quote_volume = "250000"
+
+# --- measured liquidity -------------------------------------------------------
+# All three settings below are OFF, and turning any of them on changes what the
+# planner does. Nothing here has been through a walk-forward yet.
+#
+# `liquidity_profile` points at the artefact written by `liquidity-profile`:
+# median quote volume per name in the hours this bot trades, and spreads
+# measured off the live book by `hyperliquid --example book_capture`. Supplying
+# it swaps the flat spread for a per-asset one where one was measured, and moves
+# the impact denominator from a whole day's volume to one slice-hour's.
+#
+# That second change is not a rescaling. A day holds 24 hours and impact goes as
+# the square root of participation, so the same coefficient produces roughly 3.5x
+# the impact estimate. `impact_coefficient` was ASSUMED against the daily
+# denominator and has to be refitted against the hourly one before this is
+# trusted - see the note on it in [costs].
+#
+# liquidity_profile = "data/liquidity/profile.json"
+#
+# What the planner believes about the runner's slicing, because impact meets one
+# slice against one hour. The runner currently sends two. Only consulted when a
+# profile is present.
+# execution_slices = 2
+
+# Below this annualised realised volatility an asset is a peg, not a position.
+# Behavioural rather than a maintained name list - a new stablecoin should not
+# need a config change to be recognised, and nothing genuinely risky in crypto
+# sits near zero vol.
+min_volatility = "0.10"
+
+# An asset with less history than this cannot have its features computed
+# honestly, so it is ineligible rather than silently carrying nulls.
+min_history_bars = 90
+
+# Rebalance deadband: skip a trade whose weight drift is worth less than this
+# multiple of its estimated round-trip cost. Prevents paying spread to correct
+# noise. Costs enter a constructor's *objective* only when the constructor has
+# one - equal_weight does not, so this is where they bind today.
+rebalance_cost_multiple = "3.0"
+
+# Turnover budget per run, as a fraction of NAV. A BUDGET, not a limit: it paces
+# the transition rather than vetoing the destination. Trades are taken in
+# priority order until it is spent, and whatever is dropped is disclosed on the
+# plan (never silently truncated).
+#
+# It lives here and not in [limits] because gross exposure, position size and
+# count are properties of the resulting PORTFOLIO, while turnover is a property
+# of the TRANSITION. Mixing the two made an initial build from flat impossible
+# to accept: going 0% -> 75% invested simply IS 75% turnover.
+#
+# Exits are exempt and are never dropped - a position we no longer want is risk
+# we are still carrying, and pacing out of it is not a saving.
+turnover_budget = "0.50"
+rebalance_drift_band = "0.20"
+
+[limits]
+# Properties of the RESULTING portfolio. Breaching any one rejects the plan
+# whole - never partially applied, never truncated to fit. Turnover is not here;
+# see turnover_budget above.
+max_gross_exposure = "1.00"
+max_position = "0.15"
+
+# The other half of spec 8's position cap: a position may be at most this
+# fraction of one hour's volume, and the binding cap is the LOWER of this and
+# `max_position`. Without it a thin name is limited only by the mandate, so at
+# six times today's NAV the planner would keep asking for a $20k position in a
+# name whose hour trades $200k and simply pay for it.
+#
+# Requires `liquidity_profile`; a name with no measured volume keeps the mandate
+# cap rather than being assumed illiquid. Whatever a capped name cannot hold
+# spills down the SAME side of the book, and anything that will not fit anywhere
+# is disclosed on the plan rather than silently dropped.
+#
+# Off. 0.05 is the value spec 8 argues for.
+# participation_limit = "0.05"
+# Raised from 12 in Phase 2, on measurement rather than convenience. The limit
+# exists to keep the book auditable by a human, and 12 was set for a
+# concentrated long-only book. The learned ranker is long/short and its name
+# count was swept explicitly: 12, 24 and 40 across 72 construction variants.
+# More names was better on risk-adjusted terms at every setting - the best
+# configurations in that search all held 40 - because the gain is
+# diversification rather than signal. Holding ~31 rather than ~20 lifted Sharpe
+# 2.53 to 2.65 and cut drawdown 17.5% to 16.0% at a $30k book, where liquidity
+# never binds, so it is not a capacity workaround.
+#
+# 40 remains auditable: it is one screen of positions.
+max_position_count = 40
+min_position_notional = "25"
+
+# Gross exposure per correlated group. NOT OPTIONAL per spec 6: a hundred crypto
+# assets are approximately one asset, and an equal-weight book across them is a
+# leveraged beta bet wearing a diversification costume.
+#
+# 0.40 is ASSERTED, not derived. It allows at most two max-size positions in one
+# group, which forces a book to span at least two groups before it can reach the
+# gross target. Phase 1's sweep is where a number like this earns its value, and
+# until then it is a judgement recorded rather than a result.
+max_cluster_exposure = "0.40"
+
+# |w'beta| against `benchmark`.
+#
+# Was 1.00, which turned out to be pathological: a long-only book at 0.80 gross
+# holding ~1.25-beta alts sits at ~1.00 exactly, so the limit rejected 101 of
+# 253 plans by a typical margin of 0.07% - vetoing on rounding noise rather
+# than on risk. See docs/phase-1-findings.md. The Phase 1 result was invariant
+# to this number, so raising it is a correction and not a softened gate.
+#
+# The deeper point, worth keeping: for a LONG-ONLY book this limit is close to
+# a restatement of max_gross_exposure. Its value arrives with shorts, which is
+# also when max_net_exposure starts to mean something.
+#
+# An asset whose beta cannot be estimated is assumed to be 1.0, which can only
+# tighten this. See risk.UNKNOWN_BETA.
+max_benchmark_beta = "1.25"
+
+# |sum of weights|, i.e. how far the book may sit from dollar-neutral.
+#
+# Enforced since 2026-08-19, in two places. (1) The plan's TARGET is checked
+# by the risk report like every other limit - the constructor keeps the target
+# at zero net by design, so this only fires when the participation cap leaves
+# one side short. (2) The book that will EXIST after the plan's orders is
+# checked in the rebalance: the turnover budget lets every reduction through
+# and defers additions, so on a reversal day one side shrinks while the
+# other side's rebuild waits, and the book goes net without any plan asking
+# for it (Phase 2 paper: -13.2% against a 0.0% target). Restoring neutrality
+# is risk reduction, so deferred additions on the light side are released
+# past the budget until the projected book is inside this band; what cannot
+# be fixed is disclosed as a warning rather than hidden in a rejected plan
+# that would leave the book where it is.
+#
+# 0.10 is a risk-appetite number, not a fitted one: a tenth of NAV of
+# unintended direction on a book whose whole thesis is cross-sectional.
+# Tightening it costs turnover on reversal days; loosening it is a decision
+# to carry market beta the model never asked for.
+max_net_exposure = ""
+
+# Correlated groups, for max_cluster_exposure above. Crude and present beats
+# sophisticated and Phase 5: this is a hand-maintained sector map, not a
+# correlation clustering, and it is expected to be replaced by one.
+#
+# An asset named here belongs to exactly one group - being in two makes the
+# exposure sums lie, and config loading refuses it. An asset named in NO group
+# is not constrained by the limit at all, and the plan says so by name rather
+# than absorbing it quietly.
+[clusters]
+btc = ["BTC"]
+eth = ["ETH"]
+alt_l1 = ["SOL", "AVAX", "NEAR", "ADA", "DOT", "SUI", "APT"]
+l2 = ["ARB", "OP", "MATIC", "STRK"]
+defi = ["UNI", "AAVE", "LINK", "MKR", "CRV"]
+
+[costs]
+# Hyperliquid perpetual TAKER fee at the base tier, which is where this account
+# sits and will stay: the first volume tier needs roughly $5M of 14-day volume,
+# and a $30k book at this turnover generates about $86k of 30-day volume. Reaching
+# tier 1 would take a balance near $3.7M, so the tier programme is not a lever
+# here and the base rate is the only number that matters.
+#
+# The venue was chosen for self-custody rather than for price. On fees OKX and
+# Hyperliquid are within ~10bp of each other over the whole backtest, which is
+# not a difference worth trading custody for in either direction.
+#
+# MAKER fills are 1.5bps and worth about +110pp of return over the run - a far
+# larger lever than the venue choice. This stays at the taker rate because
+# passive fills are an execution capability the system does not have yet, and
+# assuming them would price in work that has not been done.
+commission_bps = "4.5"
+# Half-spread crossed on entry. MEASURED, no longer a placeholder.
+#
+# Two independent readings agree: Binance USD-M bookTicker sampled across the
+# liquidity range gives a 0.77bp full spread at the median (0.39bp half), and a
+# live Hyperliquid L2 snapshot over the same coins gives 0.74bp full (0.37bp
+# half). BTC reads 0.03bp and ETH 0.04bp, which is the validation that the
+# measurement is a spread and not volatility in disguise - the OHLC estimators
+# tried first failed exactly that check, Corwin-Schultz returning 21bp for BTC.
+#
+# The previous 2.0bp was roughly five times too conservative for the median
+# asset. It is raised to 0.5 rather than 0.39 because the illiquid tail is
+# genuinely wider - GALA reads 2.84bp half on Hyperliquid - and a flat rate
+# should sit above the median it replaces, not on it. A per-asset spread keyed
+# to liquidity is the honest form and is not built yet.
+spread_bps = "0.5"
+# Impact coefficient. UNCALIBRATED - see CostModel. Phase 3 compares realised
+# against estimated and this is the number that moves.
+impact_coefficient = "0.10"
+adv_lookback_days = 20
+calibrated = false

@@ -286,3 +286,34 @@ the backtest shows more promise. Round 3 sweeps the SELECTION AXIS ONLY:
   spreads and impact — if breadth beyond the liquid core is expensive, the
   folds will say so (Man's finding: Sharpe declines past ~15 coins once
   costs bind; Zarattini's: flat 10–50. Round 3 adjudicates for our book).
+
+### Round 3 results and gate (2026-08-21, run as registered)
+
+Tuning grid (folds 1–5): P30/N10 (V6) 1.26, P30/N20 1.03, **P30/N30 0.97**,
+P60/N10 **1.30**, P60/N20 0.95, P60/N30 0.81. The surface is smooth and
+monotone in N at both pools: **selection is the value, breadth dilutes it**
+— the user's widen-to-30 cell is the weakest in each pool, and the
+no-selection cell (P30/N30 = every top-30 name in its own direction)
+confirms it. A wider pool to select FROM helps marginally (P60/N10 > V6 by
+0.03, i.e. noise).
+
+Selection: P60/N10. Holdout (one look): **0.37**. Nine folds: 3.94, −0.04,
+0.90, −0.29, 1.98, 0.60, 1.31, −1.08, 0.66 — fold-mean 0.89, pooled 0.98,
+compounded +122%, 6/9 positive, worst DD −15.2%, 2022 +5.7%. Gate: vs
+vol-targeted BTC **+0.22, 90% [−0.83, +1.26], 63% ahead — FAILED**, the
+same criterion, at essentially V6's numbers (its holdout was 0.49; the two
+are one strategy at these sizes). 50/50 with flat 2.17 vs 2.05 — positive
+point estimate, same as round 2.
+
+**Standing after three rounds and 13 counted trials.** The strategy family
+has converged: concentrated strength-selection at ~0.9–1.0 nine-fold,
+positive bear, low drawdowns — and statistically inseparable from
+vol-targeted BTC on this record's holdout. The selection axis is now swept
+(monotone, no spike to chase); the signal family, sizing, and label axes
+were swept in round 2; trained models are measured harmful. Within this
+data and discipline there is no obvious next axis whose prior isn't
+already refuted. Per the user's standing instruction ("needs to show more
+promise in backtest first"), the shadow is NOT started; the bot is not
+deployed; the record stands open for a future round only if a genuinely
+new axis (new data source, different venue, longer record) is brought to
+it.
