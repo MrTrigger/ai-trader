@@ -11,10 +11,24 @@ DEMAND_DIR=${IB_GATEWAY_DEMAND_DIR:-/run/aitrader/ib-demand}
 IDLE_SECONDS=${IB_GATEWAY_IDLE_SECONDS:-45}
 POLL_SECONDS=${IB_GATEWAY_POLL_SECONDS:-1}
 GATEWAY_COMMAND=${IB_GATEWAY_COMMAND:-/home/ibgateway/scripts/run.sh}
+# The API port the Gateway itself listens on — NOT the socat relay, which
+# accepts from the moment the container starts and proves nothing.
+API_PORT=${IB_GATEWAY_API_PORT:-4002}
+# How long a fresh Gateway may keep the port closed before silence starts to
+# count: IBC's login normally completes inside two minutes, but IB being slow
+# is not a wedge, so give it ten.
+LOGIN_GRACE_SECONDS=${IB_GATEWAY_LOGIN_GRACE_SECONDS:-600}
+# Past the grace, this much continuous port silence WITH demand waiting means
+# the session is wedged and a fresh login is the only way out.
+API_DEAD_SECONDS=${IB_GATEWAY_API_DEAD_SECONDS:-300}
+API_PROBE_SECONDS=${IB_GATEWAY_API_PROBE_SECONDS:-15}
 
 gateway_pid=""
 gateway_kind=""
 idle_since=""
+gateway_started=""
+api_dead_since=""
+api_probed_at=0
 # When a login could not be selected, say so once and wait, rather than
 # repeating it every poll while the leaseholder times out with its own message.
 refusal_said=""
@@ -86,6 +100,39 @@ gateway_alive() {
   [ -n "$gateway_pid" ] && kill -0 "$gateway_pid" 2>/dev/null
 }
 
+# A live pid is not a live Gateway. The 2026-08-23 wedge: the Sunday restart
+# needed a full weekly re-login, IBC never got past the login dialog, and the
+# Java process sat there for three days — alive by kill -0, dead on the API
+# port — while the bot relaunched every ten minutes into nothing. So while a
+# bot is waiting, insist the port answers: no answer past the login grace for
+# API_DEAD_SECONDS straight means this session will never serve anyone, and a
+# fresh login is the only way out.
+api_listening() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$API_PORT") 2>/dev/null || return 1
+  exec 3>&- 3<&- 2>/dev/null
+  return 0
+}
+
+# Returns 0 when the Gateway is wedged and must be replaced. Probes at most
+# once per API_PROBE_SECONDS so a healthy logged-in Gateway is not poked on
+# every one-second poll.
+gateway_wedged() {
+  local now=$1
+  [ -n "$gateway_started" ] || return 1
+  [ $((now - gateway_started)) -ge "$LOGIN_GRACE_SECONDS" ] || return 1
+  [ $((now - api_probed_at)) -ge "$API_PROBE_SECONDS" ] || return 1
+  api_probed_at=$now
+  if api_listening; then
+    api_dead_since=""
+    return 1
+  fi
+  if [ -z "$api_dead_since" ]; then
+    api_dead_since=$now
+    return 1
+  fi
+  [ $((now - api_dead_since)) -ge "$API_DEAD_SECONDS" ]
+}
+
 start_gateway() {
   local kind
   kind=$(demanded_kind)
@@ -99,6 +146,9 @@ start_gateway() {
   gateway_pid=$!
   gateway_kind=$kind
   idle_since=""
+  gateway_started=$(date +%s)
+  api_dead_since=""
+  api_probed_at=0
 }
 
 stop_gateway() {
@@ -110,6 +160,8 @@ stop_gateway() {
   gateway_pid=""
   gateway_kind=""
   idle_since=""
+  gateway_started=""
+  api_dead_since=""
 }
 
 shutdown() {
@@ -129,6 +181,10 @@ while true; do
     # rather than leave it holding the other one.
     if gateway_alive && [ -n "$gateway_kind" ] && [ "$gateway_kind" != "$(demanded_kind)" ]; then
       stop_gateway "demand changed from $gateway_kind to $(demanded_kind)"
+      refusal_said=""
+    fi
+    if gateway_alive && gateway_wedged "$(date +%s)"; then
+      stop_gateway "API port $API_PORT has been silent for ${API_DEAD_SECONDS}s with a bot waiting — replacing the session"
       refusal_said=""
     fi
     if ! gateway_alive; then
