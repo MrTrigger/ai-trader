@@ -1,6 +1,7 @@
 import { money, num } from "../lib/format";
 
 type Run = { recorded_at?: string; nav?: string | number; outcome?: string };
+type Benchmark = { label: string; points: [string, number][] };
 
 /** The smallest drawdown the panel will draw full-height. */
 const DD_FLOOR = 0.01;
@@ -44,11 +45,13 @@ export function NavChart({
   runs,
   initialCash,
   now,
+  benchmark,
 }: {
   runs: Run[];
   initialCash?: number;
   /** Mark-to-market right now, if the book reports one. */
   now?: number;
+  benchmark?: Benchmark;
 }) {
   const recorded = runs
     .filter((r) => r.nav != null)
@@ -81,10 +84,24 @@ export function NavChart({
 
   const base = initialCash && initialCash > 0 ? initialCash : pts[0].v;
   const vals = pts.map((p) => p.v);
-  const yTicks = ticks(Math.min(...vals, base), Math.max(...vals, base));
+  const benchmarkByTime = new Map(
+    (benchmark?.points ?? []).filter(([, value]) => Number.isFinite(value) && value > 0),
+  );
+  const benchmarkPoints = pts.flatMap((point, index) => {
+    const value = benchmarkByTime.get(point.t);
+    return value == null ? [] : [{ index, value }];
+  });
+  const benchmarkValues = benchmarkPoints.map(({ value }) => value);
+  const yTicks = ticks(
+    Math.min(...vals, ...benchmarkValues, base),
+    Math.max(...vals, ...benchmarkValues, base),
+  );
   // Padded, so a tick at the extreme of the range sits INSIDE the box. A label
   // centred on the boundary hangs half of itself into whatever comes next.
-  const inner = { lo: Math.min(...vals, base, ...yTicks), hi: Math.max(...vals, base, ...yTicks) };
+  const inner = {
+    lo: Math.min(...vals, ...benchmarkValues, base, ...yTicks),
+    hi: Math.max(...vals, ...benchmarkValues, base, ...yTicks),
+  };
   const pad = (inner.hi - inner.lo || Math.abs(inner.hi) * 0.01 || 1) * 0.09;
   const lo = inner.lo - pad;
   const hi = inner.hi + pad;
@@ -98,6 +115,9 @@ export function NavChart({
 
   const line = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(" ");
   const area = `${line} L${x(pts.length - 1).toFixed(1)} ${EQ_H} L${x(0).toFixed(1)} ${EQ_H} Z`;
+  const benchmarkLine = benchmarkPoints
+    .map(({ index, value }, i) => `${i ? "L" : "M"}${x(index).toFixed(1)} ${y(value).toFixed(1)}`)
+    .join(" ");
 
   // Drawdown against the running peak — the number an operator actually feels.
   let peak = base;
@@ -160,6 +180,17 @@ export function NavChart({
             vectorEffect="non-scaling-stroke"
           />
           <path d={area} fill="url(#navfill)" />
+          {benchmarkPoints.length >= 2 && (
+            <path
+              d={benchmarkLine}
+              fill="none"
+              stroke="#6E8BFF"
+              strokeWidth="1.5"
+              strokeDasharray="5 4"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
           <path
             d={line}
             fill="none"
@@ -178,7 +209,19 @@ export function NavChart({
         />
       </Plot>
 
-      <div className="mt-3 flex items-baseline justify-between">
+      <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-[10.5px] text-dim">
+        <Legend colour={stroke} label="Portfolio" value={last / base - 1} />
+        {benchmark && benchmarkPoints.length >= 2 && (
+          <Legend
+            colour="#6E8BFF"
+            dashed
+            label={benchmark.label}
+            value={benchmarkPoints[benchmarkPoints.length - 1].value / base - 1}
+          />
+        )}
+      </div>
+
+      <div className="mt-2 flex items-baseline justify-between">
         <span className="text-[10px] uppercase tracking-[0.14em] text-faint">Drawdown</span>
         <span className="num text-[10.5px] text-faint">
           worst {(worst * 100).toFixed(2)}% · {recorded.length} runs · from {money(base, 0)}
@@ -227,6 +270,31 @@ export function NavChart({
         <span>{day(pts[pts.length - 1].t)}</span>
       </div>
     </div>
+  );
+}
+
+function Legend({
+  colour,
+  dashed = false,
+  label,
+  value,
+}: {
+  colour: string;
+  dashed?: boolean;
+  label: string;
+  value: number;
+}) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span
+        className="inline-block w-5 border-t-2"
+        style={{ borderColor: colour, borderStyle: dashed ? "dashed" : "solid" }}
+      />
+      <span>{label}</span>
+      <span className="num text-faint">
+        {value >= 0 ? "+" : ""}{(value * 100).toFixed(2)}%
+      </span>
+    </span>
   );
 }
 

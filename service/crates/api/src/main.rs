@@ -84,7 +84,7 @@ const REQUEST_TIMEOUT_S: u64 = 10;
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0B0F14"/><g stroke="#53C6E8" stroke-width="2.2" fill="none" stroke-linecap="round"><circle cx="16" cy="16" r="7.5"/><path d="M16 3.5v5M16 23.5v5M3.5 16h5M23.5 16h5"/></g><circle cx="16" cy="16" r="2.4" fill="#53C6E8"/></svg>"##;
 
 const USAGE: &str = "\
-usage: api [--state-dir <dir> --initial-cash <amount>]
+usage: api [--state-dir <dir> --initial-cash <amount>] [--data-root <dir>]
            [--bot <path> --bot-config <file>]
            [--port N] [--expectation <file>] [--quote-currency USD]
            [--no-supervise]
@@ -110,6 +110,8 @@ struct Config {
     static_dir: Option<PathBuf>,
     /// `None` = pure fleet control plane: no local book view, DB only.
     state_dir: Option<PathBuf>,
+    /// Point-in-time market bars used for dashboard benchmarks.
+    data_root: PathBuf,
     /// How to invoke the bot. `None` makes this a read-only dashboard.
     bot: Option<BotCommand>,
     initial_cash: Decimal,
@@ -295,6 +297,9 @@ fn parse(args: &[String]) -> Result<Config, String> {
     Ok(Config {
         static_dir,
         state_dir,
+        data_root: get("--data-root")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data")),
         bot: BotCommand::new(get("--bot"), get("--bot-config"))?,
         initial_cash,
         quote_currency: get("--quote-currency").unwrap_or_else(|| "USD".into()),
@@ -330,6 +335,7 @@ fn snapshot(cfg: &Config) -> Result<state::Snapshot, String> {
     };
     state::build(&state::Inputs {
         state_dir,
+        data_root: &cfg.data_root,
         initial_cash: cfg.initial_cash,
         quote_currency: &cfg.quote_currency,
         cadence_hours: cfg.cadence_hours,

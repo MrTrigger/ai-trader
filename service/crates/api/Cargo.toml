@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+crypto-portfolio = { workspace = true }
 records = { path = "../records" }
 tokio = { version = "1", features = ["rt"] }
 venue.workspace = true

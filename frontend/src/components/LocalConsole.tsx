@@ -21,6 +21,10 @@ type Local = {
     fills_count?: number;
   };
   runs?: { recorded_at?: string; nav?: string | number; outcome?: string }[];
+  benchmark?: {
+    label: string;
+    points: [string, number][];
+  };
   reconciliation?: { agrees?: boolean; explain?: string; ledger_entries?: number };
   health?: { ok?: boolean; notes?: string[] };
 };
@@ -90,6 +94,7 @@ export function LocalConsole({ botId, venue }: { botId?: string; venue?: string 
             runs={runs}
             initialCash={num(b.nav) - num(b.total_pnl)}
             now={num(b.nav)}
+            benchmark={s.benchmark}
           />
         </div>
 

@@ -113,6 +113,8 @@ pub struct Snapshot {
     pub health: Health,
     pub book: Book,
     pub runs: Vec<RunRecord>,
+    /// A passive market alternative over the same observation dates as NAV.
+    pub benchmark: Option<BenchmarkView>,
     pub fills: Vec<FillView>,
     pub marks: BTreeMap<String, String>,
     /// The backtest this is supposed to be reproducing, if a record was found.
@@ -133,6 +135,13 @@ pub struct Snapshot {
     pub mode: Option<ModeView>,
     /// Anything that made a number here less trustworthy than it looks.
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkView {
+    pub label: String,
+    /// Hypothetical NAV, seeded with the same cash as the strategy.
+    pub points: Vec<(String, f64)>,
 }
 
 /// How the live account is doing, and whether that means anything yet.
@@ -172,6 +181,7 @@ pub struct ModeView {
 
 pub struct Inputs<'a> {
     pub state_dir: &'a Path,
+    pub data_root: &'a Path,
     pub initial_cash: Decimal,
     pub quote_currency: &'a str,
     pub cadence_hours: i64,
@@ -233,6 +243,12 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         inputs.quote_currency,
         &open_orders,
         &mut warnings,
+    );
+    let benchmark = load_benchmark(
+        inputs.data_root,
+        &runs,
+        inputs.initial_cash,
+        marks.get("BTC").copied(),
     );
 
     let expectation = inputs
@@ -313,6 +329,7 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         health,
         book,
         runs,
+        benchmark,
         fills: recent_fills,
         marks: marks
             .iter()
@@ -324,6 +341,76 @@ pub fn build(inputs: &Inputs) -> Result<Snapshot, String> {
         controls_enabled: inputs.controls_enabled,
         mode: read_mode(inputs.bot_config, &mut warnings),
         warnings,
+    })
+}
+
+/// BTC is the strategy's configured crypto benchmark. The comparison uses
+/// completed daily bars only, then carries the live mark as its final point.
+/// Both paths start with the account's initial cash, so the chart compares
+/// values rather than putting a dollar NAV and a BTC price on one axis.
+fn load_benchmark(
+    data_root: &Path,
+    runs: &[RunRecord],
+    initial_cash: Decimal,
+    current_mark: Option<Decimal>,
+) -> Option<BenchmarkView> {
+    let closes = crypto_portfolio::store::read_asset(data_root, 86_400, "BTC")
+        .ok()?
+        .into_iter()
+        .filter_map(|bar| {
+            (bar.close.is_finite() && bar.close > 0.0).then_some((
+                bar.ts_utc.timestamp() + i64::from(bar.interval_s),
+                bar.close,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    benchmark_from_closes(runs, initial_cash, current_mark, &closes)
+}
+
+fn benchmark_from_closes(
+    runs: &[RunRecord],
+    initial_cash: Decimal,
+    current_mark: Option<Decimal>,
+    closes: &[(i64, f64)],
+) -> Option<BenchmarkView> {
+    let cash = initial_cash.to_f64()?;
+    if cash <= 0.0 || closes.is_empty() {
+        return None;
+    }
+
+    let parse = |stamp: &str| {
+        time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(|value| value.unix_timestamp())
+    };
+    let observations = runs.iter().rev().filter_map(|run| {
+        let nav = run.nav.as_deref()?.parse::<f64>().ok()?;
+        let at = parse(&run.as_of)?;
+        (nav.is_finite() && nav > 0.0).then_some((&run.recorded_at, at))
+    });
+
+    let mut start_price = None;
+    let mut points = Vec::new();
+    for (recorded_at, at) in observations {
+        let end = closes.partition_point(|(close_at, _)| *close_at <= at);
+        let Some(index) = end.checked_sub(1) else {
+            continue;
+        };
+        let price = closes[index].1;
+        let base = *start_price.get_or_insert(price);
+        points.push((recorded_at.clone(), cash * price / base));
+    }
+
+    if let (Some(base), Some(mark)) = (start_price, current_mark.and_then(|v| v.to_f64())) {
+        if mark.is_finite() && mark > 0.0 {
+            points.push(("now".into(), cash * mark / base));
+        }
+    }
+
+    (points.len() >= 2).then_some(BenchmarkView {
+        label: "BTC buy & hold".into(),
+        points,
     })
 }
 
@@ -732,6 +819,31 @@ mod tests {
         }
     }
 
+    fn run(as_of: &str, recorded_at: &str, nav: &str) -> RunRecord {
+        RunRecord {
+            bot_id: Some("crypto-portfolio".into()),
+            run_id: recorded_at.into(),
+            plan_id: None,
+            as_of: as_of.into(),
+            recorded_at: recorded_at.into(),
+            outcome: "executed".into(),
+            detail: None,
+            orders_planned: 0,
+            orders_submitted: 0,
+            orders_skipped: 0,
+            slices_completed: 0,
+            slices_planned: 0,
+            nav: Some(nav.into()),
+            gross_exposure: None,
+            net_exposure: None,
+            control_state: "running".into(),
+            risk_checks: Vec::new(),
+            slices: Vec::new(),
+            book_after: Vec::new(),
+            result: None,
+        }
+    }
+
     /// `fold_book` with the arguments a test never varies.
     fn book(
         fills: &[Fill],
@@ -843,5 +955,33 @@ mod tests {
         assert_eq!(max_drawdown(&[100.0, 120.0, 60.0, 90.0]), Some(-0.5));
         assert_eq!(max_drawdown(&[100.0, 110.0, 120.0]), Some(0.0));
         assert_eq!(max_drawdown(&[100.0]), None);
+    }
+
+    #[test]
+    fn btc_benchmark_uses_only_closes_available_at_each_run_and_the_live_mark() {
+        let unix = |stamp: &str| {
+            time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp()
+        };
+        let closes = vec![
+            (unix("2026-01-02T00:00:00Z"), 100.0),
+            (unix("2026-01-03T00:00:00Z"), 110.0),
+            (unix("2026-01-04T00:00:00Z"), 90.0),
+        ];
+        // The run store returns newest first. The helper must put the graph
+        // back in chronological order before it chooses the inception price.
+        let runs = vec![
+            run("2026-01-04T00:00:00Z", "2026-01-04T00:01:00Z", "900"),
+            run("2026-01-03T00:00:00Z", "2026-01-03T00:01:00Z", "1000"),
+        ];
+
+        let benchmark =
+            benchmark_from_closes(&runs, dec("1000"), Some(dec("121")), &closes).unwrap();
+
+        assert_eq!(benchmark.label, "BTC buy & hold");
+        assert_eq!(benchmark.points[0], ("2026-01-03T00:01:00Z".into(), 1000.0));
+        assert!((benchmark.points[1].1 - 818.181818).abs() < 1e-6);
+        assert_eq!(benchmark.points[2], ("now".into(), 1100.0));
     }
 }
