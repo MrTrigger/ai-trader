@@ -7,6 +7,8 @@ use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 
 use crate::{config::Config, store, universe};
 
+pub const TARGET_CONTRACT: &str = "rust-crypto-targets-1";
+
 #[derive(Debug, serde::Serialize)]
 pub struct TrainingRow {
     pub date: NaiveDate,
@@ -17,12 +19,13 @@ pub struct TrainingRow {
     pub asset: String,
     /// Demeaned forward return - the reward the model has always been fit on.
     pub target: f64,
+    /// Demeaned raw_ret/vol within this date and slot's vol-bearing rows.
+    pub target_per_risk: Option<f64>,
+    /// raw_ret/vol without cross-sectional demeaning.
+    pub target_per_risk_abs: Option<f64>,
     /// The same return before demeaning, plus the asset's realised vol at the
-    /// decision. Emitted so a trainer can build ALTERNATIVE rewards - e.g. the
-    /// risk-adjusted target demean(ret/vol) - without a second matrix pass.
-    /// The record only documents the demeaned-return reward; whether a
-    /// risk-adjusted one came later lived in the uncommitted harness, so the
-    /// comparison has to be re-run rather than remembered.
+    /// decision. These raw columns support target audits. Trainers consume
+    /// the finalized target fields and do not transform these columns.
     pub raw_ret: f64,
     pub vol: Option<f64>,
     pub features: BTreeMap<String, f64>,
@@ -148,12 +151,6 @@ pub fn build(
             if !include_unlisted && listings.get(asset).is_none_or(|listed| *listed > day) {
                 continue;
             }
-            let (Some(p0), Some(p1)) = (
-                opens.get(&(entry, asset.to_owned())),
-                opens.get(&(exit, asset.to_owned())),
-            ) else {
-                continue;
-            };
             let Some(daily) = daily_by_key.get(&(daily_stamp, asset)) else {
                 continue;
             };
@@ -164,36 +161,118 @@ pub fn build(
             // Vol at the decision, same preference order as inference: the
             // 24h realised vol if the hourly store has it, else 30-day daily.
             let vol = hour.rv_24h.or(daily.vol_30).filter(|v| *v > 0.0);
-            block.push((asset.to_owned(), p1 / p0 - 1.0, vol, values));
+            let label = opens
+                .get(&(entry, asset.to_owned()))
+                .zip(opens.get(&(exit, asset.to_owned())))
+                .map(|(p0, p1)| p1 / p0 - 1.0);
+            block.push(TrainingCandidate {
+                asset: asset.to_owned(),
+                label,
+                vol,
+                values,
+            });
         }
-        if block.len() >= 12 {
-            let raw = block
-                .iter()
-                .map(|(_, _, _, v)| v.clone())
-                .collect::<Vec<_>>();
-            let normalised = features_crypto::rank_normalise(&raw)?;
-            let mean_target = block.iter().map(|(_, y, _, _)| y).sum::<f64>() / block.len() as f64;
-            for ((asset, target, vol, _), values) in block.into_iter().zip(normalised) {
-                rows.push(TrainingRow {
-                    date: day,
-                    slot: stamp.time().hour(),
-                    asset,
-                    target: target - mean_target,
-                    raw_ret: target,
-                    vol,
-                    features: feature_names.iter().cloned().zip(values).collect(),
-                });
-            }
-        }
+        rows.extend(finalize_cross_section(
+            day,
+            stamp.time().hour(),
+            &feature_names,
+            block,
+        )?);
         stamp += Duration::hours(step_hours);
     }
     if rows.is_empty() {
         return Err(format!("no usable training rows between {start} and {end}"));
     }
+    finalize_per_risk_targets(&mut rows)?;
     Ok(TrainingMatrix {
         features: feature_names,
         rows,
     })
+}
+
+struct TrainingCandidate {
+    asset: String,
+    label: Option<f64>,
+    vol: Option<f64>,
+    values: Vec<Option<f64>>,
+}
+
+fn finalize_cross_section(
+    date: NaiveDate,
+    slot: u32,
+    feature_names: &[String],
+    candidates: Vec<TrainingCandidate>,
+) -> Result<Vec<TrainingRow>, String> {
+    if candidates.len() < 12 {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<_> = candidates
+        .iter()
+        .map(|candidate| candidate.values.clone())
+        .collect();
+    let normalised = features_crypto::rank_normalise(&raw)?;
+    let labels: Vec<_> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.label)
+        .collect();
+    if labels.len() < 12 {
+        return Ok(Vec::new());
+    }
+    if labels.iter().any(|label| !label.is_finite()) {
+        return Err("nonfinite forward training return".into());
+    }
+    let mean_target = labels.iter().sum::<f64>() / labels.len() as f64;
+    Ok(candidates
+        .into_iter()
+        .zip(normalised)
+        .filter_map(|(candidate, values)| {
+            candidate.label.map(|label| TrainingRow {
+                date,
+                slot,
+                asset: candidate.asset,
+                target: label - mean_target,
+                target_per_risk: None,
+                target_per_risk_abs: None,
+                raw_ret: label,
+                vol: candidate.vol,
+                features: feature_names.iter().cloned().zip(values).collect(),
+            })
+        })
+        .collect())
+}
+
+fn finalize_per_risk_targets(rows: &mut [TrainingRow]) -> Result<(), String> {
+    let mut groups = BTreeMap::<(NaiveDate, u32), (f64, usize)>::new();
+    for row in rows.iter_mut() {
+        row.target_per_risk = None;
+        row.target_per_risk_abs = match row.vol {
+            None => None,
+            Some(vol) => {
+                let target = row.raw_ret / vol;
+                if !vol.is_finite() || vol <= 0.0 || !target.is_finite() {
+                    return Err(format!(
+                        "{} {} slot {} has invalid per-risk target inputs",
+                        row.asset, row.date, row.slot
+                    ));
+                }
+                let group = groups.entry((row.date, row.slot)).or_default();
+                group.0 += target;
+                group.1 += 1;
+                Some(target)
+            }
+        };
+    }
+    for row in rows {
+        if let Some(absolute) = row.target_per_risk_abs {
+            let (sum, count) = groups[&(row.date, row.slot)];
+            let relative = absolute - sum / count as f64;
+            if !relative.is_finite() {
+                return Err("nonfinite group mean in per-risk targets".into());
+            }
+            row.target_per_risk = Some(relative);
+        }
+    }
+    Ok(())
 }
 
 /// Mark opens exactly like the production discontinuity rule while retaining
@@ -248,6 +327,96 @@ fn canonical(asset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target_row(date: &str, slot: u32, raw_ret: f64, vol: Option<f64>) -> TrainingRow {
+        TrainingRow {
+            date: date.parse().unwrap(),
+            slot,
+            asset: "fixture".into(),
+            target: 123.0,
+            target_per_risk: None,
+            target_per_risk_abs: None,
+            raw_ret,
+            vol,
+            features: BTreeMap::from([("x_ret_7".into(), 0.5)]),
+        }
+    }
+
+    #[test]
+    fn final_per_risk_targets_group_by_date_slot_and_exclude_missing_vol() {
+        let mut rows = vec![
+            target_row("2026-01-01", 0, 0.02, Some(0.1)),
+            target_row("2026-01-01", 0, 0.06, Some(0.2)),
+            target_row("2026-01-01", 0, 999.0, None),
+            target_row("2026-01-01", 12, 0.04, Some(0.1)),
+            target_row("2026-01-02", 0, 0.02, Some(0.2)),
+            target_row("2026-01-03", 0, 0.1, None),
+        ];
+        finalize_per_risk_targets(&mut rows).unwrap();
+        assert!((rows[0].target_per_risk_abs.unwrap() - 0.2).abs() < 1e-12);
+        assert!((rows[0].target_per_risk.unwrap() + 0.05).abs() < 1e-12);
+        assert!((rows[1].target_per_risk.unwrap() - 0.05).abs() < 1e-12);
+        assert_eq!(rows[2].target_per_risk, None);
+        assert_eq!(rows[2].target_per_risk_abs, None);
+        assert_eq!(rows[3].target_per_risk, Some(0.0));
+        assert_eq!(rows[4].target_per_risk, Some(0.0));
+        assert_eq!(rows[5].target_per_risk, None);
+        assert!(rows
+            .iter()
+            .all(|row| row.target == 123.0 && row.features["x_ret_7"] == 0.5));
+        let serialized = serde_json::to_value(&rows[2]).unwrap();
+        assert!(serialized["target_per_risk"].is_null());
+    }
+
+    #[test]
+    fn per_risk_targets_reject_invalid_present_vol_or_return() {
+        for vol in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(
+                finalize_per_risk_targets(&mut [target_row("2026-01-01", 0, 0.02, Some(vol))])
+                    .is_err()
+            );
+        }
+        assert!(finalize_per_risk_targets(&mut [target_row(
+            "2026-01-01",
+            0,
+            f64::INFINITY,
+            Some(0.1)
+        )])
+        .is_err());
+    }
+
+    #[test]
+    fn missing_future_exit_does_not_change_remaining_feature_vectors() {
+        let candidates = |missing_exit: bool| {
+            (0..13)
+                .map(|i| TrainingCandidate {
+                    asset: format!("A{i:02}"),
+                    label: if missing_exit && i == 12 {
+                        None
+                    } else {
+                        Some(i as f64 * 0.01)
+                    },
+                    vol: Some(0.1),
+                    values: vec![Some(i as f64), Some((12 - i) as f64)],
+                })
+                .collect()
+        };
+        let date = "2026-01-01".parse().unwrap();
+        let names = ["x_ret_7".into(), "x_ret_30".into()];
+        let complete = finalize_cross_section(date, 0, &names, candidates(false)).unwrap();
+        let missing = finalize_cross_section(date, 0, &names, candidates(true)).unwrap();
+        assert_eq!(complete.len(), 13);
+        assert_eq!(missing.len(), 12);
+        for (full, partial) in complete.iter().zip(&missing) {
+            assert_eq!(full.asset, partial.asset);
+            assert_eq!(full.features, partial.features);
+        }
+        assert!((missing.iter().map(|row| row.target).sum::<f64>()).abs() < 1e-12);
+        assert!((missing[0].target + 0.055).abs() < 1e-12);
+        let removed_cohort: Vec<_> = candidates(false).into_iter().take(12).collect();
+        let incorrectly_ranked = finalize_cross_section(date, 0, &names, removed_cohort).unwrap();
+        assert_ne!(missing[11].features, incorrectly_ranked[11].features);
+    }
 
     #[test]
     fn targets_freeze_at_the_first_identity_break() {

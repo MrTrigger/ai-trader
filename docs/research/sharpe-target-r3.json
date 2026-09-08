@@ -1,0 +1,14 @@
+{
+  "source_suite": "docs/research/execution-suite.json",
+  "source_configs": "var/research/wf-rank-2020",
+  "config_root": "var/research/sharpe-target-r3-configs",
+  "output_prefix": "var/research/sharpe-target-r3",
+  "selection": "Highest pooled Sharpe over original folds6–8 with positive return in every fold. Confirm a new winner on folds6–9 under original4.5bp commission plus impact; target>1.5 and positivefold9. If a repeated round2 benchmark wins, retain its already-completed confirmation instead of treating it as a new hypothesis. Dates exposed; final breadth test in this batch, no further count grid.",
+  "reason": "Corrected fee-on candidates remain below1.5. Older evidence favoring breadth12/24/40 predates the funding-leak correction and did not isolate balanced per-risk score selection. Test24versus40 while preserving side budgets, weights, costfloor and risklimits. Two new policy hypotheses, two repeated controls.",
+  "hypotheses": [
+    {"id":"control","reason":"Repeated frozen24-name control.","portfolio":{}},
+    {"id":"score-selected","reason":"Repeated round2 score-selected24-name comparator.","portfolio":{"constructor":"risk_adjusted_score_selected"}},
+    {"id":"wide","reason":"Expand expected-return selection from24to40 names; unchanged balanced sizing and execution.","portfolio":{"ranker_selection_count":40}},
+    {"id":"wide-score","reason":"Expand per-risk-score selection from24to40 names; unchanged balanced sizing and execution.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_selection_count":40}}
+  ]
+}

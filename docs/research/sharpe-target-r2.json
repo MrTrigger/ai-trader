@@ -1,0 +1,12 @@
+{
+  "source_suite": "docs/research/execution-suite.json",
+  "source_configs": "var/research/wf-rank-2020",
+  "config_root": "var/research/sharpe-target-r2-configs",
+  "output_prefix": "var/research/sharpe-target-r2",
+  "selection": "Highest pooled Sharpe over original folds 6–8, subject to positive cumulative return in each fold. Confirmation uses original folds 6–9; target pooled Sharpe >1.5 with impact costs and original4.5bp commission, positive fold9 return. Retain stressed/delayed results. All dates exposed, including round1 confirmation.",
+  "reason": "Round1 zero-commission counterfactual reaches1.647 but the current Lighter market list covers only19of26 latest simulated holdings by exact perpetual symbol. Test one independent selection mechanism at original fees. Previous studies did not isolate normalized-score selection while preserving balanced allocation.",
+  "hypotheses": [
+    {"id": "control", "reason": "Unchanged frozen ranker with original commission, impact and funding.", "portfolio": {}},
+    {"id": "score-selected", "reason": "Select the top24 by conviction/volatility rather than conviction. For per-risk labels this removes volatility from the selection ranking. Preserve cost floor, two-sided minimum, balanced sizing and caps.", "portfolio": {"constructor": "risk_adjusted_score_selected"}}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "source_suite":"docs/research/execution-suite.json",
+  "source_configs":"var/research/wf-rank-2020",
+  "config_root":"var/research/sharpe-target-r4-configs",
+  "output_prefix":"var/research/sharpe-target-r4",
+  "selection":"Require positive return in each screen fold, then select highest pooled Sharpe on original folds6-8. Confirm candidate against same-cost control on folds6-9 under impact, stress and1hdelay. Target impact pooledSharpe>1.5 and positivefold9. All dates exposed; this is a combined policy and cost counterfactual, not actual Lighter history.",
+  "reason":"Round2 score-based selection improved original-cost Sharpe1.132to1.226. Separately, zero commission with a current-quote-anchored2.2bp halfspread improved original policy to1.459. Test the combination once to measure whether the observed selection benefit survives the changed execution costs. No new selection tuning or fee/spread grid. Retain original universe, funding, volume and impact proxies; coverage and venue execution remain unvalidated.",
+  "hypotheses":[
+    {"id":"control","reason":"Repeat current-quote-anchored zero-fee original policy as matched-cost control.","portfolio":{},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"score-low-fee","reason":"Combine the existing score-selected24-name policy with the same zero-fee/2.2bp cost assumptions.","portfolio":{"constructor":"risk_adjusted_score_selected"},"costs":{"commission_bps":"0","spread_bps":"2.2"}}
+  ]
+}

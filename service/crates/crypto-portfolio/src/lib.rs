@@ -9,12 +9,16 @@ pub mod binance;
 pub mod binance_archive;
 pub mod config;
 pub mod directional;
+pub mod execution;
+pub mod experiment;
 pub mod funding;
 pub mod gate;
 pub mod ic;
 pub mod inspect;
 pub mod liquidity;
 pub mod model;
+pub mod monte_carlo;
+pub mod replay_suite;
 pub mod report;
 pub mod research;
 pub mod scores;
@@ -392,7 +396,11 @@ fn generate_signal(
             for (r, s, vol) in scored {
                 out.push(Signal {
                     asset: r.asset.clone(),
-                    direction: if s > 0.0 { Direction::Long } else { Direction::Short },
+                    direction: if s > 0.0 {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    },
                     conviction: d(s.abs())?,
                     volatility: Some(d(vol)?),
                 });
@@ -718,6 +726,11 @@ fn generate_signal(
                     .as_ref()
                     .ok_or("ml_ranker requires model_path; no fallback model is permitted")?;
                 let model = model::Model::load(std::path::Path::new(path))?;
+                if cfg.funding_cost_adjustment
+                    && model.label_horizon_hours.is_some_and(|hours| hours != 24)
+                {
+                    return Err("funding_cost_adjustment requires a 24h model label horizon".into());
+                }
                 let raw: Vec<_> = model
                     .features
                     .iter()
@@ -735,9 +748,17 @@ fn generate_signal(
                     })
                     .collect();
                 let normalised = features_crypto::rank_normalise(&matrix)?;
+                // Legacy models use the completed feature date as their
+                // one-day label embargo. Explicit label windows are checked
+                // against the decision date by Model::predict itself.
+                let model_date = if model.label_horizon_hours.is_some() {
+                    score_date.succ_opt().ok_or("decision date overflow")?
+                } else {
+                    score_date
+                };
                 let mut out = Vec::new();
                 for (row, values) in rows.iter().zip(normalised) {
-                    let score = model.predict(&values, score_date)?;
+                    let score = model.predict(&values, model_date)?;
                     let volatility = hourly.get(&row.asset).and_then(|h| h.rv_24h).or(row.vol_30);
                     let Some(volatility) = volatility.filter(|v| *v > 0.0) else {
                         continue;
@@ -753,14 +774,30 @@ fn generate_signal(
                         "per_risk" | "per_risk_abs" => score.abs() * volatility,
                         _ => score.abs(),
                     };
+                    let direction = if score > 0.0 {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    };
+                    let mut conviction = d(expected_return)?;
+                    if cfg.funding_cost_adjustment {
+                        if row.ts_utc.date_naive() > score_date {
+                            return Err(format!(
+                                "{} funding row is newer than the completed feature date",
+                                row.asset
+                            ));
+                        }
+                        let Some(net) =
+                            funding::net_conviction_24h(conviction, direction, row.funding_7d)?
+                        else {
+                            continue;
+                        };
+                        conviction = net;
+                    }
                     out.push(Signal {
                         asset: row.asset.clone(),
-                        direction: if score > 0.0 {
-                            Direction::Long
-                        } else {
-                            Direction::Short
-                        },
-                        conviction: d(expected_return)?,
+                        direction,
+                        conviction,
                         volatility: Some(d(volatility)?),
                     });
                 }
@@ -770,6 +807,9 @@ fn generate_signal(
                     model.model_version,
                     model.trained_through
                 ));
+                if cfg.funding_cost_adjustment {
+                    notes.push("ranker conviction subtracts adverse 24h funding estimated as trailing funding_7d / 7; favorable carry is not rewarded; historical missing rates remain zero-imputed".into());
+                }
                 model_id = Some(model.model_id);
                 out
             }
@@ -924,7 +964,7 @@ fn construct_with_tilt(
                 );
             }
         }
-        "risk_adjusted" => {
+        "risk_adjusted" | "risk_adjusted_score_selected" => {
             let floor = Decimal::from(2) * (cfg.costs.commission_bps + cfg.costs.spread_bps) / BPS;
             let usable: Vec<_> = signals
                 .iter()
@@ -951,18 +991,20 @@ fn construct_with_tilt(
                     shorts.len()
                 ));
             } else {
-                // Faithful to the recovered harness: the floating book is the
-                // top 24 by |expected return| ACROSS both sides, split
-                // afterwards - not a per-side cap, and not ranked per-risk.
-                // Risk enters at the sizing step (edge/vol within each side),
-                // not at selection. A 20L/4S day is legal; a 1-sided one is not.
+                // Both constructors select the configured count across both sides, then
+                // size each side by conviction/vol. The score-selected variant
+                // also uses conviction/vol when choosing those names.
                 let mut all: Vec<_> = usable.clone();
-                all.sort_by(|(a, _), (b, _)| {
-                    b.conviction
-                        .partial_cmp(&a.conviction)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                all.sort_by(|(a, a_vol), (b, b_vol)| {
+                    if cfg.constructor == "risk_adjusted_score_selected" {
+                        (b.conviction / *b_vol).cmp(&(a.conviction / *a_vol))
+                    } else {
+                        b.conviction
+                            .partial_cmp(&a.conviction)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }
                 });
-                all.truncate(24);
+                all.truncate(cfg.ranker_selection_count);
                 let longs: Vec<_> = all
                     .iter()
                     .copied()
@@ -975,7 +1017,8 @@ fn construct_with_tilt(
                     .collect();
                 if longs.len() < 2 || shorts.len() < 2 {
                     notes.push(format!(
-                        "top-24 book has {} long and {} short; a two-sided book cannot form",
+                        "top-{} book has {} long and {} short; a two-sided book cannot form",
+                        cfg.ranker_selection_count,
                         longs.len(),
                         shorts.len()
                     ));
@@ -2414,6 +2457,145 @@ mod tests {
         cfg
     }
 
+    #[test]
+    fn ml_funding_adjustment_is_opt_in_and_filters_net_price_conviction() {
+        let path =
+            std::env::temp_dir().join(format!("crypto-funding-model-{}.json", std::process::id()));
+        let model = serde_json::json!({
+            "format_version": model::FORMAT_VERSION, "model_version": model::MODEL_VERSION,
+            "feature_set_version": features_crypto::FEATURE_SET_VERSION,
+            "trained_through": "2025-01-01", "trained_at": "fixture", "n_rows": 12,
+            "n_dates": 1, "features": ["x_ret_7"], "reward": "return",
+            "tree_info": [{"tree_index": 0, "num_leaves": 1, "tree_structure": {"leaf_value": 0.01}}]
+        });
+        std::fs::write(&path, serde_json::to_vec(&model).unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.signal = "ml_ranker".into();
+        cfg.model_path = Some(path.display().to_string());
+        let stamp: DateTime<Utc> = "2026-01-07T00:00:00Z".parse().unwrap();
+        let mut rows: Vec<_> = (0..12)
+            .map(|i| {
+                let mut row = row(&format!("A{i:02}"), stamp, 100.0);
+                row.funding_7d = Some(0.0);
+                row
+            })
+            .collect();
+        rows[0].funding_7d = Some(0.007);
+        rows[1].funding_7d = Some(-0.007);
+        rows[2].funding_7d = Some(0.07);
+        let generate = |cfg: &Config, rows: &[DailyRow]| {
+            generate_signal(
+                &rows.iter().collect::<Vec<_>>(),
+                &BTreeMap::new(),
+                stamp.date_naive(),
+                cfg,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(!cfg.funding_cost_adjustment);
+        let baseline = generate(&cfg, &rows);
+        assert_eq!(baseline.values.len(), 12);
+        assert!(baseline
+            .values
+            .iter()
+            .all(|signal| signal.conviction == Decimal::new(1, 2)));
+        cfg.funding_cost_adjustment = true;
+        let adjusted = generate(&cfg, &rows);
+        let values: BTreeMap<_, _> = adjusted
+            .values
+            .iter()
+            .map(|signal| (signal.asset.as_str(), signal.conviction))
+            .collect();
+        assert_eq!(values.len(), 11);
+        assert_eq!(values["A00"], Decimal::new(9, 3));
+        assert_eq!(values["A01"], Decimal::new(1, 2));
+        assert!(!values.contains_key("A02"));
+        assert!(adjusted
+            .values
+            .iter()
+            .all(|signal| signal.direction == Direction::Long));
+        rows[0].funding_7d = None;
+        assert!(generate_signal(
+            &rows.iter().collect::<Vec<_>>(),
+            &BTreeMap::new(),
+            stamp.date_naive(),
+            &cfg,
+            None
+        )
+        .is_err());
+        cfg.funding_cost_adjustment = false;
+        let unchanged = generate(&cfg, &rows);
+        assert_eq!(unchanged.values.len(), baseline.values.len());
+        assert_eq!(
+            unchanged
+                .values
+                .iter()
+                .map(|s| s.conviction)
+                .collect::<Vec<_>>(),
+            baseline
+                .values
+                .iter()
+                .map(|s| s.conviction)
+                .collect::<Vec<_>>()
+        );
+        for row in &mut rows {
+            row.funding_7d = Some(0.0);
+            row.vol_30 = Some(0.5);
+        }
+        rows[0].funding_7d = Some(0.007);
+        cfg.funding_cost_adjustment = true;
+        for reward in ["per_risk", "per_risk_abs"] {
+            let mut scaled_model = model.clone();
+            scaled_model["reward"] = reward.into();
+            std::fs::write(&path, serde_json::to_vec(&scaled_model).unwrap()).unwrap();
+            let scaled = generate(&cfg, &rows);
+            assert_eq!(
+                scaled
+                    .values
+                    .iter()
+                    .find(|s| s.asset == "A00")
+                    .unwrap()
+                    .conviction,
+                Decimal::new(4, 3)
+            );
+        }
+        let mut longer_model = model.clone();
+        longer_model["label_horizon_hours"] = 72.into();
+        std::fs::write(&path, serde_json::to_vec(&longer_model).unwrap()).unwrap();
+        let result = generate_signal(
+            &rows.iter().collect::<Vec<_>>(),
+            &BTreeMap::new(),
+            stamp.date_naive(),
+            &cfg,
+            None,
+        );
+        assert!(result.unwrap_err().contains("24h model label horizon"));
+        cfg.funding_cost_adjustment = false;
+        assert_eq!(generate(&cfg, &rows).values.len(), 12);
+        longer_model["label_horizon_hours"] = 24.into();
+        std::fs::write(&path, serde_json::to_vec(&longer_model).unwrap()).unwrap();
+        cfg.funding_cost_adjustment = true;
+        assert_eq!(generate(&cfg, &rows).values.len(), 12);
+        cfg.funding_cost_adjustment = false;
+        longer_model["label_horizon_hours"] = 72.into();
+        longer_model["label_lag_hours"] = 1.into();
+        longer_model["trained_through"] = "2026-01-04".into();
+        std::fs::write(&path, serde_json::to_vec(&longer_model).unwrap()).unwrap();
+        // Jan 7 features are used at the Jan 8 decision, after labels ended.
+        assert_eq!(generate(&cfg, &rows).values.len(), 12);
+        assert!(generate_signal(
+            &rows.iter().collect::<Vec<_>>(),
+            &BTreeMap::new(),
+            "2026-01-06".parse().unwrap(),
+            &cfg,
+            None,
+        )
+        .unwrap_err()
+        .contains("training contains the answer"));
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// A profile with one thin name, sized so the cap bites exactly once.
     fn thin_profile(asset: &str, hourly: i64) -> liquidity::Profile {
         let mut p = liquidity::Profile {
@@ -3143,6 +3325,179 @@ mod tests {
         );
         assert_eq!(
             out.weights.values().filter(|w| **w < Decimal::ZERO).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ranker_breadth_changes_membership_with_the_same_balanced_weights_and_caps() {
+        let mut cfg = config();
+        cfg.target_gross_exposure = Decimal::new(8, 1);
+        cfg.limits.max_position = Decimal::new(2, 2);
+        let mut signals: Vec<_> = (0..20)
+            .flat_map(|i| {
+                [Direction::Long, Direction::Short].map(|direction| Signal {
+                    asset: format!(
+                        "{}{i:02}",
+                        if direction == Direction::Long {
+                            "L"
+                        } else {
+                            "S"
+                        }
+                    ),
+                    direction,
+                    conviction: Decimal::new(40 - i, 3),
+                    volatility: Some(Decimal::new(1, 1)),
+                })
+            })
+            .collect();
+        signals.push(Signal {
+            asset: "BELOW_COST".into(),
+            direction: Direction::Long,
+            conviction: Decimal::new(1, 4),
+            volatility: Some(Decimal::new(1, 5)),
+        });
+        signals.push(Signal {
+            asset: "ZERO_VOL".into(),
+            direction: Direction::Short,
+            conviction: Decimal::ONE,
+            volatility: Some(Decimal::ZERO),
+        });
+        for constructor in ["risk_adjusted", "risk_adjusted_score_selected"] {
+            cfg.constructor = constructor.into();
+            for count in [24, 40] {
+                cfg.ranker_selection_count = count;
+                let result = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+                assert_eq!(result.weights.len(), count);
+                assert_eq!(result.weights.contains_key("L19"), count == 40);
+                assert!(!result.weights.contains_key("BELOW_COST"));
+                assert!(!result.weights.contains_key("ZERO_VOL"));
+                assert!(result
+                    .weights
+                    .values()
+                    .all(|weight| weight.abs() <= cfg.limits.max_position));
+                assert_eq!(result.weights["L00"], cfg.limits.max_position);
+                let net: Decimal = result.weights.values().sum();
+                assert!(net.abs() < Decimal::new(1, 12));
+                let gross: Decimal = result.weights.values().map(|weight| weight.abs()).sum();
+                assert!(gross <= cfg.target_gross_exposure);
+                assert!(
+                    (result.weights["L00"] * Decimal::from(39)
+                        - result.weights["L01"] * Decimal::from(40))
+                    .abs()
+                        < Decimal::new(1, 12)
+                );
+                assert_eq!(result.weights["L00"], -result.weights["S00"]);
+            }
+        }
+        cfg.constructor = "risk_adjusted_unbalanced".into();
+        let unaffected = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert_eq!(unaffected.weights.len(), 24);
+    }
+
+    #[test]
+    fn score_selection_keeps_stronger_per_risk_candidates_and_existing_caps() {
+        let mut cfg = config();
+        cfg.constructor = "risk_adjusted".into();
+        cfg.target_gross_exposure = Decimal::new(8, 1);
+        cfg.limits.max_position = Decimal::new(3, 2);
+        let mut signals: Vec<_> = (0..23)
+            .map(|i| Signal {
+                asset: format!("ANCHOR{i:02}"),
+                direction: if i % 2 == 0 {
+                    Direction::Long
+                } else {
+                    Direction::Short
+                },
+                conviction: Decimal::new(4, 2),
+                volatility: Some(Decimal::new(1, 1)),
+            })
+            .collect();
+        signals.extend([
+            Signal {
+                asset: "HIGH_VOL".into(),
+                direction: Direction::Long,
+                conviction: Decimal::new(3, 2),
+                volatility: Some(Decimal::new(3, 1)),
+            },
+            Signal {
+                asset: "HIGH_SCORE".into(),
+                direction: Direction::Long,
+                conviction: Decimal::new(2, 2),
+                volatility: Some(Decimal::new(1, 1)),
+            },
+            Signal {
+                asset: "BELOW_COST".into(),
+                direction: Direction::Long,
+                conviction: Decimal::new(1, 4),
+                volatility: Some(Decimal::new(1, 5)),
+            },
+            Signal {
+                asset: "ZERO_VOL".into(),
+                direction: Direction::Short,
+                conviction: Decimal::ONE,
+                volatility: Some(Decimal::ZERO),
+            },
+        ]);
+        let original = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert!(original.weights.contains_key("HIGH_VOL"));
+        assert!(!original.weights.contains_key("HIGH_SCORE"));
+        cfg.constructor = "risk_adjusted_score_selected".into();
+        let selected = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert!(selected.weights.contains_key("HIGH_SCORE"));
+        assert!(!selected.weights.contains_key("HIGH_VOL"));
+        assert!(!selected.weights.contains_key("BELOW_COST"));
+        assert!(!selected.weights.contains_key("ZERO_VOL"));
+        assert_eq!(selected.weights.len(), 24);
+        for result in [&original, &selected] {
+            assert!(result
+                .weights
+                .values()
+                .all(|weight| weight.abs() <= cfg.limits.max_position));
+            let net: Decimal = result.weights.values().sum();
+            assert!(net.abs() < Decimal::new(1, 12));
+            let gross: Decimal = result.weights.values().map(|weight| weight.abs()).sum();
+            assert!(gross <= cfg.target_gross_exposure);
+            assert!(result
+                .notes
+                .iter()
+                .any(|note| note.contains("whole book scaled")));
+        }
+    }
+
+    #[test]
+    fn score_selection_still_requires_two_names_per_side_after_top_24() {
+        let mut cfg = config();
+        cfg.constructor = "risk_adjusted_score_selected".into();
+        let mut signals: Vec<_> = (0..24)
+            .map(|i| Signal {
+                asset: format!("L{i:02}"),
+                direction: Direction::Long,
+                conviction: Decimal::new(2, 2),
+                volatility: Some(Decimal::new(1, 2)),
+            })
+            .collect();
+        signals.extend((0..2).map(|i| Signal {
+            asset: format!("S{i:02}"),
+            direction: Direction::Short,
+            conviction: Decimal::new(3, 2),
+            volatility: Some(Decimal::new(1, 1)),
+        }));
+        let selected = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert!(selected.weights.is_empty());
+        assert!(selected
+            .notes
+            .iter()
+            .any(|note| note.contains("top-24 book has 24 long and 0 short")));
+        cfg.constructor = "risk_adjusted".into();
+        let original = construct(&signals, &cfg, Decimal::from(100_000), None).unwrap();
+        assert_eq!(original.weights.len(), 24);
+        assert_eq!(
+            original
+                .weights
+                .values()
+                .filter(|value| **value < Decimal::ZERO)
+                .count(),
             2
         );
     }

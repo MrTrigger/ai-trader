@@ -11,6 +11,7 @@
 //! venue adapter lands; nothing here changes for it.
 
 mod live;
+mod research;
 
 use ibapi::prelude::StreamExt as _;
 use ibapi::prelude::SubscriptionItemStreamExt as _;
@@ -26,6 +27,12 @@ use noise_book::runtime::Book;
 
 const USAGE: &str = "\
 usage: futures-bot <command>
+
+  research-replay --bars <jsonl> --start YYYY-MM-DD --end YYYY-MM-DD
+                  --research-out <json> --initial-cash DOLLARS
+                  [--fixture <json>] [--roll-manifest <json>]
+      Export daily NQ NAV without records database access. Requires a complete
+      final session, flat final positions and documented excluded roll dates.
 
   replay --bars <jsonl> [--start YYYY-MM-DD] [--end YYYY-MM-DD]
          [--fixture <parity-fixture.json>] [--bot-id ID]
@@ -96,6 +103,7 @@ fn main() -> ExitCode {
     };
     let out = match cmd {
         Some("replay") => replay(&get),
+        Some("research-replay") => research::command(&args[1..]),
         Some("features") => features_cmd(&get),
         Some("ib-check") => block_on_async(ib_check(&get)),
         Some("rithmic-check") => block_on_async(rithmic_check(&get)),

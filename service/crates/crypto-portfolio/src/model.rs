@@ -34,6 +34,12 @@ pub struct Model {
     /// field existed, all of which were "return".
     #[serde(default = "default_reward")]
     pub reward: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_horizon_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_lag_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_contract: Option<String>,
     pub tree_info: Vec<Tree>,
     #[serde(skip)]
     pub model_id: String,
@@ -114,6 +120,19 @@ impl Model {
             .map_err(|e| format!("cannot read model {}: {e}", path.display()))?;
         let mut model: Self =
             serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        if model.label_horizon_hours.is_some_and(|hours| hours <= 0) {
+            return Err("model label_horizon_hours must be positive".into());
+        }
+        if model.label_lag_hours.is_some_and(|hours| hours < 0) {
+            return Err("model label_lag_hours must be nonnegative".into());
+        }
+        if model
+            .target_contract
+            .as_deref()
+            .is_some_and(|contract| contract != crate::training::TARGET_CONTRACT)
+        {
+            return Err("unsupported model target_contract".into());
+        }
         if model.format_version != FORMAT_VERSION {
             return Err(format!(
                 "model format {:?}, expected {FORMAT_VERSION:?}",
@@ -153,9 +172,25 @@ impl Model {
     }
 
     pub fn predict(&self, values: &[f64], as_of: NaiveDate) -> Result<f64, String> {
-        if as_of <= self.trained_through {
+        let days = match self.label_horizon_hours {
+            Some(horizon) => {
+                horizon
+                    .checked_add(self.label_lag_hours.unwrap_or(0))
+                    // trained_through is a date; a training row may use any hour
+                    // on it. Allow 23h for that slot, then ceil to a decision day.
+                    .and_then(|hours| hours.checked_add(46))
+                    .ok_or("model label window overflows")?
+                    / 24
+            }
+            None => 1,
+        };
+        let first_score_date = self
+            .trained_through
+            .checked_add_days(chrono::Days::new(days.max(1) as u64))
+            .ok_or("model label window exceeds calendar")?;
+        if as_of < first_score_date {
             return Err(format!(
-                "model trained through {} cannot score {as_of}: training contains the answer",
+                "model trained through {} cannot score {as_of}: training contains the answer until {first_score_date}",
                 self.trained_through
             ));
         }
@@ -175,6 +210,51 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_metadata_accepts_legacy_and_rejects_invalid_explicit_values() {
+        let path =
+            std::env::temp_dir().join(format!("crypto-label-metadata-{}.json", std::process::id()));
+        let baseline = serde_json::json!({
+            "format_version": FORMAT_VERSION, "model_version": MODEL_VERSION,
+            "feature_set_version": features_crypto::FEATURE_SET_VERSION,
+            "trained_through": "2025-01-01", "trained_at": "fixture", "n_rows": 12,
+            "n_dates": 1, "features": ["x_ret_7"], "reward": "return",
+            "tree_info": [{"tree_index": 0, "num_leaves": 1, "tree_structure": {"leaf_value": 0.01}}]
+        });
+        std::fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+        let legacy = Model::load(&path).unwrap();
+        assert_eq!(legacy.label_horizon_hours, None);
+        assert_eq!(legacy.label_lag_hours, None);
+        assert_eq!(legacy.target_contract, None);
+        for horizon in [24, 72] {
+            let mut metadata = baseline.clone();
+            metadata["label_horizon_hours"] = horizon.into();
+            metadata["label_lag_hours"] = 1.into();
+            metadata["target_contract"] = crate::training::TARGET_CONTRACT.into();
+            std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+            let model = Model::load(&path).unwrap();
+            assert_eq!(model.label_horizon_hours, Some(horizon));
+            assert_eq!(model.label_lag_hours, Some(1));
+            assert_eq!(
+                model.target_contract.as_deref(),
+                Some(crate::training::TARGET_CONTRACT)
+            );
+        }
+        for (key, value) in [
+            ("label_horizon_hours", serde_json::json!(0)),
+            ("label_horizon_hours", serde_json::json!(-1)),
+            ("label_horizon_hours", serde_json::json!(24.5)),
+            ("label_lag_hours", serde_json::json!(-1)),
+            ("target_contract", serde_json::json!("unknown")),
+        ] {
+            let mut metadata = baseline.clone();
+            metadata[key] = value;
+            std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+            assert!(Model::load(&path).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn leaf(value: f64) -> Node {
         Node {
@@ -210,6 +290,9 @@ mod tests {
             trained_through: "2025-01-01".parse().unwrap(),
             trained_at: "fixture".into(),
             reward: default_reward(),
+            label_horizon_hours: None,
+            label_lag_hours: None,
+            target_contract: None,
             n_rows: 1,
             n_dates: 1,
             features: vec!["x_ret_7".into()],
@@ -237,5 +320,22 @@ mod tests {
         assert!(model
             .predict(&[1.0], "2025-01-01".parse().unwrap())
             .is_err());
+        for (horizon, last_blocked, first_allowed) in [
+            (24, "2025-01-02", "2025-01-03"),
+            (72, "2025-01-04", "2025-01-05"),
+        ] {
+            let mut labeled = model.clone();
+            labeled.label_horizon_hours = Some(horizon);
+            labeled.label_lag_hours = Some(1);
+            assert!(labeled
+                .predict(&[1.0], last_blocked.parse().unwrap())
+                .is_err());
+            assert_eq!(
+                labeled
+                    .predict(&[1.0], first_allowed.parse().unwrap())
+                    .unwrap(),
+                0.3
+            );
+        }
     }
 }

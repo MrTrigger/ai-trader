@@ -15,6 +15,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::config::Config;
+use crate::execution::{self, Settings};
 use crate::{decide, store, universe, DecisionInput, Portfolio, Position};
 
 pub const CRYPTO_YEAR: f64 = 365.0;
@@ -33,6 +34,45 @@ pub struct Fill {
     #[serde(with = "rust_decimal::serde::str")]
     pub fee: Decimal,
     pub reason: OrderReason,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub reference_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub spread_cost: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub impact_cost: Decimal,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Attribution {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub nav_before: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub long_price_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub short_price_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub funding_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub commission_cost: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub spread_cost: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub impact_cost: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub delay_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub unfilled_notional: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub reconciliation_error: Decimal,
+}
+
+impl Attribution {
+    fn pnl(&self) -> Decimal {
+        self.long_price_pnl + self.short_price_pnl + self.funding_pnl + self.delay_pnl
+            - self.commission_cost
+            - self.spread_cost
+            - self.impact_cost
+    }
 }
 
 impl Fill {
@@ -61,6 +101,7 @@ pub struct Step {
     pub fills: Vec<Fill>,
     pub plan_id: uuid::Uuid,
     pub warnings: Vec<String>,
+    pub attribution: Option<Attribution>,
 }
 
 impl Step {
@@ -69,7 +110,10 @@ impl Step {
     }
 
     fn fees(&self) -> Decimal {
-        self.fills.iter().map(|fill| fill.fee).sum()
+        self.fills
+            .iter()
+            .map(|fill| fill.fee + fill.spread_cost + fill.impact_cost)
+            .sum()
     }
 }
 
@@ -93,37 +137,15 @@ pub struct Metrics {
 
 #[derive(Debug, serde::Serialize)]
 pub struct BacktestResult {
+    pub schema_version: &'static str,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub initial_cash: Decimal,
+    pub execution: Settings,
     pub steps: Vec<Step>,
     pub metrics: Metrics,
     pub disclosures: Vec<String>,
     #[serde(with = "rust_decimal::serde::str")]
     pub slippage_multiple: Decimal,
-}
-
-struct SimFill {
-    commission_bps: Decimal,
-    slippage_bps: Decimal,
-}
-
-impl SimFill {
-    fn new(cfg: &Config, slippage_multiple: Decimal) -> Self {
-        Self {
-            commission_bps: cfg.costs.commission_bps,
-            slippage_bps: cfg.costs.spread_bps * slippage_multiple,
-        }
-    }
-
-    fn price(&self, side: Side, open: Decimal) -> Decimal {
-        let edge = open * self.slippage_bps / BPS;
-        match side {
-            Side::Buy => open + edge,
-            Side::Sell => open - edge,
-        }
-    }
-
-    fn fee(&self, notional: Decimal) -> Decimal {
-        notional * self.commission_bps / BPS
-    }
 }
 
 /// Immutable feature and execution-price history. Phase 1 prepares this once
@@ -135,6 +157,8 @@ pub struct Prepared {
     /// Realised daily funding, kept so the replay can charge it rather than
     /// only feed it to the features.
     funding: features_crypto::FundingTable,
+    execution_prices: execution::Prices,
+    liquidity: BTreeMap<DateTime<Utc>, BTreeMap<String, execution::Liquidity>>,
 }
 
 pub fn prepare(
@@ -159,6 +183,7 @@ pub fn prepare(
         &funding,
         funding_window,
     )?;
+    let mut execution_prices = BTreeMap::new();
     let hourly = if require_hourly {
         let bars: Vec<_> = store::read(root, 3_600)?
             .into_iter()
@@ -166,6 +191,12 @@ pub fn prepare(
             .collect();
         if bars.is_empty() {
             return Err("ml_ranker requires hourly bars".into());
+        }
+        for bar in &bars {
+            execution_prices
+                .entry(bar.ts_utc)
+                .or_insert_with(BTreeMap::new)
+                .insert(bar.asset.clone(), decimal(bar.open)?);
         }
         Some(features_crypto::hourly_before_daily_decision(
             &bars,
@@ -175,17 +206,32 @@ pub fn prepare(
         None
     };
     let mut opens: BTreeMap<DateTime<Utc>, BTreeMap<String, Decimal>> = BTreeMap::new();
+    let mut liquidity = BTreeMap::new();
     for row in &daily {
         opens
             .entry(row.ts_utc)
             .or_default()
             .insert(row.asset.clone(), decimal(row.mark_open)?);
+        if let (Some(adv), Some(vol)) = (row.adv_quote, row.vol_30) {
+            liquidity
+                .entry(row.ts_utc + Duration::seconds(cfg.interval_s))
+                .or_insert_with(BTreeMap::new)
+                .insert(
+                    row.asset.clone(),
+                    execution::Liquidity {
+                        hourly_volume: adv / 24.0,
+                        hourly_volatility: vol / (365.0_f64 * 24.0).sqrt(),
+                    },
+                );
+        }
     }
     Ok(Prepared {
         daily,
         hourly,
         opens,
         funding,
+        execution_prices,
+        liquidity,
     })
 }
 
@@ -243,6 +289,34 @@ pub fn replay_prepared_stepped(
     prepared: &Prepared,
     step_hours_override: Option<i64>,
 ) -> Result<BacktestResult, String> {
+    replay_with_execution(
+        cfg,
+        start,
+        end,
+        root,
+        initial_cash,
+        slippage_multiple,
+        prepared,
+        step_hours_override,
+        &Settings::default(),
+    )
+}
+
+pub fn replay_with_execution(
+    cfg: &Config,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    root: &Path,
+    initial_cash: Decimal,
+    slippage_multiple: Decimal,
+    prepared: &Prepared,
+    step_hours_override: Option<i64>,
+    execution: &Settings,
+) -> Result<BacktestResult, String> {
+    execution.validate()?;
+    if initial_cash <= Decimal::ZERO {
+        return Err("initial cash must be positive".into());
+    }
     if start > end {
         return Err(format!(
             "start {} is after end {}",
@@ -265,14 +339,21 @@ pub fn replay_prepared_stepped(
         Some(h) => Duration::hours(h),
         None => Duration::seconds(cfg.interval_s * cfg.rebalance_every.max(1) as i64),
     };
-    let fills = SimFill::new(cfg, slippage_multiple);
+    if cadence <= Duration::zero() || Duration::hours(execution.delay_hours as i64) >= cadence {
+        return Err("execution delay must be shorter than a positive decision cadence".into());
+    }
+    if execution.delay_hours > 0 && prepared.execution_prices.is_empty() {
+        return Err("delayed execution requires historical hourly prices".into());
+    }
+    if cfg.liquidity_profile.is_some() {
+        return Err("historical replay refuses an undated per-decision liquidity profile; use explicit execution spread scenarios".into());
+    }
     let mut portfolio = Portfolio {
         cash: initial_cash,
         positions: Vec::new(),
     };
     let mut steps = Vec::new();
     let mut disclosures = Vec::new();
-    let mut gate_failures = 0usize;
     // The last date whose funding has been charged. None until the first step,
     // because a book that does not exist yet cannot have been funded.
     let mut last_priced: Option<DateTime<Utc>> = None;
@@ -280,8 +361,12 @@ pub fn replay_prepared_stepped(
     // Last price seen for every asset the book has touched, for settling a
     // position whose asset stops trading (below).
     let mut last_price: BTreeMap<String, Decimal> = BTreeMap::new();
+    for (_, prices) in prepared.opens.range(..start) {
+        last_price.extend(prices.iter().map(|(asset, price)| (asset.clone(), *price)));
+    }
     let mut settled_total = 0usize;
     let mut as_of = start;
+    let mut previous_nav = initial_cash;
     while as_of <= end {
         // Venue identity breaks. The daily store has no transient holes (every
         // gap of 2+ days in 659 assets since 2020-09 is a real venue event,
@@ -295,12 +380,28 @@ pub fn replay_prepared_stepped(
         // disclosed, and gone. The reborn series is a new identity as far as
         // the features are concerned already (their windows poison across
         // the gap), so nothing re-enters it until it has history again.
+        let mut attribution = Attribution {
+            nav_before: previous_nav,
+            ..Default::default()
+        };
         if let Some(opens) = prepared.opens.get(&as_of) {
+            for position in &portfolio.positions {
+                if let (Some(previous), Some(current)) =
+                    (last_price.get(&position.asset), opens.get(&position.asset))
+                {
+                    let pnl = position.qty * (*current - *previous);
+                    if position.qty > Decimal::ZERO {
+                        attribution.long_price_pnl += pnl;
+                    } else {
+                        attribution.short_price_pnl += pnl;
+                    }
+                }
+            }
             let settled = settle_missing(&mut portfolio, opens, &last_price);
             settled_total += settled.len();
             for (asset, qty, px) in settled {
                 disclosures.push(format!(
-                    "{}: {asset} has no bar; position {qty} settled at last price {px} (venue identity break)",
+                    "{}: {asset} has no bar; position {qty} closed at last-price proxy {px}; historical venue settlement is unverified",
                     as_of.date_naive()
                 ));
             }
@@ -308,18 +409,8 @@ pub fn replay_prepared_stepped(
                 last_price.insert(asset.clone(), *px);
             }
         }
-        let members = match universe::load(root, as_of) {
-            Ok(members) => members,
-            Err(error) => {
-                gate_failures += 1;
-                disclosures.push(format!(
-                    "{}: gate failed, no plan ({error})",
-                    as_of.date_naive()
-                ));
-                as_of += cadence;
-                continue;
-            }
-        };
+        let members = universe::load(root, as_of)
+            .map_err(|e| format!("{as_of}: incomplete replay universe: {e}"))?;
         let eligible: BTreeSet<_> = members
             .into_iter()
             .filter(|member| member.eligible)
@@ -337,19 +428,11 @@ pub fn replay_prepared_stepped(
             portfolio: &portfolio,
             inputs_hash: &input_id,
         });
-        let decision = match decision {
-            Ok(value) => value,
-            Err(error) => {
-                gate_failures += 1;
-                disclosures.push(format!(
-                    "{}: gate failed, no plan ({error})",
-                    as_of.date_naive()
-                ));
-                as_of += cadence;
-                continue;
-            }
-        };
-        let prices = prepared.opens.get(&as_of).cloned().unwrap_or_default();
+        let decision = decision.map_err(|e| format!("{as_of}: incomplete replay decision: {e}"))?;
+        let prices = prepared
+            .opens
+            .get(&as_of)
+            .ok_or_else(|| format!("{as_of}: no valuation prices"))?;
         // Funding for the period that just ENDED, on the book that was held
         // through it, before this step's orders change anything. The direction
         // matters more than it looks: summing the days ahead of the position
@@ -358,11 +441,41 @@ pub fn replay_prepared_stepped(
         // and excludes today.
         let carry = funding_carry(&portfolio, &prices, &prepared.funding, last_priced, as_of);
         portfolio.cash += carry;
+        attribution.funding_pnl = carry;
         funding_total += carry;
         last_priced = Some(as_of);
-        let (next, filled) = apply(&decision.plan.orders, &portfolio, &prices, &fills, as_of);
+        let fill_time = as_of + Duration::hours(execution.delay_hours as i64);
+        let fill_prices = if execution.delay_hours == 0 {
+            Some(prices)
+        } else {
+            prepared.execution_prices.get(&fill_time)
+        };
+        let (next, filled) = apply(
+            &decision.plan.orders,
+            &portfolio,
+            prices,
+            &last_price,
+            fill_prices,
+            cfg,
+            execution,
+            prepared.liquidity.get(&as_of),
+            slippage_multiple,
+            fill_time,
+            &mut attribution,
+        )?;
         portfolio = next;
         let nav = mark(&portfolio, &prices);
+        attribution.reconciliation_error = nav - previous_nav - attribution.pnl();
+        if attribution.reconciliation_error.abs() > Decimal::new(1, 8) {
+            return Err(format!(
+                "{as_of}: P&L attribution fails reconciliation: {}",
+                attribution.reconciliation_error
+            ));
+        }
+        if nav <= Decimal::ZERO {
+            return Err(format!("{as_of}: portfolio insolvent, NAV {nav}"));
+        }
+        previous_nav = nav;
         let net_exposure = if nav > Decimal::ZERO {
             portfolio
                 .positions
@@ -381,7 +494,12 @@ pub fn replay_prepared_stepped(
             as_of,
             nav,
             cash: portfolio.cash,
-            gross_exposure: decision.plan.nav.gross_exposure,
+            gross_exposure: portfolio
+                .positions
+                .iter()
+                .map(|p| p.qty.abs() * prices[&p.asset])
+                .sum::<Decimal>()
+                / nav,
             net_exposure,
             status: decision.plan.status,
             fills: filled,
@@ -392,6 +510,7 @@ pub fn replay_prepared_stepped(
                 .iter()
                 .map(|warning| warning.message.clone())
                 .collect(),
+            attribution: Some(attribution),
         });
         as_of += cadence;
     }
@@ -401,15 +520,6 @@ pub fn replay_prepared_stepped(
             0,
             format!(
                 "{settled_total} position(s) settled at last price because the asset stopped trading (venue identity break); see per-date lines"
-            ),
-        );
-    }
-    if gate_failures > 0 {
-        disclosures.insert(
-            0,
-            format!(
-                "{gate_failures} of {} dates produced no plan (gates failed); those dates are absent from the metrics",
-                gate_failures + steps.len()
             ),
         );
     }
@@ -424,7 +534,13 @@ pub fn replay_prepared_stepped(
         ));
     }
     disclosures.extend(standing_disclosures(cfg, &steps, slippage_multiple));
+    disclosures.push("execution liquidity uses trailing daily ADV / 24 and annual volatility / sqrt(365*24); these are hourly proxies, not observed venue depth".into());
+    disclosures.push("spread overrides are explicit counterfactual scenarios, not historical observations; impact coefficient is assumed, not calibrated".into());
+    disclosures.push("NAV is marked at the decision reference with execution shortfall debited; delayed fills use later hourly opens, never later prices in the signal; unfilled remainder is cancelled".into());
     Ok(BacktestResult {
+        schema_version: "rust-backtest-2",
+        initial_cash,
+        execution: execution.clone(),
         metrics: metrics(&steps),
         steps,
         disclosures,
@@ -482,9 +598,15 @@ fn apply(
     orders: &[plan::Order],
     book: &Portfolio,
     prices: &BTreeMap<String, Decimal>,
-    model: &SimFill,
+    last_prices: &BTreeMap<String, Decimal>,
+    fill_prices: Option<&BTreeMap<String, Decimal>>,
+    cfg: &Config,
+    execution: &Settings,
+    liquidity: Option<&BTreeMap<String, execution::Liquidity>>,
+    stress: Decimal,
     as_of: DateTime<Utc>,
-) -> (Portfolio, Vec<Fill>) {
+    attribution: &mut Attribution,
+) -> Result<(Portfolio, Vec<Fill>), String> {
     let mut quantities: BTreeMap<_, _> = book
         .positions
         .iter()
@@ -494,15 +616,47 @@ fn apply(
     let mut fills = Vec::new();
     for order in orders {
         let Some(open) = prices.get(&order.asset) else {
+            let last = last_prices.get(&order.asset).ok_or_else(|| {
+                format!("{}: unfilled order has no reference history", order.asset)
+            })?;
+            attribution.unfilled_notional += order.qty * *last;
             continue;
         };
-        let price = model.price(order.side, *open);
-        let notional = order.qty * price;
-        let fee = model.fee(notional);
-        let signed = match order.side {
-            Side::Buy => order.qty,
-            Side::Sell => -order.qty,
+        let Some(reference) = fill_prices.and_then(|p| p.get(&order.asset)) else {
+            attribution.unfilled_notional += order.qty * *open;
+            continue;
         };
+        let Some(quote) = execution::quote(
+            cfg,
+            execution,
+            &order.asset,
+            order.qty,
+            *reference,
+            liquidity.and_then(|l| l.get(&order.asset)).copied(),
+            stress,
+        )?
+        else {
+            attribution.unfilled_notional += order.qty * *open;
+            continue;
+        };
+        attribution.unfilled_notional += (order.qty - quote.qty) * *open;
+        let spread_cost = quote.qty * *reference * quote.spread_bps / BPS;
+        let impact_cost = quote.qty * *reference * quote.impact_bps / BPS;
+        let edge = *reference * (quote.spread_bps + quote.impact_bps) / BPS;
+        let price = match order.side {
+            Side::Buy => *reference + edge,
+            Side::Sell => *reference - edge,
+        };
+        let notional = quote.qty * price;
+        let fee = notional * cfg.costs.commission_bps / BPS;
+        let signed = match order.side {
+            Side::Buy => quote.qty,
+            Side::Sell => -quote.qty,
+        };
+        attribution.delay_pnl += signed * (*open - *reference);
+        attribution.commission_cost += fee;
+        attribution.spread_cost += spread_cost;
+        attribution.impact_cost += impact_cost;
         cash += match order.side {
             Side::Buy => -notional - fee,
             Side::Sell => notional - fee,
@@ -512,10 +666,13 @@ fn apply(
             ts: as_of,
             asset: order.asset.clone(),
             side: order.side,
-            qty: order.qty,
+            qty: quote.qty,
             price,
             fee,
             reason: order.reason,
+            reference_price: *reference,
+            spread_cost,
+            impact_cost,
         });
     }
     let positions = quantities
@@ -523,7 +680,7 @@ fn apply(
         .filter(|(_, qty)| !qty.is_zero())
         .map(|(asset, qty)| Position { asset, qty })
         .collect();
-    (Portfolio { cash, positions }, fills)
+    Ok((Portfolio { cash, positions }, fills))
 }
 
 /// Settle every held position whose asset has no price today at its last
@@ -597,7 +754,7 @@ pub fn metrics(steps: &[Step]) -> Metrics {
     } else {
         fees / average_nav * BPS
     };
-    if steps.len() < 2 {
+    if steps.len() < 2 && steps[0].attribution.is_none() {
         return Metrics {
             turnover_per_rebalance: turnover,
             cost_drag_bps: cost_drag,
@@ -605,14 +762,25 @@ pub fn metrics(steps: &[Step]) -> Metrics {
         };
     }
 
-    let first = navs[0];
+    let initial = steps[0].attribution.as_ref().map(|a| a.nav_before);
+    let first = initial.unwrap_or(navs[0]);
     let last = *navs.last().unwrap();
     let total_return = if first.is_zero() {
         Decimal::ZERO
     } else {
         (last - first) / first
     };
-    let span_days = (steps.last().unwrap().as_of - steps[0].as_of).num_seconds() as f64 / 86_400.0;
+    let initial_period = if initial.is_some() {
+        steps
+            .get(1)
+            .map(|s| s.as_of - steps[0].as_of)
+            .unwrap_or(Duration::days(1))
+    } else {
+        Duration::zero()
+    };
+    let span_days = (steps.last().unwrap().as_of - steps[0].as_of + initial_period).num_seconds()
+        as f64
+        / 86_400.0;
     let years = span_days / CRYPTO_YEAR;
     let cagr = if years > 0.0 && first > Decimal::ZERO {
         (last / first)
@@ -623,7 +791,12 @@ pub fn metrics(steps: &[Step]) -> Metrics {
     } else {
         0.0
     };
-    let returns: Vec<f64> = navs
+    let mut return_navs = Vec::with_capacity(navs.len() + 1);
+    if let Some(initial) = initial {
+        return_navs.push(initial);
+    }
+    return_navs.extend_from_slice(&navs);
+    let returns: Vec<f64> = return_navs
         .windows(2)
         .filter(|pair| !pair[0].is_zero())
         .filter_map(|pair| ((pair[1] - pair[0]) / pair[0]).to_f64())
@@ -653,7 +826,7 @@ pub fn metrics(steps: &[Step]) -> Metrics {
     } else {
         0.0
     };
-    let mut peak = navs[0];
+    let mut peak = first;
     let mut max_drawdown = Decimal::ZERO;
     for nav in navs {
         peak = peak.max(nav);
@@ -701,7 +874,7 @@ fn standing_disclosures(cfg: &Config, steps: &[Step], slippage_multiple: Decimal
             steps.len()
         ));
     }
-    out.push("the fill model crosses the spread and charges commission; it models no partial fills, queue position, or depth".into());
+    out.push("execution settings specify commission, spread, impact, delay and partial-fill assumptions; queue position and order-book depth are not simulated".into());
     out
 }
 
@@ -895,6 +1068,7 @@ mod tests {
             fills: Vec::new(),
             plan_id: uuid::Uuid::nil(),
             warnings: Vec::new(),
+            attribution: None,
         }
     }
 
@@ -908,11 +1082,129 @@ mod tests {
     }
 
     #[test]
-    fn fill_model_never_improves_the_open() {
+    fn execution_costs_and_delays_reconcile_to_cash_and_positions() {
         let cfg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
         let cfg = Config::load(&cfg_path).unwrap();
-        let model = SimFill::new(&cfg, Decimal::ONE);
-        assert!(model.price(Side::Buy, Decimal::from(100)) > Decimal::from(100));
-        assert!(model.price(Side::Sell, Decimal::from(100)) < Decimal::from(100));
+        let book = Portfolio {
+            cash: Decimal::from(100_000),
+            positions: Vec::new(),
+        };
+        let prices = BTreeMap::from([("BTC".into(), Decimal::from(100))]);
+        let later = BTreeMap::from([("BTC".into(), Decimal::from(102))]);
+        let liq = BTreeMap::from([(
+            "BTC".into(),
+            execution::Liquidity {
+                hourly_volume: 100_000.0,
+                hourly_volatility: 0.02,
+            },
+        )]);
+        for side in [Side::Buy, Side::Sell] {
+            let order = plan::Order {
+                asset: "BTC".into(),
+                side,
+                qty: Decimal::from(100),
+                order_type: plan::OrderType::Market,
+                limit_price: None,
+                reason: OrderReason::Entry,
+                est_cost_bps: None,
+            };
+            let mut attr = Attribution {
+                nav_before: book.cash,
+                ..Default::default()
+            };
+            let (next, fills) = apply(
+                &[order],
+                &book,
+                &prices,
+                &prices,
+                Some(&later),
+                &cfg,
+                &Settings::default(),
+                Some(&liq),
+                Decimal::ONE,
+                Utc::now(),
+                &mut attr,
+            )
+            .unwrap();
+            assert_eq!(fills.len(), 1);
+            assert!(fills[0].qty < Decimal::from(100));
+            assert!(
+                fills[0].qty.scale() <= 8,
+                "partial fills must use the planner's quantity precision"
+            );
+            assert!(attr.impact_cost > Decimal::ZERO);
+            assert!(attr.unfilled_notional > Decimal::ZERO);
+            assert!((mark(&next, &prices) - book.cash - attr.pnl()).abs() < Decimal::new(1, 10));
+            match side {
+                Side::Buy => {
+                    assert!(fills[0].price > Decimal::from(102));
+                    assert!(attr.delay_pnl < Decimal::ZERO);
+                }
+                Side::Sell => {
+                    assert!(fills[0].price < Decimal::from(102));
+                    assert!(attr.delay_pnl > Decimal::ZERO);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_daily_price_cannot_authorize_a_later_hourly_fill() {
+        let cfg = Config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml"),
+        )
+        .unwrap();
+        let book = Portfolio {
+            cash: Decimal::from(1000),
+            positions: vec![],
+        };
+        let stale = BTreeMap::from([("ERD".into(), Decimal::from(10))]);
+        let later = BTreeMap::from([("ERD".into(), Decimal::from(100))]);
+        let order = plan::Order {
+            asset: "ERD".into(),
+            side: Side::Buy,
+            qty: Decimal::from(2),
+            order_type: plan::OrderType::Market,
+            limit_price: None,
+            reason: OrderReason::Entry,
+            est_cost_bps: None,
+        };
+        let mut attr = Attribution::default();
+        let (next, fills) = apply(
+            &[order],
+            &book,
+            &BTreeMap::new(),
+            &stale,
+            Some(&later),
+            &cfg,
+            &Settings {
+                model: execution::Model::Flat,
+                delay_hours: 1,
+                ..Default::default()
+            },
+            None,
+            Decimal::ONE,
+            Utc::now(),
+            &mut attr,
+        )
+        .unwrap();
+        assert!(fills.is_empty());
+        assert!(next.positions.is_empty());
+        assert_eq!(next.cash, book.cash);
+        assert_eq!(attr.unfilled_notional, Decimal::from(20));
+    }
+
+    #[test]
+    fn first_day_cost_is_a_return_and_a_drawdown() {
+        let mut first = step(0, 99);
+        first.attribution = Some(Attribution {
+            nav_before: Decimal::from(100),
+            commission_cost: Decimal::ONE,
+            ..Default::default()
+        });
+        let out = metrics(&[first, step(1, 99)]);
+        assert_eq!(out.total_return, Decimal::new(-1, 2));
+        assert_eq!(out.max_drawdown, Decimal::new(-1, 2));
+        assert!(out.sharpe < 0.0);
     }
 }

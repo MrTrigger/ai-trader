@@ -58,3 +58,11 @@ labels. Python never divides a return by volatility. At inference the Rust
 runtime multiplies the fitted per-risk score by the row's decision-time
 volatility exactly once. The relative form is also centered cross-sectionally
 in Rust after division and still requires the explicit market direction layer.
+
+Crypto per-risk fits require matrices with `target_contract: rust-crypto-targets-1`.
+Rebuild older matrices with the current Rust `training-matrix` command. Rust
+emits `target_per_risk` and `target_per_risk_abs`; Python consumes those fields
+and omits null targets. `TRAIN_RANK` transformations are disabled. New model
+artifacts carry label horizon and lag, and inference waits for the training
+label window to end. The matched 24-hour/72-hour study is reproducible with
+`bin/research-horizon.sh screen`, followed by `confirm` only if selection passes.

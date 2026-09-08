@@ -1,0 +1,42 @@
+{
+  "source_dir": "var/research/lighter-quoted-cost-configs",
+  "data_root": "data",
+  "out_dir": "var/research/lighter-quoted-cost-replay",
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-12-17T00:00:00Z",
+      "end": "2024-08-09T00:00:00Z"
+    },
+    {
+      "id": 2,
+      "start": "2024-08-10T00:00:00Z",
+      "end": "2025-04-03T00:00:00Z"
+    },
+    {
+      "id": 3,
+      "start": "2025-04-04T00:00:00Z",
+      "end": "2025-11-26T00:00:00Z"
+    },
+    {
+      "id": 4,
+      "start": "2025-11-27T00:00:00Z",
+      "end": "2026-07-30T00:00:00Z"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "quoted-spread",
+      "initial_cash": "100000",
+      "execution": {
+        "model": "impact",
+        "delay_hours": 0,
+        "participation": 0.01,
+        "impact_coefficient": 0.1,
+        "spread_multiple": 1.0,
+        "impact_multiple": 1.0,
+        "half_spread_bps": {}
+      }
+    }
+  ]
+}

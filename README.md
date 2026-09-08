@@ -68,6 +68,10 @@ cargo build --workspace
 The scheduled crypto cycle expects `service/target/debug/crypto-portfolio` and
 `service/target/debug/bot`, falling back to release binaries.
 
+Run `bin/test-strategies.sh` to replay the frozen crypto execution scenarios,
+validate the experiment register and generate Monte Carlo reports. See the
+[September 2026 results and rerun requirements](docs/research/testing-2026-09.md).
+
 ## Crypto commands
 
 From the repository root:

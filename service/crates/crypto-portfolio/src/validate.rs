@@ -256,9 +256,13 @@ mod tests {
                 fills: Vec::new(),
                 plan_id: uuid::Uuid::nil(),
                 warnings: Vec::new(),
+                attribution: None,
             })
             .collect::<Vec<_>>();
         BacktestResult {
+            schema_version: "rust-backtest-2",
+            initial_cash: Decimal::from(100_000),
+            execution: crate::execution::Settings::default(),
             metrics: backtest::metrics(&steps),
             steps,
             disclosures: Vec::new(),
@@ -467,6 +471,13 @@ pub fn step_returns(result: &BacktestResult) -> Vec<(DateTime<Utc>, f64)> {
     let mut steps: Vec<&Step> = result.steps.iter().collect();
     steps.sort_by_key(|s| s.as_of);
     let mut out = Vec::new();
+    if let Some(first) = steps.first() {
+        if let (Some(nav), Some(initial)) = (first.nav.to_f64(), result.initial_cash.to_f64()) {
+            if initial > 0.0 {
+                out.push((first.as_of, nav / initial - 1.0));
+            }
+        }
+    }
     for pair in steps.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
         let (Some(prev), Some(next)) = (a.nav.to_f64(), b.nav.to_f64()) else {

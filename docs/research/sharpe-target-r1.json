@@ -1,0 +1,15 @@
+{
+  "source_suite": "docs/research/execution-suite.json",
+  "source_configs": "var/research/wf-rank-2020",
+  "config_root": "var/research/sharpe-target-r1-configs",
+  "output_prefix": "var/research/sharpe-target-r1",
+  "selection": "Highest pooled Sharpe over original folds 6–8, subject to positive cumulative return in each fold. Confirmation uses original folds 6–9; target pooled Sharpe >1.5 with impact costs, positive fold9 return. Retain all trials and stressed/delayed results. Dates were already exposed.",
+  "hypotheses": [
+    {"id": "control", "reason": "Unchanged frozen ranker with impact costs.", "portfolio": {}},
+    {"id": "funding", "reason": "Subtract estimated adverse next-day funding from conviction, using trailing seven-day daily mean; never reward favorable carry.", "portfolio": {"funding_cost_adjustment": true}},
+    {"id": "drift", "reason": "Skip same-side resizes smaller than 20% of current position; retain exits and sign changes.", "portfolio": {"rebalance_drift_band": "0.20"}},
+    {"id": "deadband", "reason": "Double the existing cost-relative resize threshold while retaining exits and sign changes.", "portfolio": {"rebalance_cost_multiple": "6.0"}},
+    {"id": "funding-drift", "reason": "Predeclared combination tests whether adverse-funding and resize-cost changes complement each other.", "portfolio": {"funding_cost_adjustment": true, "rebalance_drift_band": "0.20"}},
+    {"id": "zero-fee", "reason": "User proposed Lighter Standard accounts. Official fee page states zero maker/taker commission. This counterfactual changes commission in both planning and fills but retains recorded funding and proxy spread/impact. It is not a historical Lighter replay.", "portfolio": {}, "costs": {"commission_bps": "0"}}
+  ]
+}

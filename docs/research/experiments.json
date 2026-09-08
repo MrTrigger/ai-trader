@@ -1,0 +1,203 @@
+{
+  "experiments": [
+    {
+      "id": "crypto-funding-forward-invalid",
+      "family": "crypto-ranker",
+      "status": "invalid",
+      "trial_count": null,
+      "notes": [
+        "Historical funding features included future rates. No replay metrics are imported from this invalid record.",
+        "Historical code and dataset snapshots are not available in this manifest."
+      ],
+      "corrections": [
+        "Use trailing funding windows and retrain every fold."
+      ],
+      "sources": [
+        "docs/research/harness/dataset.py",
+        "docs/research/harness/ml_record.py",
+        "docs/research/harness/README.md"
+      ]
+    },
+    {
+      "id": "crypto-ranker-before-settlement",
+      "family": "crypto-ranker",
+      "status": "superseded",
+      "trial_count": null,
+      "notes": [
+        "Ghost positions produced phantom short gains on delistings. Saved models and configurations identify this historical replay, but do not establish its historical source commit or data snapshot."
+      ],
+      "corrections": [
+        "Superseded by the corrected settlement replay."
+      ],
+      "fold_dir": "var/research/wf-rank-2020-replay-base",
+      "expected_folds": 9,
+      "initial_cash": "100000",
+      "sources": [
+        "docs/research/settlement-correction.md",
+        "bin/replay-folds.sh"
+      ]
+    },
+    {
+      "id": "crypto-ranker-settlement-corrected",
+      "family": "crypto-ranker",
+      "status": "development",
+      "trial_count": null,
+      "supersedes": [
+        "crypto-ranker-before-settlement",
+        "crypto-funding-forward-invalid"
+      ],
+      "notes": [
+        "Corrected comparator, not fresh holdout evidence. Earlier research repeatedly inspected these dates.",
+        "Initial cash comes from bin/replay-folds.sh. Old reports omit first-step trading costs in saved metrics.",
+        "Historical trial count is unknown; do not substitute the curated register row count."
+      ],
+      "corrections": [
+        "Trailing funding features, realized funding, turnover exemption and settlement correction are documented in the research record."
+      ],
+      "fold_dir": "var/research/wf-rank-2020-replay-settle",
+      "expected_folds": 9,
+      "initial_cash": "100000",
+      "sources": [
+        "docs/research/settlement-correction.md",
+        "docs/research/turnover-cap-exemption.md",
+        "bin/replay-folds.sh"
+      ]
+    },
+    {
+      "id": "crypto-directional-r2-v6",
+      "family": "crypto-directional",
+      "status": "rejected",
+      "trial_count": null,
+      "notes": [
+        "V6 failed the benchmark confidence gate. Rounds reused the ranker's evaluation calendar.",
+        "The design records 13 counted trials across three rounds; these two selected rows are not that complete search ledger."
+      ],
+      "fold_dir": "var/research/directional-r2-v6",
+      "expected_folds": 9,
+      "initial_cash": "100000",
+      "sources": [
+        "docs/crypto-directional-design.md",
+        "bin/replay-folds.sh"
+      ]
+    },
+    {
+      "id": "crypto-directional-r3-p60n10",
+      "family": "crypto-directional",
+      "status": "rejected",
+      "trial_count": null,
+      "notes": [
+        "Selected from the third-round breadth grid and failed the benchmark confidence gate.",
+        "The same later dates had been inspected in previous rounds; this record does not call them a fresh holdout."
+      ],
+      "fold_dir": "var/research/directional-r3-p60n10",
+      "expected_folds": 9,
+      "initial_cash": "100000",
+      "sources": [
+        "docs/crypto-directional-design.md",
+        "bin/replay-folds.sh"
+      ]
+    },
+    {
+      "id": "crypto-scalper-runs-1-to-3-invalid",
+      "family": "crypto-scalper",
+      "status": "invalid",
+      "trial_count": null,
+      "notes": [
+        "Runs 1 through 3 used metrics stamped at window start as if already available, leaking five minutes. No compatible NAV series is imported."
+      ],
+      "corrections": [
+        "Run 4 uses the corrected publication-time join."
+      ],
+      "sources": [
+        "docs/crypto-scalper-STATUS.md",
+        "docs/scalper-gate-run-1.md",
+        "docs/scalper-gate-run-2.md",
+        "docs/scalper-gate-run-4.md"
+      ]
+    },
+    {
+      "id": "crypto-scalper-run-4-clean",
+      "family": "crypto-scalper",
+      "status": "rejected",
+      "trial_count": null,
+      "supersedes": [
+        "crypto-scalper-runs-1-to-3-invalid"
+      ],
+      "notes": [
+        "First causally clean run failed the registered gate at all three horizons. Source-only record; summary does not convert scalper trade metrics into crypto daily NAV metrics."
+      ],
+      "sources": [
+        "docs/scalper-gate-run-4.md",
+        "data/reports/gate-run-4-h15.json",
+        "data/reports/gate-run-4-h30.json",
+        "data/reports/gate-run-4-h60.json"
+      ]
+    },
+    {
+      "id": "crypto-scalper-run-5-tick-features",
+      "family": "crypto-scalper",
+      "status": "rejected",
+      "trial_count": null,
+      "notes": [
+        "Own-asset tick features and documented maker variants failed to rescue the clean baseline. Run 5b data corrections are retained in the gate record."
+      ],
+      "sources": [
+        "docs/scalper-gate-run-5.md",
+        "data/reports/gate-run-5b-h15.json",
+        "data/reports/gate-run-5b-h30.json",
+        "data/reports/gate-run-5b-h60.json"
+      ]
+    },
+    {
+      "id": "crypto-scalper-run-6-btc-context",
+      "family": "crypto-scalper",
+      "status": "rejected",
+      "trial_count": null,
+      "notes": [
+        "Cross-asset BTC tick context failed the gate. Source-only record includes both documented program variants."
+      ],
+      "sources": [
+        "docs/scalper-gate-run-6.md",
+        "data/reports/gate-run-6-h15.json",
+        "data/reports/gate-run-6-h30.json",
+        "data/reports/gate-run-6-h60.json",
+        "data/reports/gate-run-6b-h15.json",
+        "data/reports/gate-run-6b-h30.json",
+        "data/reports/gate-run-6b-h60.json"
+      ]
+    },
+    {
+      "id": "stockholm-exposed-fold-research",
+      "family": "stockholm-equities",
+      "status": "rejected",
+      "trial_count": null,
+      "notes": [
+        "Corrected lean baseline reversed in later diagnostics; richer features and rolling fits did not repair the gate result. Dates are exposed development evidence.",
+        "Source-only record: the Stockholm report schema is not imported into crypto daily NAV metrics. New quarterly and inactive-listing data remain prerequisites for further comparisons."
+      ],
+      "sources": [
+        "docs/stockholm-reward-loss-study.md",
+        "docs/stockholm-portfolio-design.md",
+        "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-base.json",
+        "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-stress.json",
+        "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/fold-plan.json",
+        "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/model-1.json"
+      ]
+    },
+    {
+      "id": "nq-four-sleeve-external-ledger",
+      "family": "nq-futures",
+      "status": "development",
+      "trial_count": null,
+      "notes": [
+        "Round 13 of the sibling ledger reports the four-sleeve modern-era book at Sharpe 1.0. This register records an unaudited comparator, not a deployment-state declaration.",
+        "No aligned daily return series or fresh reproduction is supplied. Joint crypto correlation and drawdown remain unmeasured."
+      ],
+      "sources": [
+        "docs/futures-bot-proposal.md",
+        "../trading-journal/backtest/lab/sleeve_screens.py",
+        "../trading-journal/docs/research-plan.md"
+      ]
+    }
+  ]
+}

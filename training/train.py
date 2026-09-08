@@ -30,6 +30,9 @@ PARAMS = {
     "bagging_freq": 1,
     "lambda_l2": 20.0,
     "verbose": -1,
+    "num_threads": 8,
+    "deterministic": True,
+    "force_col_wise": True,
 }
 NUM_ROUNDS = 300
 
@@ -44,37 +47,27 @@ def load_matrix(path: Path, through: date, reward: str = "return"):
     rows = [row for row in rows if date.fromisoformat(row["date"]) <= through]
     if len(rows) < 3_000:
         raise ValueError(f"only {len(rows)} rows through {through}; refusing a small fit")
-    if reward in ("per_risk", "per_risk_abs"):
-        # per_risk: demean(ret/vol) within each date, from the raw columns
-        # Rust emits. per_risk_abs: ret/vol NOT demeaned - the sign carries
-        # market direction, which a demeaned or ranked label throws away by
-        # construction (docs/research/absolute-label-unbalanced.md). Rows
-        # without a vol estimate cannot join either reward and are dropped
-        # from the FIT only - inference still scores every eligible name.
-        from collections import defaultdict
-
-        byday = defaultdict(list)
-        for row in rows:
-            if row.get("vol"):
-                byday[(row["date"], row.get("slot", 0))].append(row)
-        kept = []
-        for day_rows in byday.values():
-            mean = sum(r["raw_ret"] / r["vol"] for r in day_rows) / len(day_rows)
-            if reward == "per_risk_abs":
-                mean = 0.0
-            for r in day_rows:
-                r["_y"] = r["raw_ret"] / r["vol"] - mean
-                kept.append(r)
-        rows = kept
-        if len(rows) < 3_000:
-            raise ValueError(f"only {len(rows)} vol-bearing rows; refusing a small fit")
-    else:
-        for row in rows:
-            row["_y"] = row["target"]
+    contract = manifest.get("target_contract")
+    if contract is not None and contract != "rust-crypto-targets-1":
+        raise ValueError(f"unsupported Rust target contract: {contract}")
+    if contract:
+        horizon = manifest.get("label_horizon_hours")
+        lag = manifest.get("label_lag_hours")
+        if type(horizon) is not int or horizon <= 0 or type(lag) is not int or lag < 0:
+            raise ValueError("Rust target contract requires valid horizon and lag metadata")
+    target_field = {"return": "target", "per_risk": "target_per_risk",
+                    "per_risk_abs": "target_per_risk_abs"}[reward]
+    if reward != "return" and not contract:
+        raise ValueError("per-risk fits require Rust-finalized targets; rebuild training-matrix")
+    rows = [row for row in rows if row[target_field] is not None]
+    if len(rows) < 3_000:
+        raise ValueError(f"only {len(rows)} labeled rows; refusing a small fit")
     # Ordered lookup only. Values have already been computed, imputed, and
     # normalised by Rust; there is intentionally no transform here.
     x = np.asarray([[row["features"][name] for name in features] for row in rows])
-    y = np.asarray([row["_y"] for row in rows])
+    y = np.asarray([row[target_field] for row in rows])
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("matrix contains nonfinite inputs or targets")
     return manifest, features, rows, x, y
 
 
@@ -116,43 +109,12 @@ def main() -> None:
     alias = {"l2": "regression", "l1": "regression_l1", "huber": "huber"}
     objective = alias.get(objective, objective)
 
-    # TRAIN_RANK=1: replace the reward with its within-date uniform rank in
-    # [-1, 1]. Composes with --reward per_risk (rank of return-per-risk), and
-    # the per_risk artefact tag keeps inference converting score*vol exactly
-    # once, so the cost threshold still bites in return units.
-    if os.environ.get("TRAIN_RANK") == "1":
-        from collections import defaultdict
-        byday = defaultdict(list)
-        for i, row in enumerate(rows):
-            byday[(row["date"], row.get("slot", 0))].append(i)
-        for ixs in byday.values():
-            order = sorted(ixs, key=lambda i: y[i])
-            n = max(1, len(order) - 1)
-            for r, i in enumerate(order):
-                y[i] = 2.0 * r / n - 1.0
-        print("reward replaced by within-date uniform rank")
-    elif os.environ.get("TRAIN_RANK") == "signed":
-        # Signed magnitude rank (docs/research/absolute-label-unbalanced.md,
-        # cells E/F): rank |y| across ALL names of the day jointly onto
-        # (0, 1], then re-attach sign(y). The biggest move of the day is +-1,
-        # a mid-sized move about +-0.5, a flat name ~0 of either sign; the
-        # long/short count follows the real signs of the day, magnitudes are
-        # comparable across sides, and no raw drift magnitude survives. Meant
-        # for the NON-demeaned per_risk_abs input (sign = actual direction);
-        # with a demeaned reward the sign would be relative to the median.
-        from collections import defaultdict
-        byday = defaultdict(list)
-        for i, row in enumerate(rows):
-            byday[(row["date"], row.get("slot", 0))].append(i)
-        for ixs in byday.values():
-            order = sorted(ixs, key=lambda i: abs(y[i]))
-            n = max(1, len(order))
-            for r, i in enumerate(order):
-                mag = (r + 1.0) / n
-                y[i] = mag if y[i] > 0 else (-mag if y[i] < 0 else 0.0)
-        print("reward replaced by within-date signed magnitude rank")
+    if os.environ.get("TRAIN_RANK", "") not in ("", "0"):
+        raise ValueError("Python target transformations are disabled; emit the final target in Rust")
 
     n_seeds = int(os.environ.get("TRAIN_SEEDS", "1"))
+    if n_seeds < 1:
+        raise ValueError("TRAIN_SEEDS must be positive")
     def scale_leaves(node, k):
         if "leaf_value" in node and node["leaf_value"] is not None:
             node["leaf_value"] *= k
@@ -182,6 +144,9 @@ def main() -> None:
         "reward": args.reward,
         "tree_info": dump["tree_info"],
     }
+    if manifest.get("target_contract"):
+        for key in ("target_contract", "label_horizon_hours", "label_lag_hours"):
+            document[key] = manifest[key]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes((json.dumps(document, sort_keys=True, indent=2) + "\n").encode())
     print(f"wrote {args.out}: {len(rows):,} rows, {len(features)} Rust-owned features")

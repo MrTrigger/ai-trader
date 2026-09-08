@@ -15,6 +15,17 @@ use plan::Mode;
 const USAGE: &str = "\
 usage: crypto-portfolio <command>
 
+  replay-suite --manifest <json>
+      Replay frozen daily folds under declared execution scenarios, sharing data.
+
+  monte-carlo --folds DIR --out JSON [--initial-cash 100000]
+              [--iterations 10000] [--seed 42] [--block 20]
+              [--horizon-days 365] [--last-folds 4] [--benchmark DIR]
+      Block-resampled uncertainty and loss/drawdown scenarios from daily NAV.
+
+  experiment-register --manifest <json> --out <json>
+      Fingerprint evidence, flag reused dates and summarize reconciled returns.
+
   plan --config <toml> --data-root <dir> --as-of <RFC3339>
        --book <json> --out <plan.json> [--for-execution]
       Compute a deterministic Plan entirely in Rust. The book is venue truth
@@ -86,7 +97,7 @@ usage: crypto-portfolio <command>
 
   backtest --config <toml> --data-root <dir> --start YYYY-MM-DD
            --end YYYY-MM-DD --initial-cash <quote> [--slippage-multiple N]
-           [--out <json>]
+           [--execution <scenario.json>] [--out <json>]
       Replay the exact Rust live decision function and causal fill model.
 
   gate --config <toml> --data-root <dir> --start YYYY-MM-DD
@@ -938,6 +949,9 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             "kind": "manifest",
             "feature_set_version": features_crypto::FEATURE_SET_VERSION,
             "features": matrix.features,
+            "target_contract": crypto_portfolio::training::TARGET_CONTRACT,
+            "label_horizon_hours": hold_hours,
+            "label_lag_hours": lag_hours,
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1010,15 +1024,26 @@ fn cmd_backtest(args: &[String]) -> Result<(), String> {
     } else {
         features_crypto::FundingWindow::Trailing
     };
-    let result = crypto_portfolio::backtest::replay(
+    let execution = get(args, "--execution")
+        .map(|p| crypto_portfolio::execution::Settings::load(Path::new(&p)))
+        .transpose()?
+        .unwrap_or_default();
+    let prepared = crypto_portfolio::backtest::prepare(
+        &cfg,
+        &root,
+        cfg.signal == "ml_ranker" || execution.delay_hours > 0,
+        funding_window,
+    )?;
+    let result = crypto_portfolio::backtest::replay_with_execution(
         &cfg,
         start,
         end,
         &root,
         initial_cash,
         slippage,
-        funding_window,
+        &prepared,
         flag_i64(args, "--step-hours"),
+        &execution,
     )?;
     let mut bytes = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -1343,50 +1368,11 @@ fn cmd_compare(args: &[String]) -> Result<(), String> {
         .transpose()?
         .unwrap_or(2000);
 
-    // Concatenate the folds' step returns in order. Each fold is its own
-    // window, so a block never spans the seam between two of them.
-    let load = |dir: &PathBuf| -> Result<Vec<(chrono::DateTime<chrono::Utc>, f64)>, String> {
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("fold-") && n.ends_with(".json"))
-            })
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(format!("{}: no fold-*.json", dir.display()));
-        }
-        let mut out = Vec::new();
-        for f in files {
-            let text = std::fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
-            // Only the NAV path, so a fold file can gain fields without
-            // breaking the one tool that has to read every past run.
-            let v: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", f.display()))?;
-            let mut path: Vec<(chrono::DateTime<chrono::Utc>, f64)> = v["steps"]
-                .as_array()
-                .ok_or_else(|| format!("{}: no steps", f.display()))?
-                .iter()
-                .filter_map(|s| {
-                    let t = s["as_of"].as_str()?.parse().ok()?;
-                    let nav: f64 = s["nav"].as_str()?.parse().ok()?;
-                    (nav > 0.0).then_some((t, nav))
-                })
-                .collect();
-            path.sort_by_key(|(t, _)| *t);
-            for pair in path.windows(2) {
-                out.push((pair[1].0, pair[1].1 / pair[0].1 - 1.0));
-            }
-        }
-        out.sort_by_key(|(t, _)| *t);
-        Ok(out)
-    };
-
-    let baseline = load(&base_dir)?;
-    let variant = load(&var_dir)?;
+    let initial_cash = get(args, "--initial-cash")
+        .map(|v| v.parse::<f64>().map_err(|e| format!("--initial-cash: {e}")))
+        .transpose()?;
+    let baseline = crypto_portfolio::monte_carlo::daily_returns(&base_dir, initial_cash)?;
+    let variant = crypto_portfolio::monte_carlo::daily_returns(&var_dir, initial_cash)?;
     let r = crypto_portfolio::validate::bootstrap_delta(
         &baseline, &variant, block, iterations, 365.0, 0x5EED,
     )?;
@@ -1418,6 +1404,9 @@ fn cmd_compare(args: &[String]) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("replay-suite") => crypto_portfolio::replay_suite::command(&args[1..]),
+        Some("monte-carlo") => crypto_portfolio::monte_carlo::command(&args[1..]),
+        Some("experiment-register") => crypto_portfolio::experiment::command(&args[1..]),
         Some("plan") => cmd_plan(&args[1..]),
         Some("plan-verify") => cmd_plan_verify(&args[1..]),
         Some("features") => cmd_features(&args[1..]),

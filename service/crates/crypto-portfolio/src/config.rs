@@ -82,6 +82,12 @@ pub struct Config {
     /// the `market_model_tilt` signal reads. Unset for every other signal.
     pub market_matrix_path: Option<String>,
     pub timing_model_path: Option<String>,
+    /// Candidate count across both sides for the two balanced ranker
+    /// constructors. Independent of directional selection_pool/max_holdings.
+    pub ranker_selection_count: usize,
+    /// Deduct adverse expected 24h funding from the ranker's price-return
+    /// conviction. Only valid for the existing 24h-label ml_ranker recipe.
+    pub funding_cost_adjustment: bool,
     pub model_path: Option<String>,
     pub limits: RiskLimits,
     pub clusters: BTreeMap<String, String>,
@@ -272,6 +278,20 @@ impl Config {
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned),
+            ranker_selection_count: p
+                .get("ranker_selection_count")
+                .map(|_| usize_value(p, "ranker_selection_count"))
+                .transpose()?
+                .unwrap_or(24),
+            funding_cost_adjustment: p
+                .get("funding_cost_adjustment")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or("funding_cost_adjustment must be a boolean")
+                })
+                .transpose()?
+                .unwrap_or(false),
             model_path: p
                 .get("model_path")
                 .and_then(Value::as_str)
@@ -297,6 +317,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if !(4..=1000).contains(&self.ranker_selection_count) {
+            return Err("ranker_selection_count must be between 4 and 1000".into());
+        }
+        if self.funding_cost_adjustment && self.signal != "ml_ranker" {
+            return Err(
+                "funding_cost_adjustment requires ml_ranker with 24h price-return labels".into(),
+            );
+        }
         if self.interval_s != 86_400 {
             return Err("crypto portfolio currently requires daily decision bars".into());
         }
@@ -316,6 +344,73 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funding_adjustment_requires_a_boolean_and_the_ranker() {
+        let default = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
+        let source = std::fs::read_to_string(default).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("crypto-funding-config-{}.toml", std::process::id()));
+        for value in ["true", "false", "1", "\"true\""] {
+            let config = source.replace(
+                "[portfolio]",
+                &format!("[portfolio]\nfunding_cost_adjustment = {value}"),
+            );
+            std::fs::write(&path, config).unwrap();
+            let result = Config::load(&path);
+            if value == "true" || value == "false" {
+                assert_eq!(result.unwrap().funding_cost_adjustment, value == "true");
+            } else {
+                assert!(result.unwrap_err().contains("boolean"));
+            }
+        }
+        let mut cfg = Config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml"),
+        )
+        .unwrap();
+        cfg.funding_cost_adjustment = true;
+        cfg.signal = "xs_momentum".into();
+        assert!(cfg.validate().unwrap_err().contains("ml_ranker"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ranker_selection_count_defaults_and_bounds_are_independent_of_risk_limit() {
+        let default = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
+        let source = std::fs::read_to_string(&default).unwrap();
+        let cfg = Config::load(&default).unwrap();
+        assert_eq!(cfg.ranker_selection_count, 24);
+        let path = std::env::temp_dir().join(format!(
+            "crypto-ranker-count-config-{}.toml",
+            std::process::id()
+        ));
+        for value in [
+            "4", "24", "40", "1000", "0", "3", "1001", "-1", "4.5", "\"40\"", "true",
+        ] {
+            let config = source.replace(
+                "[portfolio]",
+                &format!("[portfolio]\nranker_selection_count = {value}"),
+            );
+            std::fs::write(&path, config).unwrap();
+            let result = Config::load(&path);
+            match value {
+                "4" | "24" | "40" | "1000" => {
+                    let parsed = result.unwrap();
+                    assert_eq!(
+                        parsed.ranker_selection_count,
+                        value.parse::<usize>().unwrap()
+                    );
+                    assert_eq!(
+                        parsed.limits.max_position_count,
+                        cfg.limits.max_position_count
+                    );
+                    assert_eq!(parsed.max_holdings, cfg.max_holdings);
+                }
+                _ => assert!(result.unwrap_err().contains("ranker_selection_count")),
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn loads_the_deployed_config() {

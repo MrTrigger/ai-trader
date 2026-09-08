@@ -1,0 +1,24 @@
+{
+  "source_dir": "var/research/wf-rank-2020",
+  "data_root": "data",
+  "out_dir": "var/research/testing-2026-09",
+  "folds": [
+    {"id": 1, "start": "2020-09-18T00:00:00Z", "end": "2021-05-12T00:00:00Z"},
+    {"id": 2, "start": "2021-05-13T00:00:00Z", "end": "2022-01-04T00:00:00Z"},
+    {"id": 3, "start": "2022-01-05T00:00:00Z", "end": "2022-08-29T00:00:00Z"},
+    {"id": 4, "start": "2022-08-30T00:00:00Z", "end": "2023-04-23T00:00:00Z"},
+    {"id": 5, "start": "2023-04-24T00:00:00Z", "end": "2023-12-16T00:00:00Z"},
+    {"id": 6, "start": "2023-12-17T00:00:00Z", "end": "2024-08-09T00:00:00Z"},
+    {"id": 7, "start": "2024-08-10T00:00:00Z", "end": "2025-04-03T00:00:00Z"},
+    {"id": 8, "start": "2025-04-04T00:00:00Z", "end": "2025-11-26T00:00:00Z"},
+    {"id": 9, "start": "2025-11-27T00:00:00Z", "end": "2026-07-30T00:00:00Z"}
+  ],
+  "scenarios": [
+    {"id": "flat", "initial_cash": "100000", "execution": {"model": "flat", "delay_hours": 0, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 1.0, "impact_multiple": 1.0, "half_spread_bps": {}}},
+    {"id": "impact", "initial_cash": "100000", "execution": {"model": "impact", "delay_hours": 0, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 1.0, "impact_multiple": 1.0, "half_spread_bps": {}}},
+    {"id": "stress", "initial_cash": "100000", "execution": {"model": "impact", "delay_hours": 0, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 10.0, "impact_multiple": 4.0, "half_spread_bps": {}}},
+    {"id": "delay", "initial_cash": "100000", "execution": {"model": "impact", "delay_hours": 1, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 1.0, "impact_multiple": 1.0, "half_spread_bps": {}}},
+    {"id": "capacity", "initial_cash": "300000", "execution": {"model": "impact", "delay_hours": 0, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 1.0, "impact_multiple": 1.0, "half_spread_bps": {}}},
+    {"id": "small", "initial_cash": "30000", "execution": {"model": "impact", "delay_hours": 0, "participation": 0.01, "impact_coefficient": 0.1, "spread_multiple": 1.0, "impact_multiple": 1.0, "half_spread_bps": {}}}
+  ]
+}
