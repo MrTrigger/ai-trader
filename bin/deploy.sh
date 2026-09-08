@@ -58,7 +58,8 @@ say "pinning the cluster to ${SHA:0:7}"
 cd "$LAB"
 sed -i "s|aitrader-paper:[0-9a-f]\{40\}|aitrader-paper:$SHA|g" \
   kubernetes/apps/trader/aitrader-paper/app/deployment.yaml \
-  kubernetes/apps/trader/aitrader-paper/app/cronjob.yaml
+  kubernetes/apps/trader/aitrader-paper/app/cronjob.yaml \
+  kubernetes/apps/trader/aitrader-paper/app/lighter-cronjob.yaml
 kubectl kustomize kubernetes/apps/trader/aitrader-paper/app >/dev/null
 if [ -n "$(git status --porcelain kubernetes/apps/trader/aitrader-paper)" ]; then
   git add kubernetes/apps/trader/aitrader-paper

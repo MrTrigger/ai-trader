@@ -353,6 +353,7 @@ dependencies = [
  "executor",
  "hyperliquid",
  "ib",
+ "lighter",
  "paper",
  "plan",
  "records",
@@ -1928,6 +1929,20 @@ checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "lighter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "venue",
 ]
 
 [[package]]

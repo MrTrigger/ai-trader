@@ -1,0 +1,62 @@
+# Lighter paper forward test. Venue membership is screened before ranking.
+# This restricted universe differs from the research cost counterfactual.
+[meta]
+ruleset_version = "phase0"
+bot_id = "crypto-lighter"
+
+[portfolio]
+quote_currency = "USDC"
+interval_s = 86400
+target_gross_exposure = "0.80"
+constructor = "risk_adjusted_score_selected"
+
+signal = "ml_ranker"
+
+model_path = "/app/ranker-rank-1.json"
+
+max_holdings = 10
+
+min_cross_section = 15
+
+rebalance_every = 1
+
+universe = ["BTC", "ETH", "SOL"]
+
+benchmark = "BTC"
+
+min_dollar_volume = "5000000"
+
+min_volatility = "0.10"
+
+min_history_bars = 90
+
+rebalance_cost_multiple = "3.0"
+
+turnover_budget = "0.50"
+
+[limits]
+max_gross_exposure = "1.00"
+max_position = "0.25"
+
+max_position_count = 40
+min_position_notional = "25"
+
+max_cluster_exposure = "0.40"
+
+max_benchmark_beta = "1.25"
+
+max_net_exposure = "0.10"
+
+[clusters]
+btc = ["BTC"]
+eth = ["ETH"]
+alt_l1 = ["SOL", "AVAX", "NEAR", "ADA", "DOT", "SUI", "APT"]
+l2 = ["ARB", "OP", "MATIC", "STRK"]
+defi = ["UNI", "AAVE", "LINK", "MKR", "CRV"]
+
+[costs]
+commission_bps = "0"
+spread_bps = "2.2"
+impact_coefficient = "0.10"
+adv_lookback_days = 20
+calibrated = false

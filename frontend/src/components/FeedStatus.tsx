@@ -23,13 +23,14 @@ export function FeedStatus({ feed, compact = false }: { feed?: Feed; compact?: b
   }
   const age = feed.last_bar_age_seconds ?? null;
   const down = (feed.failures ?? 0) > 0;
-  const stale = feed.market_open && (age == null || age > 900);
+  const stale = feed.healthy === false || (feed.market_open && (age == null || age > 900));
+  const priceFeed = feed.source === "lighter" || feed.source === "hyperliquid";
   const tone = down || stale ? "text-alarm" : feed.market_open ? "text-go" : "text-dim";
   const label = down
     ? `feed down · ${feed.failures} failed poll${feed.failures === 1 ? "" : "s"}`
     : age == null
-      ? "no bars yet"
-      : `last bar ${ago(age)} ago`;
+      ? (priceFeed ? "no prices yet" : "no bars yet")
+      : `last ${priceFeed ? "price" : "bar"} ${ago(age)} ago`;
 
   if (compact) return <span className={`num text-[11px] ${tone}`}>{label}</span>;
 
@@ -38,7 +39,7 @@ export function FeedStatus({ feed, compact = false }: { feed?: Feed; compact?: b
       <div className="flex items-baseline gap-2">
         <span className={`num text-[13px] ${tone}`}>{label}</span>
         <span className="text-[11px] text-faint">
-          {feed.source === "realtime" ? "realtime stream" : "polled bars"}
+          {priceFeed ? `${feed.source} prices` : feed.source === "realtime" ? "realtime stream" : "polled bars"}
           {feed.market_open === false && " · market closed"}
         </span>
       </div>

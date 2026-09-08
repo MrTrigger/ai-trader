@@ -80,6 +80,7 @@ pub enum Active {
     Paper(Box<PaperVenue<PaperUpstream, SystemClock>>),
     Live {
         adapter: Box<dyn VenueAdapter + Send + Sync>,
+        prices: Option<Arc<Feed>>,
         /// Human description captured at open ("hyperliquid mainnet for 0x…").
         description: String,
         /// The signing agent, when the venue has that concept.
@@ -195,6 +196,7 @@ impl VenueAdapter for Active {
 #[derive(Debug, Clone, Default)]
 pub struct Env {
     pub api_url: Option<String>,
+    pub lighter_api_url: Option<String>,
     pub account: Option<String>,
     pub vault: Option<String>,
     pub agent_key: Option<String>,
@@ -226,6 +228,7 @@ impl Env {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Env {
             api_url: get("HL_API_URL"),
+            lighter_api_url: get("LIGHTER_API_URL"),
             account: get("HL_ACCOUNT_ADDRESS"),
             vault: get("HL_VAULT_ADDRESS"),
             agent_key: get("HL_AGENT_PRIVATE_KEY"),
@@ -266,14 +269,6 @@ impl Env {
 
     fn base(&self) -> &str {
         self.api_url.as_deref().unwrap_or(hyperliquid::MAINNET)
-    }
-
-    /// A live price feed, if the environment describes one.
-    pub fn price_source(&self) -> Result<Arc<dyn PriceSource>, String> {
-        let account = self.account.clone().unwrap_or_default();
-        let hl = Hyperliquid::read_only(self.base(), &account)
-            .map_err(|e| format!("cannot reach {}: {e}", self.base()))?;
-        Ok(Arc::new(hl))
     }
 }
 
@@ -357,16 +352,17 @@ pub fn open(
             // read from it; only order submission is simulated. There is no
             // second list anywhere, which is the point - a hand-kept copy is
             // how paper stops predicting live.
-            let upstream = match open_live(venue_id, Mode::LiveReadonly, env)? {
-                Active::Live { adapter, .. } => adapter,
+            let (adapter, venue_prices) = match open_live(venue_id, Mode::LiveReadonly, env)? {
+                Active::Live {
+                    adapter, prices, ..
+                } => (adapter, prices),
                 other => return Ok(other),
             };
-            let upstream: Arc<dyn VenueAdapter + Send + Sync> = Arc::from(upstream);
-            // Marks: the exchange's own feed unless a file feed was configured
-            // for offline work. Either way the instruments come from `upstream`.
-            let prices = match prices {
+            let upstream: Arc<dyn VenueAdapter + Send + Sync> = Arc::from(adapter);
+            let prices: Arc<dyn PriceSource> = match prices {
                 Some(p) => p,
-                None => env.price_source()?,
+                None => venue_prices
+                    .ok_or_else(|| format!("{venue_id} has no public paper price feed"))?,
             };
             let source = PaperUpstream {
                 venue: upstream,
@@ -384,6 +380,44 @@ pub fn open(
             Ok(Active::Paper(Box::new(v)))
         }
         Mode::LiveReadonly | Mode::Live => open_live(venue_id, mode, env),
+    }
+}
+
+/// Public data selected by the same registry as the trading adapter.
+pub enum Feed {
+    Hyperliquid(hyperliquid::Info),
+    Lighter(lighter::Lighter),
+}
+
+impl Feed {
+    pub async fn marks(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, rust_decimal::Decimal>, VenueError> {
+        match self {
+            Self::Hyperliquid(info) => info.marks().await,
+            Self::Lighter(client) => client.marks().await,
+        }
+    }
+}
+
+#[async_trait]
+impl PriceSource for Feed {
+    async fn mark_price(&self, asset: &str) -> Result<rust_decimal::Decimal, VenueError> {
+        self.marks()
+            .await?
+            .get(asset)
+            .copied()
+            .ok_or_else(|| VenueError::NoPrice(asset.into()))
+    }
+}
+
+pub fn feed(venue_id: &str, env: &Env) -> Result<Arc<Feed>, String> {
+    match open_live(venue_id, Mode::LiveReadonly, env)? {
+        Active::Live {
+            prices: Some(prices),
+            ..
+        } => Ok(prices),
+        _ => Err(format!("{venue_id} has no public price feed")),
     }
 }
 
@@ -422,6 +456,20 @@ impl venue::MarketData for PaperUpstream {
 fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
     match venue_id {
         "hyperliquid" => open_hyperliquid(mode, env),
+        "lighter" => {
+            if mode == Mode::Live {
+                return Err("Lighter supports paper trading and public market data only; live orders are unavailable".into());
+            }
+            let client =
+                lighter::Lighter::new(env.lighter_api_url.as_deref().unwrap_or(lighter::MAINNET))
+                    .map_err(|e| e.to_string())?;
+            Ok(Active::Live {
+                adapter: Box::new(client.clone()),
+                prices: Some(Arc::new(Feed::Lighter(client))),
+                description: "Lighter public market data; no account access or real orders".into(),
+                agent: None,
+            })
+        }
         "ib" => open_ib(mode),
         // Broker names, not protocol names: AMP is the FCM, Rithmic is the
         // gateway it is reached through. This process has no registry to
@@ -429,7 +477,7 @@ fn open_live(venue_id: &str, mode: Mode, env: &Env) -> Result<Active, String> {
         // which does have one, dispatches on the venue's `protocol` column.
         "amp" | "rithmic" => open_rithmic(mode),
         other => Err(format!(
-            "unknown venue_id {other:?}. Known live venues: hyperliquid, ib, amp."
+            "unknown venue_id {other:?}. Known venues: hyperliquid, lighter (paper only), ib, amp."
         )),
     }
 }
@@ -455,6 +503,7 @@ fn open_ib(mode: Mode) -> Result<Active, String> {
     let description = adapter.describe();
     Ok(Active::Live {
         adapter: Box::new(adapter),
+        prices: None,
         description,
         agent: None,
     })
@@ -477,6 +526,7 @@ fn open_rithmic(mode: Mode) -> Result<Active, String> {
     let description = adapter.describe();
     Ok(Active::Live {
         adapter: Box::new(adapter),
+        prices: None,
         description,
         agent: None,
     })
@@ -528,6 +578,9 @@ fn open_hyperliquid(mode: Mode, env: &Env) -> Result<Active, String> {
             let agent = hl.agent_address().map(str::to_string);
             Ok(Active::Live {
                 adapter: Box::new(hl),
+                prices: Some(Arc::new(Feed::Hyperliquid(
+                    hyperliquid::Info::new(env.base()).map_err(|e| e.to_string())?,
+                ))),
                 description,
                 agent,
             })
@@ -541,6 +594,56 @@ mod tests {
 
     fn paper_cfg() -> PaperConfig {
         PaperConfig::default()
+    }
+
+    #[test]
+    fn lighter_paper_needs_no_credentials_and_live_is_refused() {
+        let env = Env::default();
+        let paper = open("lighter", Mode::Paper, &env, paper_cfg(), None, None).unwrap();
+        assert!(paper.is_paper());
+        let err = open("lighter", Mode::Live, &env, paper_cfg(), None, None).unwrap_err();
+        assert!(err.contains("live orders are unavailable"));
+        assert!(matches!(
+            feed("lighter", &env).unwrap().as_ref(),
+            Feed::Lighter(_)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "reads public Lighter data and fills only in memory"]
+    async fn lighter_paper_fill_survives_restore() {
+        use rust_decimal::Decimal;
+        let cfg = PaperConfig {
+            quote_currency: "USDC".into(),
+            initial_cash: Decimal::from(100000),
+            taker_fee_bps: Decimal::ZERO,
+            maker_fee_bps: Decimal::ZERO,
+            slippage_bps: Decimal::new(22, 1),
+            ..Default::default()
+        };
+        let env = Env::default();
+        let v = open("lighter", Mode::Paper, &env, cfg.clone(), None, None).unwrap();
+        v.place_order(&OrderRequest {
+            client_order_id: "lighter-paper-proof".into(),
+            asset: "BTC".into(),
+            side: venue::Side::Buy,
+            qty: Decimal::new(1, 3),
+            order_type: venue::OrderType::Market,
+            limit_price: None,
+            reason: venue::OrderReason::Entry,
+        })
+        .await
+        .unwrap();
+        let fills = v.get_fills(None).await.unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fee, Decimal::ZERO);
+        let saved = v.as_paper().unwrap().snapshot().await;
+        let restored = open("lighter", Mode::Paper, &env, cfg, None, Some(&saved)).unwrap();
+        let positions = restored.get_positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].asset, "BTC");
+        assert_eq!(positions[0].qty, Decimal::new(1, 3));
+        assert_eq!(restored.get_fills(None).await.unwrap().len(), 1);
     }
 
     #[test]

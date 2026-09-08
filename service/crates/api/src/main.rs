@@ -41,7 +41,9 @@
 //! trading system. The bind address is a constant and there is no host flag,
 //! because a flag is a thing that gets set.
 
+mod book;
 mod control;
+mod feed;
 mod fleet;
 mod state;
 
@@ -400,6 +402,24 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
             let id = r.trim_start_matches("/api/bots/").trim_end_matches("/logs");
             match fleet::logs(id, 300) {
                 Ok(v) => json(&mut stream, 200, &serde_json::to_vec(&v).unwrap()),
+                Err(e) => json_error(&mut stream, 400, &e),
+            }
+        }
+        ("GET", r) if r.starts_with("/api/bots/") && r.ends_with("/book") => {
+            let id = r.trim_start_matches("/api/bots/").trim_end_matches("/book");
+            let local_id = cfg
+                .bot
+                .as_ref()
+                .and_then(|b| std::fs::read_to_string(&b.config).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v["bot_id"].as_str().map(str::to_owned));
+            let result = if local_id.as_deref() == Some(id) {
+                snapshot(cfg)
+            } else {
+                fleet::book(&std::env::current_dir().unwrap_or_default(), id)
+            };
+            match result {
+                Ok(s) => json(&mut stream, 200, &serde_json::to_vec(&s).unwrap()),
                 Err(e) => json_error(&mut stream, 400, &e),
             }
         }

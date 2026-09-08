@@ -181,6 +181,14 @@ pub fn run(bot: &BotCommand, action: Action, reason: &str, by: &str) -> Result<O
                 .into(),
         );
     };
+    if matches!(action, Action::ModeLive | Action::ModeLiveReadonly) {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&bot.config).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if config["venue_id"].as_str() == Some("lighter") {
+            return Err("Lighter supports paper mode only".into());
+        }
+    }
     let mut cmd = Command::new(binary);
     cmd.arg("--config")
         .arg(&bot.config)
@@ -308,5 +316,21 @@ mod tests {
         let err = run(&bot, Action::Halt, "why", "who").unwrap_err();
         assert!(err.contains("read-only"), "{err}");
         std::fs::remove_file(&cfg).ok();
+    }
+    #[test]
+    fn lighter_live_modes_are_refused_before_spawning() {
+        let path =
+            std::env::temp_dir().join(format!("api-lighter-mode-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"venue_id":"lighter","bot_id":"crypto-lighter"}"#).unwrap();
+        let bot = BotCommand {
+            binary: Some("/bin/true".into()),
+            config: path.clone(),
+        };
+        for action in [Action::ModeLive, Action::ModeLiveReadonly] {
+            assert!(run(&bot, action, "test", "test")
+                .unwrap_err()
+                .contains("paper mode only"));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

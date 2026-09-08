@@ -1008,8 +1008,7 @@ async fn cmd_adopt(cfg: &BotConfig, flags: &Flags) -> Result<(), String> {
 /// price file and value the book against three assets and a truncated number.
 async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), String> {
     let env = Env::load(cfg.env_path(&config_path()).as_deref());
-    let source = hyperliquid::Info::new(env.api_url.as_deref().unwrap_or(hyperliquid::MAINNET))
-        .map_err(|e| e.to_string())?;
+    let source = active_venue::feed(&cfg.venue_id, &env)?;
 
     let path = cfg.marks_path();
     if let Some(dir) = path.parent() {
@@ -1021,10 +1020,10 @@ async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), St
     }
 
     let mut consecutive_failures = 0u32;
+    let mut updated_at: Option<String> = None;
     loop {
-        match source.marks().await {
+        let result = match source.marks().await {
             Ok(marks) => {
-                consecutive_failures = 0;
                 let body: std::collections::BTreeMap<String, String> = marks
                     .iter()
                     .map(|(k, v)| (k.clone(), v.to_string()))
@@ -1034,21 +1033,35 @@ async fn cmd_feed(cfg: &BotConfig, once: bool, interval_s: u64) -> Result<(), St
                     .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
                 std::fs::rename(&tmp, &path)
                     .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
-                if once {
-                    println!("{} marks written to {}", body.len(), path.display());
-                    return Ok(());
-                }
+                consecutive_failures = 0;
+                updated_at = Some(
+                    time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|e| e.to_string())?,
+                );
+                Ok(body.len())
             }
             Err(e) => {
-                consecutive_failures += 1;
-                // Never delete or zero the file on a failure. A stale price is
-                // visibly stale and can be reasoned about; a missing one makes
-                // the whole book unvaluable, which is worse.
+                consecutive_failures = consecutive_failures.saturating_add(1);
                 eprintln!("feed: {e} (failure {consecutive_failures})");
-                if once {
-                    return Err(e.to_string());
-                }
+                Err(e.to_string())
             }
+        };
+        // Keep the last prices on a failed poll, but publish their actual age.
+        let health = serde_json::json!({
+            "source": cfg.venue_id,
+            "updated_at": updated_at,
+            "failures": consecutive_failures,
+            "last_error": result.as_ref().err(),
+        });
+        let health_path = path.with_file_name("feed.json");
+        let tmp = health_path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&health).unwrap())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &health_path)
+            .map_err(|e| format!("cannot replace {}: {e}", health_path.display()))?;
+        if once {
+            return result.map(|count| println!("{count} marks written to {}", path.display()));
         }
         tokio::time::sleep(std::time::Duration::from_secs(interval_s.max(1))).await;
     }
@@ -1306,7 +1319,12 @@ async fn require_registered(cfg: &BotConfig) -> Result<(), String> {
     let reg = records::Registry::connect(&url)
         .await
         .map_err(|e| format!("identity registry unreachable ({e}) — fail closed"))?;
-    reg.require_enabled(&cfg.bot_id)
+    let account_kind = if cfg.mode == Mode::Paper {
+        "paper"
+    } else {
+        "live"
+    };
+    reg.require_execution_binding(&cfg.bot_id, &cfg.venue_id, account_kind)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

@@ -4,6 +4,7 @@ import { z } from "zod";
  *  field that changes shape breaks the build rather than a page at 3am. */
 
 export const Broker = z.object({
+  paper_only: z.boolean().optional(),
   venue_id: z.string().nullable().optional(),
   protocol: z.string().nullable().optional(),
   account_id: z.string().nullable().optional(),

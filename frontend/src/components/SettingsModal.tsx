@@ -46,7 +46,7 @@ export function SettingsModal({
       onSaved();
       onClose();
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -110,8 +110,9 @@ export function SettingsModal({
               })}
             </select>
             <p className="mt-2 text-[11px] leading-relaxed text-faint">
-              A real account also needs the deployment's ALLOW_LIVE flag. Your choice and the
-              deployment's permission both have to say yes.
+              {broker?.paper_only
+                ? "This bot supports paper execution only."
+                : "A real account also needs the deployment's ALLOW_LIVE flag. Your choice and the deployment's permission both have to say yes."}
             </p>
           </Field>
 

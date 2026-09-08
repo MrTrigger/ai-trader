@@ -49,6 +49,11 @@ pub struct BotRow {
     /// How the api launches this bot's process (repo-relative command).
     /// NULL: the api cannot start it and the dashboard says so.
     pub launch: Option<String>,
+    pub executor_config: Option<String>,
+    pub core_config: Option<String>,
+    pub data_root: Option<String>,
+    pub trade_protocol: Option<String>,
+    pub paper_only: bool,
 }
 
 /// A venue account the fleet knows about. Credentials are NOT here — only
@@ -84,6 +89,68 @@ pub struct Binding {
     pub account_kind: String,
 }
 
+/// Supported routing for a registered book, shared by API options and writes.
+pub fn validate_trade_account(bot: &BotRow, account: &AccountRow) -> Result<(), RecordsError> {
+    if !account.asset_classes.iter().any(|c| c == &bot.asset_class) {
+        return Err(RecordsError::Refused(
+            "account cannot trade this bot's asset class".into(),
+        ));
+    }
+    validate_execution_capability(bot, &account.protocol, &account.kind)
+}
+
+fn validate_execution_capability(
+    bot: &BotRow,
+    protocol: &str,
+    kind: &str,
+) -> Result<(), RecordsError> {
+    if bot.trade_protocol.as_ref().is_some_and(|p| p != protocol) {
+        return Err(RecordsError::Refused(
+            "account protocol does not match this bot's deployment".into(),
+        ));
+    }
+    if (bot.paper_only || protocol == "lighter") && kind != "paper" {
+        return Err(RecordsError::Refused(
+            "this execution path supports paper accounts only".into(),
+        ));
+    }
+    if protocol == "lighter" && bot.trade_protocol.as_deref() != Some("lighter") {
+        return Err(RecordsError::Refused(
+            "this bot has no Lighter deployment".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check the runtime's venue and money mode against its sole trade binding.
+pub fn validate_execution_binding(
+    bot: &BotRow,
+    bindings: &[Binding],
+    venue_id: &str,
+    account_kind: &str,
+) -> Result<(), RecordsError> {
+    let mut trades = bindings.iter().filter(|b| b.scope == "trade");
+    let binding = trades
+        .next()
+        .ok_or_else(|| RecordsError::Refused("bot has no trade account binding".into()))?;
+    if trades.next().is_some() {
+        return Err(RecordsError::Refused(
+            "bot has multiple trade account bindings".into(),
+        ));
+    }
+    if binding.bot_id != bot.bot_id || binding.venue_id != venue_id {
+        return Err(RecordsError::Refused(
+            "configured venue differs from the bot's trade account binding".into(),
+        ));
+    }
+    if !matches!(account_kind, "paper" | "live") || binding.account_kind != account_kind {
+        return Err(RecordsError::Refused(
+            "configured execution mode differs from the trade account kind".into(),
+        ));
+    }
+    validate_execution_capability(bot, &binding.protocol, account_kind)
+}
+
 pub struct Registry {
     pool: PgPool,
 }
@@ -112,9 +179,20 @@ impl Registry {
         }
     }
 
+    pub async fn require_execution_binding(
+        &self,
+        bot_id: &str,
+        venue_id: &str,
+        account_kind: &str,
+    ) -> Result<(), RecordsError> {
+        let bot = self.require_enabled(bot_id).await?;
+        let bindings = self.bindings(bot_id).await?;
+        validate_execution_binding(&bot, &bindings, venue_id, account_kind)
+    }
+
     pub async fn bot(&self, bot_id: &str) -> Result<Option<BotRow>, RecordsError> {
         let row = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch, executor_config, core_config, data_root, trade_protocol, paper_only \
              FROM bots WHERE bot_id = $1",
         )
         .bind(bot_id)
@@ -129,12 +207,17 @@ impl Registry {
             enabled: r.get(5),
             state_dir: r.get(6),
             launch: r.get(7),
+            executor_config: r.get(8),
+            core_config: r.get(9),
+            data_root: r.get(10),
+            trade_protocol: r.get(11),
+            paper_only: r.get(12),
         }))
     }
 
     pub async fn list_bots(&self) -> Result<Vec<BotRow>, RecordsError> {
         let rows = sqlx::query(
-            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch \
+            "SELECT bot_id, display_name, cadence, asset_class, decision_core, enabled, state_dir, launch, executor_config, core_config, data_root, trade_protocol, paper_only \
              FROM bots ORDER BY bot_id",
         )
         .fetch_all(&self.pool)
@@ -150,6 +233,11 @@ impl Registry {
                 enabled: r.get(5),
                 state_dir: r.get(6),
                 launch: r.get(7),
+                executor_config: r.get(8),
+                core_config: r.get(9),
+                data_root: r.get(10),
+                trade_protocol: r.get(11),
+                paper_only: r.get(12),
             })
             .collect())
     }
@@ -212,6 +300,17 @@ impl Registry {
         bot_id: &str,
         account_id: &str,
     ) -> Result<(), RecordsError> {
+        let bot = self
+            .bot(bot_id)
+            .await?
+            .ok_or_else(|| RecordsError::UnknownBot(bot_id.into()))?;
+        let account = self
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|a| a.account_id == account_id)
+            .ok_or_else(|| RecordsError::Refused(format!("unknown account {account_id:?}")))?;
+        validate_trade_account(&bot, &account)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM account_bindings WHERE bot_id = $1 AND scope = 'trade' \
@@ -294,10 +393,46 @@ impl Registry {
         quote_currency: &str,
         notes: Option<&str>,
     ) -> Result<(), RecordsError> {
+        if venue_id == "lighter" && kind != "paper" {
+            return Err(RecordsError::Refused(
+                "Lighter supports paper accounts only".into(),
+            ));
+        }
         if kind != "paper" && kind != "live" {
             return Err(RecordsError::Refused(format!(
                 "account kind {kind:?} is neither paper nor live"
             )));
+        }
+        let venue = sqlx::query("SELECT protocol, asset_classes FROM venues WHERE venue_id = $1")
+            .bind(venue_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| RecordsError::Refused(format!("unknown venue {venue_id:?}")))?;
+        let account = AccountRow {
+            account_id: account_id.into(),
+            venue_id: venue_id.into(),
+            kind: kind.into(),
+            credential_ref: credential_ref.into(),
+            protocol: venue.get(0),
+            asset_classes: venue.get(1),
+        };
+        if account.protocol == "lighter" && kind != "paper" {
+            return Err(RecordsError::Refused(
+                "Lighter supports paper accounts only".into(),
+            ));
+        }
+        let bound: Vec<String> = sqlx::query_scalar(
+            "SELECT bot_id FROM account_bindings WHERE account_id = $1 AND scope = 'trade'",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for id in bound {
+            let bot = self
+                .bot(&id)
+                .await?
+                .ok_or_else(|| RecordsError::UnknownBot(id))?;
+            validate_trade_account(&bot, &account)?;
         }
         sqlx::query(
             "INSERT INTO accounts (account_id, venue_id, kind, credential_ref, quote_currency, \
@@ -879,6 +1014,18 @@ pub mod blocking {
     }
 
     impl Records {
+        pub fn require_execution_binding(
+            &self,
+            bot_id: &str,
+            venue_id: &str,
+            account_kind: &str,
+        ) -> Result<(), RecordsError> {
+            self.wait(
+                self.inner
+                    .require_execution_binding(bot_id, venue_id, account_kind),
+            )
+        }
+
         pub fn connect(database_url: &str) -> Result<Arc<Self>, RecordsError> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1088,5 +1235,104 @@ pub mod blocking {
                 .join()
                 .expect("records db call panicked")
         })
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn bot(protocol: Option<&str>, paper_only: bool) -> BotRow {
+        BotRow {
+            bot_id: "test-book".into(),
+            display_name: "Test".into(),
+            cadence: "cron".into(),
+            asset_class: "crypto".into(),
+            decision_core: "crypto-portfolio".into(),
+            enabled: false,
+            state_dir: None,
+            launch: None,
+            executor_config: None,
+            core_config: None,
+            data_root: None,
+            trade_protocol: protocol.map(str::to_owned),
+            paper_only,
+        }
+    }
+
+    fn account(protocol: &str, kind: &str) -> AccountRow {
+        AccountRow {
+            account_id: format!("{protocol}-{kind}"),
+            venue_id: protocol.into(),
+            protocol: protocol.into(),
+            kind: kind.into(),
+            credential_ref: "PUBLIC".into(),
+            asset_classes: vec!["crypto".into()],
+        }
+    }
+
+    #[test]
+    fn lighter_requires_its_own_paper_deployment() {
+        let lighter = bot(Some("lighter"), true);
+        assert!(validate_trade_account(&lighter, &account("lighter", "paper")).is_ok());
+        assert!(validate_trade_account(&lighter, &account("lighter", "live")).is_err());
+        assert!(validate_trade_account(&lighter, &account("hyperliquid", "paper")).is_err());
+        assert!(validate_trade_account(&bot(None, false), &account("lighter", "paper")).is_err());
+    }
+
+    #[test]
+    fn hyperliquid_retains_paper_and_live_accounts() {
+        let hl = bot(Some("hyperliquid"), false);
+        assert!(validate_trade_account(&hl, &account("hyperliquid", "paper")).is_ok());
+        assert!(validate_trade_account(&hl, &account("hyperliquid", "live")).is_ok());
+        assert!(validate_trade_account(&hl, &account("lighter", "paper")).is_err());
+        let mut futures = account("ib", "paper");
+        futures.asset_classes = vec!["futures".into()];
+        assert!(validate_trade_account(&hl, &futures).is_err());
+    }
+    #[test]
+    fn execution_requires_one_matching_trade_account() {
+        let lighter = bot(Some("lighter"), true);
+        let binding = Binding {
+            bot_id: lighter.bot_id.clone(),
+            account_id: "lighter-sim".into(),
+            venue_id: "lighter".into(),
+            protocol: "lighter".into(),
+            scope: "trade".into(),
+            credential_ref: "PUBLIC".into(),
+            account_kind: "paper".into(),
+        };
+        assert!(
+            validate_execution_binding(&lighter, &[binding.clone()], "lighter", "paper").is_ok()
+        );
+        assert!(validate_execution_binding(&lighter, &[], "lighter", "paper").is_err());
+        assert!(validate_execution_binding(
+            &lighter,
+            &[binding.clone(), binding.clone()],
+            "lighter",
+            "paper"
+        )
+        .is_err());
+        assert!(
+            validate_execution_binding(&lighter, &[binding.clone()], "hyperliquid", "paper")
+                .is_err()
+        );
+        assert!(
+            validate_execution_binding(&lighter, &[binding.clone()], "lighter", "live").is_err()
+        );
+        let mut invalid_live = binding;
+        invalid_live.account_kind = "live".into();
+        assert!(validate_execution_binding(&lighter, &[invalid_live], "lighter", "live").is_err());
+        let hl = bot(Some("hyperliquid"), false);
+        let binding = Binding {
+            bot_id: hl.bot_id.clone(),
+            account_id: "hl-sim".into(),
+            venue_id: "hyperliquid".into(),
+            protocol: "hyperliquid".into(),
+            scope: "trade".into(),
+            credential_ref: "HL_READONLY".into(),
+            account_kind: "paper".into(),
+        };
+        assert!(validate_execution_binding(&hl, &[binding], "hyperliquid", "paper").is_ok());
     }
 }

@@ -722,23 +722,30 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
     // Which broker this bot trades through, and what else it could. The
     // selection lives in the registry, so it survives restarts and the UI
     // is only ever a view of it.
+    let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
     let trade = bindings.iter().find(|b| b.scope == "trade");
-    let asset_class = bot
-        .as_ref()
-        .map(|b| b.asset_class.clone())
-        .unwrap_or_default();
+    let feed = (bot.asset_class == "crypto")
+        .then(|| {
+            crate::feed::read(
+                repo_root,
+                bot.state_dir.as_deref(),
+                trade.map(|b| b.venue_id.as_str()),
+            )
+        })
+        .flatten();
     let broker = json!({
         "account_id": trade.map(|b| b.account_id.clone()),
         "venue_id": trade.map(|b| b.venue_id.clone()),
         "protocol": trade.map(|b| b.protocol.clone()),
         "kind": trade.map(|b| b.account_kind.clone()),
         "credential_ref": trade.map(|b| b.credential_ref.clone()),
+        "paper_only": bot.paper_only,
         // Only brokers that can trade what this bot trades. Offering a
         // futures book a crypto venue is not a harmless extra row: it is a
         // one-click way to bind a bot to something that cannot fill it.
         "options": accounts
             .iter()
-            .filter(|a| a.asset_classes.iter().any(|c| c == &asset_class))
+            .filter(|a| records::validate_trade_account(&bot, a).is_ok())
             .map(|a| json!({
                 "account_id": a.account_id,
                 "venue_id": a.venue_id,
@@ -748,7 +755,6 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             }))
             .collect::<Vec<_>>(),
     });
-    let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
     // The operator's control word comes from the DB for EVERY branch below.
     // The never-published branch used to read a `controls.json` that exists
     // only on a laptop, so a freshly deployed bot reported no control word at
@@ -760,7 +766,18 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         .unwrap_or(Value::Null);
 
     if let Some(srow) = status {
-        let state: Value = serde_json::from_str(&srow.payload).unwrap_or(Value::Null);
+        let mut state: Value = serde_json::from_str(&srow.payload).unwrap_or(Value::Null);
+        if bot.asset_class == "crypto" && state.is_object() {
+            if !state["detail"].is_object() {
+                state["detail"] = json!({});
+            }
+            if let Some(feed) = feed {
+                state["detail"]["feed"] = feed;
+            } else if let Some(detail) = state["detail"].as_object_mut() {
+                detail.remove("feed");
+            }
+        }
+
         if dialect_of(&state) == "botstate" {
             // Chronological, like the journal file the shape came from.
             let fills: Vec<Value> = fills
@@ -790,6 +807,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
             .collect();
         return Ok(json!({
             "contract": "runner",
+            "state": state,
             "source": "db",
             "display_name": bot.display_name,
             "cadence": bot.cadence,
@@ -819,6 +837,7 @@ pub fn detail(repo_root: &Path, bot_id: &str) -> Result<Value, String> {
         "botstate"
     };
     let never_ran = json!({
+        "state": { "detail": feed.map(|f| json!({"feed": f})).unwrap_or_else(|| json!({})) },
         "contract": contract,
         "source": "registry",
         "display_name": bot.display_name,
@@ -1241,4 +1260,13 @@ pub fn set_venue(bot_id: &str, account_id: &str, reason: &str, by: &str) -> Resu
             }))
         })
     })
+}
+
+pub fn book(repo_root: &Path, bot_id: &str) -> Result<crate::state::Snapshot, String> {
+    let id = bot_id.to_string();
+    let (bot, bindings) = with_registry(move |reg| {
+        Box::pin(async move { Ok((reg.bot(&id).await?, reg.bindings(&id).await?)) })
+    })?;
+    let bot = bot.ok_or_else(|| format!("unknown bot {bot_id:?}"))?;
+    crate::book::build(repo_root, &bot, &bindings)
 }

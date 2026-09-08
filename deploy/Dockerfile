@@ -25,6 +25,8 @@ COPY --from=build /src/service/target/release/api /usr/local/bin/api
 COPY --from=build /src/service/target/release/futures-bot /usr/local/bin/futures-bot
 COPY config/default.toml /app/config.toml
 COPY deploy/bot.cluster.json /app/bot.json
+COPY deploy/lighter-bot.json /app/lighter-bot.json
+COPY deploy/lighter-config.toml /app/lighter-config.toml
 COPY deploy/cycle.sh /usr/local/bin/cycle.sh
 COPY deploy/bootstrap-cycle.sh /usr/local/bin/bootstrap-cycle.sh
 COPY deploy/futures-live.sh /usr/local/bin/futures-live.sh

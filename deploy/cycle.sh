@@ -2,11 +2,12 @@
 # One decision-and-execution cycle on the cluster. Same commands a human runs.
 # Exit codes are the point: a non-zero stage fails the CronJob and shows red.
 set -euo pipefail
-BOT=/usr/local/bin/bot
-CP=/usr/local/bin/crypto-portfolio
-CFG=/app/config.toml
-BOTCFG=/app/bot.json
-DATA=/data
+BOT=${BOT_BINARY:-/usr/local/bin/bot}
+CP=${PLANNER_BINARY:-/usr/local/bin/crypto-portfolio}
+CFG=${PORTFOLIO_CONFIG:-/app/config.toml}
+BOTCFG=${BOT_CONFIG:-/app/bot.json}
+DATA=${DATA_ROOT:-/data}
+MARKET_DATA=${MARKET_DATA_ROOT:-$DATA}
 STATE=$DATA/state
 mkdir -p "$STATE"
 say() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
@@ -21,17 +22,37 @@ flock -n 9 || { say "a cycle is already running; leaving it alone"; exit 0; }
 say "settle (catch-up)"
 $BOT --config $BOTCFG settle || say "settle failed; continuing - the next cycle will pick it up"
 
+# Each venue owns its universe and state. Only bars/funding are shared.
+if [[ "$DATA" != "$MARKET_DATA" ]]; then
+  for part in bars funding; do
+    if [[ -L "$DATA/$part" ]]; then
+      [[ "$(readlink "$DATA/$part")" == "$MARKET_DATA/$part" ]] || { say "wrong shared $part target"; exit 1; }
+    elif [[ -e "$DATA/$part" ]]; then
+      say "$DATA/$part must be a link to shared market data"; exit 1
+    else
+      ln -s "$MARKET_DATA/$part" "$DATA/$part"
+    fi
+  done
+fi
 say "pull"
-$CP data-pull --config $CFG --data-root $DATA --days 8
+# Both venue schedules take this lock before updating shared partitions.
+(
+  flock 8
+  "$CP" data-pull --config "$CFG" --data-root "$MARKET_DATA" --days 8
+) 8>"$MARKET_DATA/market-data.lock"
 
 say "universe (venue-screened)"
 # Snapshots are append-only and never backfilled - that rule is what makes a
 # historical universe reconstruction honest. A cycle re-run on the same day is
 # not a violation of it, it is the idempotent case, so tolerate exactly that
 # one refusal and nothing else.
+MARKETS=$(mktemp "$STATE/markets.XXXXXX")
+BOOK=$(mktemp "$STATE/book.XXXXXX")
+trap 'rm -f "$MARKETS" "$BOOK"' EXIT
+"$BOT" --config "$BOTCFG" markets > "$MARKETS"
 if ! out=$($CP universe-rank --config $CFG --data-root $DATA \
       --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --step-days 1 \
-      --tradeable <($BOT --config $BOTCFG markets) 2>&1); then
+      --tradeable "$MARKETS" 2>&1); then
   case "$out" in
     *"already exists; snapshots are append-only"*)
       say "today's snapshot is already recorded; keeping it" ;;
@@ -42,9 +63,10 @@ else
 fi
 
 say "plan (frozen rank artefact, live book)"
+"$BOT" --config "$BOTCFG" book > "$BOOK"
 $CP plan --config $CFG --data-root $DATA \
   --as-of "$(date -u +%Y-%m-%d)T00:00:00Z" --for-execution \
-  --book <($BOT --config $BOTCFG book) --out "$STATE/plan.json"
+  --book "$BOOK" --out "$STATE/plan.json"
 
 # What the book would charge us for this plan, read before anything is sent.
 # The cost model's spread is a constant and its impact coefficient is assumed,

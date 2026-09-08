@@ -1,0 +1,15 @@
+{
+  "bot_id": "crypto-lighter",
+  "venue_id": "lighter",
+  "notes": "Lighter Standard paper experiment: public venue marks, native markets and depth; simulated market fills with zero fees and 2.2bp slippage. Funding, queueing and partial fills are not simulated.",
+  "state_dir": "/data/lighter/state",
+  "mode": "paper",
+  "feed": "venue",
+  "quote_currency": "USDC",
+  "initial_cash": "100000",
+  "taker_fee_bps": "0",
+  "maker_fee_bps": "0",
+  "slippage_bps": "2.2",
+  "max_plan_age_minutes": 120,
+  "cadence_hours": 24
+}

@@ -15,6 +15,7 @@ plan.workspace = true
 venue.workspace = true
 paper.workspace = true
 hyperliquid.workspace = true
+lighter.workspace = true
 ib = { path = "../ib" }
 rithmic = { path = "../rithmic" }
 async-trait.workspace = true

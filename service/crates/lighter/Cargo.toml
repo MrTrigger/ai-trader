@@ -1,0 +1,19 @@
+[package]
+name = "lighter"
+description = "Public Lighter perpetual market data for paper trading."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+venue.workspace = true
+async-trait.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "sync", "test-util"] }

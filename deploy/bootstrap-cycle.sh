@@ -15,7 +15,7 @@
 set -euo pipefail
 WINDOW_HOURS="${BOOTSTRAP_WINDOW_HOURS:-20}"
 BOT=/usr/local/bin/bot
-BOTCFG=/app/bot.json
+BOTCFG=${BOT_CONFIG:-/app/bot.json}
 say() { echo "[$(date -u +%H:%M:%SZ)] bootstrap: $*"; }
 
 if ! status=$("$BOT" --config "$BOTCFG" status 2>&1); then

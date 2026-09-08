@@ -1,61 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { Card } from "./Card";
 import { NavChart } from "./NavChart";
-import { Positions, type Position } from "./Positions";
+import { Positions } from "./Positions";
+import { fetchBook } from "../api/book";
 import { money, num, signed, tone } from "../lib/format";
 
-type Local = {
-  bot_id?: string;
-  control_state?: string;
-  controls_enabled?: boolean;
-  book?: {
-    nav?: string | number;
-    cash?: string | number;
-    total_pnl?: string | number;
-    unrealised_pnl?: string | number;
-    realised_pnl?: string | number;
-    fees_paid?: string | number;
-    gross_exposure?: string | number;
-    net_exposure?: string | number;
-    positions?: Position[];
-    fills_count?: number;
-  };
-  runs?: { recorded_at?: string; nav?: string | number; outcome?: string }[];
-  benchmark?: {
-    label: string;
-    points: [string, number][];
-  };
-  reconciliation?: { agrees?: boolean; explain?: string; ledger_entries?: number };
-  health?: { ok?: boolean; notes?: string[] };
-};
-
-/**
- * The book of a bot this api process wraps directly.
- *
- * Only this process can read it — it has the state dir — so the panel appears
- * for that bot and stays absent everywhere else, rather than showing empty
- * cards that imply missing data.
- *
- * `botId` is the page being viewed, and the panel refuses to render unless the
- * local view is OF that bot. It used to render for any runner-contract bot,
- * which meant /bot/futures-noise showed crypto-portfolio's positions under the
- * futures bot's name — the worst kind of wrong, because every number on it was
- * real.
- */
-export function LocalConsole({ botId, venue }: { botId?: string; venue?: string }) {
+export function LocalConsole({ botId, venue }: { botId: string; venue?: string }) {
   const q = useQuery({
-    queryKey: ["local"],
-    queryFn: async () => {
-      const r = await fetch("/api/state", { headers: { accept: "application/json" } });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = (await r.json()) as Local & { fleet_only?: boolean };
-      return j.fleet_only ? null : j;
-    },
+    queryKey: ["book", botId],
+    queryFn: () => fetchBook(botId),
     refetchInterval: 10_000,
     retry: false,
   });
 
   const s = q.data;
+  if (q.error) return <Card title="Book"><p className="text-[12px] text-faint">{q.error.message}</p></Card>;
   if (!s) return null;
   // A local view that cannot name its bot cannot prove it is the right one.
   if (!s.bot_id || (botId && s.bot_id !== botId)) return null;
@@ -70,7 +29,7 @@ export function LocalConsole({ botId, venue }: { botId?: string; venue?: string 
 
   return (
     <>
-      <Card title="Book" aside="as this process reads it">
+      <Card title="Book" aside="stored fills and marks">
         <div className="flex flex-wrap items-end justify-between gap-x-8 gap-y-4">
           <div>
             <p className="eyebrow mb-1.5">Net asset value</p>
@@ -94,7 +53,7 @@ export function LocalConsole({ botId, venue }: { botId?: string; venue?: string 
             runs={runs}
             initialCash={num(b.nav) - num(b.total_pnl)}
             now={num(b.nav)}
-            benchmark={s.benchmark}
+            benchmark={s.benchmark ?? undefined}
           />
         </div>
 
