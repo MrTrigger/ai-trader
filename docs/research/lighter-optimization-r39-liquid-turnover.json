@@ -1,0 +1,103 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:41:50.399488+00:00",
+  "output": "var/research/lighter-optimization-r39-liquid-turnover",
+  "hypothesis": "BTCETH selection improves return26.51%/Sharpe1.552 but stressedcostsconsume19.68percentagepoints. Fixed2x2 comparison: existing71feature versus8slowfeature native5seed models, each with existing0or20% same-side resize deadband. No refit or new thresholds; full modelcohort preserved, same100k andnative1%executioncap. Deadband never suppressesentries/exits/signchanges. Tests whether slow inputs or fewer smallresizes reduce turnover without sacrificing direction. R35slowmodel failed allassetfullperiod; this tests explicit interactionwithliquidassetselection, withallfourresultsretained.",
+  "candidates": [
+    {
+      "id": "btc-eth-full-daily",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-full-deadband",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-slow-daily",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r35-slow-features/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-slow-deadband",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r35-slow-features/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

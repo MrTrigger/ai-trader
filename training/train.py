@@ -37,12 +37,30 @@ PARAMS = {
 NUM_ROUNDS = 300
 
 
+MARKET_CONTEXT_CONTRACT = "btc-daily-raw-v1"
+MARKET_CONTEXT_FEATURES = ["mkt_btc_ret_7d", "mkt_btc_ret_30d", "mkt_btc_ret_90d", "mkt_btc_vol_30d"]
+
+
+def validate_market_context(manifest, features):
+    contract = manifest.get("market_context")
+    if contract is None:
+        if any(name.startswith("mkt_") for name in features):
+            raise ValueError("raw market features require an explicit market_context contract")
+        return
+    if contract != MARKET_CONTEXT_CONTRACT:
+        raise ValueError("unknown market_context contract")
+    if (len(features) <= 4 or features[-4:] != MARKET_CONTEXT_FEATURES
+            or any(not name.startswith("x_") for name in features[:-4])):
+        raise ValueError("market context requires the fixed four-feature suffix after ranked inputs")
+
+
 def load_matrix(path: Path, through: date, reward: str = "return"):
     with path.open(encoding="utf-8") as source:
         manifest = json.loads(next(source))
         if manifest.get("kind") != "manifest":
             raise ValueError("first matrix row is not the Rust feature manifest")
         features = manifest["features"]
+        validate_market_context(manifest, features)
         rows = [json.loads(line) for line in source if line.strip()]
     rows = [row for row in rows if date.fromisoformat(row["date"]) <= through]
     if len(rows) < 3_000:
@@ -97,6 +115,7 @@ def main() -> None:
         keep_ix = [i for i, f in enumerate(features) if f not in drop]
         features = [features[i] for i in keep_ix]
         x = x[:, keep_ix]
+        validate_market_context(manifest, features)
         print(f"dropped {len(drop)}, fitting on {len(features)} features")
 
     # TRAIN_SEEDS: fit N boosters differing only in their sampling seeds and
@@ -144,6 +163,8 @@ def main() -> None:
         "reward": args.reward,
         "tree_info": dump["tree_info"],
     }
+    if manifest.get("market_context") is not None:
+        document["market_context"] = manifest["market_context"]
     if manifest.get("target_contract"):
         for key in ("target_contract", "label_horizon_hours", "label_lag_hours"):
             document[key] = manifest[key]

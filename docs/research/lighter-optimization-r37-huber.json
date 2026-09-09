@@ -1,0 +1,77 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:24:37.740134+00:00",
+  "output": "var/research/lighter-optimization-r37-huber",
+  "hypothesis": "One limited gradient-clipping trial: fixed training-only p95 absolute initial residual sets Huber alpha. Compare native five-seed L2 control to native five-seed Huber with all rows, targets, features, hyperparameters and replay assumptions otherwise unchanged. No threshold search, L1 trial or row removal; not a claim that tails dominate.",
+  "training": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "weight": "equal",
+    "trees_per_seed": 300,
+    "reward": "per_risk_abs",
+    "through": "2025-11-24",
+    "objective": "huber",
+    "rank_transform": false,
+    "alpha": 0.13750992596765854,
+    "alpha_rule": "p95(abs(y - full training-label mean)), calculated in Rust on native training matrix only",
+    "alpha_source": "var/research/lighter-label-tail-diagnosis/report-final.json",
+    "alpha_source_sha256": "3ceb7ae4d2d6f13564f21df0f7ed39c185e3badb0b6e5dd03054c5faf5a3b598",
+    "matrix": "var/research/lighter-ranker-r31-native-hourly/matrix/matrix.jsonl",
+    "rows": 6486,
+    "features": 71,
+    "label_horizon_hours": 24,
+    "label_lag_hours": 1,
+    "label_timing": "D+01 through D+25",
+    "control_objective": "regression"
+  },
+  "candidates": [
+    {
+      "id": "native-ensemble-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-ensemble-huber",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r37-huber/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

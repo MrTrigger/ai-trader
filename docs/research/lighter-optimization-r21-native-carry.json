@@ -1,0 +1,82 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "After the frozen24h price model scores its unchangednormalizedcohort, adjust conviction for the same side by trailingnativefunding estimate. Estimate next24h longfundingcost=sum signed fractional rates over168hours[D-7d,D)/7. Favorablecarry increases conviction; adversecarry reducesit; neverflip or createcarry-onlysignals. Incompleteprelistingwarmup preservespriceconvictionwithwarning. Realizedfundingcash unchanged. Compare original and doubledriskmandates against matchedcontrols.",
+  "source_suite": "var/research/lighter-funding-r21-warmup/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r21-native-carry",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "price-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "native_funding_adjustment": false
+        }
+      }
+    },
+    {
+      "id": "price-control-double",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "native_funding_adjustment": false,
+          "target_gross_exposure": "1.60",
+          "turnover_budget": "1.00"
+        },
+        "limits": {
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_net_exposure": "0.20",
+          "max_cluster_exposure": "0.80",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    },
+    {
+      "id": "native-carry",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "native_funding_adjustment": true
+        }
+      }
+    },
+    {
+      "id": "native-carry-double",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "native_funding_adjustment": true,
+          "target_gross_exposure": "1.60",
+          "turnover_budget": "1.00"
+        },
+        "limits": {
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_net_exposure": "0.20",
+          "max_cluster_exposure": "0.80",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    }
+  ],
+  "coverage": "var/research/lighter-funding-r21-warmup/coverage.json",
+  "selection": "Record allfourpolicies central/stress. RequireSharpe>1.5,BTCoutperformance,materialreturnimprovement and reportlaterperiod/stress/actualrisk. Choose no model or multiplier fromresult; no nativefundingestimate added toNAV."
+}

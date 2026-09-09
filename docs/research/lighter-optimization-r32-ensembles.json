@@ -1,0 +1,102 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:59:45.508828+00:00",
+  "output": "var/research/lighter-optimization-r32-ensembles",
+  "hypothesis": "Reduce dependence on one stochastic bagging/feature-sampling realization by averaging five fixed seeds0..4 equally, never selecting the best seed. Fit the existing absolute71feature recipe for external and native hourly labels, compare each with its seed0control. Allotherhyperparameters/rows/dates/risk/execution unchanged. Twoensemble fits; no per-seed performance search.",
+  "training": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "weight": "equal",
+    "trees_per_seed": 300,
+    "reward": "per_risk_abs",
+    "through": "2025-11-24",
+    "objective": "regression",
+    "rank_transform": false
+  },
+  "candidates": [
+    {
+      "id": "external-single",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "external-ensemble",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-external/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-single",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r31-native-hourly/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-ensemble",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

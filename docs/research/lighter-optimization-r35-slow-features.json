@@ -1,0 +1,77 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:19:34.144364+00:00",
+  "output": "var/research/lighter-optimization-r35-slow-features",
+  "hypothesis": "Fixed feature ablation tests whether noisy short-horizon and microstructure inputs weaken the absolute daily model. Retain only asset cross-sectional7/30/90day returns and30dayvol plus corresponding raw BTC context. Same native6486rows/241dates, exact existing Rust feature values and targets, 5fixed equal seeds,300trees15leavesmin200 each, same execution/risk. No data-driven feature selection, no threshold search. Existing71feature model is matched control.",
+  "training": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "weight": "equal",
+    "trees_per_seed": 300,
+    "reward": "per_risk_abs",
+    "through": "2025-11-24",
+    "objective": "regression",
+    "rank_transform": false,
+    "features": [
+      "x_ret_7",
+      "x_ret_30",
+      "x_ret_90",
+      "x_vol_30",
+      "mkt_btc_ret_7d",
+      "mkt_btc_ret_30d",
+      "mkt_btc_ret_90d",
+      "mkt_btc_vol_30d"
+    ],
+    "matrix": "var/research/lighter-ranker-r31-native-hourly/matrix/matrix.jsonl"
+  },
+  "candidates": [
+    {
+      "id": "native-full-features",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-slow-features",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r35-slow-features/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

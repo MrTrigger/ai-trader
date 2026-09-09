@@ -1,0 +1,1251 @@
+{
+  "annualization": 365,
+  "experiments": [
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [
+          "Use trailing funding windows and retrain every fold."
+        ],
+        "expected_folds": null,
+        "family": "crypto-ranker",
+        "fold_dir": null,
+        "id": "crypto-funding-forward-invalid",
+        "initial_cash": null,
+        "notes": [
+          "Historical funding features included future rates. No replay metrics are imported from this invalid record.",
+          "Historical code and dataset snapshots are not available in this manifest."
+        ],
+        "sources": [
+          "docs/research/harness/dataset.py",
+          "docs/research/harness/ml_record.py",
+          "docs/research/harness/README.md"
+        ],
+        "status": "invalid",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/docs/research/harness/README.md": "674939675873003170eda91824d7b0411466552b8288a58a1b9e0a06a33d21ff",
+        "/home/magnus/dev/magnus/ai-trader/docs/research/harness/dataset.py": "b3ea119ba90159952382d5bbb2fcfa58d0da285a722197b9fdd1e95ea5f5134a",
+        "/home/magnus/dev/magnus/ai-trader/docs/research/harness/ml_record.py": "24ba77e562ba3091ebe7195d87429776eedb40f5eb2272c69d264359f0c56c33"
+      },
+      "start": null
+    },
+    {
+      "end": "2026-07-30",
+      "experiment": {
+        "corrections": [
+          "Superseded by the corrected settlement replay."
+        ],
+        "expected_folds": 9,
+        "family": "crypto-ranker",
+        "fold_dir": "var/research/wf-rank-2020-replay-base",
+        "id": "crypto-ranker-before-settlement",
+        "initial_cash": "100000",
+        "notes": [
+          "Ghost positions produced phantom short gains on delistings. Saved models and configurations identify this historical replay, but do not establish its historical source commit or data snapshot."
+        ],
+        "sources": [
+          "docs/research/settlement-correction.md",
+          "bin/replay-folds.sh"
+        ],
+        "status": "superseded",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 5.620631871504363,
+          "days": 237,
+          "end": "2021-05-12T00:00:00Z",
+          "execution": null,
+          "fold": 1,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 5.635432646655305,
+          "slippage_multiple": "1",
+          "start": "2020-09-18T00:00:00Z",
+          "steps": 237,
+          "total_return": "1.1825829937890039840412967041"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.8199456151985527,
+          "days": 237,
+          "end": "2022-01-04T00:00:00Z",
+          "execution": null,
+          "fold": 2,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.8276269128187947,
+          "slippage_multiple": "1",
+          "start": "2021-05-13T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.5310241677981425095471165928"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.0139740566619486,
+          "days": 237,
+          "end": "2022-08-29T00:00:00Z",
+          "execution": null,
+          "fold": 3,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.0198418038571555,
+          "slippage_multiple": "1",
+          "start": "2022-01-05T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.3514239347315288505838602799"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.7970904121669644,
+          "days": 237,
+          "end": "2023-04-23T00:00:00Z",
+          "execution": null,
+          "fold": 4,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.8032845056543312,
+          "slippage_multiple": "1",
+          "start": "2022-08-30T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.2003109686664654159639587225"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.8540484516979858,
+          "days": 237,
+          "end": "2023-12-16T00:00:00Z",
+          "execution": null,
+          "fold": 5,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.8599996599616784,
+          "slippage_multiple": "1",
+          "start": "2023-04-24T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.2471585156168613551606757873"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.2777991116378694,
+          "days": 237,
+          "end": "2024-08-09T00:00:00Z",
+          "execution": null,
+          "fold": 6,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.2800476335905768,
+          "slippage_multiple": "1",
+          "start": "2023-12-17T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.024582117961001952467511744"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.160750621919919,
+          "days": 237,
+          "end": "2025-04-03T00:00:00Z",
+          "execution": null,
+          "fold": 7,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.1669581203117647,
+          "slippage_multiple": "1",
+          "start": "2024-08-10T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.3555960865700710112576890204"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.3988612693001983,
+          "days": 237,
+          "end": "2025-11-26T00:00:00Z",
+          "execution": null,
+          "fold": 8,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.4056312662667665,
+          "slippage_multiple": "1",
+          "start": "2025-04-04T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.4244707389880367777883812779"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.9052630064974816,
+          "days": 246,
+          "end": "2026-07-30T00:00:00Z",
+          "execution": null,
+          "fold": 9,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.9084072928822514,
+          "slippage_multiple": "1",
+          "start": "2025-11-27T00:00:00Z",
+          "steps": 246,
+          "total_return": "0.1566501120741827311983877835"
+        }
+      ],
+      "mean_fold_daily_sharpe": 2.2053738240650316,
+      "mean_saved_fold_sharpe": 2.211914426888736,
+      "pooled_daily_sharpe": 2.1441524870995723,
+      "pooled_days": 2142,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/bin/replay-folds.sh": "dd16d25c8879386fbb861fea81d09a60d4044699aa9f47067b62dcc8a29f53e0",
+        "/home/magnus/dev/magnus/ai-trader/docs/research/settlement-correction.md": "f0bf516d00289985a8c23c0cef492c9fadd597102c77decb28dbe688c80a4bb7",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-1.toml": "bc19af6dfd876adc7685e530fca838f060d957fd69dd247ae0bbc503783e54d0",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-2.toml": "c3ad7237279da9a67541fb0a98392061063a25c3b397b6f1e33443d4b3d5817d",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-3.toml": "203dc60e3aabe687b377bfa9ab5a952ce65ab8b553b3525231dc364eedf3ceac",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-4.toml": "121a5b6acb265cb972ce57cf55d0a16af15095c0afc07568f08f746b28457442",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-5.toml": "385cb98f81ed2bb747196e70769d79d1c48ae8fdb2bc26a3ed7e0346cde84dea",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-6.toml": "ced65c13bef83e87637a8ebfef685e05572058536266016339b2442b29d75492",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-7.toml": "75f4605e35f802a55ac3f92cca767ee5546f5a2053b245931902715c94592e3e",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-8.toml": "41675c6ad46f2dae2a90b9bbb760b55a2421fb1933179fc8496594a08f18abdc",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/config-9.toml": "91232e41f8b560f13699015ac01382cc82967180ee6395ba1c7b293d3f328c5c",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-1.json": "b8166f61feaf5d1386e79b919b779ecfbef43c59aff113f86c95e5e3332e99d6",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-2.json": "47a779e9b0104748ea4b2c33c4e3d5a789e7a05b817f427802be58b00de9f08b",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-3.json": "591793a4f7e48d82fba44c6377bac04c664f07b0dd668afb3eb1d754570fc235",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-4.json": "0e6bbb2c3fe35dc3a143cabe5b664520713e0f1ff1f5a758c9deff6f2d6685f2",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-5.json": "bb66957828e164cfc9f2d1cbe321ad7f75c98c368dfbb7c024162dabd6d765e9",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-6.json": "0f7a4429d2b7cd23fb61f19da76ad79644e45c726d9138ae6ece631aaa2f0c95",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-7.json": "12ba3e1847c48767c6e1cb9fd62b74b624e4f8b85f488b960bb483e2430bb97a",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-8.json": "3bad361c52825630e0d4c53c813ab63e03f7c57bb0cd843337a34743ef927d50",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-base/fold-9.json": "a9b24ffadde3fe02742636849e7c1399c19bf62f516a9b5183064e8936992fda",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-1.json": "6f3d179060cce1738361ee73603cb68b639a695afdb981a62b7299d0696e1afb",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-2.json": "1a69b2929b1b579afb00b4e656f3b6ec72913fef98eb692369c4b8d022eae564",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-3.json": "80215a9e86528b682c72b27f7cc0d5d3de2b4120182dd66833bb2b146d9fe43c",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-4.json": "72be5a5b17d879ccc6fbf400aa4f84f32cfe8d18e587fd472cf190d9aa800250",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-5.json": "6f0149770cc7c479222d110c45b772b3657269c7a128061e7799277b161bfc1e",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-6.json": "1ca6348bf6e1e83a696f734adfd0282746804be56806e58aa7641234b776ad48",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-7.json": "a105fb76b5db1b60749d23d9d1a6a1eba510408aa849516331657901ea6db97b",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-8.json": "e8238c1c1b7560ab3e2757e0eb215cf157e9709b94fcec9c5a9cde8340fd9aff",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-9.json": "7d04d11c07c7aa1fea34a186ef91f971a5dd9b98ae69fd87f6c611cd1b25ce86"
+      },
+      "start": "2020-09-18"
+    },
+    {
+      "end": "2026-07-30",
+      "experiment": {
+        "corrections": [
+          "Trailing funding features, realized funding, turnover exemption and settlement correction are documented in the research record."
+        ],
+        "expected_folds": 9,
+        "family": "crypto-ranker",
+        "fold_dir": "var/research/wf-rank-2020-replay-settle",
+        "id": "crypto-ranker-settlement-corrected",
+        "initial_cash": "100000",
+        "notes": [
+          "Corrected comparator, not fresh holdout evidence. Earlier research repeatedly inspected these dates.",
+          "Initial cash comes from bin/replay-folds.sh. Old reports omit first-step trading costs in saved metrics.",
+          "Historical trial count is unknown; do not substitute the curated register row count."
+        ],
+        "sources": [
+          "docs/research/settlement-correction.md",
+          "docs/research/turnover-cap-exemption.md",
+          "bin/replay-folds.sh"
+        ],
+        "status": "development",
+        "supersedes": [
+          "crypto-ranker-before-settlement",
+          "crypto-funding-forward-invalid"
+        ],
+        "trial_count": null
+      },
+      "folds": [
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 5.551560248364514,
+          "days": 237,
+          "end": "2021-05-12T00:00:00Z",
+          "execution": null,
+          "fold": 1,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 5.566219517111383,
+          "slippage_multiple": "1",
+          "start": "2020-09-18T00:00:00Z",
+          "steps": 237,
+          "total_return": "1.1237742986649729040230013056"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.8199456151985527,
+          "days": 237,
+          "end": "2022-01-04T00:00:00Z",
+          "execution": null,
+          "fold": 2,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.8276269128187947,
+          "slippage_multiple": "1",
+          "start": "2021-05-13T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.5310241677981425095471165928"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.9713799843732003,
+          "days": 237,
+          "end": "2022-08-29T00:00:00Z",
+          "execution": null,
+          "fold": 3,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.977363973266176,
+          "slippage_multiple": "1",
+          "start": "2022-01-05T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.2991871908711074819693880321"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.5567713841667268,
+          "days": 237,
+          "end": "2023-04-23T00:00:00Z",
+          "execution": null,
+          "fold": 4,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.5624139563450965,
+          "slippage_multiple": "1",
+          "start": "2022-08-30T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.1720342124500545974155291437"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.8540484516979858,
+          "days": 237,
+          "end": "2023-12-16T00:00:00Z",
+          "execution": null,
+          "fold": 5,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.8599996599616784,
+          "slippage_multiple": "1",
+          "start": "2023-04-24T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.2471585156168613551606757873"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.2777991116378694,
+          "days": 237,
+          "end": "2024-08-09T00:00:00Z",
+          "execution": null,
+          "fold": 6,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.2800476335905768,
+          "slippage_multiple": "1",
+          "start": "2023-12-17T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.024582117961001952467511744"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.6950725366013966,
+          "days": 237,
+          "end": "2025-04-03T00:00:00Z",
+          "execution": null,
+          "fold": 7,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.7003457470171472,
+          "slippage_multiple": "1",
+          "start": "2024-08-10T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.2507570910887609214404148945"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.3988612693001983,
+          "days": 237,
+          "end": "2025-11-26T00:00:00Z",
+          "execution": null,
+          "fold": 8,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.4056312662667665,
+          "slippage_multiple": "1",
+          "start": "2025-04-04T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.4244707389880367777883812779"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.8309776761214058,
+          "days": 246,
+          "end": "2026-07-30T00:00:00Z",
+          "execution": null,
+          "fold": 9,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.8339642401290939,
+          "slippage_multiple": "1",
+          "start": "2025-11-27T00:00:00Z",
+          "steps": 246,
+          "total_return": "0.1407598533482584219066240082"
+        }
+      ],
+      "mean_fold_daily_sharpe": 2.1062684752735388,
+      "mean_saved_fold_sharpe": 2.112623656278524,
+      "pooled_daily_sharpe": 2.0444303191957216,
+      "pooled_days": 2142,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/bin/replay-folds.sh": "dd16d25c8879386fbb861fea81d09a60d4044699aa9f47067b62dcc8a29f53e0",
+        "/home/magnus/dev/magnus/ai-trader/docs/research/settlement-correction.md": "f0bf516d00289985a8c23c0cef492c9fadd597102c77decb28dbe688c80a4bb7",
+        "/home/magnus/dev/magnus/ai-trader/docs/research/turnover-cap-exemption.md": "3d762ee0ccd3817103aae5dcdd5ea3649c6066b89a1fdcf7bf13f632dde50376",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-1.toml": "bc19af6dfd876adc7685e530fca838f060d957fd69dd247ae0bbc503783e54d0",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-2.toml": "c3ad7237279da9a67541fb0a98392061063a25c3b397b6f1e33443d4b3d5817d",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-3.toml": "203dc60e3aabe687b377bfa9ab5a952ce65ab8b553b3525231dc364eedf3ceac",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-4.toml": "121a5b6acb265cb972ce57cf55d0a16af15095c0afc07568f08f746b28457442",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-5.toml": "385cb98f81ed2bb747196e70769d79d1c48ae8fdb2bc26a3ed7e0346cde84dea",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-6.toml": "ced65c13bef83e87637a8ebfef685e05572058536266016339b2442b29d75492",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-7.toml": "75f4605e35f802a55ac3f92cca767ee5546f5a2053b245931902715c94592e3e",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-8.toml": "41675c6ad46f2dae2a90b9bbb760b55a2421fb1933179fc8496594a08f18abdc",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/config-9.toml": "91232e41f8b560f13699015ac01382cc82967180ee6395ba1c7b293d3f328c5c",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-1.json": "33664b6e6f82da5d842625f5e452638380a3b9c9ab766c328d15eeed6911f58d",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-2.json": "47a779e9b0104748ea4b2c33c4e3d5a789e7a05b817f427802be58b00de9f08b",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-3.json": "93a55291203f829db3cfd849eff53c38faf05832e3baf9a3bb8035575ecc3783",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-4.json": "891b296ffe23082e9ecc43280220b1dbcc114848a94205e39d614355e9adb448",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-5.json": "bb66957828e164cfc9f2d1cbe321ad7f75c98c368dfbb7c024162dabd6d765e9",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-6.json": "0f7a4429d2b7cd23fb61f19da76ad79644e45c726d9138ae6ece631aaa2f0c95",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-7.json": "16d5b886d202d0e030f2a2b84254e348ff4780f22d9db455d61cbaccde4a9337",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-8.json": "3bad361c52825630e0d4c53c813ab63e03f7c57bb0cd843337a34743ef927d50",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020-replay-settle/fold-9.json": "8b19cc11d2c06642f0671c8920ad8a8aac5df95fc15c6d34d7acb6a72cd5a2c7",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-1.json": "6f3d179060cce1738361ee73603cb68b639a695afdb981a62b7299d0696e1afb",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-2.json": "1a69b2929b1b579afb00b4e656f3b6ec72913fef98eb692369c4b8d022eae564",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-3.json": "80215a9e86528b682c72b27f7cc0d5d3de2b4120182dd66833bb2b146d9fe43c",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-4.json": "72be5a5b17d879ccc6fbf400aa4f84f32cfe8d18e587fd472cf190d9aa800250",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-5.json": "6f0149770cc7c479222d110c45b772b3657269c7a128061e7799277b161bfc1e",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-6.json": "1ca6348bf6e1e83a696f734adfd0282746804be56806e58aa7641234b776ad48",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-7.json": "a105fb76b5db1b60749d23d9d1a6a1eba510408aa849516331657901ea6db97b",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-8.json": "e8238c1c1b7560ab3e2757e0eb215cf157e9709b94fcec9c5a9cde8340fd9aff",
+        "/home/magnus/dev/magnus/ai-trader/var/research/wf-rank-2020/model-9.json": "7d04d11c07c7aa1fea34a186ef91f971a5dd9b98ae69fd87f6c611cd1b25ce86"
+      },
+      "start": "2020-09-18"
+    },
+    {
+      "end": "2026-07-30",
+      "experiment": {
+        "corrections": [],
+        "expected_folds": 9,
+        "family": "crypto-directional",
+        "fold_dir": "var/research/directional-r2-v6",
+        "id": "crypto-directional-r2-v6",
+        "initial_cash": "100000",
+        "notes": [
+          "V6 failed the benchmark confidence gate. Rounds reused the ranker's evaluation calendar.",
+          "The design records 13 counted trials across three rounds; these two selected rows are not that complete search ledger."
+        ],
+        "sources": [
+          "docs/crypto-directional-design.md",
+          "bin/replay-folds.sh"
+        ],
+        "status": "rejected",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 3.8153971057627087,
+          "days": 237,
+          "end": "2021-05-12T00:00:00Z",
+          "execution": null,
+          "fold": 1,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 3.8244329049037393,
+          "slippage_multiple": "1",
+          "start": "2020-09-18T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.5016821608202069606452176447"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.08486451694568725,
+          "days": 237,
+          "end": "2022-01-04T00:00:00Z",
+          "execution": null,
+          "fold": 2,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.08588455083154471,
+          "slippage_multiple": "1",
+          "start": "2021-05-13T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.0020408835882069619656811451"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.6894882045100913,
+          "days": 237,
+          "end": "2022-08-29T00:00:00Z",
+          "execution": null,
+          "fold": 3,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.6916730219791949,
+          "slippage_multiple": "1",
+          "start": "2022-01-05T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.06749656055996308186042908"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": -0.32625600757137857,
+          "days": 237,
+          "end": "2023-04-23T00:00:00Z",
+          "execution": null,
+          "fold": 4,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": -0.32591739877799186,
+          "slippage_multiple": "1",
+          "start": "2022-08-30T00:00:00Z",
+          "steps": 237,
+          "total_return": "-0.0356720782819669599607619683"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 2.0336921547725724,
+          "days": 237,
+          "end": "2023-12-16T00:00:00Z",
+          "execution": null,
+          "fold": 5,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 2.038838189730765,
+          "slippage_multiple": "1",
+          "start": "2023-04-24T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.1960560641147516484609231999"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.7283934659761511,
+          "days": 237,
+          "end": "2024-08-09T00:00:00Z",
+          "execution": null,
+          "fold": 6,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.7315061149562112,
+          "slippage_multiple": "1",
+          "start": "2023-12-17T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.0647185413627076298366292298"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.366300138559454,
+          "days": 237,
+          "end": "2025-04-03T00:00:00Z",
+          "execution": null,
+          "fold": 7,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.3702151925729311,
+          "slippage_multiple": "1",
+          "start": "2024-08-10T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.1328449180874454718338355495"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": -0.8658738475476553,
+          "days": 237,
+          "end": "2025-11-26T00:00:00Z",
+          "execution": null,
+          "fold": 8,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": -0.866438056210958,
+          "slippage_multiple": "1",
+          "start": "2025-04-04T00:00:00Z",
+          "steps": 237,
+          "total_return": "-0.0685462168238546364461443984"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.7067835290047189,
+          "days": 246,
+          "end": "2026-07-30T00:00:00Z",
+          "execution": null,
+          "fold": 9,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.7092033935779035,
+          "slippage_multiple": "1",
+          "start": "2025-11-27T00:00:00Z",
+          "steps": 246,
+          "total_return": "0.0731759818431742666660144827"
+        }
+      ],
+      "mean_fold_daily_sharpe": 0.9147543622680386,
+      "mean_saved_fold_sharpe": 0.9177108792848157,
+      "pooled_daily_sharpe": 1.0036319691543,
+      "pooled_days": 2142,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/bin/replay-folds.sh": "dd16d25c8879386fbb861fea81d09a60d4044699aa9f47067b62dcc8a29f53e0",
+        "/home/magnus/dev/magnus/ai-trader/docs/crypto-directional-design.md": "5a6c71b16fb5de3356d7603d49b89ad18785d69832ee210818d830245b61a278",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-1.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-2.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-3.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-4.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-5.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-6.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-7.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-8.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/config-9.toml": "1144c43226d56eba6d5e3b742285307f5e2804ec991d2786650ac39efe21f12f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-1.json": "c19873e23a81be2c13c0122bf6489b936285bfdb9cb4e33b31a85a0e8e811204",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-2.json": "a00fece501151db63a69ce919b88fec44fe9f27838900067f57723358bc30550",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-3.json": "2f08dd1e48c15ba031ef1bfd9c645c1492de9b43a53c74488a87daa82bc4755f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-4.json": "a5e6c82963158dd8134220d92dec975ccfc51046f123b2c4b79d8ccb958523d2",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-5.json": "e6b2eea545d8329b19e2fd2d7ce52ff9fc18733ea38a5d90de29ace166f0ebcb",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-6.json": "85043411b7e2866ac84a2b614dd25e1a86149edad253c87b14b571365746378f",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-7.json": "ffce6662a936d73826acd07fc8f95ceca9be448760484917b8659258d0e74859",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-8.json": "fde16474ef3346b343264dc5f89935f3ce189a677685ca9ced6673235af81ac2",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r2-v6/fold-9.json": "aca8d78ca7063b4aa4baad0eab51a647615473a988997dca0461f5d0262f2693"
+      },
+      "start": "2020-09-18"
+    },
+    {
+      "end": "2026-07-30",
+      "experiment": {
+        "corrections": [],
+        "expected_folds": 9,
+        "family": "crypto-directional",
+        "fold_dir": "var/research/directional-r3-p60n10",
+        "id": "crypto-directional-r3-p60n10",
+        "initial_cash": "100000",
+        "notes": [
+          "Selected from the third-round breadth grid and failed the benchmark confidence gate.",
+          "The same later dates had been inspected in previous rounds; this record does not call them a fresh holdout."
+        ],
+        "sources": [
+          "docs/crypto-directional-design.md",
+          "bin/replay-folds.sh"
+        ],
+        "status": "rejected",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 3.9289215495692593,
+          "days": 237,
+          "end": "2021-05-12T00:00:00Z",
+          "execution": null,
+          "fold": 1,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 3.938213900000935,
+          "slippage_multiple": "1",
+          "start": "2020-09-18T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.533749293150634885833097785"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": -0.044901720447426484,
+          "days": 237,
+          "end": "2022-01-04T00:00:00Z",
+          "execution": null,
+          "fold": 2,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": -0.04338581074472394,
+          "slippage_multiple": "1",
+          "start": "2021-05-13T00:00:00Z",
+          "steps": 237,
+          "total_return": "-0.0078539553098081159455341936"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.8964568452287717,
+          "days": 237,
+          "end": "2022-08-29T00:00:00Z",
+          "execution": null,
+          "fold": 3,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.8991191070027462,
+          "slippage_multiple": "1",
+          "start": "2022-01-05T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.0932560892501866201704252228"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": -0.2918967634700993,
+          "days": 237,
+          "end": "2023-04-23T00:00:00Z",
+          "execution": null,
+          "fold": 4,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": -0.2914783909180175,
+          "slippage_multiple": "1",
+          "start": "2022-08-30T00:00:00Z",
+          "steps": 237,
+          "total_return": "-0.0334003355287886485575346671"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.9718230286343095,
+          "days": 237,
+          "end": "2023-12-16T00:00:00Z",
+          "execution": null,
+          "fold": 5,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.9768500377385945,
+          "slippage_multiple": "1",
+          "start": "2023-04-24T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.1956778169959000177770588266"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.6000146321149682,
+          "days": 237,
+          "end": "2024-08-09T00:00:00Z",
+          "execution": null,
+          "fold": 6,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.6026628483847646,
+          "slippage_multiple": "1",
+          "start": "2023-12-17T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.0538622159108764574145325116"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 1.3038303236178417,
+          "days": 237,
+          "end": "2025-04-03T00:00:00Z",
+          "execution": null,
+          "fold": 7,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 1.307685289841226,
+          "slippage_multiple": "1",
+          "start": "2024-08-10T00:00:00Z",
+          "steps": 237,
+          "total_return": "0.1299631774287781624966856157"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": -1.0782452898880506,
+          "days": 237,
+          "end": "2025-11-26T00:00:00Z",
+          "execution": null,
+          "fold": 8,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": -1.0793179361365153,
+          "slippage_multiple": "1",
+          "start": "2025-04-04T00:00:00Z",
+          "steps": 237,
+          "total_return": "-0.0901970942680680175542880261"
+        },
+        {
+          "attribution": {
+            "reason": "saved replay has no attribution",
+            "status": "unavailable"
+          },
+          "daily_sharpe": 0.6619785586388842,
+          "days": 246,
+          "end": "2026-07-30T00:00:00Z",
+          "execution": null,
+          "fold": 9,
+          "initial_cash": "100000",
+          "replay_metadata": null,
+          "replay_schema_version": null,
+          "saved_sharpe": 0.6641376613657098,
+          "slippage_multiple": "1",
+          "start": "2025-11-27T00:00:00Z",
+          "steps": 246,
+          "total_return": "0.0664754022950620943775585002"
+        }
+      ],
+      "mean_fold_daily_sharpe": 0.8831090182220511,
+      "mean_saved_fold_sharpe": 0.8860540785038576,
+      "pooled_daily_sharpe": 0.9770621849349983,
+      "pooled_days": 2142,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/bin/replay-folds.sh": "dd16d25c8879386fbb861fea81d09a60d4044699aa9f47067b62dcc8a29f53e0",
+        "/home/magnus/dev/magnus/ai-trader/docs/crypto-directional-design.md": "5a6c71b16fb5de3356d7603d49b89ad18785d69832ee210818d830245b61a278",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-1.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-2.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-3.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-4.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-5.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-6.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-7.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-8.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/config-9.toml": "faffc016f84f605b84e9da858bd448b251d1a2bcf53b474859afc63598a454ee",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-1.json": "7e3ff27c53303ae082a3d86a135044e41e098e24bd79b42265c9799800311477",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-2.json": "87bf998af8c8fe23f9cb325970ca34af6ce093b364491a0876a85d55e0bc6f80",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-3.json": "0bc82f304fd6e970fa40ff5827d9ff3006bdda32a95c1a6bc9ee13ed4166b683",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-4.json": "a8d9483b7691ee3a50c356c022ccedff9e631ff97df41c4fe9a5963d25051239",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-5.json": "cf158137866bc797c2dcd045a5b2e438b6a69609b55ef6816fe7a7ea566ccac2",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-6.json": "d36f2d6dc587bdae6d5c981f68d72c03c01a627940e38872a622db78611d5393",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-7.json": "621731956b0db26fa98889554dde6ee0d421ff9764eb71eca34437c18f6f2708",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-8.json": "11914911e40d3d5e282e26cef34b1b558c83160711e78e7ef7de315c1ad42606",
+        "/home/magnus/dev/magnus/ai-trader/var/research/directional-r3-p60n10/fold-9.json": "0d6b9d62fe451e619d4d8d06f48135c0b68c2bc6ed96ed5da7182069f89444ab"
+      },
+      "start": "2020-09-18"
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [
+          "Run 4 uses the corrected publication-time join."
+        ],
+        "expected_folds": null,
+        "family": "crypto-scalper",
+        "fold_dir": null,
+        "id": "crypto-scalper-runs-1-to-3-invalid",
+        "initial_cash": null,
+        "notes": [
+          "Runs 1 through 3 used metrics stamped at window start as if already available, leaking five minutes. No compatible NAV series is imported."
+        ],
+        "sources": [
+          "docs/crypto-scalper-STATUS.md",
+          "docs/scalper-gate-run-1.md",
+          "docs/scalper-gate-run-2.md",
+          "docs/scalper-gate-run-4.md"
+        ],
+        "status": "invalid",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/docs/crypto-scalper-STATUS.md": "9e686b3ba21b6c8e37a00652965123d69b5d4875f8eae6d9e04b2bd7a950336d",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-1.md": "d5009c8c3b58984ef7d9961fdb309c1effd85f9bbeea71e1dfe16406949a1509",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-2.md": "5f8ff3c66d47e2cfd6e1189db7c148647a72c40b58436ef0f1fbbc7d35d3edfb",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-4.md": "3a7224d2bda9a8b743980b9064dee520f6a269c4c4f44c3c0abae519382be8a4"
+      },
+      "start": null
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [],
+        "expected_folds": null,
+        "family": "crypto-scalper",
+        "fold_dir": null,
+        "id": "crypto-scalper-run-4-clean",
+        "initial_cash": null,
+        "notes": [
+          "First causally clean run failed the registered gate at all three horizons. Source-only record; summary does not convert scalper trade metrics into crypto daily NAV metrics."
+        ],
+        "sources": [
+          "docs/scalper-gate-run-4.md",
+          "data/reports/gate-run-4-h15.json",
+          "data/reports/gate-run-4-h30.json",
+          "data/reports/gate-run-4-h60.json"
+        ],
+        "status": "rejected",
+        "supersedes": [
+          "crypto-scalper-runs-1-to-3-invalid"
+        ],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-4-h15.json": "db05a09f2ca1536098244c0b4447a3131bf6b503af396cebd8e4589bd13af8ec",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-4-h30.json": "6c4b76e095eeb416b2bc30d7eb6f3645acb5e48361894fda2c2d3c41fda1181c",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-4-h60.json": "81ee5b0a846e61f5d37419aa7dad3695db190e40546cae3d8d66627c1bf68ebe",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-4.md": "3a7224d2bda9a8b743980b9064dee520f6a269c4c4f44c3c0abae519382be8a4"
+      },
+      "start": null
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [],
+        "expected_folds": null,
+        "family": "crypto-scalper",
+        "fold_dir": null,
+        "id": "crypto-scalper-run-5-tick-features",
+        "initial_cash": null,
+        "notes": [
+          "Own-asset tick features and documented maker variants failed to rescue the clean baseline. Run 5b data corrections are retained in the gate record."
+        ],
+        "sources": [
+          "docs/scalper-gate-run-5.md",
+          "data/reports/gate-run-5b-h15.json",
+          "data/reports/gate-run-5b-h30.json",
+          "data/reports/gate-run-5b-h60.json"
+        ],
+        "status": "rejected",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-5b-h15.json": "88ac5b05c524a8ff8501643c4e04be7abb2d30cc2b95fd9394b5c4eb89771c83",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-5b-h30.json": "0eba53c36b9f1db134840df64dd5e657f58f34dedfae1aad1bd529a788a4c8b4",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-5b-h60.json": "50c4ad4f9b8e45a5a5acecbd46066cee95e68155a85ffed5a245756efb064bb3",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-5.md": "b17f51f2c7c9df207c992c859813bc1b496a0b1143bc7ad9d9b565e7b760607f"
+      },
+      "start": null
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [],
+        "expected_folds": null,
+        "family": "crypto-scalper",
+        "fold_dir": null,
+        "id": "crypto-scalper-run-6-btc-context",
+        "initial_cash": null,
+        "notes": [
+          "Cross-asset BTC tick context failed the gate. Source-only record includes both documented program variants."
+        ],
+        "sources": [
+          "docs/scalper-gate-run-6.md",
+          "data/reports/gate-run-6-h15.json",
+          "data/reports/gate-run-6-h30.json",
+          "data/reports/gate-run-6-h60.json",
+          "data/reports/gate-run-6b-h15.json",
+          "data/reports/gate-run-6b-h30.json",
+          "data/reports/gate-run-6b-h60.json"
+        ],
+        "status": "rejected",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6-h15.json": "6a9c6b7f82c95182908d4a44662c7e66eabef2050dbc51d59e04a280d3126d52",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6-h30.json": "27ab312ad533baee153f8036b073e21433634b08531145ea5116f029cbe9ebdd",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6-h60.json": "9a9d816e59659e2fed8667c28e7677cc8e39251dfbc0c95fa856eed602bd716d",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6b-h15.json": "4a0a2ccd5d1dc589aee1c4e8a06d078348d3fc4b4e6e2a12685ff330b477c627",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6b-h30.json": "dcf5b325e18a269d81c0fa48d89b036432434ed1a1d9398ddc49fe70d7c48ac1",
+        "/home/magnus/dev/magnus/ai-trader/data/reports/gate-run-6b-h60.json": "f54cb19683dda3ce1827e628bcdd20e53bae071743cb777aa8b1206c5f261b8f",
+        "/home/magnus/dev/magnus/ai-trader/docs/scalper-gate-run-6.md": "b5fc018e44ddb781b9f10ddca9399949134a0b24c5567d68f73486704e1ed465"
+      },
+      "start": null
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [],
+        "expected_folds": null,
+        "family": "stockholm-equities",
+        "fold_dir": null,
+        "id": "stockholm-exposed-fold-research",
+        "initial_cash": null,
+        "notes": [
+          "Corrected lean baseline reversed in later diagnostics; richer features and rolling fits did not repair the gate result. Dates are exposed development evidence.",
+          "Source-only record: the Stockholm report schema is not imported into crypto daily NAV metrics. New quarterly and inactive-listing data remain prerequisites for further comparisons."
+        ],
+        "sources": [
+          "docs/stockholm-reward-loss-study.md",
+          "docs/stockholm-portfolio-design.md",
+          "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-base.json",
+          "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-stress.json",
+          "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/fold-plan.json",
+          "var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/model-1.json"
+        ],
+        "status": "rejected",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/docs/stockholm-portfolio-design.md": "3596a2d44353ae55ad29b944fd474b87a74e86ee9225df3f00531b576c97f2be",
+        "/home/magnus/dev/magnus/ai-trader/docs/stockholm-reward-loss-study.md": "a51b4d4f842194e280cd475144ed9dcf448046345a31983f9a352a8c4f57ce96",
+        "/home/magnus/dev/magnus/ai-trader/var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/fold-plan.json": "0ab7b50ff666c69ec655414092499c60030c82485eab2ac433f688744b5aa641",
+        "/home/magnus/dev/magnus/ai-trader/var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/model-1.json": "321745a0e973b5e4c5ecebcc93b09acc7343f7cb0a6679ed95b074ed5d0c0166",
+        "/home/magnus/dev/magnus/ai-trader/var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-base.json": "4820b636ef341a5b905d2686fee9cdb32f830899c594302431e6555e72950a1c",
+        "/home/magnus/dev/magnus/ai-trader/var/stockholm/baseline-ridge-20d-membership-prenorm-v4-rolling504-pseudo-holdout/report-stress.json": "d54cd971038c1cf24f61628cce75d5d59e8db7c19b718c78e604787713b69b4d"
+      },
+      "start": null
+    },
+    {
+      "end": null,
+      "experiment": {
+        "corrections": [],
+        "expected_folds": null,
+        "family": "nq-futures",
+        "fold_dir": null,
+        "id": "nq-four-sleeve-external-ledger",
+        "initial_cash": null,
+        "notes": [
+          "Round 13 of the sibling ledger reports the four-sleeve modern-era book at Sharpe 1.0. This register records an unaudited comparator, not a deployment-state declaration.",
+          "No aligned daily return series or fresh reproduction is supplied. Joint crypto correlation and drawdown remain unmeasured."
+        ],
+        "sources": [
+          "docs/futures-bot-proposal.md",
+          "../trading-journal/backtest/lab/sleeve_screens.py",
+          "../trading-journal/docs/research-plan.md"
+        ],
+        "status": "development",
+        "supersedes": [],
+        "trial_count": null
+      },
+      "folds": [],
+      "mean_fold_daily_sharpe": null,
+      "mean_saved_fold_sharpe": null,
+      "pooled_daily_sharpe": null,
+      "pooled_days": 0,
+      "sha256": {
+        "/home/magnus/dev/magnus/ai-trader/../trading-journal/backtest/lab/sleeve_screens.py": "c853136d2e62424d738d2b32ef8417277627ce6e3d3f56858947e33a36597bfd",
+        "/home/magnus/dev/magnus/ai-trader/../trading-journal/docs/research-plan.md": "95367d19055f644a8bf3d5310fe29ab05156fb1a04b578b63417d3de660829ad",
+        "/home/magnus/dev/magnus/ai-trader/docs/futures-bot-proposal.md": "871ac242d0716bb8c75c2b9bbe335179626549da6dc56bc072566f71a7400fff"
+      },
+      "start": null
+    }
+  ],
+  "limitations": [
+    "Statuses and trial counts are declarations, never inferred promotion.",
+    "Hashes identify supplied artifacts, not an unavailable historical code commit or data snapshot.",
+    "Shared dates identify reused evidence, not independent validation.",
+    "This curated register is not an exhaustive count of all searches."
+  ],
+  "manifest_sha256": "4ea08ea0cc7e87af2f1498de112916e8efa0c5e4d20e210e8f12a1b7c434bb0e",
+  "method": "Compound decision returns by UTC date; include first step versus initial cash; pool nonoverlapping fold days; sample standard deviation; zero-variance Sharpe is null.",
+  "reused_evidence": [
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-ranker-before-settlement",
+        "crypto-ranker-settlement-corrected"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    },
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-ranker-before-settlement",
+        "crypto-directional-r2-v6"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    },
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-ranker-before-settlement",
+        "crypto-directional-r3-p60n10"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    },
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-ranker-settlement-corrected",
+        "crypto-directional-r2-v6"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    },
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-ranker-settlement-corrected",
+        "crypto-directional-r3-p60n10"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    },
+    {
+      "end": "2026-07-30",
+      "experiments": [
+        "crypto-directional-r2-v6",
+        "crypto-directional-r3-p60n10"
+      ],
+      "overlapping_days": 2142,
+      "start": "2020-09-18",
+      "status": "reused_evaluation_dates"
+    }
+  ],
+  "schema_version": 1
+}

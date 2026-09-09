@@ -1,0 +1,21 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "LockedR22candidate continuation. No policy/model/riskparameterchanges afterlock. Verifyexact246dayprefix thenevaluate38newdays usingcontinuousNAV, neverrestartcash.",
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-locked-confirmation/config.toml",
+  "output": "var/research/lighter-confirmation-replay",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "locked-price-ranker",
+      "execution": {
+        "delay_hours": 1
+      }
+    }
+  ],
+  "lock": "var/research/lighter-locked-confirmation/lock.json",
+  "lock_sha256": "edebd7cb7067afa3bc9d919344b1a80da7935026354a08b9137e1db7b92d74f6"
+}

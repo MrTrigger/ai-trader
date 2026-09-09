@@ -1,0 +1,51 @@
+{
+  "declared_at": "2026-09-08T20:10:42.234625+00:00",
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "hypothesis": "Condition the unchanged cross-sectional ranker on four raw completed BTC regime inputs appended after rank normalization: 7/30/90-day returns and 30-day volatility. Fixed original training recipe, horizon and pre-evaluation cutoff. One model, no parameter grid.",
+  "output": "var/research/lighter-optimization-r24-context",
+  "training": {
+    "start": "2025-01-18",
+    "through": "2025-11-24",
+    "label_lag_hours": 1,
+    "label_horizon_hours": 24,
+    "reward": "per_risk",
+    "objective": "regression",
+    "trees": 300,
+    "num_leaves": 15,
+    "min_data_in_leaf": 200,
+    "seeds": 1,
+    "rank_transform": false,
+    "market_context": "btc-daily-raw-v1"
+  },
+  "candidates": [
+    {
+      "id": "ranker-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"
+        }
+      }
+    },
+    {
+      "id": "market-context",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r24-context/model.json"
+        }
+      }
+    }
+  ],
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite."
+}

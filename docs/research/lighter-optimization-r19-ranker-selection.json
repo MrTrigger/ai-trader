@@ -1,0 +1,39 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Re-evaluate two previously declared selection rules on the frozen Lighter-cohort model:16global names versus24globalcontrol, and12per-side versus global24. Same balancedgross.8 and originalrisk/turnover, all native costs unchanged. These rules were already tested on older broad-market models; no new parameter grid or fit.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r19-ranker-selection",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "select16",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "ranker_selection_count": 16
+        }
+      }
+    },
+    {
+      "id": "per-side",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "ranker_selection": "per_side"
+        }
+      }
+    }
+  ],
+  "acceptance": "NetSharpe>1.5 and BTCoutperformance minimum, material return/consistency improvement required. Reused development dates."
+}

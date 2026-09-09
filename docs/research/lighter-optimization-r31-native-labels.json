@@ -1,0 +1,68 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:54:32.831333+00:00",
+  "output": "var/research/lighter-optimization-r31-native-labels",
+  "hypothesis": "Test native hourly Lighter open-to-open labels at D+01 to D+25 against external hourly labels at identical timestamps. Same original6486rows/241dates/45markets, same67normalized plus4rawBTCfeatures, samevolinputs, fixed300tree15leafmin200 absolute per-risk recipe, same preNov24 cutoff. Labels are native mark returns, not hypothetical full fills; execution still uses native VWAP/volume/funding. Missing native endpoints fail; no fallback or outcome-based row selection.",
+  "training": {
+    "start": "2025-01-18",
+    "through": "2025-11-24",
+    "label_lag_hours": 1,
+    "label_horizon_hours": 24,
+    "reward": "per_risk_abs",
+    "objective": "regression",
+    "trees": 300,
+    "num_leaves": 15,
+    "min_data_in_leaf": 200,
+    "seeds": 1,
+    "rank_transform": false,
+    "market_context": "btc-daily-raw-v1",
+    "matrix": "var/research/lighter-ranker-r31-native-hourly/matrix/matrix.jsonl",
+    "label_prices": "native-hourly",
+    "hourly_root": "var/research/lighter-training-hourly/hourly"
+  },
+  "candidates": [
+    {
+      "id": "external-label-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-hourly-absolute",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r31-native-hourly/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

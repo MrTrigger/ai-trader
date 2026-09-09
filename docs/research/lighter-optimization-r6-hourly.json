@@ -1,0 +1,14 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Re-evaluate the unchanged selected policy with observed opening-hour capacity and native hourly VWAP instead of daily-open execution with ADV/24 alone. Observed volume only determines realized fills; it never feeds selection. Keep1% participation, capital, commission, spread and impact coefficients fixed. Mark01h, charge old book funding through01h, execute at00h VWAP with1h completion convention.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r6-hourly",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "original-hourly", "execution": {"delay_hours": 1}},
+    {"id": "cohort-external-hourly", "execution": {"delay_hours": 1}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id": "cohort-external-deadband-hourly", "execution": {"delay_hours": 1}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json", "rebalance_drift_band": "0.20"}}}
+  ]
+}

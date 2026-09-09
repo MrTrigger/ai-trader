@@ -1,0 +1,39 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "One fixed five-day relative-return ranker tests whether a longer forecast horizon reduces one-day signal churn. ExternalhourlylabelsD+1toD+121, trainedJan18-Nov20, original67features/300trees15leavesmin200 recipe. FinalpossiblelabelNov25at01UTC,47hbeforeevaluation. Testdaily and3dayrebalance with dailyNAV/funding. All dates remain reused development data.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r20-five-day",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "five-day-daily",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r20-5day/model.json",
+          "rebalance_every": 1
+        }
+      }
+    },
+    {
+      "id": "five-day-hold3",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r20-5day/model.json",
+          "rebalance_every": 3
+        }
+      }
+    }
+  ],
+  "model_provenance": "var/research/lighter-ranker-r20-5day/verification.json"
+}

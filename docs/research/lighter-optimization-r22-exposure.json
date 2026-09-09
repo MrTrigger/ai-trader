@@ -1,0 +1,57 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Explicit risk-sizing experiment: double targetgross0.80to1.60 and relatedposition/net/cluster/turnover limits, retaining native1%hourlyparticipation, zero commission, spread/impact,100000initialcash. Compare R6daily and R20five-dayhold3. Do not multiply old NAV returns: replay actualnewfills/costs/funding. Any higherreturn is partly greater risk, not new predictive edge.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r22-exposure",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "one-day-double",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "rebalance_every": 1,
+          "target_gross_exposure": "1.60",
+          "turnover_budget": "1.00"
+        },
+        "limits": {
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_net_exposure": "0.20",
+          "max_cluster_exposure": "0.80",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    },
+    {
+      "id": "five-day-double-hold3",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r20-5day/model.json",
+          "rebalance_every": 3,
+          "target_gross_exposure": "1.60",
+          "turnover_budget": "1.00"
+        },
+        "limits": {
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_net_exposure": "0.20",
+          "max_cluster_exposure": "0.80",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    }
+  ],
+  "acceptance": "Sharpe>1.5 andBTCoutperformance minimum; report actualgross,annualvol,DD,chronologicalhalves andstress. Do not promote leverage that merely magnifies unstable returns."
+}

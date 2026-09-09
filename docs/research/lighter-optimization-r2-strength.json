@@ -1,0 +1,28 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Previously tested strongest-trend selection V6 concentrates the existing Donchian signal. Test this unchanged selection rule on the corrected native venue replay; same limits and costs as the liquidity-selected Donchian comparator.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r2-strength",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "donchian-strength",
+      "overrides": {
+        "portfolio": {
+          "signal": "donchian_strength_select",
+          "constructor": "donchian_vol_sized",
+          "rebalance_drift_band": "0.20",
+          "selection_pool": 30,
+          "max_holdings": 10
+        },
+        "limits": {
+          "max_net_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

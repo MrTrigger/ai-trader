@@ -193,6 +193,8 @@ struct LoadedDecision {
 impl LoadedDecision {
     fn decide(&self, created_at: DateTime<Utc>, mode: Mode) -> Result<DecisionResult, String> {
         decide(DecisionInput {
+            native_funding: None,
+            sizing_liquidity: None,
             as_of: self.as_of,
             created_at,
             mode,
@@ -204,6 +206,32 @@ impl LoadedDecision {
             inputs_hash: &self.inputs_hash,
         })
     }
+}
+
+fn overlay_input_hash(
+    base: String,
+    config: &Config,
+    as_of: DateTime<Utc>,
+) -> Result<String, String> {
+    let Some(secondary) = &config.ranker_directional_model_path else {
+        return Ok(base);
+    };
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"directional-overlay-inputs-1");
+    hash.update(base.as_bytes());
+    let primary = config
+        .model_schedule
+        .as_ref()
+        .map(|schedule| schedule.at(as_of).map(|entry| entry.model_path.as_str()))
+        .transpose()?
+        .or(config.model_path.as_deref())
+        .ok_or("directional overlay requires primary model")?;
+    for path in [primary, secondary] {
+        let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+        hash.update(Sha256::digest(bytes));
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn load_decision(args: &[String]) -> Result<LoadedDecision, String> {
@@ -254,6 +282,7 @@ fn load_decision(args: &[String]) -> Result<LoadedDecision, String> {
         Some(hourly) => store::content_hash_sets(&[&bars, hourly]),
         None => store::content_hash(&bars),
     };
+    let hash = overlay_input_hash(hash, &config, as_of)?;
     Ok(LoadedDecision {
         config,
         as_of,
@@ -929,7 +958,12 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
     // that is the execution path - but the hold is the cadence in hours.
     let lag_hours = flag_i64(args, "--lag-hours").unwrap_or(1);
     let hold_hours = flag_i64(args, "--hold-hours").unwrap_or(24);
-    let matrix = crypto_portfolio::training::build(
+    // --market-context appends the fixed raw BTC context features (the same
+    // contract the venue-aware matrix builder uses), so an external-only
+    // walk-forward can fit the same 71-input recipe as the Lighter rankers.
+    let market_context = args.iter().any(|a| a == "--market-context");
+    let matrix = crypto_portfolio::training::build_for_universe(
+        &root,
         &root,
         &cfg,
         start,
@@ -939,6 +973,11 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
         funding_window,
         args.iter().any(|a| a == "--include-unlisted-training"),
         flag_i64(args, "--step-hours").unwrap_or(24),
+        crypto_portfolio::training::LabelPrices::ExternalHourly,
+        &std::collections::BTreeSet::new(),
+        12,
+        false,
+        market_context,
     )?;
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut out = std::io::BufWriter::new(file);
@@ -952,6 +991,7 @@ fn cmd_training_matrix(args: &[String]) -> Result<(), String> {
             "target_contract": crypto_portfolio::training::TARGET_CONTRACT,
             "label_horizon_hours": hold_hours,
             "label_lag_hours": lag_hours,
+            "market_context": matrix.market_context,
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1441,5 +1481,60 @@ fn main() -> ExitCode {
             eprintln!("crypto-portfolio: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_cli_hash_tracks_both_models_and_preserves_default_hash() {
+        let directory =
+            std::env::temp_dir().join(format!("overlay-cli-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::fs::write(&first, "primary").unwrap();
+        std::fs::write(&second, "secondary").unwrap();
+        let mut cfg = Config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .unwrap(),
+            "bars"
+        );
+        cfg.model_path = Some(first.display().to_string());
+        cfg.ranker_directional_model_path = Some(second.display().to_string());
+        let original =
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .unwrap();
+        std::fs::write(&second, "changed-secondary").unwrap();
+        assert_ne!(
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .unwrap(),
+            original
+        );
+        std::fs::write(&second, "secondary").unwrap();
+        std::fs::write(&first, "changed-primary").unwrap();
+        assert_ne!(
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .unwrap(),
+            original
+        );
+        std::fs::remove_file(&second).unwrap();
+        assert!(
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .is_err()
+        );
+        cfg.ranker_directional_model_path = None;
+        assert_eq!(
+            overlay_input_hash("bars".into(), &cfg, "2026-01-08T00:00:00Z".parse().unwrap())
+                .unwrap(),
+            "bars"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

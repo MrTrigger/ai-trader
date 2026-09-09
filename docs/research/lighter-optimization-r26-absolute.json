@@ -1,0 +1,66 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:24:51.892362+00:00",
+  "output": "var/research/lighter-optimization-r26-absolute",
+  "hypothesis": "The relative per-risk training target removes each day market direction even after adding raw BTC context. Fit the existing Rust absolute per-risk target with the identical 71-column matrix and fixed recipe. Compare relative and absolute models under the same existing conviction/volatility directional constructor, allowing model-implied long/short shares rather than forced 50/50. One new fit, no parameter grid.",
+  "training": {
+    "start": "2025-01-18",
+    "through": "2025-11-24",
+    "label_lag_hours": 1,
+    "label_horizon_hours": 24,
+    "reward": "per_risk_abs",
+    "objective": "regression",
+    "trees": 300,
+    "num_leaves": 15,
+    "min_data_in_leaf": 200,
+    "seeds": 1,
+    "rank_transform": false,
+    "market_context": "btc-daily-raw-v1",
+    "matrix": "var/research/lighter-ranker-r24-context/matrix/matrix.jsonl"
+  },
+  "candidates": [
+    {
+      "id": "relative-directional",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r24-context/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "absolute-directional",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

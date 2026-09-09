@@ -1,0 +1,11 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Rank each candidate by per-risk forecast times min(1, prior native hourly volume times 1% divided by the equal-weight intended position). Preserve feature normalization, model, final per-side score sizing and execution costs. Unavailable native execution history has zero reachable capacity.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r3-selection",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "capacity-selection", "overrides": {"portfolio": {"ranker_capacity_selection": true}, "limits": {"participation_limit": "0.01", "capacity_balance": true}}}
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "declared": "2026-09-08",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r1-capacity-v2",
+  "costs": [
+    "central"
+  ],
+  "candidates": [
+    {
+      "id": "control"
+    },
+    {
+      "id": "capacity",
+      "overrides": {
+        "limits": {
+          "participation_limit": "0.01",
+          "capacity_balance": true
+        }
+      }
+    }
+  ],
+  "implementation_note": "Prior-only sizing input, zero executable capacity for insufficient native history; no completed candidate measurement preceded this correction."
+}

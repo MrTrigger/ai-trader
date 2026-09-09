@@ -1,0 +1,58 @@
+{
+  "id": "horizon-24-vs-72",
+  "reason": "Portfolio and turnover variants did not reach recent fee-on Sharpe1.5. Test whether a slower price forecast retains more signal after execution costs, using a matched fresh24h control.",
+  "source_suite": "docs/research/execution-suite.json",
+  "source_configs": "var/research/wf-rank-2020",
+  "output_prefix": "var/research/horizon-env-negative",
+  "matrix_start": "2020-02-10T00:00:00Z",
+  "matrix_end": "2025-11-23T00:00:00Z",
+  "label_horizons_hours": [
+    24,
+    72
+  ],
+  "label_lag_hours": 1,
+  "step_hours": 24,
+  "target_contract": "rust-crypto-targets-1",
+  "reward": "per_risk",
+  "training": {
+    "rounds": 300,
+    "learning_rate": 0.03,
+    "num_leaves": 15,
+    "min_data_in_leaf": 200,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.7,
+    "bagging_freq": 1,
+    "lambda_l2": 20,
+    "objective": "regression",
+    "seed": 0,
+    "bagging_seed": 100,
+    "feature_fraction_seed": 200,
+    "num_threads": 8,
+    "deterministic": true,
+    "force_col_wise": true
+  },
+  "folds": [
+    {
+      "original": 6,
+      "id": 1,
+      "through": "2023-12-13"
+    },
+    {
+      "original": 7,
+      "id": 2,
+      "through": "2024-08-06"
+    },
+    {
+      "original": 8,
+      "id": 3,
+      "through": "2025-03-31"
+    },
+    {
+      "original": 9,
+      "id": 4,
+      "through": "2025-11-23"
+    }
+  ],
+  "selection": "Screen both horizons on original folds6-8. Select72h only if all fold returns are positive and pooled Sharpe strictly exceeds fresh24h and frozen control screen1.3893034737. Otherwise stop this horizon hypothesis. Confirm selected72h against fresh24h on all4recent folds under impact, stress and1hdelay; target impact pooledSharpe>1.5 and positivefold9return. Report all arms and block5/20/60 MonteCarlo; paired20day differences.",
+  "constraints": "Same decision-time feature cohort independent of future label availability; future labels are attached only after normalization. Both fresh models use this correction, all67features, same daily decision cadence and4daytraining-date purge. Last72h label plus1h lag ends23hours before evaluation. Same original risk_adjusted24-name construction,0.8gross target,4.5bpcommission,0.5bphalfspread and original impact model. No Python target transformations, no funding_cost_adjustment, no additional horizon grid. All evaluation dates already exposed; development evidence only. Longer horizon expected-return magnitudes intentionally feed existing absolute costfloor; disclose this policy coupling. Historical frozen control differs in training pipeline and purge and is a reference, not the matched comparison."
+}

@@ -42,7 +42,7 @@ while IFS= read -r id; do
   mkdir -p "$CONFIGS/$id"
   jq -r --arg id "$id" '.hypotheses[]|select(.id==$id)|["portfolio","costs"][] as $section | (.[$section]//{}|to_entries[]) | "\($section) \(.key) \(.value|tojson)"' "$DECLARATION" > "$CONFIGS/$id/overrides.txt"
   for original in 6 7 8 9; do
-    awk 'FILENAME==ARGV[1] {s="[" $1 "]"; patch[s]=patch[s] $2 " = " $3 "\n"; keys[s SUBSEP $2]=1; next}
+    awk -v original_fold="$original" 'FILENAME==ARGV[1] {gsub(/\{fold\}/, original_fold, $3); s="[" $1 "]"; patch[s]=patch[s] $2 " = " $3 "\n"; keys[s SUBSEP $2]=1; next}
       /^\[/ {section=$0}
       (section SUBSEP $1) in keys {next}
       {print}
@@ -78,9 +78,11 @@ if [[ "$PHASE" == confirm ]]; then
     "$CP" monte-carlo --folds "$OUT/$CANDIDATE-$cost" --benchmark "$OUT/control-$cost" \
       --out "$OUT/monte-carlo/paired-$cost.json" --block 20 --iterations 10000 --seed 42 --horizon-days 365
   done
-  jq --arg id "$CANDIDATE-impact" '.experiments[]|select(.experiment.id==$id)|
-    {candidate:.experiment.id,pooled_sharpe:.pooled_daily_sharpe,latest_fold_return:(.folds[-1].total_return|tonumber),
-      development_target_met:(.pooled_daily_sharpe>1.5 and (.folds[-1].total_return|tonumber)>0),
+  jq --arg id "$CANDIDATE-impact" '(.experiments[]|select(.experiment.id=="control-impact")|.pooled_daily_sharpe) as $control |
+    .experiments[]|select(.experiment.id==$id)|
+    {candidate:.experiment.id,pooled_sharpe:.pooled_daily_sharpe,control_sharpe:$control,
+      sharpe_improvement:(.pooled_daily_sharpe-$control),latest_fold_return:(.folds[-1].total_return|tonumber),
+      development_target_met:(.pooled_daily_sharpe>1.5 and .pooled_daily_sharpe>$control and (.folds[-1].total_return|tonumber)>0),
       independent_validation:false}' "$OUT/register.json" > "$OUT/verdict.json"
   cat "$OUT/verdict.json"
   jq -e '.development_target_met' "$OUT/verdict.json" >/dev/null

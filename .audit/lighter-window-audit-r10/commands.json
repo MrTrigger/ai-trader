@@ -1,0 +1,76 @@
+{
+  "build": "cargo build --release --manifest-path var/research/lighter-window-audit-r10/Cargo.toml",
+  "runs": [
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-reference/replay/frozen-daily-central/fold-1.json",
+        "var/research/lighter-window-audit-r10/reference-frozen-daily-central.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/reference-frozen-daily-central.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-control/replay/frozen-daily-central/fold-1.json",
+        "var/research/lighter-window-audit-r10/control-frozen-daily-central.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/control-frozen-daily-central.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-extended/replay/frozen-daily-central/fold-1.json",
+        "var/research/lighter-window-audit-r10/extended-frozen-daily-central.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/extended-frozen-daily-central.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-extended/replay/frozen-3d-central/fold-1.json",
+        "var/research/lighter-window-audit-r10/extended-frozen-3d-central.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/extended-frozen-3d-central.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-extended/replay/frozen-daily-stress/fold-1.json",
+        "var/research/lighter-window-audit-r10/extended-frozen-daily-stress.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/extended-frozen-daily-stress.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-optimization-r10-extended/replay/frozen-3d-stress/fold-1.json",
+        "var/research/lighter-window-audit-r10/extended-frozen-3d-stress.json"
+      ],
+      "exit_code": 0,
+      "log": ".audit/lighter-window-audit-r10/extended-frozen-3d-stress.log"
+    },
+    {
+      "argv": [
+        "var/research/lighter-window-audit-r10/target/release/lighter-window-audit-r10",
+        "/home/magnus/dev/magnus/ai-trader",
+        "var/research/lighter-window-audit-r10/corrupted-book-fixture/fold-1.json",
+        "var/research/lighter-window-audit-r10/corrupted-book-result.json"
+      ],
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": ".audit/lighter-window-audit-r10/corrupted-book.log"
+    }
+  ]
+}

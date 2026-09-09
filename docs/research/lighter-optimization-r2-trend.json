@@ -1,0 +1,12 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Use existing slow directional trend policies to choose long/short exposure instead of forcing dollar neutrality. No fitted parameters. Gross remains 0.8; net limit expands to 0.8 because market direction is the tested mechanism.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r2-trend",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "trend-z", "overrides": {"portfolio": {"signal": "tsmom_z", "constructor": "tsmom_vol_parity", "rebalance_drift_band": "0.20"}, "limits": {"max_net_exposure": "0.80"}}},
+    {"id": "donchian-ls", "overrides": {"portfolio": {"signal": "donchian_ensemble_ls", "constructor": "donchian_vol_sized", "rebalance_drift_band": "0.20"}, "limits": {"max_net_exposure": "0.80"}}}
+  ]
+}

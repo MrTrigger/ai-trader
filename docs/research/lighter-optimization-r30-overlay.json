@@ -1,0 +1,38 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:47:13.606793+00:00",
+  "output": "var/research/lighter-optimization-r30-overlay",
+  "hypothesis": "Frozen relative R6 and absolute R26 paths have daily return correlation -0.104; their ideal50/50return blend has Sharpe1.64 but only10.39%return and does not represent shared native execution. Test an additive target overlay at one full original mandate per component, summing and netting targets in one account before risk/orders/fills/funding. This is explicitly twice the capital mandate of a50/50unlevered blend, with potential leverage and unchanged1%nativecapacity. No allocation-weight grid or new model fit.",
+  "diagnostic": "var/research/lighter-relative-absolute-diversification/paired-central.json",
+  "candidates": [
+    {
+      "id": "relative-absolute-overlay",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "ranker_directional_model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "target_gross_exposure": "1.60",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_net_exposure": "1.10",
+          "max_cluster_exposure": "1.40",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    }
+  ]
+}

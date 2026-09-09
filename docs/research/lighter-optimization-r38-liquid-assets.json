@@ -1,0 +1,76 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:31:32.196079+00:00",
+  "output": "var/research/lighter-optimization-r38-liquid-assets",
+  "hypothesis": "Preserve complete eligible cross-section and every model input/prediction, but trade only BTC+ETH orBTC afterscoring. Frozen native5seed absolute model, no refit, fixedmostliquid benchmarkassets not selected by backtestreturn. Keep original.25positioncap,.25volbudget,.8targetgross,.8net/cluster and100k/1%participation. Tests whether removing alt-specificnoise and routing to deeper markets improves actual return/Sharpe. Lower assetcount increases concentration; disclose exposure andstress, and never force ineligible names. Existing allassetsmatchedcontrol.",
+  "candidates": [
+    {
+      "id": "native-all-assets",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-btc-eth",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-btc",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "ranker_trade_assets": [
+            "BTC"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+{
+  "declared_at": "2026-09-09T06:57:27.468973+00:00",
+  "output": "var/research/lighter-optimization-r44-turnover",
+  "hypothesis": "R43 shows the deployed all-asset relative long/short ranker earns 137.48% at Sharpe 1.47 over three honest walk-forward folds-years, positive in every fold, drawdown 19.27%, BTC correlation -0.26, but turns over 70-85% of the book daily (26 fills/day, ~370 bps cost drag per half-year at central costs) and loses 61% under x10 spread/x4 impact stress. Test three existing turnover levers separately on that book with no model or selection change: 20% same-side resize deadband; turnover budget halved to 0.25 (exits exempt); rebalance cost deadband doubled to 6x round-trip cost. Control is the unchanged R43 book and must reproduce it exactly. A moderate cost case (x3 spread, x2 impact) is added to every scenario for information; central and stress remain the reference cases.",
+  "acceptance": "A lever qualifies if it keeps central Sharpe at or above the control minus 0.1, stays positive in at least five of six folds, and improves the stressed and moderate outcomes materially. Per-fold and cost-case results are all reported; nothing is promoted from this round.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+    "built_by": "R42",
+    "market_context": true
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "control",
+      "reward": "per_risk",
+      "portfolio": {},
+      "limits": {}
+    },
+    {
+      "id": "band-20",
+      "reward": "per_risk",
+      "portfolio": {
+        "rebalance_drift_band": "0.20"
+      },
+      "limits": {}
+    },
+    {
+      "id": "budget-25",
+      "reward": "per_risk",
+      "portfolio": {
+        "turnover_budget": "0.25"
+      },
+      "limits": {}
+    },
+    {
+      "id": "cost-6x",
+      "reward": "per_risk",
+      "portfolio": {
+        "rebalance_cost_multiple": "6.0"
+      },
+      "limits": {}
+    }
+  ]
+}

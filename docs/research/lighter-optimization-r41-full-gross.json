@@ -1,0 +1,63 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-09T06:24:58.536755+00:00",
+  "output": "var/research/lighter-optimization-r41-full-gross",
+  "hypothesis": "User direction after R40: BTC/ETH book with 50% per-position cap and 100% gross target, net and cluster limits raised to 100% so they cannot bind before the cap. R40 cap40/gross80 is the matched control. Frozen R32 native five-seed model, 20% deadband, no refit; same 100k, 1% participation, native execution and funding. Expect higher return with proportionally higher drawdown, volatility, turnover and stressed-cost drag; disclose all.",
+  "candidates": [
+    {
+      "id": "btc-eth-cap40-gross80",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ],
+          "target_gross_exposure": "0.80"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80",
+          "max_position": "0.40"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-cap50-gross100",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ],
+          "target_gross_exposure": "1.00"
+        },
+        "limits": {
+          "max_net_exposure": "1.00",
+          "max_cluster_exposure": "1.00",
+          "max_position": "0.50"
+        }
+      }
+    }
+  ]
+}

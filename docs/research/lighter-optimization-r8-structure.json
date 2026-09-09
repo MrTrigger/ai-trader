@@ -1,0 +1,17 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Slower trading may preserve the ranker's edge with lower churn; a wider directional budget may improve broad-rally participation. Test these structural changes separately using the frozen model. Daily native valuation and funding continue on non-trading days.",
+  "acceptance": "Require full-period net Sharpe > 1.5 and return above matched BTC. Seek material return improvement over R6 plus stronger later-half and stressed results. All dates are reused development evidence. Report every candidate.",
+  "risk_change": "The breadth-40 candidate alone widens maximum target net exposure from 0.10 to 0.40 NAV. Gross target remains 0.80 and gross limit1.00. This is a research-only directional-risk change, not increased gross leverage or a deployment change.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r8-structure",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id":"control", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id":"hold-3d", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json", "rebalance_every":3}}},
+    {"id":"hold-7d", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json", "rebalance_every":7}}},
+    {"id":"breadth-40", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json", "ranker_allocation":"breadth", "ranker_net_band":"0.40"},"limits":{"max_net_exposure":"0.40"}}}
+  ]
+}

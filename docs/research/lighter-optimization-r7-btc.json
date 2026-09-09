@@ -1,0 +1,15 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "The frozen Lighter-cohort model may capture more return when higher-timeframe momentum changes selection or long/short budgets. Test the two previously specified controls on the final native hourly execution, separately. No retraining or parameter sweep.",
+  "acceptance": "Both full-window net Sharpe > 1.5 and net return > matched BTC price buy-and-hold are mandatory. Rank qualifying candidates by return gap over BTC. Require improvement over the R6 control to replace it. Report chronological halves, monthly BTC-rising segments and stress; reused development dates cannot establish future performance. The user prefers much better than BTC but has specified no numerical margin or per-segment acceptance rule.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r7-btc",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "control", "execution": {"delay_hours": 1}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id": "htf-conviction", "execution": {"delay_hours": 1}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json", "ranker_trend_weight": "0.25"}}},
+    {"id": "breadth-budget", "execution": {"delay_hours": 1}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json", "ranker_allocation": "breadth", "ranker_net_band": "0.10"}}}
+  ]
+}

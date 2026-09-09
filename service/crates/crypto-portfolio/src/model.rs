@@ -40,6 +40,8 @@ pub struct Model {
     pub label_lag_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_context: Option<String>,
     pub tree_info: Vec<Tree>,
     #[serde(skip)]
     pub model_id: String,
@@ -152,8 +154,9 @@ impl Model {
                 features_crypto::FEATURE_SET_VERSION
             ));
         }
-        let raw: Vec<String> = model
-            .features
+        let ranked_count =
+            crate::market_context::ranked_count(&model.features, model.market_context.as_deref())?;
+        let raw: Vec<String> = model.features[..ranked_count]
             .iter()
             .map(|name| {
                 name.strip_prefix("x_")
@@ -171,7 +174,31 @@ impl Model {
         Ok(model)
     }
 
+    pub fn ranked_features(&self) -> &[String] {
+        let count = self.features.len()
+            - if self.market_context.is_some() {
+                crate::market_context::FEATURES.len()
+            } else {
+                0
+            };
+        &self.features[..count]
+    }
+
     pub fn predict(&self, values: &[f64], as_of: NaiveDate) -> Result<f64, String> {
+        self.ensure_available(as_of)?;
+        if values.len() != self.features.len() {
+            return Err(format!(
+                "model expects {} inputs, received {}",
+                self.features.len(),
+                values.len()
+            ));
+        }
+        self.tree_info.iter().try_fold(0.0, |sum, tree| {
+            tree.tree_structure.predict(values).map(|v| sum + v)
+        })
+    }
+
+    pub fn ensure_available(&self, as_of: NaiveDate) -> Result<(), String> {
         let days = match self.label_horizon_hours {
             Some(horizon) => {
                 horizon
@@ -194,22 +221,76 @@ impl Model {
                 self.trained_through
             ));
         }
-        if values.len() != self.features.len() {
-            return Err(format!(
-                "model expects {} inputs, received {}",
-                self.features.len(),
-                values.len()
-            ));
-        }
-        self.tree_info.iter().try_fold(0.0, |sum, tree| {
-            tree.tree_structure.predict(values).map(|v| sum + v)
-        })
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_context_contract_requires_fixed_raw_suffix_and_valid_ranked_prefix() {
+        let path =
+            std::env::temp_dir().join(format!("crypto-market-schema-{}.json", std::process::id()));
+        let mut doc = serde_json::json!({
+            "format_version":FORMAT_VERSION,"model_version":MODEL_VERSION,
+            "feature_set_version":features_crypto::FEATURE_SET_VERSION,
+            "trained_through":"2025-01-01","trained_at":"fixture","n_rows":12,"n_dates":1,
+            "features":["x_ret_7"],"reward":"return",
+            "tree_info":[{"tree_index":0,"num_leaves":1,"tree_structure":{"leaf_value":0.01}}]
+        });
+        let save = |doc: &serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec(doc).unwrap()).unwrap()
+        };
+        save(&doc);
+        let legacy = Model::load(&path).unwrap();
+        assert_eq!(legacy.market_context, None);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("market_context")
+            .is_none());
+        let features: Vec<_> = std::iter::once("x_ret_7")
+            .chain(crate::market_context::FEATURES)
+            .collect();
+        doc["features"] = serde_json::json!(features);
+        save(&doc);
+        assert!(Model::load(&path).is_err());
+        doc["market_context"] = crate::market_context::CONTRACT.into();
+        save(&doc);
+        let context = Model::load(&path).unwrap();
+        assert_eq!(context.ranked_features(), ["x_ret_7"]);
+        for (key, value) in [
+            ("market_context", serde_json::json!("unknown")),
+            ("features", serde_json::json!(["x_ret_7", "mkt_btc_ret_7d"])),
+            (
+                "features",
+                serde_json::json!([
+                    "x_unknown",
+                    "mkt_btc_ret_7d",
+                    "mkt_btc_ret_30d",
+                    "mkt_btc_ret_90d",
+                    "mkt_btc_vol_30d"
+                ]),
+            ),
+            (
+                "features",
+                serde_json::json!([
+                    "mkt_btc_ret_7d",
+                    "mkt_btc_ret_30d",
+                    "mkt_btc_ret_90d",
+                    "mkt_btc_vol_30d",
+                    "x_ret_7"
+                ]),
+            ),
+        ] {
+            let mut bad = doc.clone();
+            bad[key] = value;
+            save(&bad);
+            assert!(Model::load(&path).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn label_metadata_accepts_legacy_and_rejects_invalid_explicit_values() {
@@ -293,6 +374,7 @@ mod tests {
             label_horizon_hours: None,
             label_lag_hours: None,
             target_contract: None,
+            market_context: None,
             n_rows: 1,
             n_dates: 1,
             features: vec!["x_ret_7".into()],

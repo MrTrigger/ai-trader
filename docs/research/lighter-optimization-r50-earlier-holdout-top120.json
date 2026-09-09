@@ -1,0 +1,109 @@
+{
+  "declared_at": "2026-09-09T07:56:33.899741+00:00",
+  "output": "var/research/lighter-optimization-r50-earlier-holdout-top120",
+  "hypothesis": "Breadth (top 120), book size (40) and hysteresis (1.5x) were chosen on August 2023 to August 2026. This runs the chosen book, plus the 24-name variant, on September 2020 to August 2023 with the same expanding walk-forward, recipe, costs and research data root. The first fold model has under nine months of training rows, which is disclosed. This is a holdout of the design choices, not a new fit.",
+  "acceptance": "Descriptive holdout. Report Sharpe, return, drawdown, per-fold results, turnover, BTC buy and hold and cost cases. A clearly negative or flat result means the three-year choices do not transfer.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/three-year-data-top120/matrix/matrix.jsonl",
+    "market_context": true,
+    "universe": "point-in-time Binance liquidity rank, top 120, recorded into a research data root that symlinks the live bars/funding"
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2020-09-18",
+    "end": "2023-08-06",
+    "days": 1053,
+    "reason": "the period before the three-year window; never used to evaluate any candidate in this line, only as training history"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2020-09-18T00:00:00Z",
+      "end": "2021-03-11T00:00:00Z",
+      "train_through": "2020-09-16"
+    },
+    {
+      "id": 2,
+      "start": "2021-03-12T00:00:00Z",
+      "end": "2021-09-02T00:00:00Z",
+      "train_through": "2021-03-10"
+    },
+    {
+      "id": 3,
+      "start": "2021-09-03T00:00:00Z",
+      "end": "2022-02-24T00:00:00Z",
+      "train_through": "2021-09-01"
+    },
+    {
+      "id": 4,
+      "start": "2022-02-25T00:00:00Z",
+      "end": "2022-08-18T00:00:00Z",
+      "train_through": "2022-02-23"
+    },
+    {
+      "id": 5,
+      "start": "2022-08-19T00:00:00Z",
+      "end": "2023-02-09T00:00:00Z",
+      "train_through": "2022-08-17"
+    },
+    {
+      "id": 6,
+      "start": "2023-02-10T00:00:00Z",
+      "end": "2023-08-06T00:00:00Z",
+      "train_through": "2023-02-08"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "sel40-hold15",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_selection_count": 40,
+        "ranker_hold_rank_multiple": "1.5"
+      },
+      "limits": {}
+    },
+    {
+      "id": "sel24",
+      "reward": "per_risk",
+      "portfolio": {},
+      "limits": {}
+    }
+  ],
+  "data_root": "var/research/three-year-data-top120"
+}

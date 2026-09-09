@@ -20,6 +20,10 @@ pub struct Settings {
     pub spread_multiple: f64,
     pub impact_multiple: f64,
     pub half_spread_bps: BTreeMap<String, f64>,
+    /// Batch guard on realized added net risk after capacity-limited quotes.
+    /// Absence preserves the original independent-order execution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_exposure_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -39,12 +43,21 @@ impl Default for Settings {
             spread_multiple: 1.0,
             impact_multiple: 1.0,
             half_spread_bps: BTreeMap::new(),
+            net_exposure_limit: None,
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        if self.net_exposure_limit.is_some_and(|limit| {
+            !limit.is_finite() || limit <= 0.0 || limit > 1.0 || self.delay_hours != 0
+        }) {
+            return Err(
+                "execution net_exposure_limit requires a finite limit in (0,1] and zero delay"
+                    .into(),
+            );
+        }
         if self.delay_hours > 23
             || !self.participation.is_finite()
             || self.participation <= 0.0
@@ -220,6 +233,31 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn net_guard_settings_require_a_finite_positive_limit_and_zero_delay() {
+        for limit in [0.0, -0.1, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(Settings {
+                net_exposure_limit: Some(limit),
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(Settings {
+            net_exposure_limit: Some(0.1),
+            delay_hours: 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Settings {
+            net_exposure_limit: Some(0.1),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

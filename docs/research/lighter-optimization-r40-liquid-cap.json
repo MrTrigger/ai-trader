@@ -1,0 +1,84 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-09T06:11:08.469016+00:00",
+  "output": "var/research/lighter-optimization-r40-liquid-cap",
+  "hypothesis": "User direction: with only BTC and ETH tradeable the 25% per-position cap holds gross at or below 50% and leaves the 80% gross target unused. Raise the cap so the two-asset book can use its full budget: 40% each fills target gross exactly; 80% makes the cap non-binding so only the existing volatility budget and net/cluster limits govern size. R39 best cell (full features, 20% deadband, cap 25%) is the matched control. Frozen R32 native five-seed model, no refit; same 100k, 1% participation, native execution and funding. Higher exposure raises drawdown and stressed-cost sensitivity proportionally; disclose both.",
+  "candidates": [
+    {
+      "id": "btc-eth-cap25",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80",
+          "max_position": "0.25"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-cap40",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80",
+          "max_position": "0.40"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-cap80",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.20",
+          "ranker_trade_assets": [
+            "BTC",
+            "ETH"
+          ]
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80",
+          "max_position": "0.80"
+        }
+      }
+    }
+  ]
+}

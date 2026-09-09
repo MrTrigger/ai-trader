@@ -220,6 +220,7 @@ fn verify_suite_fold(
     }
     for key in [
         "model_path",
+        "ranker_directional_model_path",
         "timing_model_path",
         "market_matrix_path",
         "liquidity_profile",
@@ -497,6 +498,7 @@ fn build(manifest: Manifest, root: &Path) -> Result<Value, String> {
                     .map_err(|e| e.to_string())?;
                 for key in [
                     "model_path",
+                    "ranker_directional_model_path",
                     "timing_model_path",
                     "market_matrix_path",
                     "liquidity_profile",

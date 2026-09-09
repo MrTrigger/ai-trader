@@ -1,0 +1,123 @@
+{
+  "declared_at": "2026-09-09T07:06:52.980294+00:00",
+  "output": "var/research/lighter-optimization-r45-hysteresis",
+  "hypothesis": "R44 shows the churn is membership, not sizing: the top-24 book has about six entries and six exits a day, so resize deadbands and cost floors leave turnover near 75%, and halving the turnover budget cuts return from 137% to 77%. Test selection hysteresis, new code: an incumbent keeps its slot while it ranks inside top 24 x multiple and its held side still matches the signal; new names fill only vacated slots from the top. Multiples 1.5, 2.0 and 3.0, declared together; sizing, model, universe, costs and folds unchanged. Control must reproduce R43/R44 exactly.",
+  "acceptance": "Same rule as R44: central Sharpe within 0.1 of control, at least five of six folds positive, and a material improvement in moderate and stressed outcomes. Turnover and fills per day are reported for every cell.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+    "built_by": "R42",
+    "market_context": true
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "control",
+      "reward": "per_risk",
+      "portfolio": {},
+      "limits": {}
+    },
+    {
+      "id": "hold-15",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_hold_rank_multiple": "1.5"
+      },
+      "limits": {}
+    },
+    {
+      "id": "hold-20",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_hold_rank_multiple": "2.0"
+      },
+      "limits": {}
+    },
+    {
+      "id": "hold-30",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_hold_rank_multiple": "3.0"
+      },
+      "limits": {}
+    }
+  ]
+}

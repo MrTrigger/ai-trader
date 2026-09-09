@@ -1,0 +1,17 @@
+{
+  "source_suite": "docs/research/execution-suite.json",
+  "source_configs": "var/research/wf-rank-2020",
+  "config_root": "var/research/selection-trend-configs",
+  "output_prefix": "var/research/selection-trend",
+  "selection": "Declare all candidates before replay. Screen original folds6-8: require positive return in each fold then select highest pooled Sharpe with ID tie-break. Confirm the selected candidate and current score-selected control on folds6-9, with matched central costs, absolute severe stress22bp/4ximpact, one-hour delay and paired20dayblock bootstrap. The improvement gate additionally requires candidate central Sharpe greater than matched control1.5405 and positive finalfold return. All dates exposed; no independent-validation claim.",
+  "reason": "Keep frozen ranker, capital, gross target, costs and historical eligibility fixed. Test selection breadth/balance and a small directional allocation separately. Net tilt bounded to0.10NAV; no unrestricted long/short allocation. HTF reweighting adjusts conviction and therefore selection, cost threshold and sizing together. Timing model fixed7day target, 7causal market features,2leaves50roundsmin180leaf; no tuning.",
+  "hypotheses": [
+    {"id":"control","reason":"Current score-selected24-name policy at the same costs.","portfolio":{"constructor":"risk_adjusted_score_selected"},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"per-side","reason":"Select12 names per side to avoid concentrating half the gross in a few weak-side names.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_selection":"per_side"},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"select16","reason":"Keep only16 global per-risk scores to avoid diluting the strongest predictions.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_selection_count":16},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"htf-conviction","reason":"Multiply conviction by1+0.25*direction*mean(sign30dayreturn,sign90dayreturn), neutral if either horizon missing. Keep 50/50 sleeve budgets.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_trend_weight":"0.25"},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"breadth-budget","reason":"Keep current names; net target0.10*mean30/90day breadth. Fixed gross0.8.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_allocation":"breadth","ranker_net_band":"0.10"},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"confidence-budget","reason":"Keep current names; net target0.10*(long-score-sum minus short-score-sum)/(total-score-sum). Relative rank confidence may lack market timing; test once.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_allocation":"confidence","ranker_net_band":"0.10"},"costs":{"commission_bps":"0","spread_bps":"2.2"}},
+    {"id":"timing-budget","reason":"Keep current names; net target0.10*bounded7day low-capacity timing prediction. Per-fold training purged before evaluation.","portfolio":{"constructor":"risk_adjusted_score_selected","ranker_allocation":"timing","ranker_net_band":"0.10","market_matrix_path":"var/research/selection-timer/market-matrix.jsonl","timing_model_path":"var/research/selection-timer/model-{fold}.json"},"costs":{"commission_bps":"0","spread_bps":"2.2"}}
+  ]
+}

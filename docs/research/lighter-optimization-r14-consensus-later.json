@@ -1,0 +1,40 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "One fixed consensus rule: trade BTC only when the existing slow momentum ensemble and purged seven-feature market timer agree in sign. Otherwise holdcash. Preserve original momentum volatility sizing,0.80gross cap,2.00turnover allowance and0.20resize deadband. No model retraining, horizon tuning or threshold search. Evaluate both earlier and later periods regardless of results.",
+  "acceptance": "Net Sharpe >1.5 and BTC outperformance are minimums; require material netreturn improvement and stronger subperiod evidence. All current dates remain development evidence. Do not promote merely because directional risk increased.",
+  "risk_change": "Compared with R11 only the trading turnover allowance rises0.50to2.00NAV. Target gross0.80 and position/net/cluster0.80 remain; hourly participation and fees unchanged. This permits intended reversals, not greater target leverage. Not a deployment change.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r14-consensus-later",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "btc-consensus",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": true,
+          "max_holdings": 1,
+          "rebalance_drift_band": "0.20",
+          "signal": "benchmark_consensus",
+          "constructor": "tsmom_vol_parity",
+          "timing_model_path": "var/research/selection-timer/model-9.json",
+          "market_matrix_path": "var/research/selection-timer/market-matrix.jsonl",
+          "turnover_budget": "2.00",
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

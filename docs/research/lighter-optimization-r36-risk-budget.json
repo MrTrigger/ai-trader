@@ -1,0 +1,56 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:22:40.167620+00:00",
+  "output": "var/research/lighter-optimization-r36-risk-budget",
+  "hypothesis": "Test a fixed doubling of the native5seed candidate risk budget from25% to50% fully-correlated ex-ante volatility proxy, with corresponding targetgross/position/net/cluster/beta/turnover limits doubled. This changes risk, not predictions; any return gain is partly higher exposure. Replay actualfills/funding/costs at unchanged100k andnative1%participation; never scale savedreturns. Do not accept a marginalSharpe change or return caused by unstable/leverage-amplified path without exposure/drawdown/stress/chronological evidence. One explicit2xlevel only, no grid.",
+  "candidates": [
+    {
+      "id": "native-risk-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-double-risk",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "4.00",
+          "rebalance_drift_band": "0.00",
+          "vol_parity_budget": "0.50",
+          "target_gross_exposure": "1.60"
+        },
+        "limits": {
+          "max_net_exposure": "1.60",
+          "max_cluster_exposure": "1.60",
+          "max_gross_exposure": "2.00",
+          "max_position": "0.50",
+          "max_benchmark_beta": "2.50"
+        }
+      }
+    }
+  ]
+}

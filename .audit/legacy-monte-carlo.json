@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "method": "within-fold circular fixed-length block bootstrap; SplitMix64",
+  "seed": 42,
+  "iterations": 10000,
+  "block_days": 20,
+  "horizon_days": 365,
+  "annual_periods": 365.0,
+  "observations": 2142,
+  "first_date": "2020-09-18T00:00:00Z",
+  "last_date": "2026-07-30T00:00:00Z",
+  "original_pooled_sharpe": 2.044430319195697,
+  "original_mean_fold_sharpe": 2.1062684752735117,
+  "original_cumulative_return": 11.858537909702925,
+  "original_max_drawdown": 0.1763451410807546,
+  "sources": [
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-1.json",
+      "sha256": "33664b6e6f82da5d842625f5e452638380a3b9c9ab766c328d15eeed6911f58d",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 5.5515602483644795
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-2.json",
+      "sha256": "47a779e9b0104748ea4b2c33c4e3d5a789e7a05b817f427802be58b00de9f08b",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 2.8199456151985256
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-3.json",
+      "sha256": "93a55291203f829db3cfd849eff53c38faf05832e3baf9a3bb8035575ecc3783",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 1.971379984373166
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-4.json",
+      "sha256": "891b296ffe23082e9ecc43280220b1dbcc114848a94205e39d614355e9adb448",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 1.556771384166712
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-5.json",
+      "sha256": "bb66957828e164cfc9f2d1cbe321ad7f75c98c368dfbb7c024162dabd6d765e9",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 1.8540484516979499
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-6.json",
+      "sha256": "0f7a4429d2b7cd23fb61f19da76ad79644e45c726d9138ae6ece631aaa2f0c95",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 0.27779911163786086
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-7.json",
+      "sha256": "16d5b886d202d0e030f2a2b84254e348ff4780f22d9db455d61cbaccde4a9337",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 1.6950725366013653
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-8.json",
+      "sha256": "3bad361c52825630e0d4c53c813ab63e03f7c57bb0cd843337a34743ef927d50",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 237,
+      "sharpe": 2.398861269300171
+    },
+    {
+      "file": "var/research/wf-rank-2020-replay-settle/fold-9.json",
+      "sha256": "8b19cc11d2c06642f0671c8920ad8a8aac5df95fc15c6d34d7acb6a72cd5a2c7",
+      "initial_cash": 100000.0,
+      "initial_cash_source": "cli",
+      "observations": 246,
+      "sharpe": 0.8309776761213741
+    }
+  ],
+  "whole_sample_sharpe_bootstrap": {
+    "defined_iterations": 10000,
+    "undefined_iterations": 0,
+    "percentile_interval": {
+      "p025": 1.2967805034190345,
+      "p05": 1.4161777523557333,
+      "p50": 2.0572770743277773,
+      "p95": 2.7147960736403993,
+      "p975": 2.8385515530816257
+    }
+  },
+  "horizon_scenarios": {
+    "cumulative_return": {
+      "p025": 0.028938964999113668,
+      "p05": 0.09536102140044708,
+      "p50": 0.5402592617144094,
+      "p95": 1.217935604739651,
+      "p975": 1.386350632763792
+    },
+    "max_drawdown": {
+      "p025": 0.0669327627295238,
+      "p05": 0.07225254899573438,
+      "p50": 0.13229157644781414,
+      "p95": 0.21091032076167893,
+      "p975": 0.23188459491585267
+    },
+    "probability_loss": 0.0176,
+    "probability_drawdown_over_25_percent": 0.0135
+  },
+  "paired": null,
+  "disclosures": [
+    "Returns include each fold's first NAV / initial cash - 1, including initial fills and fees. Each fold restarts at initial cash. Liquidation and transition costs absent from saved NAVs remain absent.",
+    "Source days are sampled uniformly. Consecutive days within blocks retain local dependence. Blocks wrap within a fold and never cross folds; wraparound and block joins introduce artificial adjacencies. Check multiple block lengths.",
+    "Horizon quantiles describe empirical scenarios conditional on observed regimes and recorded execution costs, not calibrated forecasts. Unseen regimes, missing costs and signal decay are absent.",
+    "Whole-sample Sharpe percentile intervals resample N observed days separately from horizon paths. Sharpe uses sample standard deviation, zero risk-free rate and the stated annual periods. Undefined zero-variance draws are counted and omitted from quantiles.",
+    "The original pooled Sharpe differs from the unweighted mean of recomputed fold Sharpes. First-day cost inclusion can change both relative to legacy reports.",
+    "Simulations do not validate alpha, repair look-ahead or reused holdouts, or create independent observations. No correction for strategy selection or multiple testing is applied.",
+    "The optional 50/50 blend rebalances daily at fixed weights, with no additional allocation transaction costs. Benchmark and strategy use identical sampled indices; no weights are optimized."
+  ]
+}

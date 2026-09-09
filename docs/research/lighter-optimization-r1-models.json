@@ -1,0 +1,13 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Fixed ranker recipe with causal Lighter training cohorts; compare external labels, native next-open labels, and native-label model plus the predeclared capacity-balanced sizing.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r1-models",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "cohort-external", "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id": "cohort-native", "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/native/model.json"}}},
+    {"id": "cohort-native-capacity", "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/native/model.json"}, "limits": {"participation_limit": "0.01", "capacity_balance": true}}}
+  ]
+}

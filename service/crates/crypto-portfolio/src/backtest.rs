@@ -159,6 +159,21 @@ pub struct Prepared {
     funding: features_crypto::FundingTable,
     execution_prices: execution::Prices,
     liquidity: BTreeMap<DateTime<Utc>, BTreeMap<String, execution::Liquidity>>,
+    native_lighter: Option<crate::lighter_execution::Native>,
+}
+
+impl Prepared {
+    pub fn use_lighter(
+        &mut self,
+        sources: &crate::lighter_execution::Sources,
+    ) -> Result<(), String> {
+        let mut native = crate::lighter_execution::Native::load(sources)?;
+        self.opens = std::mem::take(&mut native.opens);
+        self.liquidity = std::mem::take(&mut native.liquidity);
+        self.execution_prices = std::mem::take(&mut native.fills);
+        self.native_lighter = Some(native);
+        Ok(())
+    }
 }
 
 pub fn prepare(
@@ -232,6 +247,7 @@ pub fn prepare(
         funding,
         execution_prices,
         liquidity,
+        native_lighter: None,
     })
 }
 
@@ -314,6 +330,15 @@ pub fn replay_with_execution(
     execution: &Settings,
 ) -> Result<BacktestResult, String> {
     execution.validate()?;
+    if let Some(native) = &prepared.native_lighter {
+        native.history.validate_period(start, end)?;
+    }
+    if let Some(native) = &prepared.native_lighter {
+        let expected_delay = if native.hourly_execution { 1 } else { 0 };
+        if execution.delay_hours != expected_delay || execution.model != execution::Model::Impact {
+            return Err(format!("native Lighter replay requires {expected_delay}h delay and volume-limited impact execution for this source"));
+        }
+    }
     if initial_cash <= Decimal::ZERO {
         return Err("initial cash must be positive".into());
     }
@@ -332,16 +357,26 @@ pub fn replay_with_execution(
         return Err("prepared replay data has no hourly features for ml_ranker".into());
     }
 
-    let cadence = match step_hours_override {
+    let rebalance_cadence = match step_hours_override {
         // The evaluation grid, decoupled from the bar interval: a 12h grid
         // decides twice a day on the same daily features plus fresher hourly
         // ones. None keeps the config cadence exactly as before.
         Some(h) => Duration::hours(h),
         None => Duration::seconds(cfg.interval_s * cfg.rebalance_every.max(1) as i64),
     };
-    if cadence <= Duration::zero() || Duration::hours(execution.delay_hours as i64) >= cadence {
+    if rebalance_cadence <= Duration::zero()
+        || Duration::hours(execution.delay_hours as i64) >= rebalance_cadence
+    {
         return Err("execution delay must be shorter than a positive decision cadence".into());
     }
+    let cadence = if prepared.native_lighter.is_some() && step_hours_override.is_none() {
+        if cfg.interval_s != 86_400 {
+            return Err("native Lighter daily valuation requires a daily feature interval".into());
+        }
+        Duration::days(1)
+    } else {
+        rebalance_cadence
+    };
     if execution.delay_hours > 0 && prepared.execution_prices.is_empty() {
         return Err("delayed execution requires historical hourly prices".into());
     }
@@ -385,6 +420,13 @@ pub fn replay_with_execution(
             ..Default::default()
         };
         if let Some(opens) = prepared.opens.get(&as_of) {
+            if prepared.native_lighter.is_some() {
+                for position in &portfolio.positions {
+                    if !opens.contains_key(&position.asset) {
+                        return Err(format!("{as_of}: missing native Lighter valuation for {}; refusing last-price settlement proxy", position.asset));
+                    }
+                }
+            }
             for position in &portfolio.positions {
                 if let (Some(previous), Some(current)) =
                     (last_price.get(&position.asset), opens.get(&position.asset))
@@ -416,54 +458,159 @@ pub fn replay_with_execution(
             .filter(|member| member.eligible)
             .map(|member| member.asset)
             .collect();
+        if let Some(native) = &prepared.native_lighter {
+            let available = native.history.active_at(as_of)?;
+            if !eligible.is_subset(&available) {
+                return Err(format!("{as_of}: universe includes assets without prior-day Lighter activity or before creation"));
+            }
+        }
         let input_id = format!("rust-backtest:{}", as_of.to_rfc3339());
-        let decision = decide(DecisionInput {
-            as_of,
-            created_at: as_of,
-            mode: Mode::Dry,
-            config: cfg,
-            daily_features: &prepared.daily,
-            hourly_features: prepared.hourly.as_deref(),
-            eligible_universe: &eligible,
-            portfolio: &portfolio,
-            inputs_hash: &input_id,
-        });
-        let decision = decision.map_err(|e| format!("{as_of}: incomplete replay decision: {e}"))?;
+        let planning_profile = if cfg.limits.participation_limit > Decimal::ZERO {
+            let native = prepared
+                .native_lighter
+                .as_ref()
+                .ok_or("historical participation sizing requires native Lighter liquidity")?;
+            let values = native
+                .planning_liquidity
+                .get(&as_of)
+                .ok_or("missing prior native planning liquidity")?;
+            let assets = eligible
+                .iter()
+                .map(|asset| {
+                    let hourly_volume = values.get(asset).map_or(0.0, |v| v.hourly_volume);
+                    Ok((
+                        asset.clone(),
+                        crate::liquidity::AssetLiquidity {
+                            hourly_quote_volume: Some(crate::d(hourly_volume)?),
+                            ..Default::default()
+                        },
+                    ))
+                })
+                .collect::<Result<_, String>>()?;
+            Some(crate::liquidity::Profile {
+                measured_at: as_of.to_rfc3339(),
+                hours: Vec::new(),
+                assets,
+            })
+        } else {
+            None
+        };
+        let scheduled = (as_of - start).num_seconds() % rebalance_cadence.num_seconds() == 0;
+        let native_funding = if scheduled && cfg.native_funding_adjustment {
+            Some(
+                prepared
+                    .native_lighter
+                    .as_ref()
+                    .ok_or("native funding adjustment requires native Lighter history")?
+                    .funding_forecast(as_of, &eligible)?,
+            )
+        } else {
+            None
+        };
+        let decision = if scheduled {
+            Some(
+                decide(DecisionInput {
+                    native_funding: native_funding.as_ref(),
+                    sizing_liquidity: planning_profile.as_ref(),
+                    as_of,
+                    created_at: as_of,
+                    mode: Mode::Dry,
+                    config: cfg,
+                    daily_features: &prepared.daily,
+                    hourly_features: prepared.hourly.as_deref(),
+                    eligible_universe: &eligible,
+                    portfolio: &portfolio,
+                    inputs_hash: &input_id,
+                })
+                .map_err(|e| format!("{as_of}: incomplete replay decision: {e}"))?,
+            )
+        } else {
+            None
+        };
         let prices = prepared
             .opens
             .get(&as_of)
             .ok_or_else(|| format!("{as_of}: no valuation prices"))?;
-        // Funding for the period that just ENDED, on the book that was held
-        // through it, before this step's orders change anything. The direction
-        // matters more than it looks: summing the days ahead of the position
-        // instead of behind it is the one-character error that turned a
-        // +134.9% backtest into +760.7%, so the window is closed on both ends
-        // and excludes today.
-        let carry = funding_carry(&portfolio, &prices, &prepared.funding, last_priced, as_of);
-        portfolio.cash += carry;
-        attribution.funding_pnl = carry;
-        funding_total += carry;
-        last_priced = Some(as_of);
-        let fill_time = as_of + Duration::hours(execution.delay_hours as i64);
-        let fill_prices = if execution.delay_hours == 0 {
-            Some(prices)
-        } else {
-            prepared.execution_prices.get(&fill_time)
-        };
-        let (next, filled) = apply(
-            &decision.plan.orders,
-            &portfolio,
-            prices,
-            &last_price,
-            fill_prices,
-            cfg,
-            execution,
-            prepared.liquidity.get(&as_of),
-            slippage_multiple,
-            fill_time,
-            &mut attribution,
-        )?;
-        portfolio = next;
+        let native_hourly = prepared
+            .native_lighter
+            .as_ref()
+            .filter(|native| native.hourly_execution);
+        let execution_hours = native_hourly.map_or(1, |native| native.execution_hours);
+        let mut remaining = decision
+            .as_ref()
+            .map_or_else(Vec::new, |decision| decision.plan.orders.clone());
+        if native_hourly.is_some() {
+            for order in &remaining {
+                if !prices.contains_key(&order.asset) {
+                    return Err(format!("{} at {as_of}: missing native valuation for planned order; refusing to suppress execution", order.asset));
+                }
+            }
+        }
+        let mut filled = Vec::new();
+        for hour in 0..execution_hours {
+            let fill_time = as_of
+                + Duration::hours(if native_hourly.is_some() {
+                    i64::from(hour + 1)
+                } else {
+                    i64::from(execution.delay_hours)
+                });
+            let carry_time = if native_hourly.is_some() {
+                fill_time
+            } else {
+                as_of
+            };
+            let carry = match &prepared.native_lighter {
+                Some(native) => native.carry(&portfolio, last_priced, carry_time)?,
+                None => funding_carry(&portfolio, prices, &prepared.funding, last_priced, as_of),
+            };
+            portfolio.cash += carry;
+            attribution.funding_pnl += carry;
+            funding_total += carry;
+            last_priced = Some(carry_time);
+            let fill_prices = if execution.delay_hours == 0 {
+                Some(prices)
+            } else {
+                prepared.execution_prices.get(&fill_time)
+            };
+            let liquidity = match native_hourly {
+                Some(native) => native
+                    .slice_liquidity
+                    .get(&(as_of + Duration::hours(i64::from(hour)))),
+                None => prepared.liquidity.get(&as_of),
+            };
+            // Each attempt reports its remainder; retain only the final cancelled remainder.
+            attribution.unfilled_notional = Decimal::ZERO;
+            let (next, slice_fills) = apply(
+                &remaining,
+                &portfolio,
+                prices,
+                &last_price,
+                fill_prices,
+                cfg,
+                execution,
+                match &prepared.native_lighter {
+                    Some(native) => native.planning_liquidity.get(&as_of),
+                    None => prepared.liquidity.get(&as_of),
+                },
+                liquidity,
+                slippage_multiple,
+                fill_time,
+                &mut attribution,
+            )?;
+            subtract_fills(&mut remaining, &slice_fills)?;
+            portfolio = next;
+            filled.extend(slice_fills);
+        }
+        if let Some(native) = native_hourly {
+            let valuation_time = as_of + Duration::hours(i64::from(native.valuation_hours));
+            if last_priced.is_some_and(|last| last < valuation_time) {
+                let carry = native.carry(&portfolio, last_priced, valuation_time)?;
+                portfolio.cash += carry;
+                attribution.funding_pnl += carry;
+                funding_total += carry;
+                last_priced = Some(valuation_time);
+            }
+        }
         let nav = mark(&portfolio, &prices);
         attribution.reconciliation_error = nav - previous_nav - attribution.pnl();
         if attribution.reconciliation_error.abs() > Decimal::new(1, 8) {
@@ -490,6 +637,26 @@ pub fn replay_with_execution(
         } else {
             Decimal::ZERO
         };
+        let mut warnings: Vec<String> = decision.as_ref().map_or_else(
+            || vec!["Valuation and funding only; no rebalance scheduled.".into()],
+            |decision| {
+                decision
+                    .plan
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.message.clone())
+                    .collect()
+            },
+        );
+        if scheduled {
+            if let Some(schedule) = &cfg.model_schedule {
+                let entry = schedule.at(as_of)?;
+                warnings.push(format!(
+                    "Scheduled model {} SHA256 {} trained through {}",
+                    entry.model_path, entry.sha256, entry.trained_through
+                ));
+            }
+        }
         steps.push(Step {
             as_of,
             nav,
@@ -501,15 +668,14 @@ pub fn replay_with_execution(
                 .sum::<Decimal>()
                 / nav,
             net_exposure,
-            status: decision.plan.status,
+            status: decision
+                .as_ref()
+                .map_or(Status::Accepted, |decision| decision.plan.status),
             fills: filled,
-            plan_id: decision.plan.plan_id,
-            warnings: decision
-                .plan
-                .warnings
-                .iter()
-                .map(|warning| warning.message.clone())
-                .collect(),
+            plan_id: decision
+                .as_ref()
+                .map_or(uuid::Uuid::nil(), |decision| decision.plan.plan_id),
+            warnings,
             attribution: Some(attribution),
         });
         as_of += cadence;
@@ -523,7 +689,23 @@ pub fn replay_with_execution(
             ),
         );
     }
-    if prepared.funding.is_empty() {
+    if cadence < rebalance_cadence {
+        disclosures.push(format!("NAV and funding are recorded daily; rebalances occur every {} days from the declared start. Non-rebalance days retain holdings, have no orders, and use a nil plan ID. turnover_per_rebalance is the legacy field name for turnover per daily valuation.", rebalance_cadence.num_days()));
+    }
+    if execution.net_exposure_limit.is_some() {
+        disclosures.push("execution net guard uses prior-only capacity previews; actual zero-volume or unavailable fills are rejected afterward without changing other orders. It limits planned added net risk, not guaranteed realized net after unexpected no-fill".into());
+    }
+    if let Some(native) = &prepared.native_lighter {
+        disclosures.push(format!("native Lighter hourly funding payments on held quantities: {funding_total}; all held hours require explicit payment coverage"));
+        if native.hourly_execution {
+            disclosures.push(format!("decisions use external features closed before00:00 UTC. The midnight orders remain fixed for {} hourly execution slices; each slice retries only remaining quantity at that hour's native VWAP plus spread/impact, capped at participation times min(prior midnight ADV/24, observed hourly turnover). Later volume cannot change earlier fills. Zero-volume hours cannot fill.", native.execution_hours));
+            disclosures.push(format!("fills book at each hour's completion after funding on the then-held book. Daily NAV marks the native {:02}:00 open; step as_of remains the00:00 decision stamp. Funding continues on actual post-fill quantities through valuation. Within-hour funding ownership, queue position and historical spread are approximations.", native.valuation_hours));
+        } else {
+            disclosures.push("signal features use the external bar/funding store; valuation and fills use native Lighter daily opens, funding uses exact native hourly per-unit payments, and liquidity uses trailing native volume/volatility proxies".into());
+            disclosures.push("zero-trade native daily candles cannot fill orders: this ex-post synthetic-candle check is not opening liquidity known at decision time; positive current-day volume does not change prior-day capacity; historical intraday depth, settlement events and funding rebates are not reconstructed".into());
+        }
+        disclosures.push("historical membership requires contract creation before the decision and positive native volume in the prior completed day, including currently inactive contracts; this is an activity screen, not a complete listing/halt/settlement event ledger".into());
+    } else if prepared.funding.is_empty() {
         disclosures
             .push("no funding data in the store, so this replay carries no funding P&L".into());
     } else {
@@ -536,7 +718,18 @@ pub fn replay_with_execution(
     disclosures.extend(standing_disclosures(cfg, &steps, slippage_multiple));
     disclosures.push("execution liquidity uses trailing daily ADV / 24 and annual volatility / sqrt(365*24); these are hourly proxies, not observed venue depth".into());
     disclosures.push("spread overrides are explicit counterfactual scenarios, not historical observations; impact coefficient is assumed, not calibrated".into());
-    disclosures.push("NAV is marked at the decision reference with execution shortfall debited; delayed fills use later hourly opens, never later prices in the signal; unfilled remainder is cancelled".into());
+    if !prepared
+        .native_lighter
+        .as_ref()
+        .is_some_and(|n| n.hourly_execution)
+    {
+        disclosures.push("NAV is marked at the decision reference with execution shortfall debited; delayed fills use later hourly opens, never later prices in the signal; unfilled remainder is cancelled".into());
+    } else {
+        disclosures.push(
+            "unfilled remainder is cancelled once after the declared hourly execution window"
+                .into(),
+        );
+    }
     Ok(BacktestResult {
         schema_version: "rust-backtest-2",
         initial_cash,
@@ -594,6 +787,195 @@ fn funding_carry(
     total
 }
 
+struct NetGuard<'a> {
+    cfg: &'a Config,
+    execution: &'a Settings,
+    liquidity: Option<&'a BTreeMap<String, execution::Liquidity>>,
+    stress: Decimal,
+}
+
+fn subtract_fills(orders: &mut Vec<plan::Order>, fills: &[Fill]) -> Result<(), String> {
+    for order in orders.iter_mut() {
+        let filled: Decimal = fills
+            .iter()
+            .filter(|fill| fill.asset == order.asset && fill.side == order.side)
+            .map(|fill| fill.qty)
+            .sum();
+        if filled > order.qty {
+            return Err(format!(
+                "{}: execution filled more than the remaining order",
+                order.asset
+            ));
+        }
+        order.qty -= filled;
+    }
+    orders.retain(|order| order.qty > Decimal::ZERO);
+    Ok(())
+}
+
+/// Preview capacity-limited fills before limiting additions. Closing quantities
+/// survive unchanged, including the closing part of a sign reversal. This is a
+/// batch execution guard, not a cap on target holdings.
+fn guarded_quotes(
+    orders: &[plan::Order],
+    book: &Portfolio,
+    prices: &BTreeMap<String, Decimal>,
+    fill_prices: Option<&BTreeMap<String, Decimal>>,
+    guard: &NetGuard<'_>,
+) -> Result<Vec<Option<execution::Quote>>, String> {
+    guard.execution.validate()?;
+    let limit = decimal(
+        guard
+            .execution
+            .net_exposure_limit
+            .ok_or("missing net guard limit")?,
+    )?;
+    if limit <= Decimal::ZERO {
+        return Err("net guard limit is below Decimal precision".into());
+    }
+    let nav = book.nav(prices)?;
+    if nav <= Decimal::ZERO {
+        return Err("net guard requires positive marked NAV".into());
+    }
+    let positions: BTreeMap<_, _> = book
+        .positions
+        .iter()
+        .map(|p| (p.asset.as_str(), p.qty))
+        .collect();
+    let mut reduced_net = nav - book.cash;
+    let mut additions = [Decimal::ZERO; 2];
+    let mut cost_bound = Decimal::ZERO;
+    let mut seen = BTreeSet::new();
+    // (closing quantity, opening quantity, side index), one entry per order.
+    let mut parts = Vec::with_capacity(orders.len());
+    let mut previews = Vec::with_capacity(orders.len());
+    for order in orders {
+        if !seen.insert(&order.asset) {
+            return Err("net guard requires one order per asset".into());
+        }
+        let side = if order.side == Side::Buy { 0 } else { 1 };
+        let sign = if side == 0 {
+            Decimal::ONE
+        } else {
+            -Decimal::ONE
+        };
+        let Some(reference) = fill_prices.and_then(|p| p.get(&order.asset)) else {
+            parts.push((Decimal::ZERO, Decimal::ZERO, side));
+            previews.push(None);
+            continue;
+        };
+        if prices.get(&order.asset) != Some(reference) {
+            return Err("net guard requires matching zero-delay valuation/fill references".into());
+        }
+        let Some(quote) = execution::quote(
+            guard.cfg,
+            guard.execution,
+            &order.asset,
+            order.qty,
+            *reference,
+            guard.liquidity.and_then(|v| v.get(&order.asset)).copied(),
+            guard.stress,
+        )?
+        else {
+            parts.push((Decimal::ZERO, Decimal::ZERO, side));
+            previews.push(None);
+            continue;
+        };
+        let held = positions
+            .get(order.asset.as_str())
+            .copied()
+            .unwrap_or_default();
+        let close = quote.qty.min((-sign * held).max(Decimal::ZERO));
+        let add = quote.qty - close;
+        reduced_net += sign * close * *reference;
+        additions[side] += add * *reference;
+        // Using the buy-side fee base bounds both buy and sell commissions.
+        // Requoting smaller quantities cannot increase this bound: impact and
+        // spread are nonnegative and modeled impact increases with notional.
+        let edge = (quote.spread_bps + quote.impact_bps) / BPS;
+        cost_bound += quote.qty
+            * *reference
+            * (edge + (Decimal::ONE + edge) * guard.cfg.costs.commission_bps / BPS);
+        parts.push((close, add, side));
+        previews.push(Some(quote));
+    }
+    let band = limit * (nav - cost_bound).max(Decimal::ZERO);
+    let mut scale = [Decimal::ONE; 2];
+    // A pre-existing/reduction-only breach never authorizes worsening additions.
+    if reduced_net > band {
+        scale[0] = Decimal::ZERO;
+    }
+    if reduced_net < -band {
+        scale[1] = Decimal::ZERO;
+    }
+    let net = reduced_net + additions[0] * scale[0] - additions[1] * scale[1];
+    if net > band && additions[0] > Decimal::ZERO {
+        scale[0] = ((band - reduced_net + additions[1] * scale[1]) / additions[0])
+            .max(Decimal::ZERO)
+            .min(scale[0]);
+    } else if net < -band && additions[1] > Decimal::ZERO {
+        scale[1] = ((band + reduced_net + additions[0] * scale[0]) / additions[1])
+            .max(Decimal::ZERO)
+            .min(scale[1]);
+    }
+    parts
+        .into_iter()
+        .zip(previews)
+        .zip(orders)
+        .map(|(((close, add, side), preview), order)| {
+            let allowed = close
+                + (add * scale[side])
+                    .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
+            let Some(original) = preview else {
+                return Ok(None);
+            };
+            if allowed == original.qty {
+                return Ok(Some(original));
+            }
+            if allowed.is_zero() {
+                return Ok(None);
+            }
+            if allowed < close {
+                return Err("net guard would remove a preserved reduction".into());
+            }
+            requote_within_capacity(guard, order, allowed, prices[&order.asset], original)
+        })
+        .collect()
+}
+
+/// Keep the exact permitted Decimal quantity. The original quote establishes
+/// capacity; the second quote updates costs only. Tiny f64 round trips cannot
+/// shave another quantity tick, and an underflow uses original conservative costs.
+fn requote_within_capacity(
+    guard: &NetGuard<'_>,
+    order: &plan::Order,
+    allowed: Decimal,
+    reference: Decimal,
+    original: execution::Quote,
+) -> Result<Option<execution::Quote>, String> {
+    if allowed < Decimal::ZERO || allowed > original.qty {
+        return Err("net guard quantity exceeds its original capacity bounds".into());
+    }
+    if allowed.is_zero() {
+        return Ok(None);
+    }
+    if allowed == original.qty {
+        return Ok(Some(original));
+    }
+    let repriced = execution::quote(
+        guard.cfg,
+        guard.execution,
+        &order.asset,
+        allowed,
+        reference,
+        guard.liquidity.and_then(|v| v.get(&order.asset)).copied(),
+        guard.stress,
+    )?;
+    let mut quote = repriced.unwrap_or(original);
+    quote.qty = allowed;
+    Ok(Some(quote))
+}
+
 fn apply(
     orders: &[plan::Order],
     book: &Portfolio,
@@ -602,11 +984,30 @@ fn apply(
     fill_prices: Option<&BTreeMap<String, Decimal>>,
     cfg: &Config,
     execution: &Settings,
+    planning_liquidity: Option<&BTreeMap<String, execution::Liquidity>>,
     liquidity: Option<&BTreeMap<String, execution::Liquidity>>,
     stress: Decimal,
     as_of: DateTime<Utc>,
     attribution: &mut Attribution,
 ) -> Result<(Portfolio, Vec<Fill>), String> {
+    let mut guarded = if execution.net_exposure_limit.is_some() {
+        Some(guarded_quotes(
+            orders,
+            book,
+            prices,
+            fill_prices,
+            &NetGuard {
+                cfg,
+                execution,
+                liquidity: Some(
+                    planning_liquidity.ok_or("net guard requires prior-only planning liquidity")?,
+                ),
+                stress,
+            },
+        )?)
+    } else {
+        None
+    };
     let mut quantities: BTreeMap<_, _> = book
         .positions
         .iter()
@@ -614,7 +1015,7 @@ fn apply(
         .collect();
     let mut cash = book.cash;
     let mut fills = Vec::new();
-    for order in orders {
+    for (index, order) in orders.iter().enumerate() {
         let Some(open) = prices.get(&order.asset) else {
             let last = last_prices.get(&order.asset).ok_or_else(|| {
                 format!("{}: unfilled order has no reference history", order.asset)
@@ -626,16 +1027,50 @@ fn apply(
             attribution.unfilled_notional += order.qty * *open;
             continue;
         };
-        let Some(quote) = execution::quote(
-            cfg,
-            execution,
-            &order.asset,
-            order.qty,
-            *reference,
-            liquidity.and_then(|l| l.get(&order.asset)).copied(),
-            stress,
-        )?
-        else {
+        let quote = if let Some(previews) = guarded.as_mut() {
+            match previews[index].take() {
+                None => None,
+                Some(planned) => {
+                    // Realized availability applies only to this order after
+                    // the entire prior-only batch decision has been fixed.
+                    let actual = execution::quote(
+                        cfg,
+                        execution,
+                        &order.asset,
+                        order.qty,
+                        *reference,
+                        liquidity.and_then(|l| l.get(&order.asset)).copied(),
+                        stress,
+                    )?;
+                    match actual {
+                        None => None,
+                        Some(actual) => requote_within_capacity(
+                            &NetGuard {
+                                cfg,
+                                execution,
+                                liquidity,
+                                stress,
+                            },
+                            order,
+                            planned.qty.min(actual.qty),
+                            *reference,
+                            actual,
+                        )?,
+                    }
+                }
+            }
+        } else {
+            execution::quote(
+                cfg,
+                execution,
+                &order.asset,
+                order.qty,
+                *reference,
+                liquidity.and_then(|l| l.get(&order.asset)).copied(),
+                stress,
+            )?
+        };
+        let Some(quote) = quote else {
             attribution.unfilled_notional += order.qty * *open;
             continue;
         };
@@ -1121,6 +1556,7 @@ mod tests {
                 &cfg,
                 &Settings::default(),
                 Some(&liq),
+                Some(&liq),
                 Decimal::ONE,
                 Utc::now(),
                 &mut attr,
@@ -1183,6 +1619,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
             Decimal::ONE,
             Utc::now(),
             &mut attr,
@@ -1206,5 +1643,445 @@ mod tests {
         assert_eq!(out.total_return, Decimal::new(-1, 2));
         assert_eq!(out.max_drawdown, Decimal::new(-1, 2));
         assert!(out.sharpe < 0.0);
+    }
+}
+
+#[cfg(test)]
+mod net_guard_tests {
+    use super::*;
+
+    fn config() -> Config {
+        let mut cfg = Config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml"),
+        )
+        .unwrap();
+        cfg.costs.commission_bps = Decimal::new(45, 1);
+        cfg.costs.spread_bps = Decimal::new(22, 1);
+        cfg
+    }
+    #[test]
+    fn delayed_reduction_reconciles_vwap_fill_to_completion_mark() {
+        let mut cfg = config();
+        cfg.costs.commission_bps = Decimal::ZERO;
+        cfg.costs.spread_bps = Decimal::ZERO;
+        let book = Portfolio {
+            cash: Decimal::from(9000),
+            positions: vec![Position {
+                asset: "A".into(),
+                qty: Decimal::from(10),
+            }],
+        };
+        let marks = BTreeMap::from([("A".into(), Decimal::from(110))]);
+        let fills = BTreeMap::from([("A".into(), Decimal::from(105))]);
+        let mut attribution = Attribution {
+            nav_before: Decimal::from(10000),
+            long_price_pnl: Decimal::from(100),
+            ..Default::default()
+        };
+        let (next, _) = apply(
+            &[order("A", Side::Sell, 4)],
+            &book,
+            &marks,
+            &marks,
+            Some(&fills),
+            &cfg,
+            &Settings {
+                model: execution::Model::Flat,
+                delay_hours: 1,
+                ..Default::default()
+            },
+            None,
+            None,
+            Decimal::ONE,
+            Utc::now(),
+            &mut attribution,
+        )
+        .unwrap();
+        assert_eq!(attribution.delay_pnl, -Decimal::from(20));
+        assert_eq!(next.nav(&marks).unwrap(), Decimal::from(10080));
+        assert_eq!(attribution.pnl(), Decimal::from(80));
+    }
+    fn order(asset: &str, side: Side, qty: i64) -> plan::Order {
+        plan::Order {
+            asset: asset.into(),
+            side,
+            qty: Decimal::from(qty),
+            order_type: plan::OrderType::Market,
+            limit_price: None,
+            reason: OrderReason::Entry,
+            est_cost_bps: None,
+        }
+    }
+    fn settings(guard: bool) -> Settings {
+        Settings {
+            net_exposure_limit: guard.then_some(0.10),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn slice_retries_keep_remainders_and_cannot_overfill() {
+        let mut remaining = vec![order("A", Side::Buy, 10)];
+        let mut book = Portfolio {
+            cash: Decimal::from(10000),
+            positions: Vec::new(),
+        };
+        let mut total = Decimal::ZERO;
+        for (volume, expected) in [(30000.0, 3), (0.0, 0), (100000.0, 7)] {
+            let liquidity = BTreeMap::from([(
+                "A".into(),
+                execution::Liquidity {
+                    hourly_volume: volume,
+                    hourly_volatility: 0.01,
+                },
+            )]);
+            let (next, fills, _) = run(&remaining, &book, &settings(false), &liquidity);
+            assert_eq!(
+                fills.iter().map(|fill| fill.qty).sum::<Decimal>(),
+                Decimal::from(expected)
+            );
+            if expected == 3 {
+                assert!(subtract_fills(&mut vec![order("A", Side::Buy, 1)], &fills).is_err());
+            }
+            subtract_fills(&mut remaining, &fills).unwrap();
+            total += Decimal::from(expected);
+            assert_eq!(
+                remaining.iter().map(|order| order.qty).sum::<Decimal>(),
+                Decimal::from(10) - total
+            );
+            book = next;
+        }
+        assert!(remaining.is_empty());
+        assert_eq!(book.positions[0].qty, Decimal::from(10));
+    }
+    fn run(
+        orders: &[plan::Order],
+        book: &Portfolio,
+        settings: &Settings,
+        liq: &BTreeMap<String, execution::Liquidity>,
+    ) -> (Portfolio, Vec<Fill>, Attribution) {
+        let prices: BTreeMap<_, _> = liq
+            .keys()
+            .map(|a| (a.clone(), Decimal::from(100)))
+            .collect();
+        let mut attr = Attribution {
+            nav_before: book.nav(&prices).unwrap(),
+            ..Default::default()
+        };
+        let (next, fills) = apply(
+            orders,
+            book,
+            &prices,
+            &prices,
+            Some(&prices),
+            &config(),
+            settings,
+            Some(liq),
+            Some(liq),
+            Decimal::ONE,
+            Utc::now(),
+            &mut attr,
+        )
+        .unwrap();
+        assert!(
+            (next.nav(&prices).unwrap() - attr.nav_before - attr.pnl()).abs() < Decimal::new(1, 9)
+        );
+        (next, fills, attr)
+    }
+    fn liquidity(names: &[(&str, f64)]) -> BTreeMap<String, execution::Liquidity> {
+        names
+            .iter()
+            .map(|(a, v)| {
+                (
+                    a.to_string(),
+                    execution::Liquidity {
+                        hourly_volume: *v,
+                        hourly_volatility: 0.02,
+                    },
+                )
+            })
+            .collect()
+    }
+    fn net(book: &Portfolio) -> Decimal {
+        book.positions
+            .iter()
+            .map(|p| p.qty * Decimal::from(100))
+            .sum()
+    }
+    fn nav(book: &Portfolio) -> Decimal {
+        book.cash + net(book)
+    }
+
+    #[test]
+    fn net_guard_asymmetric_capacity_requotes_trimmed_additions_and_reconciles_costs() {
+        let book = Portfolio {
+            cash: Decimal::from(100000),
+            positions: vec![],
+        };
+        let orders = [order("A", Side::Buy, 200), order("B", Side::Sell, 200)];
+        let liq = liquidity(&[("A", 2000000.0), ("B", 100000.0)]);
+        let (unchecked, old_fills, old_attr) = run(&orders, &book, &settings(false), &liq);
+        assert!(net(&unchecked) / nav(&unchecked) > Decimal::new(1, 1));
+        assert_eq!(old_fills[0].qty, Decimal::from(200));
+        assert_eq!(old_fills[1].qty, Decimal::from(10));
+        let (guarded, fills, attr) = run(&orders, &book, &settings(true), &liq);
+        assert!(net(&guarded).abs() / nav(&guarded) <= Decimal::new(1, 1));
+        assert!(fills[0].qty < old_fills[0].qty);
+        assert_eq!(fills[1].qty, old_fills[1].qty);
+        assert!(
+            fills[0].price < old_fills[0].price,
+            "smaller buy must be requoted at lower modeled impact"
+        );
+        assert!(attr.unfilled_notional > old_attr.unfilled_notional);
+        let filled: Decimal = fills.iter().map(|f| f.qty * f.reference_price).sum();
+        assert_eq!(
+            (filled + attr.unfilled_notional).round_dp(8),
+            Decimal::from(40000)
+        );
+    }
+
+    #[test]
+    fn excess_side_additions_are_trimmed_proportionally() {
+        let book = Portfolio {
+            cash: Decimal::from(100000),
+            positions: vec![],
+        };
+        let orders = [
+            order("A", Side::Buy, 200),
+            order("C", Side::Buy, 100),
+            order("B", Side::Sell, 100),
+        ];
+        let liq = liquidity(&[("A", 2000000.0), ("C", 1000000.0), ("B", 100000.0)]);
+        let (next, fills, _) = run(&orders, &book, &settings(true), &liq);
+        let a = fills.iter().find(|f| f.asset == "A").unwrap().qty;
+        let c = fills.iter().find(|f| f.asset == "C").unwrap().qty;
+        assert!((a - Decimal::from(2) * c).abs() <= Decimal::new(2, 8));
+        assert!(net(&next).abs() / nav(&next) <= Decimal::new(1, 1));
+    }
+
+    #[test]
+    fn net_guard_sign_reversal_preserves_closing_fills_and_trims_only_opening_part() {
+        let book = Portfolio {
+            cash: Decimal::from(100000),
+            positions: vec![
+                Position {
+                    asset: "A".into(),
+                    qty: Decimal::from(100),
+                },
+                Position {
+                    asset: "B".into(),
+                    qty: Decimal::from(-100),
+                },
+            ],
+        };
+        let orders = [order("A", Side::Sell, 300), order("B", Side::Buy, 100)];
+        let liq = liquidity(&[("A", 3000000.0), ("B", 1000000.0)]);
+        let (next, fills, _) = run(&orders, &book, &settings(true), &liq);
+        let a = fills.iter().find(|f| f.asset == "A").unwrap();
+        let b = fills.iter().find(|f| f.asset == "B").unwrap();
+        assert!(a.qty >= Decimal::from(100));
+        assert!(a.qty < Decimal::from(300));
+        assert_eq!(b.qty, Decimal::from(100));
+        assert!(net(&next).abs() / nav(&next) <= Decimal::new(1, 1));
+        assert!(!next.positions.iter().any(|p| p.asset == "B"));
+    }
+
+    #[test]
+    fn existing_breach_preserves_reductions_and_forbids_worsening_additions() {
+        let book = Portfolio {
+            cash: Decimal::from(75000),
+            positions: vec![Position {
+                asset: "A".into(),
+                qty: Decimal::from(250),
+            }],
+        };
+        let orders = [order("A", Side::Sell, 50), order("C", Side::Buy, 100)];
+        let liq = liquidity(&[("A", 1000000.0), ("C", 1000000.0)]);
+        let (next, fills, attr) = run(&orders, &book, &settings(true), &liq);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].asset, "A");
+        assert_eq!(fills[0].qty, Decimal::from(50));
+        assert!(net(&next) / nav(&next) > Decimal::new(1, 1));
+        assert!(net(&next) < net(&book));
+        assert_eq!(attr.unfilled_notional, Decimal::from(10000));
+    }
+
+    #[test]
+    fn fractional_hbar_reduction_survives_requote_rounding() {
+        // Actual saved HBAR quantity/reference reproduces the extra lost tick.
+        let close = Decimal::from_str_exact("18418.94810758").unwrap();
+        let px = Decimal::from_str_exact("0.14694").unwrap();
+        let cfg = config();
+        let settings = settings(true);
+        let liq = liquidity(&[("HBAR", 1e12), ("B", 1e12)]);
+        let shaved = execution::quote(
+            &cfg,
+            &settings,
+            "HBAR",
+            close,
+            px,
+            liq.get("HBAR").copied(),
+            Decimal::ONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shaved.qty, close - Decimal::new(1, 8));
+        let book = Portfolio {
+            cash: Decimal::from(120000) - close * px,
+            positions: vec![
+                Position {
+                    asset: "HBAR".into(),
+                    qty: close,
+                },
+                Position {
+                    asset: "B".into(),
+                    qty: Decimal::from(-200),
+                },
+            ],
+        };
+        let mut request = order("HBAR", Side::Sell, 1);
+        request.qty = close * Decimal::from(2);
+        let prices = BTreeMap::from([("HBAR".into(), px), ("B".into(), Decimal::from(100))]);
+        let mut attr = Attribution::default();
+        let (next, fills) = apply(
+            &[request],
+            &book,
+            &prices,
+            &prices,
+            Some(&prices),
+            &cfg,
+            &settings,
+            Some(&liq),
+            Some(&liq),
+            Decimal::ONE,
+            Utc::now(),
+            &mut attr,
+        )
+        .unwrap();
+        assert_eq!(fills[0].qty, close);
+        assert!(!next.positions.iter().any(|p| p.asset == "HBAR"));
+        assert_eq!(next.positions[0].qty, Decimal::from(-200));
+    }
+
+    #[test]
+    fn repricing_underflow_keeps_exact_quantity_with_original_cost_bound() {
+        let cfg = config();
+        let settings = settings(true);
+        let liq = liquidity(&[("TINY", 1e12)]);
+        let reference = Decimal::new(1, 21);
+        let allowed = Decimal::new(1, 8);
+        assert!(execution::quote(
+            &cfg,
+            &settings,
+            "TINY",
+            allowed,
+            reference,
+            liq.get("TINY").copied(),
+            Decimal::ONE
+        )
+        .unwrap()
+        .is_none());
+        let original = execution::quote(
+            &cfg,
+            &settings,
+            "TINY",
+            Decimal::ONE,
+            reference,
+            liq.get("TINY").copied(),
+            Decimal::ONE,
+        )
+        .unwrap()
+        .unwrap();
+        let costs = (original.spread_bps, original.impact_bps);
+        let q = requote_within_capacity(
+            &NetGuard {
+                cfg: &cfg,
+                execution: &settings,
+                liquidity: Some(&liq),
+                stress: Decimal::ONE,
+            },
+            &order("TINY", Side::Buy, 1),
+            allowed,
+            reference,
+            original,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(q.qty, allowed);
+        assert_eq!((q.spread_bps, q.impact_bps), costs);
+    }
+
+    #[test]
+    fn future_zero_volume_rejection_cannot_resize_other_orders() {
+        let cfg = config();
+        let settings = settings(true);
+        let book = Portfolio {
+            cash: Decimal::from(100000),
+            positions: vec![],
+        };
+        let orders = [order("A", Side::Buy, 200), order("B", Side::Sell, 100)];
+        let planning = liquidity(&[("A", 2000000.0), ("B", 1000000.0)]);
+        let mut zero = planning.clone();
+        zero.get_mut("B").unwrap().hourly_volume = 0.0;
+        let prices = BTreeMap::from([
+            ("A".into(), Decimal::from(100)),
+            ("B".into(), Decimal::from(100)),
+        ]);
+        let go = |actual: &BTreeMap<String, execution::Liquidity>| {
+            apply(
+                &orders,
+                &book,
+                &prices,
+                &prices,
+                Some(&prices),
+                &cfg,
+                &settings,
+                Some(&planning),
+                Some(actual),
+                Decimal::ONE,
+                Utc::now(),
+                &mut Attribution::default(),
+            )
+            .unwrap()
+        };
+        let (_, normal) = go(&planning);
+        let (next, rejected) = go(&zero);
+        let planned_a = normal.iter().find(|f| f.asset == "A").unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].asset, "A");
+        assert_eq!(rejected[0].qty, planned_a.qty);
+        assert_eq!(rejected[0].price, planned_a.price);
+        // Unexpected no-fill can breach the realized band; no future liquidity
+        // is allowed to trim the independently fixed A order retroactively.
+        assert!(net(&next) / nav(&next) > Decimal::new(1, 1));
+    }
+
+    #[test]
+    fn absent_guard_preserves_original_json_and_quotes() {
+        let original = serde_json::json!({"model":"impact","delay_hours":0,"participation":0.01,"impact_coefficient":0.1,"spread_multiple":1.0,"impact_multiple":1.0,"half_spread_bps":{}});
+        let parsed: Settings = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), original);
+        let book = Portfolio {
+            cash: Decimal::from(100000),
+            positions: vec![],
+        };
+        let liq = liquidity(&[("A", 1000000.0)]);
+        let orders = [order("A", Side::Buy, 100)];
+        let (_, fills, _) = run(&orders, &book, &parsed, &liq);
+        let quoted = execution::quote(
+            &config(),
+            &parsed,
+            "A",
+            Decimal::from(100),
+            Decimal::from(100),
+            liq.get("A").copied(),
+            Decimal::ONE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fills[0].qty, quoted.qty);
+        assert_eq!(
+            fills[0].price,
+            Decimal::from(100) * (Decimal::ONE + (quoted.spread_bps + quoted.impact_bps) / BPS)
+        );
     }
 }

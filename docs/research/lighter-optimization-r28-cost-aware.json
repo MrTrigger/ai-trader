@@ -1,0 +1,70 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:35:29.326336+00:00",
+  "output": "var/research/lighter-optimization-r28-cost-aware",
+  "hypothesis": "R26 reuses a trend constructor with no expected-return cost floor and a fixed0.25 exantevol budget. Compare the existing daily cost-aware unbalanced constructor and a per-risk-selected variant, holding forecasts/model/dates/limits/costs/turnover fixed. Both new constructions allocate jointly across signs to gross0.80 with maxposition0.25. This changes risk sizing, not just selection; the two cost-aware variants isolate expected-return versus per-risk ordering. One frozen model, no fitting or parameter grid.",
+  "candidates": [
+    {
+      "id": "absolute-vol-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "1.00",
+          "max_cluster_exposure": "1.00"
+        }
+      }
+    },
+    {
+      "id": "return-ranked-absolute",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "risk_adjusted_unbalanced",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "1.00",
+          "max_cluster_exposure": "1.00"
+        }
+      }
+    },
+    {
+      "id": "risk-ranked-absolute",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "risk_adjusted_score_unbalanced",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "1.00",
+          "max_cluster_exposure": "1.00"
+        }
+      }
+    }
+  ],
+  "risk_note": "All three candidates use net/cluster limits1.00 equal to existing gross limit1.00, leaving room above gross target0.80 for a fully directional target. Maxposition stays0.25, targetgross0.80, turnover2.00. These two limits differ from R26; the matched vol control measures any resulting execution change. No risk-engine tolerance change."
+}

@@ -98,11 +98,176 @@ pub(crate) fn net_conviction_24h(
     Ok((net > Decimal::ZERO).then_some(net))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeEstimate {
+    Available {
+        long_cost_24h: rust_decimal::Decimal,
+    },
+    Unavailable {
+        observed_hours: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeForecast {
+    pub as_of: chrono::DateTime<chrono::Utc>,
+    pub assets: BTreeMap<String, NativeEstimate>,
+}
+
+impl NativeForecast {
+    pub fn validate_date(&self, as_of: chrono::DateTime<chrono::Utc>) -> Result<(), String> {
+        if self.as_of != as_of {
+            return Err(format!(
+                "native funding forecast dated {} does not match decision {as_of}",
+                self.as_of
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn native_forecast(
+    rates: &BTreeMap<chrono::DateTime<chrono::Utc>, BTreeMap<String, rust_decimal::Decimal>>,
+    as_of: chrono::DateTime<chrono::Utc>,
+    assets: &std::collections::BTreeSet<String>,
+) -> Result<NativeForecast, String> {
+    use rust_decimal::Decimal;
+    if as_of.timestamp() % 3600 != 0 || as_of.timestamp_subsec_nanos() != 0 {
+        return Err("native funding forecast requires an hourly decision boundary".into());
+    }
+    let mut estimates = BTreeMap::new();
+    for asset in assets {
+        let mut sum = Decimal::ZERO;
+        let mut observed_hours = 0;
+        for offset in 1..=168 {
+            let at = as_of - chrono::Duration::hours(offset);
+            if let Some(rate) = rates.get(&at).and_then(|row| row.get(asset)) {
+                sum += *rate;
+                observed_hours += 1;
+            }
+        }
+        estimates.insert(
+            asset.clone(),
+            if observed_hours == 168 {
+                NativeEstimate::Available {
+                    long_cost_24h: sum / Decimal::from(7),
+                }
+            } else {
+                NativeEstimate::Unavailable { observed_hours }
+            },
+        );
+    }
+    Ok(NativeForecast {
+        as_of,
+        assets: estimates,
+    })
+}
+
+pub(crate) fn native_net_conviction_24h(
+    conviction: rust_decimal::Decimal,
+    direction: plan::Direction,
+    long_cost_24h: rust_decimal::Decimal,
+) -> Option<rust_decimal::Decimal> {
+    use rust_decimal::Decimal;
+    if conviction <= Decimal::ZERO {
+        return None;
+    }
+    let cost = match direction {
+        plan::Direction::Long => long_cost_24h,
+        plan::Direction::Short => -long_cost_24h,
+    };
+    let net = conviction - cost;
+    (net > Decimal::ZERO).then_some(net)
+}
+
 #[cfg(test)]
 mod adjustment_tests {
     use super::*;
     use plan::Direction;
     use rust_decimal::Decimal;
+
+    #[test]
+    fn native_forecast_requires_all_168_prior_hours_and_ignores_future_events() {
+        use chrono::{Duration, Utc};
+        let as_of: chrono::DateTime<Utc> = "2026-01-08T00:00:00Z".parse().unwrap();
+        let names = ["BTC".into(), "NEW".into()].into_iter().collect();
+        let mut rates: BTreeMap<_, _> = (1..=168)
+            .map(|offset| {
+                (
+                    as_of - Duration::hours(offset),
+                    BTreeMap::from([("BTC".into(), Decimal::new(1, 4))]),
+                )
+            })
+            .collect();
+        let before = native_forecast(&rates, as_of, &names).unwrap();
+        assert_eq!(
+            before.assets["BTC"],
+            NativeEstimate::Available {
+                long_cost_24h: Decimal::new(24, 4)
+            }
+        );
+        assert_eq!(
+            before.assets["NEW"],
+            NativeEstimate::Unavailable { observed_hours: 0 }
+        );
+        for at in [
+            as_of,
+            as_of + Duration::hours(1),
+            as_of - Duration::hours(169),
+        ] {
+            rates.insert(at, BTreeMap::from([("BTC".into(), Decimal::from(999))]));
+        }
+        assert_eq!(native_forecast(&rates, as_of, &names).unwrap(), before);
+        rates.remove(&(as_of - Duration::hours(80)));
+        assert_eq!(
+            native_forecast(&rates, as_of, &names).unwrap().assets["BTC"],
+            NativeEstimate::Unavailable {
+                observed_hours: 167
+            }
+        );
+        assert!(before.validate_date(as_of).is_ok());
+        assert!(before.validate_date(as_of + Duration::hours(1)).is_err());
+        assert!(before.validate_date(as_of - Duration::hours(1)).is_err());
+        assert!(native_forecast(&rates, as_of + Duration::seconds(1), &names).is_err());
+    }
+
+    #[test]
+    fn native_carry_rewards_favorable_and_drops_adverse_without_reviving_zero() {
+        let price = Decimal::new(1, 2);
+        let carry = Decimal::new(1, 3);
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Long, carry),
+            Some(Decimal::new(9, 3))
+        );
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Short, carry),
+            Some(Decimal::new(11, 3))
+        );
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Long, -carry),
+            Some(Decimal::new(11, 3))
+        );
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Short, -carry),
+            Some(Decimal::new(9, 3))
+        );
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Long, price),
+            None
+        );
+        assert_eq!(
+            native_net_conviction_24h(price, Direction::Short, -price * Decimal::from(2)),
+            None
+        );
+        for direction in [Direction::Long, Direction::Short] {
+            for carry in [-Decimal::ONE, Decimal::ONE] {
+                assert_eq!(
+                    native_net_conviction_24h(Decimal::ZERO, direction, carry),
+                    None
+                );
+            }
+        }
+    }
 
     #[test]
     fn adverse_costs_reduce_both_sides_without_rewarding_carry() {

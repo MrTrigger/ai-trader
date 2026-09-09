@@ -1,0 +1,109 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "The existing vol-parity constructor cancels single-asset conviction magnitude. Compare fixed existing sign-ensemble and continuous z momentum with the existing conviction-preserving volatility constructor. Same horizons and 25% risk budget; no fitted parameters. Test BTC and BTC/ETH continuously across483days.",
+  "acceptance": "Net Sharpe >1.5 and BTC outperformance are minimums; require material netreturn improvement and stronger subperiod evidence. All current dates remain development evidence. Do not promote merely because directional risk increased.",
+  "risk_change": "Compared with R11 only the trading turnover allowance rises0.50to2.00NAV. Target gross0.80 and position/net/cluster0.80 remain; hourly participation and fees unchanged. This permits intended reversals, not greater target leverage. Not a deployment change.",
+  "source_suite": "var/research/lighter-btc-eth-history-full/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-btc-eth-history-full/hourly",
+  "output": "var/research/lighter-optimization-r16-momentum-strength",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "btc-sign-strength",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": true,
+          "max_holdings": 1,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_ensemble",
+          "constructor": "donchian_vol_sized",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-z-strength",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": true,
+          "max_holdings": 1,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_z",
+          "constructor": "donchian_vol_sized",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-sign-strength",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": false,
+          "max_holdings": 2,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_ensemble",
+          "constructor": "donchian_vol_sized",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-z-strength",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": false,
+          "max_holdings": 2,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_z",
+          "constructor": "donchian_vol_sized",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ],
+  "universe": "Predeclared BTC trade instrument and ETH benchmark only; raw native daily pages unchanged, derived catalog records original hash. Minimumcrosssection1 permits this explicit universe and no ranker is used."
+}

@@ -1,0 +1,59 @@
+{
+  "declared_at": "2026-09-08T20:10:42.234625+00:00",
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "hypothesis": "Fixed asymmetric market allocation: if prior completed BTC 30-day return is strictly positive, target BTC long at 0.80 NAV; otherwise use the frozen R6 ranker with its original component risk caps. No horizon/threshold grid. One continuous account with netted targets and native partial fills, funding and costs.",
+  "output": "var/research/lighter-optimization-r23-regime",
+  "candidates": [
+    {
+      "id": "ranker-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"
+        }
+      }
+    },
+    {
+      "id": "ranker-control-turnover2",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        }
+      }
+    },
+    {
+      "id": "btc-positive-month",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "ranker_btc_regime": true,
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ],
+  "control_note": "Original ranker and matched turnover2 ranker distinguish the joint policy from its regime contribution. Component risk caps stay original in ranker mode; account turnover2 applies throughout.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite."
+}

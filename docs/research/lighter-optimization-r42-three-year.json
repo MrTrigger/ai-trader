@@ -1,0 +1,101 @@
+{
+  "declared_at": "2026-09-09T06:29:27.436587+00:00",
+  "output": "var/research/lighter-optimization-r42-three-year",
+  "hypothesis": "User asks whether the BTC/ETH book (R41 sizing: cap 50%, gross 100%, 20% deadband, tsmom_vol_parity, full-cohort ranker inference) holds over three years. Lighter native data begins 2025-01-17, so this runs on Binance USD-M hourly/daily bars and funding from the signal store with the Lighter cost assumptions as proxies: 2.2 bps half-spread, zero commission, impact 0.1, 1% participation, one-hour delay; stress multiplies spread by 10 and impact by 4. Expanding walk-forward: six equal test blocks, each scored by a model trained only on dates at least two days before the block, same fixed recipe as R32 (per_risk_abs reward, regression, 5 equal seeds x 300 trees, lag 1h, hold 24h, BTC daily raw market context). No hyperparameter search. The universe is the recorded point-in-time Binance liquidity snapshots, whose top-N varies between 24 and 40 across history; disclosed, not fixed. This is a signal robustness check under proxy execution, not a Lighter performance estimate.",
+  "acceptance": "Descriptive. Report full-period and per-fold Sharpe, return, drawdown, BTC buy-and-hold, stressed costs and paired bootstrap; no threshold promotes anything. First-fold models have the least training history.",
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "matrix": {
+    "config": "var/research/lighter-native-baseline-configs/config-1.toml",
+    "data_root": "data",
+    "start": "2020-01-01",
+    "end": "2026-02-01",
+    "lag_hours": 1,
+    "hold_hours": 24,
+    "market_context": true
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "reward": "per_risk_abs",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "portfolio_overrides": {
+    "constructor": "tsmom_vol_parity",
+    "turnover_budget": "2.00",
+    "rebalance_drift_band": "0.20",
+    "ranker_trade_assets": [
+      "BTC",
+      "ETH"
+    ],
+    "target_gross_exposure": "1.00"
+  },
+  "limit_overrides": {
+    "max_position": "0.50",
+    "max_net_exposure": "1.00",
+    "max_cluster_exposure": "1.00"
+  },
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    }
+  }
+}

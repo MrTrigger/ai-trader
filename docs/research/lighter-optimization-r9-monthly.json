@@ -1,0 +1,16 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "A ranker frozen through November may decay as the venue cohort and return relationships change. Refit on a fixed monthly expanding window with the same features, target, historical eligibility and training recipe; retain one continuous portfolio across switches. Separately test daily and three-day rebalancing.",
+  "acceptance": "Full net Sharpe > 1.5 AND return above matched BTC are mandatory; material improvement over R6 must be assessed with later-half, rally and stress results. All evaluated dates remain development data.",
+  "training": "Use the R6 model through December31. Activate seven fixed refits January1 through July1, trained through effective date minus3days; explicit 24h labels plus1h lag end before activation. New training matrix old prefix matches all6486 R6 rows. No hyperparameter changes.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "output": "var/research/lighter-optimization-r9-monthly",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id":"control", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id":"monthly-daily", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json", "model_schedule_path":"var/research/lighter-monthly-r9/attempt-2/schedule.json"}}},
+    {"id":"monthly-3d", "execution":{"delay_hours":1}, "overrides":{"portfolio":{"model_path":"var/research/lighter-ranker-r1-2026-09-08/external/model.json", "model_schedule_path":"var/research/lighter-monthly-r9/attempt-2/schedule.json", "rebalance_every":3}}}
+  ]
+}

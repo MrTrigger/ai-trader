@@ -1,0 +1,103 @@
+{
+  "declared_at": "2026-09-09T06:52:36.895535+00:00",
+  "output": "var/research/lighter-optimization-r43-three-year-baselines",
+  "hypothesis": "User directs continued improvement of the full-altcoin book, not BTC/ETH only, and requires multi-year evidence. Before any change, establish three-year walk-forward baselines for the two existing all-asset books under identical proxy execution: (a) the R32 absolute book, tsmom_vol_parity with per-risk absolute reward, 25% cap, 80% gross, 80% net/cluster, turnover budget 2.0, no deadband; (b) the deployed relative long/short ranker, risk_adjusted_score_selected with demeaned per-risk reward, 10% net limit, 0.5 turnover budget. Same matrix, folds, trainer recipe, universe snapshots and costs as R42. These are controls; nothing is tuned.",
+  "acceptance": "Descriptive controls. Any later candidate must beat the corresponding baseline on the same folds, and the comparison is reported per fold and under stress.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+    "built_by": "R42",
+    "market_context": true
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "all-abs-tsmom",
+      "reward": "per_risk_abs",
+      "portfolio": {
+        "constructor": "tsmom_vol_parity",
+        "turnover_budget": "2.00",
+        "rebalance_drift_band": "0.00"
+      },
+      "limits": {
+        "max_net_exposure": "0.80",
+        "max_cluster_exposure": "0.80"
+      }
+    },
+    {
+      "id": "all-relative-ls",
+      "reward": "per_risk",
+      "portfolio": {},
+      "limits": {}
+    }
+  ]
+}

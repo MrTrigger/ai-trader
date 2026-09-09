@@ -1,0 +1,13 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Venue-cohort training with external labels reached 1.49928 Sharpe. Test the previously motivated fixed 0.10 execution net guard and an existing 20% relative resize deadband separately, without changing forecasts, dates, capital, spreads, impact or participation.",
+  "selection": "External-label model is the highest central Sharpe of the three declared model/sizing candidates. This is selection on reused development data, not an independent holdout.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-r5-model-execution",
+  "costs": ["central", "stress"],
+  "candidates": [
+    {"id": "cohort-external-net-guard", "execution": {"net_exposure_limit": 0.10}, "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"}}},
+    {"id": "cohort-external-deadband", "overrides": {"portfolio": {"model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json", "rebalance_drift_band": "0.20"}}}
+  ]
+}

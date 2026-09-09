@@ -1,0 +1,52 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T21:15:21.535612+00:00",
+  "output": "var/research/lighter-optimization-r34-cost-filter",
+  "hypothesis": "Isolate expected-return cost filtering from allocation changes. Existing volatility sizing and fixed native5seed model, same285developmentdates and100k. Exclude forecasts below2*(commission+spread)/10000 expected24h return before existing sizing. Floor uses fixed declared config costs, never realized slippage or later volumes. R28 also changed sizing and selection, so did not isolate this effect. No extra threshold tuning, no refit.",
+  "candidates": [
+    {
+      "id": "native-ensemble-control",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "native-ensemble-cost-filter",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r32-native/model.json",
+          "constructor": "ranker_cost_aware_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00"
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ],
+  "model": "var/research/lighter-ranker-r32-native/model.json"
+}

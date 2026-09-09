@@ -7,7 +7,8 @@ regularisation, NaN-native - not tuned per fold.
 """
 import argparse
 import json
-from datetime import date
+import hashlib
+from datetime import date, timedelta
 from pathlib import Path
 
 import lightgbm as lgb
@@ -31,6 +32,38 @@ PARAMS = {
 }
 N_TREES = 300
 MIN_ROWS = 400
+SELECTION_FEATURES = [
+    "mkt_ret_7", "mkt_ret_30", "mkt_ret_90", "mkt_vol_30",
+    "breadth_30", "breadth_90", "fund_mean_7d",
+]
+SELECTION_PROFILE = "selection-timer-7d-v1"
+
+
+def profile_settings(profile, label, available_features):
+    if profile == "original":
+        return list(available_features), dict(PARAMS), N_TREES
+    if profile != SELECTION_PROFILE or label != "fwd_z_7":
+        raise ValueError("selection timer requires the fixed fwd_z_7 label")
+    if not set(SELECTION_FEATURES).issubset(available_features):
+        raise ValueError("market matrix lacks required selection timer features")
+    return list(SELECTION_FEATURES), dict(PARAMS, num_leaves=2, min_data_in_leaf=180), 50
+
+
+def training_prefix(rows, through, horizon, label):
+    cutoff = through - timedelta(days=horizon + 2)
+    previous = None
+    for row in rows:
+        stamp = date.fromisoformat(row["date"])
+        if previous is not None and stamp <= previous:
+            raise ValueError("market matrix dates must be strictly increasing")
+        if previous is not None and stamp != previous + timedelta(days=1):
+            raise ValueError("market matrix must have consecutive daily rows for horizon labels")
+        previous = stamp
+    keep = [row for row in rows if label in row["labels"] and date.fromisoformat(row["date"]) <= cutoff]
+    if len(keep) < MIN_ROWS:
+        raise ValueError(f"only {len(keep)} labeled rows through the purged cutoff; refusing a small fit")
+    return keep
+
 
 
 def main() -> None:
@@ -39,13 +72,14 @@ def main() -> None:
     ap.add_argument("--label", choices=["fwd_z_7", "fwd_z_14", "fwd_z_30"], required=True)
     ap.add_argument("--through", type=date.fromisoformat, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--profile", choices=["original", SELECTION_PROFILE], default="original")
     args = ap.parse_args()
 
     with args.matrix.open() as fh:
         manifest = json.loads(fh.readline())
         if manifest.get("kind") != "market-matrix":
             raise ValueError("not a market matrix")
-        features = manifest["features"]
+        features, params, rounds = profile_settings(args.profile, args.label, manifest["features"])
         rows = [json.loads(line) for line in fh if line.strip()]
 
     # The label at date D looks up to h days FORWARD; a row is usable for a
@@ -53,32 +87,39 @@ def main() -> None:
     # window. Purge by shifting the cutoff back by the label horizon + 2-day
     # margin (the ranker's purge convention).
     horizon = int(args.label.rsplit("_", 1)[1])
-    cutoff = args.through.toordinal() - horizon - 2
-    keep = [
-        r
-        for r in rows
-        if args.label in r["labels"] and date.fromisoformat(r["date"]).toordinal() <= cutoff
-    ]
-    if len(keep) < MIN_ROWS:
-        raise ValueError(f"only {len(keep)} labeled rows through the purged cutoff; refusing a small fit")
+    keep = training_prefix(rows, args.through, horizon, args.label)
     x = np.array(
         [[r["features"].get(f, float("nan")) for f in features] for r in keep], dtype=float
     )
     y = np.array([r["labels"][args.label] for r in keep], dtype=float)
-    booster = lgb.train(PARAMS, lgb.Dataset(x, label=y, feature_name=features), num_boost_round=N_TREES)
+    if not np.isfinite(y).all() or np.isinf(x).any():
+        raise ValueError("training data contains non-finite targets or infinite features")
+    label_std = float(np.std(y, ddof=1))
+    if not np.isfinite(label_std) or label_std <= 0:
+        raise ValueError("training label variance must be positive")
+    booster = lgb.train(params, lgb.Dataset(x, label=y, feature_name=features), num_boost_round=rounds)
     dump = booster.dump_model()
     doc = {
         "format_version": "crypto-lightgbm-json-1",
         "model_version": "market-timing-1",
         "features": features,
         "label": args.label,
-        "label_std": float(np.std(y, ddof=1)),
+        "label_std": label_std,
         "trained_through": args.through.isoformat(),
         "n_rows": len(keep),
+        "training_profile": args.profile,
+        "training_parameters": params,
+        "requested_rounds": rounds,
+        "training_first_date": keep[0]["date"],
+        "training_last_date": keep[-1]["date"],
+        "training_label_end": (date.fromisoformat(keep[-1]["date"]) + timedelta(days=horizon)).isoformat(),
+        "purge_days": horizon + 2,
+        "matrix_sha256": hashlib.sha256(args.matrix.read_bytes()).hexdigest(),
+
         "tree_info": dump["tree_info"],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(doc, sort_keys=True) + "\n")
+    args.out.write_text(json.dumps(doc, sort_keys=True, allow_nan=False) + "\n")
     print(f"wrote {args.out}: {len(keep)} rows through {args.through} (purged {horizon}+2d), label_std {doc['label_std']:.3f}")
 
 

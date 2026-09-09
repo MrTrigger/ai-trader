@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::{config::Config, store, universe};
 
@@ -32,8 +33,16 @@ pub struct TrainingRow {
 }
 
 pub struct TrainingMatrix {
+    pub market_context: Option<&'static str>,
     pub features: Vec<String>,
     pub rows: Vec<TrainingRow>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LabelPrices<'a> {
+    ExternalHourly,
+    NativeDaily(&'a [features_crypto::Bar]),
+    NativeHourly(&'a crate::lighter_hourly::LabelMarks),
 }
 
 pub fn build(
@@ -47,6 +56,56 @@ pub fn build(
     include_unlisted: bool,
     step_hours: i64,
 ) -> Result<TrainingMatrix, String> {
+    build_for_universe(
+        root,
+        root,
+        cfg,
+        start,
+        end,
+        lag_hours,
+        hold_hours,
+        funding_window,
+        include_unlisted,
+        step_hours,
+        LabelPrices::ExternalHourly,
+        &BTreeSet::new(),
+        12,
+        false,
+        false,
+    )
+}
+
+/// Build with a separately generated venue-aware universe and an explicit
+/// label-price source. `omitted_decisions` removes whole cross-sections before
+/// feature normalisation; it is intended for recorded native-data quarantine.
+pub fn build_for_universe(
+    root: &Path,
+    universe_root: &Path,
+    cfg: &Config,
+    start: NaiveDate,
+    end: NaiveDate,
+    lag_hours: i64,
+    hold_hours: i64,
+    funding_window: features_crypto::FundingWindow,
+    include_unlisted: bool,
+    step_hours: i64,
+    label_prices: LabelPrices<'_>,
+    omitted_decisions: &BTreeSet<NaiveDate>,
+    min_cross_section: usize,
+    apply_runtime_eligibility: bool,
+    market_context: bool,
+) -> Result<TrainingMatrix, String> {
+    if min_cross_section < 2 {
+        return Err("minimum cross-section must be at least 2".into());
+    }
+    if apply_runtime_eligibility && cfg.min_hourly_quote_volume != rust_decimal::Decimal::ZERO {
+        return Err("venue-aware training cannot reproduce a nonzero hourly-volume profile".into());
+    }
+    if matches!(label_prices, LabelPrices::NativeDaily(_))
+        && (lag_hours != 0 || hold_hours != 24 || step_hours != 24)
+    {
+        return Err("native daily labels require lag 0h, hold 24h and step 24h".into());
+    }
     if step_hours <= 0 || 24 % step_hours != 0 && step_hours % 24 != 0 {
         return Err("step_hours must be positive and divide or multiply 24".into());
     }
@@ -75,7 +134,29 @@ pub fn build(
     let feature_start = first_decision - Duration::hours(169);
     let feature_end = last_decision - Duration::hours(1);
     let target_end = last_decision + Duration::hours(lag_hours + hold_hours);
-    let opens = marked_opens(&all_hourly, first_decision, target_end);
+    let external_opens = marked_opens(&all_hourly, first_decision, target_end);
+    let native_opens: BTreeMap<_, _> = match label_prices {
+        LabelPrices::ExternalHourly => BTreeMap::new(),
+        LabelPrices::NativeDaily(bars) => bars
+            .iter()
+            .filter(|bar| bar.volume > 0.0 && bar.quote_volume.is_some_and(|v| v > 0.0))
+            .map(|bar| ((bar.ts_utc, bar.asset.clone()), bar.open))
+            .collect(),
+        LabelPrices::NativeHourly(history) => history
+            .opens
+            .iter()
+            .filter(|((at, _), _)| *at >= first_decision && *at <= target_end)
+            .map(|((at, asset), open)| {
+                let price = open
+                    .to_f64()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .ok_or_else(|| {
+                        format!("invalid native hourly label price for {asset} at {at}")
+                    })?;
+                Ok(((*at, asset.clone()), price))
+            })
+            .collect::<Result<_, String>>()?,
+    };
     let hourly_bars: Vec<_> = all_hourly
         .into_iter()
         .filter(|bar| bar.ts_utc >= feature_start && bar.ts_utc <= feature_end)
@@ -104,18 +185,22 @@ pub fn build(
         .chain(features_crypto::HOURLY_FEATURE_NAMES.iter())
         .map(|v| (*v).to_owned())
         .collect();
-    let feature_names: Vec<String> = raw_names.iter().map(|v| format!("x_{v}")).collect();
+    let mut feature_names: Vec<String> = raw_names.iter().map(|v| format!("x_{v}")).collect();
     let mut rows = Vec::new();
     let mut stamp = start.and_hms_opt(0, 0, 0).unwrap().and_utc();
     let end_stamp = end.and_hms_opt(0, 0, 0).unwrap().and_utc();
     while stamp <= end_stamp {
         let day = stamp.date_naive();
+        if omitted_decisions.contains(&day) {
+            stamp += Duration::hours(step_hours);
+            continue;
+        }
         let hourly_stamp = stamp - Duration::hours(1);
         let Some(hour_rows) = hourly_by_ts.get(&hourly_stamp) else {
             stamp += Duration::hours(step_hours);
             continue;
         };
-        let members = match universe::load(root, stamp) {
+        let members = match universe::load(universe_root, stamp) {
             Ok(v) => v,
             Err(_) => {
                 stamp += Duration::hours(step_hours);
@@ -154,6 +239,9 @@ pub fn build(
             let Some(daily) = daily_by_key.get(&(daily_stamp, asset)) else {
                 continue;
             };
+            if apply_runtime_eligibility && !runtime_daily_eligible(daily, cfg)? {
+                continue;
+            }
             let values = raw_names
                 .iter()
                 .map(|name| daily.value(name).or_else(|| hour.value(name)))
@@ -161,10 +249,17 @@ pub fn build(
             // Vol at the decision, same preference order as inference: the
             // 24h realised vol if the hourly store has it, else 30-day daily.
             let vol = hour.rv_24h.or(daily.vol_30).filter(|v| *v > 0.0);
-            let label = opens
-                .get(&(entry, asset.to_owned()))
-                .zip(opens.get(&(exit, asset.to_owned())))
-                .map(|(p0, p1)| p1 / p0 - 1.0);
+            let prices = match label_prices {
+                LabelPrices::ExternalHourly => &external_opens,
+                LabelPrices::NativeDaily(_) | LabelPrices::NativeHourly(_) => &native_opens,
+            };
+            let label = forward_return(
+                prices,
+                asset,
+                entry,
+                exit,
+                matches!(label_prices, LabelPrices::NativeHourly(_)),
+            )?;
             block.push(TrainingCandidate {
                 asset: asset.to_owned(),
                 label,
@@ -172,22 +267,85 @@ pub fn build(
                 values,
             });
         }
-        rows.extend(finalize_cross_section(
+        let mut completed = finalize_cross_section(
             day,
             stamp.time().hour(),
             &feature_names,
             block,
-        )?);
+            min_cross_section,
+        )?;
+        if market_context && !completed.is_empty() {
+            let context = crate::market_context::values(
+                daily_by_key.get(&(daily_stamp, "BTC")).copied(),
+                daily_stamp.date_naive(),
+            )?;
+            append_context(&mut completed, context);
+        }
+        rows.extend(completed);
         stamp += Duration::hours(step_hours);
     }
     if rows.is_empty() {
         return Err(format!("no usable training rows between {start} and {end}"));
     }
     finalize_per_risk_targets(&mut rows)?;
+    if market_context {
+        feature_names.extend(
+            crate::market_context::FEATURES
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
     Ok(TrainingMatrix {
+        market_context: market_context.then_some(crate::market_context::CONTRACT),
         features: feature_names,
         rows,
     })
+}
+
+fn forward_return(
+    prices: &BTreeMap<(DateTime<Utc>, String), f64>,
+    asset: &str,
+    entry: DateTime<Utc>,
+    exit: DateTime<Utc>,
+    require_complete: bool,
+) -> Result<Option<f64>, String> {
+    let label = prices
+        .get(&(entry, asset.to_owned()))
+        .zip(prices.get(&(exit, asset.to_owned())))
+        .map(|(p0, p1)| p1 / p0 - 1.0);
+    if require_complete && label.is_none() {
+        return Err(format!(
+            "native hourly label lacks {asset} entry {entry} or exit {exit}"
+        ));
+    }
+    Ok(label)
+}
+
+fn append_context(rows: &mut [TrainingRow], values: [f64; 4]) {
+    for row in rows {
+        row.features.extend(
+            crate::market_context::FEATURES
+                .into_iter()
+                .zip(values)
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+    }
+}
+
+fn runtime_daily_eligible(row: &features_crypto::DailyRow, cfg: &Config) -> Result<bool, String> {
+    let min_dollar_volume = cfg
+        .min_dollar_volume
+        .to_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or("invalid minimum dollar volume")?;
+    let min_volatility = cfg
+        .min_volatility
+        .to_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or("invalid minimum volatility")?;
+    Ok(row.bars_available >= cfg.min_history_bars
+        && row.adv_quote.is_some_and(|v| v >= min_dollar_volume)
+        && !row.vol_30.is_some_and(|v| v < min_volatility))
 }
 
 struct TrainingCandidate {
@@ -202,8 +360,9 @@ fn finalize_cross_section(
     slot: u32,
     feature_names: &[String],
     candidates: Vec<TrainingCandidate>,
+    min_cross_section: usize,
 ) -> Result<Vec<TrainingRow>, String> {
-    if candidates.len() < 12 {
+    if candidates.len() < min_cross_section {
         return Ok(Vec::new());
     }
     let raw: Vec<_> = candidates
@@ -328,6 +487,35 @@ fn canonical(asset: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_hourly_labels_require_exact_delayed_marks_without_fallback() {
+        let decision: DateTime<Utc> = "2025-02-25T00:00:00Z".parse().unwrap();
+        let entry = decision + Duration::hours(1);
+        let exit = decision + Duration::hours(25);
+        let mut prices = BTreeMap::from([
+            ((decision, "BTC".into()), 500.0),
+            ((entry, "BTC".into()), 100.0),
+            ((exit, "BTC".into()), 110.0),
+            ((exit + Duration::hours(1), "BTC".into()), 900.0),
+        ]);
+        assert!(
+            (forward_return(&prices, "BTC", entry, exit, true)
+                .unwrap()
+                .unwrap()
+                - 0.1)
+                .abs()
+                < 1e-12
+        );
+        prices.remove(&(exit, "BTC".into()));
+        assert!(forward_return(&prices, "BTC", entry, exit, true)
+            .unwrap_err()
+            .contains("native hourly label lacks BTC"));
+        assert_eq!(
+            forward_return(&prices, "BTC", entry, exit, false).unwrap(),
+            None
+        );
+    }
+
     fn target_row(date: &str, slot: u32, raw_ret: f64, vol: Option<f64>) -> TrainingRow {
         TrainingRow {
             date: date.parse().unwrap(),
@@ -340,6 +528,36 @@ mod tests {
             vol,
             features: BTreeMap::from([("x_ret_7".into(), 0.5)]),
         }
+    }
+
+    #[test]
+    fn raw_context_addition_preserves_all_ranked_inputs_rows_and_targets() {
+        let date = "2025-02-01".parse().unwrap();
+        let block = (0..13)
+            .map(|i| TrainingCandidate {
+                asset: format!("A{i}"),
+                label: (i != 12).then_some(i as f64 / 1000.0),
+                vol: Some(0.5),
+                values: vec![Some(i as f64)],
+            })
+            .collect();
+        let mut rows = finalize_cross_section(date, 0, &["x_ret_7".into()], block, 12).unwrap();
+        finalize_per_risk_targets(&mut rows).unwrap();
+        let before = serde_json::to_value(&rows).unwrap();
+        append_context(&mut rows, [0.14, -0.22, 0.31, 0.55]);
+        assert_eq!(rows.len(), 12);
+        for row in &rows {
+            assert_eq!(row.features["mkt_btc_ret_7d"], 0.14);
+            assert_eq!(row.features["mkt_btc_ret_30d"], -0.22);
+            assert_eq!(row.features["mkt_btc_vol_30d"], 0.55);
+        }
+        let mut stripped = serde_json::to_value(&rows).unwrap();
+        for row in stripped.as_array_mut().unwrap() {
+            for name in crate::market_context::FEATURES {
+                row["features"].as_object_mut().unwrap().remove(name);
+            }
+        }
+        assert_eq!(stripped, before);
     }
 
     #[test]
@@ -403,8 +621,8 @@ mod tests {
         };
         let date = "2026-01-01".parse().unwrap();
         let names = ["x_ret_7".into(), "x_ret_30".into()];
-        let complete = finalize_cross_section(date, 0, &names, candidates(false)).unwrap();
-        let missing = finalize_cross_section(date, 0, &names, candidates(true)).unwrap();
+        let complete = finalize_cross_section(date, 0, &names, candidates(false), 12).unwrap();
+        let missing = finalize_cross_section(date, 0, &names, candidates(true), 12).unwrap();
         assert_eq!(complete.len(), 13);
         assert_eq!(missing.len(), 12);
         for (full, partial) in complete.iter().zip(&missing) {
@@ -414,8 +632,27 @@ mod tests {
         assert!((missing.iter().map(|row| row.target).sum::<f64>()).abs() < 1e-12);
         assert!((missing[0].target + 0.055).abs() < 1e-12);
         let removed_cohort: Vec<_> = candidates(false).into_iter().take(12).collect();
-        let incorrectly_ranked = finalize_cross_section(date, 0, &names, removed_cohort).unwrap();
+        let incorrectly_ranked =
+            finalize_cross_section(date, 0, &names, removed_cohort, 12).unwrap();
         assert_ne!(missing[11].features, incorrectly_ranked[11].features);
+    }
+
+    #[test]
+    fn venue_minimum_is_applied_to_the_decision_cohort() {
+        let candidates = (0..14)
+            .map(|i| TrainingCandidate {
+                asset: format!("A{i:02}"),
+                label: Some(i as f64 * 0.01),
+                vol: Some(0.1),
+                values: vec![Some(i as f64)],
+            })
+            .collect();
+        let date = "2026-01-01".parse().unwrap();
+        assert!(
+            finalize_cross_section(date, 0, &["x_ret_7".into()], candidates, 15)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

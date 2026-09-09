@@ -16,6 +16,7 @@ use crate::{backtest, config::Config, execution::Settings};
 struct Suite {
     source_dir: PathBuf,
     data_root: PathBuf,
+    lighter_execution: Option<crate::lighter_execution::Sources>,
     out_dir: PathBuf,
     folds: Vec<Fold>,
     scenarios: Vec<Scenario>,
@@ -51,11 +52,12 @@ fn load_configs(
         .map(|fold| {
             let path = source.join(format!("config-{}.toml", fold.id));
             let cfg = Config::load(&path)?;
-            if cfg.interval_s != 86400 || cfg.rebalance_every != 1 {
-                return Err("suite requires a daily strategy".into());
+            if cfg.interval_s != 86400 || (cfg.rebalance_every != 1 && suite.lighter_execution.is_none()) {
+                return Err("suite requires daily valuation; multi-day rebalances require native Lighter valuation".into());
             }
             for artifact in [
                 &cfg.model_path,
+                &cfg.ranker_directional_model_path,
                 &cfg.timing_model_path,
                 &cfg.market_matrix_path,
             ]
@@ -65,6 +67,12 @@ fn load_configs(
                 files.insert(artifact.clone(), hash_file(Path::new(artifact))?);
             }
             files.insert(path.to_string_lossy().into_owned(), hash_file(&path)?);
+            if let Some(schedule) = &cfg.model_schedule {
+                files.insert(schedule.source.to_string_lossy().into_owned(), hash_file(&schedule.source)?);
+                for entry in &schedule.entries {
+                    files.insert(entry.model_path.clone(), hash_file(Path::new(&entry.model_path))?);
+                }
+            }
             Ok(cfg)
         })
         .collect()
@@ -216,6 +224,16 @@ pub fn command(args: &[String]) -> Result<(), String> {
     for name in ["bars", "funding", "universe"] {
         inventory(&suite.data_root.join(name), &mut files)?;
     }
+    if let Some(native) = &suite.lighter_execution {
+        inventory(&native.daily, &mut files)?;
+        inventory(&native.funding, &mut files)?;
+        if let Some(hourly) = &native.hourly {
+            inventory(hourly, &mut files)?;
+        }
+        for hourly in &native.hourly_extensions {
+            inventory(hourly, &mut files)?;
+        }
+    }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     files.insert("executable".into(), hash_file(&executable)?);
     files.insert(path.to_string_lossy().into_owned(), hash_file(&path)?);
@@ -245,12 +263,15 @@ pub fn command(args: &[String]) -> Result<(), String> {
         .flatten()
         .any(|cfg| cfg.signal == "ml_ranker")
         || suite.scenarios.iter().any(|s| s.execution.delay_hours > 0);
-    let prepared = backtest::prepare(
+    let mut prepared = backtest::prepare(
         base,
         &suite.data_root,
         hourly,
         features_crypto::FundingWindow::Trailing,
     )?;
+    if let Some(native) = &suite.lighter_execution {
+        prepared.use_lighter(native)?;
+    }
     std::thread::scope(|scope| {
         let handles: Vec<_> = suite
             .scenarios
@@ -323,6 +344,22 @@ pub fn command(args: &[String]) -> Result<(), String> {
                             json["source_config_path"] = serde_json::json!(source_config);
                             json["source_config_sha256"] = serde_json::json!(config_hash);
                             json["scenario_id"] = serde_json::json!(scenario.id);
+                            if let Some(native) = &suite.lighter_execution {
+                                let hourly = native.hourly.is_some();
+                                let valuation_hours = if hourly { native.valuation_hours.unwrap_or(native.execution_hours) } else { 0 };
+                                json["metadata"] = serde_json::json!({
+                                    "execution_venue": "lighter",
+                                    "signal_data": "external_store",
+                                    "valuation": if !hourly { "native_daily_open" } else if valuation_hours==1 { "native_01h_open" } else { "native_hourly_open" },
+                                    "valuation_hour_utc":valuation_hours,
+                                    "execution_hours":native.execution_hours,
+                                    "execution_window": if hourly { "sequential_hourly_vwap_completion" } else { "daily_open" },
+                                    "funding": "native_hourly_per_unit_payments",
+                                    "membership": "created_before_decision_and_prior_day_activity_then_liquidity_rank",
+                                    "historical_depth_verified": false,
+                                    "settlement_events_reconstructed": false
+                                });
+                            }
                             std::fs::copy(
                                 &source_config,
                                 out.join(format!("config-{}.toml", fold.id)),
@@ -359,6 +396,79 @@ pub fn command(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suite_inventory_tracks_secondary_model_contents() {
+        let directory =
+            std::env::temp_dir().join(format!("overlay-suite-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let primary = directory.join("relative.json");
+        let secondary = directory.join("directional.json");
+        std::fs::write(&primary, "relative").unwrap();
+        std::fs::write(&secondary, "directional").unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/default.toml");
+        let mut config: toml::Value = std::fs::read_to_string(source).unwrap().parse().unwrap();
+        for (key, value) in [
+            ("signal", "ml_ranker".to_string()),
+            ("constructor", "risk_adjusted_score_selected".to_string()),
+            ("target_gross_exposure", "1.60".to_string()),
+            ("model_path", primary.display().to_string()),
+            (
+                "ranker_directional_model_path",
+                secondary.display().to_string(),
+            ),
+        ] {
+            config["portfolio"]
+                .as_table_mut()
+                .unwrap()
+                .insert(key.into(), toml::Value::String(value));
+        }
+        std::fs::write(
+            directory.join("config-1.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        let suite = Suite {
+            source_dir: directory.clone(),
+            data_root: directory.clone(),
+            lighter_execution: None,
+            out_dir: directory.clone(),
+            folds: vec![Fold {
+                id: 1,
+                start: "2026-01-01T00:00:00Z".parse().unwrap(),
+                end: "2026-01-01T00:00:00Z".parse().unwrap(),
+            }],
+            scenarios: Vec::new(),
+        };
+        let scenario = Scenario {
+            id: "fixture".into(),
+            config_dir: None,
+            initial_cash: Decimal::from(100),
+            execution: Settings::default(),
+        };
+        let mut before = BTreeMap::new();
+        load_configs(&suite, &scenario, &mut before).unwrap();
+        assert_eq!(
+            before[&secondary.display().to_string()],
+            hash_file(&secondary).unwrap()
+        );
+        assert_eq!(
+            before[&primary.display().to_string()],
+            hash_file(&primary).unwrap()
+        );
+        std::fs::write(&secondary, "changed directional").unwrap();
+        let mut after = BTreeMap::new();
+        load_configs(&suite, &scenario, &mut after).unwrap();
+        assert_ne!(
+            before[&secondary.display().to_string()],
+            after[&secondary.display().to_string()]
+        );
+        assert_eq!(
+            before[&primary.display().to_string()],
+            after[&primary.display().to_string()]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn fingerprint_alone_cannot_authorize_a_cached_result() {

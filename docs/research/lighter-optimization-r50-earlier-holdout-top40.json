@@ -1,0 +1,100 @@
+{
+  "declared_at": "2026-09-09T07:56:33.899741+00:00",
+  "output": "var/research/lighter-optimization-r50-earlier-holdout-top40",
+  "hypothesis": "Matched narrow-cohort control for R50 on the live store snapshots, same folds and costs.",
+  "acceptance": "Descriptive holdout. Report Sharpe, return, drawdown, per-fold results, turnover, BTC buy and hold and cost cases. A clearly negative or flat result means the three-year choices do not transfer.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+    "market_context": true,
+    "universe": "live store snapshots, top 24-40"
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2020-09-18",
+    "end": "2023-08-06",
+    "days": 1053,
+    "reason": "the period before the three-year window; never used to evaluate any candidate in this line, only as training history"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2020-09-18T00:00:00Z",
+      "end": "2021-03-11T00:00:00Z",
+      "train_through": "2020-09-16"
+    },
+    {
+      "id": 2,
+      "start": "2021-03-12T00:00:00Z",
+      "end": "2021-09-02T00:00:00Z",
+      "train_through": "2021-03-10"
+    },
+    {
+      "id": 3,
+      "start": "2021-09-03T00:00:00Z",
+      "end": "2022-02-24T00:00:00Z",
+      "train_through": "2021-09-01"
+    },
+    {
+      "id": 4,
+      "start": "2022-02-25T00:00:00Z",
+      "end": "2022-08-18T00:00:00Z",
+      "train_through": "2022-02-23"
+    },
+    {
+      "id": 5,
+      "start": "2022-08-19T00:00:00Z",
+      "end": "2023-02-09T00:00:00Z",
+      "train_through": "2022-08-17"
+    },
+    {
+      "id": 6,
+      "start": "2023-02-10T00:00:00Z",
+      "end": "2023-08-06T00:00:00Z",
+      "train_through": "2023-02-08"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "sel24",
+      "reward": "per_risk",
+      "portfolio": {},
+      "limits": {}
+    }
+  ],
+  "data_root": "data"
+}

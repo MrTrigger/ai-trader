@@ -1,0 +1,133 @@
+{
+  "declared_at": "2026-09-09T07:48:42.390401+00:00",
+  "output": "var/research/lighter-optimization-r49-tranches-fixed",
+  "hypothesis": "R47 top-120 cohort with a 40-name book and 1.5x hysteresis is the best three-year book (Sharpe 1.85, 236%, moderate 137%, stress -32%, turnover 63%). Turnover is still daily churn of a one-day forecast. Test staggered sleeves, new code: each asset belongs to one fixed sleeve by a stable symbol hash and only one of N sleeves may change weight on a given day, so every name holds its one-day forecast for N days while the book as a whole still trades daily on fresh signals. This is the tranche cadence the original research chose (weekly, 7 tranches) that was never migrated to Rust. N = 2 and 3 against the unchanged R47 cell as control, which must reproduce exactly. Sleeve membership is by hash, not by return. R48 first implementation let the mixed sleeve book breach the 40-position count and the 10% net band, so plans were rejected on about a quarter of days and nothing traded. R49 repeats the same declaration with the corrected sleeve logic: the smallest fresh entries are dropped to respect the position count, and one side of the traded sleeve is scaled so the whole book nets what the constructor asked for. Held positions are never touched. R48 results are retained as a failed trial.",
+  "acceptance": "Same rule: central Sharpe not lower than control by more than 0.1, at least five of six folds positive, materially better moderate and stressed outcomes with lower turnover.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/three-year-data-top120/matrix/matrix.jsonl",
+    "market_context": true,
+    "universe": "point-in-time Binance liquidity rank, top 120, recorded into a research data root that symlinks the live bars/funding"
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "control",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_selection_count": 40,
+        "ranker_hold_rank_multiple": "1.5"
+      },
+      "limits": {}
+    },
+    {
+      "id": "tranches-2",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_selection_count": 40,
+        "ranker_hold_rank_multiple": "1.5",
+        "ranker_tranches": 2
+      },
+      "limits": {}
+    },
+    {
+      "id": "tranches-3",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_selection_count": 40,
+        "ranker_hold_rank_multiple": "1.5",
+        "ranker_tranches": 3
+      },
+      "limits": {}
+    },
+    {
+      "id": "tranches-4",
+      "reward": "per_risk",
+      "portfolio": {
+        "ranker_selection_count": 40,
+        "ranker_hold_rank_multiple": "1.5",
+        "ranker_tranches": 4
+      },
+      "limits": {}
+    }
+  ],
+  "data_root": "var/research/three-year-data-top120"
+}

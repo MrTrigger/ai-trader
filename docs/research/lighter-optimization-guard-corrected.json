@@ -1,0 +1,43 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Limit added net risk using capacity previews, retaining closing fills and proportionally trimming excess-side additions. Fixed limit 0.10. Existing breaches can persist when reductions cannot execute; they never authorize additions on the excess side.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-optimization-guard-corrected",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "net-guard",
+      "execution": {
+        "net_exposure_limit": 0.1
+      }
+    },
+    {
+      "id": "capacity-net-guard",
+      "execution": {
+        "net_exposure_limit": 0.1
+      },
+      "overrides": {
+        "limits": {
+          "participation_limit": "0.01",
+          "capacity_balance": true
+        }
+      }
+    },
+    {
+      "id": "cohort-external-net-guard",
+      "execution": {
+        "net_exposure_limit": 0.1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"
+        }
+      }
+    }
+  ],
+  "implementation_note": "Repetition of failed predeclared guard policies after Decimal closing-quantity preservation and prior-only preview correction. Actual rejected fills cannot reallocate other orders. No new policy candidates."
+}

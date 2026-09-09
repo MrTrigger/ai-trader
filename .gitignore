@@ -20,3 +20,9 @@
 docs/research/*.html
 data/models/
 .claude/worktrees/
+
+# research audit trail: keep ledgers and declarations, not copied binaries or logs
+/.audit/lighter-portfolio.*
+/.audit/lighter-runner.*
+/.audit/*.log
+/.audit/lighter-monthly-r9/

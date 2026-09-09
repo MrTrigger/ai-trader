@@ -1,0 +1,64 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Continuous 483-day test of fixed BTC/ETH time-series momentum diversification, against separate single-asset momentum controls. Same existing signal and volatility budget; no fit or tuned horizons. All dates are development evidence.",
+  "acceptance": "Net Sharpe >1.5 and BTC outperformance are minimums; require material netreturn improvement and stronger subperiod evidence. All current dates remain development evidence. Do not promote merely because directional risk increased.",
+  "risk_change": "Compared with R11 only the trading turnover allowance rises0.50to2.00NAV. Target gross0.80 and position/net/cluster0.80 remain; hourly participation and fees unchanged. This permits intended reversals, not greater target leverage. Not a deployment change.",
+  "source_suite": "var/research/lighter-btc-eth-history-full/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-btc-eth-history-full/hourly",
+  "output": "var/research/lighter-optimization-r15-continuous-momentum-joint",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "btc-momentum",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": true,
+          "max_holdings": 1,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_ensemble",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "btc-eth-momentum",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "benchmark_only": false,
+          "max_holdings": 2,
+          "rebalance_drift_band": "0.20",
+          "signal": "tsmom_ensemble",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "min_cross_section": 1,
+          "model_path": ""
+        },
+        "limits": {
+          "max_position": "0.80",
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ],
+  "universe": "Predeclared BTC trade instrument and ETH benchmark only; raw native daily pages unchanged, derived catalog records original hash. Minimumcrosssection1 permits this explicit universe and no ranker is used.",
+  "preparation_note": "Initial combined suite failed before replay because shared feature preparation requires matching benchmark; split ETH-only control into its own suite with no policy changes."
+}

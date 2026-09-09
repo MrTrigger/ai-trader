@@ -208,6 +208,27 @@ pub fn daily_returns(
     Ok(series.dates.into_iter().zip(series.returns).collect())
 }
 
+#[derive(Serialize)]
+pub struct ObservedMetrics {
+    pub sharpe: Option<f64>,
+    pub total_return: f64,
+    pub max_drawdown: f64,
+}
+
+pub fn observed_metrics(dir: &Path) -> Result<ObservedMetrics, String> {
+    let series = load(dir, None, 365.0, None)?;
+    let (total_return, max_drawdown) = path_metrics(series.returns.iter().copied())?;
+    Ok(ObservedMetrics {
+        sharpe: if series.returns.len() < 2 {
+            None
+        } else {
+            sharpe(&series.returns, 365.0)
+        },
+        total_return,
+        max_drawdown,
+    })
+}
+
 fn crop(
     mut series: Series,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,

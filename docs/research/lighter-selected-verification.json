@@ -1,0 +1,23 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Exact repetition of the selected R5 deadband policy to verify stable results after unrelated research guard fixes. No new policy trial.",
+  "selection": "External-label model is the highest central Sharpe of the three declared model/sizing candidates. This is selection on reused development data, not an independent holdout.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "output": "var/research/lighter-selected-verification",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "cohort-external-deadband",
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "rebalance_drift_band": "0.20"
+        }
+      }
+    }
+  ]
+}

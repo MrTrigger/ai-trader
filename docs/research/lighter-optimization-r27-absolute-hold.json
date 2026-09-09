@@ -1,0 +1,68 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:29:01.517839+00:00",
+  "output": "var/research/lighter-optimization-r27-absolute-hold",
+  "hypothesis": "R26 absolute direction improves both halves but central Sharpe1.321 misses1.5 and execution costs reduce returns. Compare existing one-day absolute model at three-day trading with one fixed five-day absolute model at the same cadence. Native daily NAV/funding and partial fills unchanged. Five-day cutoff is Nov20 to preserve label embargo; no horizon grid.",
+  "training": {
+    "start": "2025-01-18",
+    "through": "2025-11-20",
+    "label_lag_hours": 1,
+    "label_horizon_hours": 120,
+    "reward": "per_risk_abs",
+    "objective": "regression",
+    "trees": 300,
+    "num_leaves": 15,
+    "min_data_in_leaf": 200,
+    "seeds": 1,
+    "rank_transform": false,
+    "market_context": "btc-daily-raw-v1",
+    "matrix": "var/research/lighter-ranker-r27-five-day/matrix/matrix.jsonl"
+  },
+  "candidates": [
+    {
+      "id": "one-day-model-hold3",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r26-absolute/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "rebalance_every": 3
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    },
+    {
+      "id": "five-day-model-hold3",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r27-five-day/model.json",
+          "constructor": "tsmom_vol_parity",
+          "turnover_budget": "2.00",
+          "rebalance_drift_band": "0.00",
+          "rebalance_every": 3
+        },
+        "limits": {
+          "max_net_exposure": "0.80",
+          "max_cluster_exposure": "0.80"
+        }
+      }
+    }
+  ]
+}

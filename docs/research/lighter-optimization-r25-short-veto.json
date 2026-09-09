@@ -1,0 +1,45 @@
+{
+  "source_suite": "var/research/lighter-locked-confirmation/source-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "acceptance": "Net Sharpe > 1.5 AND return above matched BTC; material return improvement, rally participation, chronological and stressed-cost evidence remain necessary. All 285 days are now exposed development data. No unseen confirmation claim.",
+  "source_suite_note": "Generator template only. Every candidate overrides native execution delay_hours to 1 in the generated suite.",
+  "declared_at": "2026-09-08T20:23:34.672555+00:00",
+  "output": "var/research/lighter-optimization-r25-short-veto",
+  "hypothesis": "Independent raw-ledger diagnosis attributes later losses to alt shorts, dominated by ZEC/PUMP. After original R6 target construction, remove short targets only when their exact prior completed 30-day return is positive. Preserve all other weights exactly without redistribution; this allows net-long exposure up to 0.40 while reducing gross. Zero/negative momentum retain shorts. No horizon/threshold grid; missing/nonfinite required momentum fails closed.",
+  "candidates": [
+    {
+      "id": "ranker-control-net04",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"
+        },
+        "limits": {
+          "max_net_exposure": "0.400001"
+        }
+      }
+    },
+    {
+      "id": "positive-month-short-veto",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "ranker_short_trend_veto": true
+        },
+        "limits": {
+          "max_net_exposure": "0.400001"
+        }
+      }
+    }
+  ],
+  "precision_note": "Both policies allow max net 0.400001: one six-decimal weight quantum above the mathematical 0.40 retained-long sleeve. A six-name equal-weight fixture exposed a Decimal sum of 0.4000000000000000000000000002 that exact risk comparison rejects at 0.40. No target weights, risk-engine tolerances or scaling are changed."
+}

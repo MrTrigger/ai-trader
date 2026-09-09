@@ -1,0 +1,5 @@
+{
+  "exit_code": 1,
+  "stderr": "lighter-confirmation: confirmation lock differs from the recorded pre-outcome protocol\n",
+  "output_created": false
+}

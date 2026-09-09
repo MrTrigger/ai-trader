@@ -1,0 +1,117 @@
+{
+  "declared_at": "2026-09-09T07:16:17.964102+00:00",
+  "output": "var/research/lighter-optimization-r46-horizon",
+  "hypothesis": "R45 fills show the long/short churn is one-day forecast sign noise: names exit and re-enter on the opposite side within days, so rank hysteresis gains only Sharpe 1.47 to 1.54 and leaves turnover near 77%. Test a slower target with the same recipe and daily trading: forward labels of 24h (control), 48h and 72h, each fitted on its own matrix built by the same Rust command with lag 1h and BTC market context. Every candidate uses a five-day purge (train_through = fold start minus 5 days) so the longest label window never overlaps its test block and the purge is identical across horizons; the 24h control therefore differs from R43 only by that purge. No hysteresis, no other change.",
+  "acceptance": "Same rule as R44: central Sharpe within 0.1 of the 24h control, at least five of six folds positive, and a material improvement in moderate and stressed outcomes together with lower turnover. Per-fold, turnover, fills and cost cases reported for every cell.",
+  "base_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "matrix": {
+    "path": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+    "built_by": "R42",
+    "market_context": true
+  },
+  "trainer": {
+    "program": "training/train.py",
+    "objective": "regression",
+    "seeds": 5,
+    "trees_per_seed": 300
+  },
+  "window": {
+    "start": "2023-08-07",
+    "end": "2026-08-06",
+    "days": 1096,
+    "reason": "three years ending at the last complete day in the Binance store; no network pull"
+  },
+  "folds": [
+    {
+      "id": 1,
+      "start": "2023-08-07T00:00:00Z",
+      "end": "2024-02-04T00:00:00Z",
+      "train_through": "2023-08-05"
+    },
+    {
+      "id": 2,
+      "start": "2024-02-05T00:00:00Z",
+      "end": "2024-08-04T00:00:00Z",
+      "train_through": "2024-02-03"
+    },
+    {
+      "id": 3,
+      "start": "2024-08-05T00:00:00Z",
+      "end": "2025-02-02T00:00:00Z",
+      "train_through": "2024-08-03"
+    },
+    {
+      "id": 4,
+      "start": "2025-02-03T00:00:00Z",
+      "end": "2025-08-03T00:00:00Z",
+      "train_through": "2025-02-01"
+    },
+    {
+      "id": 5,
+      "start": "2025-08-04T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "train_through": "2025-08-02"
+    },
+    {
+      "id": 6,
+      "start": "2026-02-02T00:00:00Z",
+      "end": "2026-08-06T00:00:00Z",
+      "train_through": "2026-01-31"
+    }
+  ],
+  "costs": {
+    "central": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 1.0,
+      "impact_multiple": 1.0,
+      "half_spread_bps": {}
+    },
+    "stress": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 10.0,
+      "impact_multiple": 4.0,
+      "half_spread_bps": {}
+    },
+    "moderate": {
+      "model": "impact",
+      "delay_hours": 1,
+      "participation": 0.01,
+      "impact_coefficient": 0.1,
+      "spread_multiple": 3.0,
+      "impact_multiple": 2.0,
+      "half_spread_bps": {}
+    }
+  },
+  "candidates": [
+    {
+      "id": "h24",
+      "reward": "per_risk",
+      "matrix": "var/research/lighter-optimization-r42-three-year/matrix/matrix.jsonl",
+      "train_through_offset_days": 5,
+      "portfolio": {},
+      "limits": {}
+    },
+    {
+      "id": "h48",
+      "reward": "per_risk",
+      "matrix": "var/research/lighter-optimization-r42-three-year/matrix/matrix-h48.jsonl",
+      "train_through_offset_days": 5,
+      "portfolio": {},
+      "limits": {}
+    },
+    {
+      "id": "h72",
+      "reward": "per_risk",
+      "matrix": "var/research/lighter-optimization-r42-three-year/matrix/matrix-h72.jsonl",
+      "train_through_offset_days": 5,
+      "portfolio": {},
+      "limits": {}
+    }
+  ]
+}

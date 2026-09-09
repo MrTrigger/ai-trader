@@ -1,0 +1,40 @@
+{
+  "declared": "2026-09-08",
+  "hypothesis": "Fill more of the same midnight target using four sequential hourly participation windows; retain 1% hourly participation, frozen prior liquidity and one fixed plan. Compare one-hour and four-hour execution at matched04h valuations. No allocation from future volume, no fresh decision inside the window.",
+  "acceptance": "Require net Sharpe >1.5 and matched BTC outperformance; seek material improvement over R6 and stronger laterhalf and stress results. All dates are reused development data.",
+  "source_suite": "var/research/lighter-native-baseline-native-suite.json",
+  "source_config": "var/research/lighter-native-baseline-configs/config-1.toml",
+  "lighter_hourly": "var/research/lighter-history-audit/hourly-selected-2025nov-2026jul",
+  "costs": [
+    "central",
+    "stress"
+  ],
+  "candidates": [
+    {
+      "id": "frozen-daily",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json"
+        }
+      }
+    },
+    {
+      "id": "frozen-3d",
+      "execution": {
+        "delay_hours": 1
+      },
+      "overrides": {
+        "portfolio": {
+          "model_path": "var/research/lighter-ranker-r1-2026-09-08/external/model.json",
+          "rebalance_every": 3
+        }
+      }
+    }
+  ],
+  "execution_hours": 1,
+  "valuation_hours": 4,
+  "output": "var/research/lighter-optimization-r10-control"
+}
