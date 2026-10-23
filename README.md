@@ -396,3 +396,7 @@ research discipline—causal prefix tests, time-ordered validation, cost stress,
 and disclosure-first reporting—not its discrete-trade backtest engine. A
 continuously rebalanced portfolio has different accounting and execution
 semantics.
+
+## CI validation
+
+See [CI test checkpoints](docs/ci.md) for routine checks and full validation.

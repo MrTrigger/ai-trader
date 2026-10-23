@@ -4,13 +4,41 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  release:
+    types: [published]
+  schedule:
+    - cron: '23 4 * * 1'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.scope.outputs.app }}
+      full: ${{ steps.scope.outputs.full }}
+      rust: ${{ steps.scope.outputs.rust }}
+      training: ${{ steps.scope.outputs.training }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash .github/ci-scope.sh "$EVENT" "$ACTION" "$BASE" "$HEAD" "$DRAFT" >> "$GITHUB_OUTPUT"
+
   rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: rust workspace
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +52,8 @@ jobs:
         run: cargo test --workspace
 
   training:
+    needs: changes
+    if: needs.changes.outputs.training == 'true'
     name: python fitting boundary
     runs-on: ubuntu-latest
     steps:
