@@ -38,10 +38,15 @@ jobs:
 
   rust:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.rust == 'false') }}
     name: rust workspace
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful validation plan
+        env:
+          PLAN_RESULT: ${{ needs.changes.result }}
+          RUN_SUITE: ${{ needs.changes.outputs.rust }}
+        run: test "$PLAN_RESULT" = success && test "$RUN_SUITE" = true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -53,10 +58,15 @@ jobs:
 
   training:
     needs: changes
-    if: needs.changes.outputs.training == 'true'
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.training == 'false') }}
     name: python fitting boundary
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful validation plan
+        env:
+          PLAN_RESULT: ${{ needs.changes.result }}
+          RUN_SUITE: ${{ needs.changes.outputs.training }}
+        run: test "$PLAN_RESULT" = success && test "$RUN_SUITE" = true
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
