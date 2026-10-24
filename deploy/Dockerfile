@@ -2,7 +2,7 @@
 # futures-bot (the NQ noise book), api (dashboard and process supervisor). One
 # image, four entrypoints - the same binaries a human runs, which is the §8.1
 # rule that keeps cron and shell from drifting apart.
-FROM oven/bun:1 AS frontend
+FROM oven/bun:1.4.3 AS frontend
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/bun.lock ./
 RUN bun install --frozen-lockfile

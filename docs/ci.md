@@ -20,3 +20,11 @@ to validate workflow source edits. Full runtime validation occurs after delivery
 
 A PR opened ready for review also runs the complete checks. Root Markdown and nested
 README/changelog files are documentation-only inputs on PRs.
+
+## Shared toolchain policy
+
+The committed `.github/ci/toolchains.json` follows `MrTrigger/dotfiles`
+`ci/fleet.json`. Existing CI jobs run `.github/ci/check-toolchains.py` to reject
+version drift. Change the central policy and run `scripts/ci-fleet.py sync` from
+dotfiles, then validate the affected build. See the dotfiles `ci/README.md` for
+compatibility exceptions, update commands, timing reports and cache boundaries.

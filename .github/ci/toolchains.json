@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "source": "MrTrigger/dotfiles:ci/fleet.json",
+  "repository": "MrTrigger/ai-trader",
+  "versions": {
+    "node": "26.12.0",
+    "bun": "1.4.3",
+    "pnpm": "12.3.4",
+    "bazel": "8.4.2"
+  },
+  "overrides": {},
+  "exclude": {}
+}

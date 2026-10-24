@@ -9,7 +9,7 @@ on:
   release:
     types: [published]
   schedule:
-    - cron: '23 4 * * 1'
+    - cron: '17 1 * * 2'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Check shared toolchain versions
+        run: python3 "$GITHUB_WORKSPACE/.github/ci/check-toolchains.py" --root "$GITHUB_WORKSPACE"
       - id: scope
         env:
           EVENT: ${{ github.event_name }}
