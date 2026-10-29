@@ -158,12 +158,13 @@ def pipeline():
 
 
 def rust():
-    container('rust:stable-bookworm', 'mkdir -p /ci-cache/cargo; cd service; cargo test --workspace',
+    container('rust:1-bookworm', 'mkdir -p /ci-cache/cargo; cd service; cargo test --workspace',
               {'CARGO_HOME': '/ci-cache/cargo', 'RUSTUP_HOME': '/usr/local/rustup'})
 
 
 def training():
-    container('python:3.12-slim-bookworm', 'python -m venv /tmp/venv; /tmp/venv/bin/pip install -e "training[dev]"; /tmp/venv/bin/pytest -q training',
+    run(['docker', 'build', '-f', '.buildkite/Dockerfile.training', '-t', 'ai-trader-training:python312', '.buildkite'])
+    container('ai-trader-training:python312', 'python -m venv /tmp/venv; /tmp/venv/bin/pip install -e "training[dev]"; /tmp/venv/bin/pytest -q training',
               {'PIP_CACHE_DIR': '/ci-cache/pip'})
 
 
