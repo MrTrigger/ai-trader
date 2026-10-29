@@ -1,0 +1,40 @@
+{
+  "retire": [
+    ".github/workflows/ci.yaml",
+    ".github/workflows/image.yaml"
+  ],
+  "schedules": [
+    {
+      "cron": "17 1 * * 2",
+      "branch": "main",
+      "workflow": "ci"
+    }
+  ],
+  "events": {
+    "push": [
+      "main"
+    ],
+    "pull_request": [
+      "opened",
+      "synchronize",
+      "reopened",
+      "ready_for_review"
+    ],
+    "release": [
+      "published"
+    ],
+    "workflow_dispatch": [
+      "ci",
+      "image",
+      "all"
+    ]
+  },
+  "credentials": [
+    "GHCR_WRITE_TOKEN: only image/publish steps"
+  ],
+  "repository": "MrTrigger/ai-trader",
+  "defaultBranch": "main",
+  "sourceRevision": "c829f98bc823ba6d20caf3e861a38ecfeb315c57",
+  "hosted": [],
+  "forkPullRequests": false
+}
