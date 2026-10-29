@@ -30,7 +30,7 @@
     ]
   },
   "credentials": [
-    "GHCR_WRITE_TOKEN: only image/publish steps"
+    "REGISTRY_PASSWORD: only image/publish steps"
   ],
   "repository": "MrTrigger/ai-trader",
   "defaultBranch": "main",

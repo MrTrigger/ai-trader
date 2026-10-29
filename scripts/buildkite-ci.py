@@ -78,6 +78,9 @@ def step(key, label, timeout=30, **kwargs):
 def upload(steps):
     if not steps:
         steps = [{'label': 'No checks selected', 'command': 'true', 'timeout_in_minutes': 1}]
+    for job in steps:
+        if job.get("agents", {}).get("capacity") == "large":
+            job.update(concurrency=3, concurrency_group="personal-large", concurrency_method="eager")
     run(['buildkite-agent', 'pipeline', 'upload', '--no-interpolation'],
         input=json.dumps({'agents': {'queue': 'personal'}, 'steps': steps}), text=True)
 
@@ -115,12 +118,12 @@ def github(method, path, body=None):
 def publish(repository, dockerfile='Dockerfile', tags=(), buildargs=(), provenance=True):
     if ENV['CI_EVENT'] not in {'push', 'workflow_dispatch'}:
         raise ValueError('Publication requires a trusted branch event')
-    token = ENV.get('GHCR_WRITE_TOKEN')
+    token = ENV.get('REGISTRY_PASSWORD')
     if not token:
-        raise ValueError('Missing step-scoped GHCR_WRITE_TOKEN')
+        raise ValueError('Missing step-scoped REGISTRY_PASSWORD')
     with tempfile.TemporaryDirectory(prefix='bk-docker-auth-') as directory:
         environment = dict(ENV, DOCKER_CONFIG=directory)
-        run(['docker', 'login', 'ghcr.io', '-u', ENV.get('GHCR_USERNAME', 'MrTrigger'), '--password-stdin'],
+        run(['docker', 'login', 'registry.wallintech.eu', '-u', ENV.get('REGISTRY_USERNAME', 'ci-publisher'), '--password-stdin'],
             input=token, text=True, env=environment)
         command = ['docker', 'buildx', 'build', '--file', dockerfile, '--push']
         if not provenance:
@@ -171,7 +174,7 @@ def training():
 def image():
     if ENV['CI_BRANCH'] != 'main':
         raise ValueError('Paper image publication is restricted to main')
-    publish('ghcr.io/mrtrigger/aitrader-paper', 'deploy/Dockerfile', ['latest', ENV['CI_COMMIT']], provenance=False)
+    publish('registry.wallintech.eu/mrtrigger/aitrader-paper', 'deploy/Dockerfile', ['latest', ENV['CI_COMMIT']], provenance=False)
 
 
 ACTIONS = {'rust': rust, 'training': training, 'image': image}
