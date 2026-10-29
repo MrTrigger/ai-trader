@@ -1,0 +1,7 @@
+agents:
+  queue: personal
+steps:
+  - label: Plan native checks
+    command: python3 -B scripts/buildkite-ci.py pipeline
+    priority: 10
+    timeout_in_minutes: 10

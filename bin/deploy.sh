@@ -92,7 +92,7 @@ kubectl rollout status deployment/aitrader-paper -n trader --timeout=1200s
 # second after the rollout reports done - and reading it accuses a good deploy
 # of shipping the previous commit. Retried, because the replacement is not
 # necessarily listed the instant the rollout returns.
-want="ghcr.io/mrtrigger/aitrader-paper:$SHA"
+want="registry.wallintech.eu/mrtrigger/aitrader-paper:$SHA"
 for _ in $(seq 1 20); do
   running=$(kubectl get pod -n trader -l app.kubernetes.io/name=aitrader-paper \
     -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{range .spec.containers}}{{if eq .name "api"}}{{.image}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}')
